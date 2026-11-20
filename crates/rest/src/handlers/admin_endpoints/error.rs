@@ -64,6 +64,43 @@ pub struct ApiError {
     pub current_revision: Option<u64>,
     /// `Retry-After` seconds.
     pub retry_after: Option<u64>,
+    /// `(field, value, held by)` of a uniqueness conflict.
+    pub duplicate: Option<Box<(String, String, String)>>,
+}
+
+/// What kind of failure an [`ApiError`] is, for callers that do not speak
+/// HTTP (the manager console's backend adapter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// `404`.
+    NotFound,
+    /// `409`/`412` with the stored revision: re-read and retry.
+    Conflict {
+        /// Stored revision.
+        current: u64,
+    },
+    /// `409`: a unique field is taken.
+    Duplicate {
+        /// Field path.
+        field: String,
+        /// The value.
+        value: String,
+        /// Endpoint holding it.
+        by: String,
+    },
+    /// `400`/`422`: see [`ApiError::field_errors`].
+    Invalid,
+    /// `409` business rule (immutable field, env-managed, default endpoint,
+    /// limit, no key ring), `403`.
+    Forbidden,
+    /// `401`/`428`: credential or precondition missing.
+    Unauthorized,
+    /// `429`/`503`.
+    Unavailable,
+    /// `501`: the service behind it is not installed.
+    NotImplemented,
+    /// Anything else (`5xx`).
+    Internal,
 }
 
 /// Result alias for handlers.
@@ -81,7 +118,43 @@ impl ApiError {
             }],
             current_revision: None,
             retry_after: None,
+            duplicate: None,
         }
+    }
+
+    /// Classifies the error for non-HTTP callers.
+    pub fn kind(&self) -> ErrorKind {
+        if let Some(d) = &self.duplicate {
+            let (field, value, by) = &**d;
+            return ErrorKind::Duplicate {
+                field: field.clone(),
+                value: value.clone(),
+                by: by.clone(),
+            };
+        }
+        if let Some(current) = self.current_revision {
+            return ErrorKind::Conflict { current };
+        }
+        match self.status.as_u16() {
+            404 => ErrorKind::NotFound,
+            400 | 415 | 422 => ErrorKind::Invalid,
+            403 | 409 | 412 => ErrorKind::Forbidden,
+            401 | 428 => ErrorKind::Unauthorized,
+            429 | 503 => ErrorKind::Unavailable,
+            501 => ErrorKind::NotImplemented,
+            _ => ErrorKind::Internal,
+        }
+    }
+
+    /// Per-field problems (field path, message), as P0's `FieldError`.
+    pub fn field_errors(&self) -> Vec<helios_endpoints::model::FieldError> {
+        self.issues
+            .iter()
+            .map(|i| helios_endpoints::model::FieldError {
+                field: i.field.clone().unwrap_or_default(),
+                message: i.message.clone(),
+            })
+            .collect()
     }
 
     /// `400 invalid`.
@@ -105,6 +178,7 @@ impl ApiError {
             issues,
             current_revision: None,
             retry_after: None,
+            duplicate: None,
         }
     }
 
@@ -233,6 +307,7 @@ impl From<StoreError> for ApiError {
                     field,
                     format!("{field} {value:?} is already used by endpoint {by}"),
                 )],
+                duplicate: Some(Box::new((field.to_string(), value.clone(), by.clone()))),
                 ..Self::new(StatusCode::CONFLICT, "duplicate", "")
             },
             StoreError::Invalid(v) => v.into(),
@@ -355,5 +430,56 @@ mod tests {
         assert!(e.to_string().starts_with("503"));
         let r = e.into_response();
         assert_eq!(r.headers()[header::RETRY_AFTER], "5");
+    }
+
+    #[test]
+    fn kinds() {
+        assert_eq!(
+            ApiError::endpoint_not_found("x").kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            ApiError::conflict(3).kind(),
+            ErrorKind::Conflict { current: 3 }
+        );
+        assert_eq!(
+            ApiError::precondition_failed(3, "\"1\"").kind(),
+            ErrorKind::Conflict { current: 3 }
+        );
+        assert_eq!(ApiError::invalid_field("a", "b").kind(), ErrorKind::Invalid);
+        assert_eq!(ApiError::bad_request("b").kind(), ErrorKind::Invalid);
+        assert_eq!(
+            ApiError::from(StoreError::Forbidden("no".into())).kind(),
+            ErrorKind::Forbidden
+        );
+        assert_eq!(
+            ApiError::precondition_required().kind(),
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(
+            ApiError::from(StoreError::Unavailable("x".into())).kind(),
+            ErrorKind::Unavailable
+        );
+        assert_eq!(
+            ApiError::not_implemented("x").kind(),
+            ErrorKind::NotImplemented
+        );
+        assert_eq!(ApiError::internal("x").kind(), ErrorKind::Internal);
+        let d = ApiError::from(StoreError::Duplicate {
+            field: "path",
+            value: "a".into(),
+            by: "b".into(),
+        });
+        assert_eq!(
+            d.kind(),
+            ErrorKind::Duplicate {
+                field: "path".into(),
+                value: "a".into(),
+                by: "b".into()
+            }
+        );
+        let f = ApiError::invalid_field("auth.issuer", "required").field_errors();
+        assert_eq!(f[0].field, "auth.issuer");
+        assert_eq!(f[0].message, "required");
     }
 }

@@ -1,11 +1,9 @@
-//! The endpoint admin API suite over PostgreSQL storage: package registry
-//! (per tenant), tenant statistics, AuditEvent search and tenant purge run
-//! against a real PostgreSQL database (one fresh database per test).
-//!
-//! The endpoint store is the in-memory contract store until package P1's
-//! PostgreSQL `EndpointStore` (`crates/endpoints/src/pg.rs`) lands; the
-//! suite is store-agnostic (`Harness::new` takes any `Arc<dyn EndpointStore>`),
-//! so switching [`endpoint_store`] to it is the only change needed then.
+//! The endpoint admin API suite over PostgreSQL: the endpoint configuration
+//! lives in `hfs_endpoints` / `hfs_endpoint_revisions` through
+//! `helios_endpoints::pg::PgEndpointStore` (CAS revisions, epochs, history),
+//! and the package registry (per tenant), tenant statistics, AuditEvent
+//! search and tenant purge run on the same database (one fresh database per
+//! test).
 //!
 //! PostgreSQL: `HFS_TEST_PG_HOST`/`HFS_TEST_PG_PORT` (user, password and
 //! database `postgres`), as in HealthyMind CI; otherwise a `postgres:16`
@@ -21,7 +19,8 @@ mod container_cleanup;
 
 use std::sync::Arc;
 
-use helios_endpoints::{EndpointStore, MemoryEndpointStore, SecretKeyRing};
+use helios_endpoints::pg::PgEndpointStore;
+use helios_endpoints::{EndpointStore, SecretKeyRing};
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
 use suite::{FakeDuplicate, Harness, Options};
 use testcontainers::ImageExt;
@@ -103,12 +102,10 @@ async fn postgres() -> Arc<PostgresBackend> {
     Arc::new(backend)
 }
 
-fn endpoint_store() -> Arc<dyn EndpointStore> {
-    Arc::new(MemoryEndpointStore::new())
-}
-
 async fn harness(opts: Options) -> Harness {
-    Harness::new(postgres().await, endpoint_store(), opts).await
+    let backend = postgres().await;
+    let store: Arc<dyn EndpointStore> = Arc::new(PgEndpointStore::new(backend.shared_pool()));
+    Harness::new(backend, store, opts).await
 }
 
 #[tokio::test]

@@ -30,6 +30,11 @@
 //! write-only ([`spec_input`], [`secrets`]); URLs the server fetches pass the
 //! SSRF policy ([`outbound`]); errors are OperationOutcomes ([`error`]);
 //! authorization is pluggable ([`authz`]).
+//!
+//! Every rule lives in [`service`] (methods on [`AdminEndpointsState`]); the
+//! HTTP handlers in [`endpoints`] only parse and render, so the manager
+//! console can call the same service and get the same validation, errors
+//! ([`error::ErrorKind`]) and audit trail.
 
 pub mod audit;
 pub mod authz;
@@ -39,6 +44,7 @@ pub mod hooks;
 pub mod outbound;
 pub mod packages;
 pub mod secrets;
+pub mod service;
 pub mod spec_input;
 
 use std::sync::Arc;
