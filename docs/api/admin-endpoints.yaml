@@ -1,0 +1,860 @@
+openapi: 3.1.0
+info:
+  title: HealthyMind FHIR Server Manager — endpoint admin API
+  version: 0.1.0
+  summary: Create, configure, enable/disable and delete the FHIR endpoints of one HFS deployment.
+  description: |
+    Package P4 of `docs/design/fhir-server-manager.md` (§8). Served by HFS
+    under `/admin` (publicly `https://host/admin/...` next to `/fhir/...`).
+    The implementation is `crates/rest/src/routing/admin_endpoints.rs` and
+    `crates/rest/src/handlers/admin_endpoints/`; the test
+    `crates/rest/tests/admin_endpoints_openapi.rs` fails when a route exists
+    on one side only.
+
+    **Authorization.** Administrators only: the `HFS_ADMIN_PASSWORD`
+    credential (`Authorization: Basic admin:<password>`, a bearer password, or
+    the console's admin session cookie — cookie writes must be same-site), a
+    bearer JWT holding `HFS_ADMIN_TOKEN_SCOPE` (default `system/*.cruds`), or —
+    once console sign-in is installed — a console session with role `admin`.
+    Unauthenticated calls answer `401` (development override:
+    `HFS_CONSOLE_ALLOW_ANONYMOUS_ADMIN=true`).
+
+    **Concurrency.** Every endpoint response carries `ETag: "<revision>"`.
+    `PUT` and `PATCH` must send it back as `If-Match` (`428` without it,
+    `412` when stale); `$enable`, `$disable` and `DELETE` honour it when sent.
+    A write that loses a race inside the store answers `409` with the current
+    revision (OperationOutcome extension
+    `https://healthymind.tech/fhir/StructureDefinition/hfs-current-revision`
+    and `ETag`).
+
+    **Hot reload.** A successful write reloads the routing snapshot of the
+    instance that served it before the response is sent; other instances
+    follow within `HFS_CLUSTER_SYNC_INTERVAL_MS` (NOTIFY usually sooner).
+
+    **Secrets** (`terminology.token`) are sealed with AES-256-GCM under
+    `HFS_SECRET_KEYS`, bound to the endpoint id and field, and never returned:
+    responses show `{"set": true}`. They change only through the `secrets`
+    member of a request (`{"set": "…"}`, `"keep"` — the default — or
+    `"clear"`); a spec that carries anything but `null`/`{"set": bool}` in a
+    secret field is refused. Without a key ring, setting a secret answers `409`.
+
+    **Outbound URLs** the server fetches (`auth.issuer`, `auth.jwksUrl`,
+    `terminology.serverUrl`) are checked when they change: https only (http
+    for hosts in `HFS_OUTBOUND_ALLOW`), no credentials, no cloud metadata
+    names, and no internal address after DNS resolution (`422`, issue code
+    `security`).
+
+    **Errors** are FHIR `OperationOutcome`s (`application/fhir+json`); `422`
+    has one issue per field with the field path in `expression`.
+
+    Every write is audited as an `AuditEvent` in the default tenant
+    (`entity.what` = `Endpoint/{name}`).
+servers:
+  - url: /
+security:
+  - adminBasic: []
+  - adminBearer: []
+  - adminSession: []
+tags:
+  - name: endpoints
+  - name: packages
+  - name: secrets
+
+paths:
+  /admin/endpoints:
+    get:
+      tags: [endpoints]
+      operationId: listEndpoints
+      summary: List endpoints (redacted)
+      parameters:
+        - name: include
+          in: query
+          description: Comma list of `deleted` (tombstones too) and `stats` (resource counts per endpoint).
+          schema: {type: string, example: "deleted,stats"}
+      responses:
+        "200":
+          description: Endpoints, default first then by name.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, epoch, endpoints]
+                properties:
+                  total: {type: integer}
+                  epoch: {type: integer, description: Store epoch (advances on every write).}
+                  endpoints:
+                    type: array
+                    items: {$ref: "#/components/schemas/Endpoint"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+    post:
+      tags: [endpoints]
+      operationId: createEndpoint
+      summary: Create an endpoint
+      description: |
+        `path` defaults to `name`, `storage` to the tenant named like the
+        endpoint, `displayName` to `name`. `status` may be `enabled`
+        (default) or `disabled`. At most 200 endpoints per deployment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EndpointInput"}
+            example:
+              name: twcore
+              displayName: TW Core sandbox
+              fhirVersion: R4
+              auth:
+                mode: write-protect
+                issuer: https://hfs.gugulu.tw/auth/realms/hfs-test
+                jwksUrl: https://hfs.gugulu.tw/auth/realms/hfs-test/protocol/openid-connect/certs
+                audience: twcore-api
+              validation: {mode: enforce, terminology: remote}
+              terminology: {serverUrl: "https://tx.example.org/fhir"}
+              secrets:
+                terminology.token: {set: "…"}
+      responses:
+        "201":
+          description: Created.
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+            Location:
+              description: "`admin/endpoints/{name}`"
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Endpoint"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+
+  /admin/endpoints/{name}:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    get:
+      tags: [endpoints]
+      operationId: getEndpoint
+      summary: One endpoint (redacted)
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: {type: string}
+      responses:
+        "200":
+          description: The endpoint.
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Endpoint"}
+        "304": {description: Unchanged since the ETag sent in If-None-Match.}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [endpoints]
+      operationId: replaceEndpoint
+      summary: Replace the spec
+      description: |
+        Full replacement. A GET body can be sent back as is: `id`,
+        `revision`, timestamps, `publicBaseUrl` and `warnings` are ignored and
+        redacted secrets mean "keep". `name` and `storage` are immutable;
+        `status` must equal the current status (use `$enable`/`$disable`/`DELETE`).
+      parameters:
+        - $ref: "#/components/parameters/IfMatchRequired"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EndpointInput"}
+      responses:
+        "200":
+          description: Updated.
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Endpoint"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "428": {$ref: "#/components/responses/PreconditionRequired"}
+    patch:
+      tags: [endpoints]
+      operationId: patchEndpoint
+      summary: JSON merge patch (RFC 7396) of the spec
+      description: "`null` removes a member (a policy section set to `null` inherits the server's environment again). `secrets` works as in PUT."
+      parameters:
+        - $ref: "#/components/parameters/IfMatchRequired"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: {type: object}
+            example: {rateLimit: {anonymousPerMinute: 60, authenticatedPerMinute: 600, burstSeconds: 10}, cors: null}
+          application/json:
+            schema: {type: object}
+      responses:
+        "200":
+          description: Updated.
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Endpoint"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+        "415": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "428": {$ref: "#/components/responses/PreconditionRequired"}
+    delete:
+      tags: [endpoints]
+      operationId: deleteEndpoint
+      summary: Delete (tombstone) an endpoint
+      description: |
+        Its name, path and tenant become reusable. The default endpoint and
+        env-managed endpoints cannot be deleted (`409`). With `purge=true` the
+        endpoint is disabled, its tenant's data is purged (resources, history,
+        search index; irreversible), then it is tombstoned; a failed purge
+        leaves it disabled and the DELETE can be retried.
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must repeat the endpoint name.
+          schema: {type: string}
+        - name: purge
+          in: query
+          schema: {type: boolean, default: false}
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoint: {$ref: "#/components/schemas/Endpoint"}
+                  purged: {type: boolean}
+                  resourcesRemoved: {type: [integer, "null"]}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+
+  /admin/endpoints/{name}/$enable:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      tags: [endpoints]
+      operationId: enableEndpoint
+      summary: Enable (serve requests)
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200": {$ref: "#/components/responses/EndpointOk"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+
+  /admin/endpoints/{name}/$disable:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      tags: [endpoints]
+      operationId: disableEndpoint
+      summary: Disable (the endpoint answers 503)
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200": {$ref: "#/components/responses/EndpointOk"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "412": {$ref: "#/components/responses/PreconditionFailed"}
+
+  /admin/endpoints/{name}/history:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    get:
+      tags: [endpoints]
+      operationId: endpointHistory
+      summary: Configuration revisions, newest first (secrets redacted)
+      description: For a deleted name, the history of the most recently deleted endpoint of that name.
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 500, default: 50}
+      responses:
+        "200":
+          description: Revisions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  id: {type: string}
+                  revisions:
+                    type: array
+                    items: {$ref: "#/components/schemas/Revision"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/endpoints/{name}/$duplicate:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      tags: [endpoints]
+      operationId: duplicateEndpoint
+      summary: Duplicate an endpoint (config ± data) through the sync service
+      description: |
+        Validates the request (name/path grammar and reserved list, free
+        name/path/tenant, key ring when secrets are copied) and hands it to
+        the sync service, which creates the copy (`provisioning`) and the job
+        that fills it. `501` while the sync service is not installed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DuplicateRequest"}
+      responses:
+        "202":
+          description: Started.
+          headers:
+            Location:
+              description: Job status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId: {type: string}
+                  statusUrl: {type: string}
+                  endpoint: {$ref: "#/components/schemas/Endpoint"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /admin/endpoints/{name}/$test-auth:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      tags: [endpoints]
+      operationId: testEndpointAuth
+      summary: Probe issuer discovery and JWKS
+      description: Tests the stored `auth` section, or an unsaved one sent as the body. URLs pass the outbound policy first. `501` while the probe is not installed.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EndpointAuth"}
+      responses:
+        "200":
+          description: Probe report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  checks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: {type: string}
+                        ok: {type: boolean}
+                        detail: {type: [string, "null"]}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /admin/endpoints/{name}/stats:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    get:
+      tags: [endpoints]
+      operationId: endpointStats
+      summary: Resource counts, last write and recent traffic (this instance)
+      parameters:
+        - name: window
+          in: query
+          description: Traffic window in seconds.
+          schema: {type: integer, minimum: 60, maximum: 86400, default: 3600}
+      responses:
+        "200":
+          description: Statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  tenant: {type: string}
+                  status: {type: string}
+                  resources: {type: object, additionalProperties: {type: integer}}
+                  total: {type: integer}
+                  lastWrite: {type: [string, "null"], format: date-time}
+                  trafficScope: {type: string, const: this-instance}
+                  traffic:
+                    type: object
+                    properties:
+                      windowSeconds: {type: integer}
+                      samples: {type: integer}
+                      requestsPerMinute: {type: number}
+                      p95Ms: {type: number}
+                      errorRate: {type: number}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /admin/endpoints/{name}/audit:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    get:
+      tags: [endpoints]
+      operationId: endpointAudit
+      summary: AuditEvents of the endpoint's tenant, newest first
+      parameters:
+        - name: _count
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: cursor
+          in: query
+          description: Opaque cursor from the `next` link.
+          schema: {type: string}
+      responses:
+        "200":
+          description: A FHIR searchset Bundle (`next` link when there are more).
+          content:
+            application/fhir+json:
+              schema: {type: object}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /admin/endpoints/{name}/packages:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    get:
+      tags: [packages]
+      operationId: listEndpointPackages
+      summary: Packages installed in the endpoint's tenant
+      description: Same shape as `GET /admin/packages`; requires `HFS_ADMIN_UI=true` (`403` otherwise).
+      responses:
+        "200":
+          description: Installed packages.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: {type: string}
+                  packages: {type: array, items: {type: object}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+    post:
+      tags: [packages]
+      operationId: installEndpointPackage
+      summary: Plan or install a package into the endpoint's tenant
+      description: |
+        A JSON install request (`{"package": "name#version", "dryRun": false, "options": {…}}`,
+        as for `POST /admin/packages`) or a `.tgz` upload
+        (`application/gzip` / `application/octet-stream`, at most
+        `HFS_PACKAGE_MAX_SIZE`). Progress at `/admin/packages/jobs/{id}`.
+      parameters:
+        - name: dryRun
+          in: query
+          schema: {type: boolean}
+        - name: wait
+          in: query
+          description: Hold the response until the job ends, at most this many seconds (≤ 60).
+          schema: {type: integer, maximum: 60}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object}
+          application/gzip:
+            schema: {type: string, format: binary}
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "200": {$ref: "#/components/responses/Job"}
+        "202": {$ref: "#/components/responses/Job"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /admin/endpoints/{name}/packages/{package}/{version}:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+      - name: package
+        in: path
+        required: true
+        schema: {type: string}
+      - name: version
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [packages]
+      operationId: getEndpointPackage
+      summary: One installed package, resources by type
+      parameters:
+        - name: resources
+          in: query
+          schema: {type: boolean, default: true}
+      responses:
+        "200":
+          description: The package.
+          content:
+            application/json:
+              schema: {type: object}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [packages]
+      operationId: uninstallEndpointPackage
+      summary: Uninstall a package from the endpoint's tenant
+      parameters:
+        - name: wait
+          in: query
+          schema: {type: integer, maximum: 60}
+      responses:
+        "200": {$ref: "#/components/responses/Job"}
+        "202": {$ref: "#/components/responses/Job"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /admin/secrets/$rewrap:
+    post:
+      tags: [secrets]
+      operationId: rewrapSecrets
+      summary: Re-seal every stored secret under the active key
+      description: |
+        Key rotation: prepend a new key to `HFS_SECRET_KEYS`, restart, call
+        this, then drop the old key. Env-managed endpoints are reported as
+        failures (edit `HFS_ENDPOINTS_FILE`). `409` without a key ring.
+      responses:
+        "200":
+          description: Report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  activeKey: {type: string}
+                  rewrapped: {type: integer}
+                  failed: {type: integer}
+                  reports:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        scope: {type: string}
+                        rewrapped: {type: integer}
+                        current: {type: integer}
+                        failed: {type: array, items: {type: string}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+components:
+  securitySchemes:
+    adminBasic:
+      type: http
+      scheme: basic
+      description: "`admin:<HFS_ADMIN_PASSWORD>`"
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: A JWT with the admin token scope, or the administrator password as a bearer value.
+    adminSession:
+      type: apiKey
+      in: cookie
+      name: hfs_admin
+      description: Console administrator session (same-site writes only).
+
+  parameters:
+    Name:
+      name: name
+      in: path
+      required: true
+      description: Endpoint name (`^[a-z][a-z0-9-]{0,62}$`, not ending in `-`).
+      schema: {type: string}
+    IfMatch:
+      name: If-Match
+      in: header
+      description: '`"<revision>"` (or `*`).'
+      schema: {type: string}
+    IfMatchRequired:
+      name: If-Match
+      in: header
+      required: true
+      description: '`"<revision>"` from the ETag of the endpoint being edited (or `*`).'
+      schema: {type: string}
+
+  headers:
+    ETag:
+      description: '`"<revision>"`'
+      schema: {type: string}
+
+  responses:
+    EndpointOk:
+      description: The endpoint after the change (unchanged when already in that status).
+      headers:
+        ETag: {$ref: "#/components/headers/ETag"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Endpoint"}
+    Job:
+      description: A package job (`200` finished within `wait`, `202` still running; `Location` = `admin/packages/jobs/{id}`).
+      content:
+        application/json:
+          schema: {type: object}
+    Error:
+      description: Error.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    BadRequest:
+      description: Malformed request (bad JSON, bad query, missing `confirm`).
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    Unauthorized:
+      description: No administrator credential.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    Forbidden:
+      description: Not an administrator, cross-site cookie write, or package administration disabled.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    NotFound:
+      description: Unknown endpoint or package.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    Conflict:
+      description: Revision conflict (with current revision), duplicate name/path/tenant, change not allowed (immutable field, env-managed, default endpoint), endpoint limit, or no key ring.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    PreconditionFailed:
+      description: Stale If-Match.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    PreconditionRequired:
+      description: If-Match missing.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    Unprocessable:
+      description: Validation failed; one issue per field (`expression` = field path).
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+    NotImplemented:
+      description: The service behind this route is not installed in this server.
+      content:
+        application/fhir+json:
+          schema: {$ref: "#/components/schemas/OperationOutcome"}
+
+  schemas:
+    OperationOutcome:
+      type: object
+      required: [resourceType, issue]
+      properties:
+        resourceType: {const: OperationOutcome}
+        extension:
+          type: array
+          items:
+            type: object
+            properties:
+              url: {type: string}
+              valueInteger: {type: integer}
+        issue:
+          type: array
+          items:
+            type: object
+            required: [severity, code]
+            properties:
+              severity: {type: string}
+              code: {type: string}
+              diagnostics: {type: string}
+              expression: {type: array, items: {type: string}}
+
+    Sealed:
+      description: A stored secret, redacted.
+      type: object
+      properties:
+        set: {type: boolean}
+
+    SecretInput:
+      oneOf:
+        - type: object
+          required: [set]
+          properties:
+            set: {type: string, minLength: 1}
+        - enum: [keep, clear]
+
+    EndpointAuth:
+      type: object
+      properties:
+        mode: {enum: ["off", write-protect, full]}
+        issuer: {type: [string, "null"]}
+        jwksUrl: {type: [string, "null"]}
+        audience: {type: [string, "null"]}
+        algorithms: {type: array, items: {enum: [RS256, RS384, RS512, ES256, ES384, PS256, PS384, PS512]}}
+        clockSkewSecs: {type: [integer, "null"]}
+        jwksMaxAgeSecs: {type: [integer, "null"]}
+        scopes:
+          type: object
+          properties:
+            acceptV1: {type: boolean}
+            allowPatient: {type: boolean}
+            allowUser: {type: boolean}
+            allowSystem: {type: boolean}
+            patientNonCompartment: {enum: [allow, deny]}
+            patientSharedTypes: {type: [array, "null"], items: {type: string}}
+        smart: {type: object}
+        acceptAdminCredential: {type: boolean}
+
+    EndpointSpec:
+      type: object
+      description: "`crates/endpoints/src/model.rs` `EndpointSpec` (policy sections `null` = inherit the server's environment)."
+      properties:
+        name: {type: string, pattern: "^[a-z][a-z0-9-]{0,62}$"}
+        path: {type: string, description: '"" only for the default endpoint.'}
+        displayName: {type: string, minLength: 1, maxLength: 120}
+        description: {type: [string, "null"]}
+        fhirVersion: {enum: [R4, R4B, R5, R6]}
+        storage:
+          type: object
+          required: [kind, tenantId]
+          properties:
+            kind: {const: tenant}
+            tenantId: {type: string}
+        status: {enum: [enabled, disabled, provisioning, deleted]}
+        auth:
+          oneOf:
+            - {type: "null"}
+            - $ref: "#/components/schemas/EndpointAuth"
+        validation:
+          type: [object, "null"]
+          properties:
+            mode: {enum: ["off", log, enforce]}
+            terminology: {enum: ["off", embedded, remote, remote-only]}
+            storedProfiles: {type: boolean}
+            requiredProfiles:
+              type: array
+              items:
+                type: object
+                properties:
+                  resourceType: {type: string}
+                  profile: {type: string}
+        terminology:
+          type: [object, "null"]
+          properties:
+            serverUrl: {type: [string, "null"]}
+            publicUrl: {type: [string, "null"]}
+            timeoutSecs: {type: [integer, "null"]}
+            token:
+              oneOf:
+                - {type: "null"}
+                - $ref: "#/components/schemas/Sealed"
+        cors:
+          type: [object, "null"]
+          properties:
+            enabled: {type: boolean}
+            allowedOrigins: {type: array, items: {type: string}}
+            allowCredentials: {type: boolean}
+            extraHeaders: {type: array, items: {type: string}}
+        rateLimit:
+          type: [object, "null"]
+          properties:
+            anonymousPerMinute: {type: integer}
+            authenticatedPerMinute: {type: integer}
+            burstSeconds: {type: integer}
+        consoleAccess: {enum: ["off", read-only, role-based]}
+        legacyTenantHeader: {type: boolean}
+        managedBy: {enum: [ui, env]}
+        labels: {type: object, additionalProperties: {type: string}}
+
+    EndpointInput:
+      description: An EndpointSpec plus write-only secret inputs.
+      allOf:
+        - $ref: "#/components/schemas/EndpointSpec"
+        - type: object
+          properties:
+            secrets:
+              type: object
+              additionalProperties: {$ref: "#/components/schemas/SecretInput"}
+              propertyNames: {enum: [terminology.token]}
+
+    Endpoint:
+      allOf:
+        - $ref: "#/components/schemas/EndpointSpec"
+        - type: object
+          properties:
+            id: {type: string, format: uuid}
+            revision: {type: integer}
+            createdAt: {type: string, format: date-time}
+            updatedAt: {type: string, format: date-time}
+            createdBy: {type: [string, "null"]}
+            updatedBy: {type: [string, "null"]}
+            publicBaseUrl: {type: string}
+            warnings: {type: array, items: {type: string}}
+            stats: {type: object}
+
+    Revision:
+      type: object
+      properties:
+        endpointId: {type: string}
+        revision: {type: integer}
+        change: {enum: [create, update, status]}
+        spec: {$ref: "#/components/schemas/EndpointSpec"}
+        changedAt: {type: string, format: date-time}
+        changedBy: {type: [string, "null"]}
+
+    DuplicateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        path: {type: [string, "null"]}
+        displayName: {type: [string, "null"]}
+        data: {enum: [none, current, history], default: none}
+        packages: {type: boolean, default: true}
+        auth: {type: boolean, default: true}
+        secrets: {type: boolean, default: false}
+        keepInSync: {type: boolean, default: false}
