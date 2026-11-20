@@ -1214,7 +1214,12 @@ Later packages: rebase on these.
   `helios_auth::EndpointAuthProbe::new(OutboundGuard)` (or
   `AuthHook::probe(managed_by)`) `.test(&EndpointAuth).await -> ProbeReport`
   (serde camelCase: `ok, mode, issuer{ok,url,detail,elapsedMs},
-  jwks{…,keyCount}, warnings[]`). Warnings: `helios_auth::discovery::
+  jwks{…,keyCount}, warnings[], checks[{name,ok,detail}]` — `checks` has the
+  shape of P4's `ProbeCheck`: `issuer-discovery`, `jwks`, `algorithms`, and
+  `token` from `.test_with_token(&auth, jwt)`, which validates a supplied token
+  exactly as the endpoint would). P4 implements its `EndpointAuthProbe` trait
+  over it (or re-exports `helios_auth::{ProbeReport, ProbeCheck}`) and wires it
+  with `OutboundGuard::Policy(OutboundPolicy::from_env())`. Warnings: `helios_auth::discovery::
   auth_warnings(&EndpointAuth)` and `shared_audience_warnings(iter of (name,
   &EndpointAuth))`. New admin routes layer
   `middleware::auth::admin_token_scope_middleware` with
@@ -1224,5 +1229,11 @@ Later packages: rebase on these.
   (environment document unchanged). CapabilityStatement: P1's builder keeps the
   configured `oauth-uris`; for endpoint-configured auth the handler replaces
   `rest.security` with the discovery-filled one (keeping P1's `cors` flag).
+- **One middleware.** `auth_layer` installs a single `from_fn` running
+  resolve → authenticate → rate limit → audit attribution → authorize
+  (`middleware::auth::{authenticate_request, authorize_request}` and
+  `client_rate_limit::check` return results instead of calling `next`). With
+  one layer per step, debug builds overflowed a worker's 2 MiB stack on
+  `$validate` under `HFS_MANAGER=on` + audit + auth.
 - **Patient shared types** follow the endpoint's policy, in batch/transaction
   entries too (task-local set by the authorization layer).

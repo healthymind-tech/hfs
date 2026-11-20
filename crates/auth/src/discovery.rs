@@ -462,7 +462,38 @@ pub struct ProbeReport {
     pub jwks: Option<ProbeStep>,
     /// Non-blocking findings (no audience, admin credential accepted, …).
     pub warnings: Vec<String>,
+    /// The same outcome as a flat list (`issuer-discovery`, `jwks`,
+    /// `algorithms`, and `token` when one was supplied), the shape the admin
+    /// API's `$test-auth` answers with (package P4's `ProbeCheck`).
+    pub checks: Vec<ProbeCheck>,
 }
+
+/// One check of a [`ProbeReport`] (`{name, ok, detail}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeCheck {
+    /// `issuer-discovery`, `jwks`, `algorithms`, `token`.
+    pub name: String,
+    /// Whether it passed.
+    pub ok: bool,
+    /// Details or the error.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl ProbeCheck {
+    fn new(name: &str, ok: bool, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+/// Algorithms the token verifier implements (`EndpointAuth::algorithms`
+/// may name others the model accepts, e.g. `PS256`; those never verify).
+const VERIFIER_ALGORITHMS: &[&str] = &["RS256", "RS384", "RS512", "ES256", "ES384"];
 
 /// Probes an endpoint's auth configuration (package P2's contract for the
 /// admin API's `$test-auth`, package P4).
@@ -492,16 +523,104 @@ impl EndpointAuthProbe {
                 issuer: None,
                 jwks: None,
                 warnings,
+                checks: vec![ProbeCheck::new(
+                    "mode",
+                    true,
+                    "auth is off: no credential is needed",
+                )],
             };
         }
         let issuer = self.issuer_step(auth.issuer.as_deref()).await;
         let jwks = self.jwks_step(auth.jwks_url.as_deref()).await;
+        let unsupported: Vec<&str> = auth
+            .algorithms
+            .iter()
+            .map(String::as_str)
+            .filter(|a| !VERIFIER_ALGORITHMS.contains(a))
+            .collect();
+        let algorithms = if auth.algorithms.is_empty() {
+            ProbeCheck::new("algorithms", true, "default: RS256, RS384, ES256, ES384")
+        } else if unsupported.len() == auth.algorithms.len() {
+            ProbeCheck::new(
+                "algorithms",
+                false,
+                format!(
+                    "none of {} is supported by the verifier ({})",
+                    unsupported.join(", "),
+                    VERIFIER_ALGORITHMS.join(", ")
+                ),
+            )
+        } else if unsupported.is_empty() {
+            ProbeCheck::new("algorithms", true, auth.algorithms.join(", "))
+        } else {
+            ProbeCheck::new(
+                "algorithms",
+                true,
+                format!("{} are ignored (unsupported)", unsupported.join(", ")),
+            )
+        };
+        let checks = vec![
+            ProbeCheck::new("issuer-discovery", issuer.ok, issuer.detail.clone()),
+            ProbeCheck::new("jwks", jwks.ok, jwks.detail.clone()),
+            algorithms,
+        ];
         ProbeReport {
-            ok: issuer.ok && jwks.ok,
+            ok: checks.iter().all(|c| c.ok),
             mode: mode.into(),
             issuer: Some(issuer),
             jwks: Some(jwks),
             warnings,
+            checks,
+        }
+    }
+
+    /// [`test`](Self::test), plus a `token` check: `token` (a bare JWT, no
+    /// `Bearer `) is validated exactly as the endpoint would validate it
+    /// (issuer, audience, algorithms, signature against the JWKS fetched
+    /// through the guard, expiry with the endpoint's skew). The detail names
+    /// the subject and scopes on success, the reason otherwise. The token is
+    /// never logged or echoed.
+    pub async fn test_with_token(&self, auth: &EndpointAuth, token: &str) -> ProbeReport {
+        let mut report = self.test(auth).await;
+        let check = self.token_check(auth, token.trim()).await;
+        report.ok &= check.ok;
+        report.checks.push(check);
+        report
+    }
+
+    async fn token_check(&self, auth: &EndpointAuth, token: &str) -> ProbeCheck {
+        use crate::provider::AuthProvider;
+        if auth.mode == EndpointAuthMode::Off {
+            return ProbeCheck::new("token", true, "auth is off: tokens are ignored");
+        }
+        let config = AuthConfig::from_endpoint(auth, &AuthConfig::default());
+        let Some(jwks_url) = config.jwks_url.clone() else {
+            return ProbeCheck::new("token", false, "no JWKS URL configured");
+        };
+        if let Err(e) = self.guard.check_url(&jwks_url) {
+            return ProbeCheck::new("token", false, e);
+        }
+        let cache = Arc::new(
+            crate::jwks::JwksCache::new(&jwks_url, 0)
+                .with_max_ttl(config.jwks_max_age_secs)
+                .with_http_client(self.guard.client(Duration::from_secs(10))),
+        );
+        let provider = crate::provider::jwks_bearer::JwksBearerAuthProvider::new(cache, &config);
+        match provider.authenticate(&format!("Bearer {token}")).await {
+            Ok(p) => ProbeCheck::new(
+                "token",
+                true,
+                format!(
+                    "accepted: sub {}, scopes {}",
+                    p.subject,
+                    if p.scopes.raw().is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        p.scopes.raw().join(" ")
+                    }
+                ),
+            ),
+            Err(e) => ProbeCheck::new("token", false, format!("refused: {e}")),
         }
     }
 
@@ -798,6 +917,61 @@ mod tests {
         auth.mode = EndpointAuthMode::Off;
         let report = probe.test(&auth).await;
         assert!(report.ok && report.issuer.is_none() && report.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_probe_checks_a_supplied_token_and_the_algorithms() {
+        let (_server, issuer) = idp(None).await;
+        let probe = EndpointAuthProbe::new(loopback_policy());
+        let mut auth = EndpointAuth {
+            mode: EndpointAuthMode::Full,
+            issuer: Some(issuer.clone()),
+            jwks_url: Some(format!("{issuer}/certs")),
+            audience: Some("api".into()),
+            ..EndpointAuth::default()
+        };
+        let sign = |aud: &str| {
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+            header.kid = Some("k".into());
+            let claims = serde_json::json!({"sub": "app", "iss": issuer, "aud": aud,
+                "exp": jsonwebtoken::get_current_timestamp() + 300, "scope": "system/*.rs"});
+            let key = jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!(
+                "../tests/data/test_rsa_key.pem"
+            ))
+            .unwrap();
+            jsonwebtoken::encode(&header, &claims, &key).unwrap()
+        };
+        let report = probe.test_with_token(&auth, &sign("api")).await;
+        assert!(report.ok, "{report:?}");
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["issuer-discovery", "jwks", "algorithms", "token"]);
+        let token = report.checks.last().unwrap();
+        assert!(
+            token.detail.as_deref().unwrap().contains("system/*.rs"),
+            "{token:?}"
+        );
+
+        let report = probe.test_with_token(&auth, &sign("other-api")).await;
+        assert!(!report.ok);
+        let token = report.checks.last().unwrap();
+        assert!(
+            !token.ok && token.detail.as_deref().unwrap().contains("audience"),
+            "{token:?}"
+        );
+
+        auth.algorithms = vec!["PS256".into()];
+        let report = probe.test(&auth).await;
+        assert!(!report.ok);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "algorithms" && !c.ok)
+        );
+        auth.algorithms = vec!["PS256".into(), "RS256".into()];
+        assert!(probe.test(&auth).await.ok);
+        let json = serde_json::to_value(probe.test(&auth).await).unwrap();
+        assert_eq!(json["checks"][0]["name"], "issuer-discovery");
     }
 
     #[tokio::test]

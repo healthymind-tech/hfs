@@ -55,10 +55,12 @@ use tracing::{debug, warn};
 
 use crate::audit::AttributeToPrincipal;
 use crate::middleware::auth::{
-    AuthMiddlewareState, EndpointScopePolicy, authenticate, authorize, console_principal,
-    forbidden_response,
+    AuthMiddlewareState, EndpointScopePolicy, authenticate_request, authorize_request,
+    console_principal, forbidden_response, run_authorized,
 };
-use crate::middleware::client_rate_limit::{ClientRateLimiter, RateBudget, RateLimitConfig};
+use crate::middleware::client_rate_limit::{
+    self as rate_limit, ClientRateLimiter, RateBudget, RateLimitConfig,
+};
 
 /// What every per-endpoint auth state shares with the environment's: the
 /// audit sink and its settings, the administrator gate, the tenant routing
@@ -645,66 +647,78 @@ fn is_safe(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
-/// Wraps the FHIR router in the per-endpoint auth layers, outermost first:
-/// effective-auth resolution → authentication (endpoint verifier, admin
-/// credential, console session) → rate limit (per endpoint and client) →
-/// principal capture for audit → authorization (scopes, patient compartment).
-/// Each step is a pass-through when the endpoint's auth is off.
+/// Wraps the FHIR router in the per-endpoint auth layer. One middleware runs,
+/// in order: effective-auth resolution → authentication (endpoint verifier,
+/// admin credential, console session) → rate limit (per endpoint and client)
+/// → principal capture for audit → authorization (scopes, patient
+/// compartment). Each auth step is a pass-through when the endpoint's auth is
+/// off. (One layer instead of five keeps the request future chain shallow:
+/// debug builds overflowed a worker's 2 MiB stack under the dispatcher, the
+/// audit layer and the validator with one middleware per step.)
 pub fn auth_layer<S>(router: Router<S>, hook: Arc<AuthHook>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let limiter = Arc::clone(&hook.limiter);
-    router
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&hook),
-            endpoint_authz,
-        ))
-        .layer(axum::middleware::from_fn(
-            crate::middleware::audit::capture_principal,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            limiter,
-            crate::middleware::client_rate_limit::endpoint_rate_limit_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&hook),
-            endpoint_authn,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            hook,
-            resolve_effective,
-        ))
+    router.layer(axum::middleware::from_fn_with_state(hook, endpoint_auth))
 }
 
-/// Stores the request's [`EffectiveAuth`], [`RateBudget`] and (for an
-/// endpoint with its own auth) [`EndpointScopePolicy`].
-async fn resolve_effective(
+async fn endpoint_auth(
     State(hook): State<Arc<AuthHook>>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    // The request's EffectiveAuth, RateBudget and (for an endpoint with its
+    // own auth) EndpointScopePolicy.
     let effective = hook.effective(request.extensions().get::<ResolvedEndpoint>());
-    let ext = request.extensions_mut();
-    ext.insert(effective.rate.clone());
-    if let Some(policy) = &effective.scope_policy {
-        ext.insert(EndpointScopePolicy(policy.clone()));
+    {
+        let ext = request.extensions_mut();
+        ext.insert(effective.rate.clone());
+        if let Some(policy) = &effective.scope_policy {
+            ext.insert(EndpointScopePolicy(policy.clone()));
+        }
+        ext.insert(Arc::clone(&effective));
     }
-    ext.insert(effective);
-    next.run(request).await
+    let state = effective.state.clone();
+
+    // Authentication.
+    if let Some(state) = &state {
+        request = match authenticate_endpoint(&hook, &effective, state, request).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    }
+
+    // Rate limit (inside authentication: billed to the OAuth client).
+    if let Some(refusal) = rate_limit::check(&hook.limiter, &effective.rate, &request) {
+        return refusal;
+    }
+
+    // Audit attribution, before authorization so a 403 names its user.
+    if let Some(principal) = request.extensions().get::<helios_auth::Principal>() {
+        helios_audit::context::set_user(crate::middleware::audit::audit_user(principal));
+    }
+
+    // Authorization.
+    match &state {
+        Some(state) => match authorize_request(state, request).await {
+            Ok((request, shared_types)) => run_authorized(request, shared_types, next).await,
+            Err(response) => response,
+        },
+        None => next.run(request).await,
+    }
 }
 
-async fn endpoint_authn(
-    State(hook): State<Arc<AuthHook>>,
+/// Authentication of one request: the console session principal when the
+/// request carries a console cookie and no `Authorization`, else the
+/// endpoint's [`authenticate_request`].
+// The `Err` is the response that ends the request, returned at once.
+#[allow(clippy::result_large_err)]
+async fn authenticate_endpoint(
+    hook: &AuthHook,
+    effective: &EffectiveAuth,
+    state: &AuthMiddlewareState,
     mut request: Request,
-    next: Next,
-) -> Response {
-    let Some(effective) = EffectiveAuth::of(request.extensions()) else {
-        return next.run(request).await;
-    };
-    let Some(state) = effective.state.clone() else {
-        return next.run(request).await;
-    };
+) -> Result<Request, Response> {
     if !request.headers().contains_key(header::AUTHORIZATION)
         && effective.console_access != ConsoleAccess::Off
         && !helios_auth::is_cross_site(request.headers())
@@ -721,7 +735,7 @@ async fn endpoint_authn(
     {
         if !is_safe(request.method()) && !hook.same_origin(request.headers()) {
             warn!(sub = %console.subject, "cross-site console write refused");
-            return forbidden_response("cross-site request refused");
+            return Err(forbidden_response("cross-site request refused"));
         }
         let principal = console_principal(&console, scopes);
         let path = request.uri().path().to_string();
@@ -737,25 +751,18 @@ async fn endpoint_authn(
                 .build();
             state.audit_sink.record(event).await;
         }
-        debug!(sub = %principal.subject, endpoint = effective.endpoint_name(), "console session principal");
+        debug!(
+            sub = %principal.subject,
+            endpoint = effective.endpoint_name(),
+            "console session principal"
+        );
         request
             .extensions_mut()
             .insert(crate::audit::audit_agent(&principal));
         request.extensions_mut().insert(principal);
-        return next.run(request).await;
+        return Ok(request);
     }
-    authenticate(&state, request, next).await
-}
-
-async fn endpoint_authz(
-    State(_hook): State<Arc<AuthHook>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    match EffectiveAuth::of(request.extensions()).and_then(|e| e.state.clone()) {
-        Some(state) => authorize(&state, request, next).await,
-        None => next.run(request).await,
-    }
+    authenticate_request(state, request).await
 }
 
 /// `404` for the SMART discovery document of an endpoint whose auth is off.

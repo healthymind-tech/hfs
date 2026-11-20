@@ -296,14 +296,26 @@ async fn limit(
     request: Request,
     next: Next,
 ) -> Response {
+    match check(limiter, budget, &request) {
+        Some(refusal) => refusal,
+        None => next.run(request).await,
+    }
+}
+
+/// Bills `request` to its bucket under `budget`: `None` when it may proceed,
+/// the `429` otherwise. Health probes and the administrator credential are
+/// never limited.
+pub(crate) fn check(
+    limiter: &ClientRateLimiter,
+    budget: &RateBudget,
+    request: &Request,
+) -> Option<Response> {
     if !budget.enabled() || exempt(request.uri().path()) {
-        return next.run(request).await;
+        return None;
     }
     let config = &limiter.config;
     let (key, per_minute) = match request.extensions().get::<Principal>() {
-        Some(p) if p.issuer == crate::middleware::auth::ADMIN_ISSUER => {
-            return next.run(request).await;
-        }
+        Some(p) if p.issuer == crate::middleware::auth::ADMIN_ISSUER => return None,
         Some(p) => {
             let who = p
                 .client_id()
@@ -331,32 +343,30 @@ async fn limit(
         }
     };
     if per_minute == 0 {
-        return next.run(request).await;
+        return None;
     }
-    match limiter.take_with(&key, per_minute, budget.burst_seconds, Instant::now()) {
-        Ok(()) => next.run(request).await,
-        Err(retry_after) => {
-            tracing::warn!(key = %key, retry_after, "Rate limit exceeded");
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "throttled",
-                        "diagnostics": format!(
-                            "rate limit of {per_minute} requests per minute exceeded; retry in {retry_after} s"
-                        ),
-                    }]
-                })),
-            )
-                .into_response();
-            if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, v);
-            }
-            response
-        }
+    let retry_after = limiter
+        .take_with(&key, per_minute, budget.burst_seconds, Instant::now())
+        .err()?;
+    tracing::warn!(key = %key, retry_after, "Rate limit exceeded");
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "throttled",
+                "diagnostics": format!(
+                    "rate limit of {per_minute} requests per minute exceeded; retry in {retry_after} s"
+                ),
+            }]
+        })),
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, v);
     }
+    Some(response)
 }
 
 #[cfg(test)]

@@ -43,8 +43,8 @@ pub mod verifier_cache;
 // Re-export commonly used types
 pub use config::{AuthConfig, AuthMode, DEFAULT_PATIENT_SHARED_TYPES, NonCompartmentPolicy};
 pub use discovery::{
-    EndpointAuthProbe, IssuerDiscovery, OidcMetadata, OutboundGuard, ProbeReport, ProbeStep,
-    SmartConfiguration,
+    EndpointAuthProbe, IssuerDiscovery, OidcMetadata, OutboundGuard, ProbeCheck, ProbeReport,
+    ProbeStep, SmartConfiguration,
 };
 pub use error::{AuthError, FhirOperation};
 pub use jwks::JwksCache;

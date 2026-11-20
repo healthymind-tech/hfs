@@ -379,16 +379,30 @@ pub async fn auth_middleware(
 /// [`apply_scope_policy`]).
 pub async fn authenticate(
     auth_state: &AuthMiddlewareState,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
+    match authenticate_request(auth_state, request).await {
+        Ok(request) => next.run(request).await,
+        Err(response) => response,
+    }
+}
+
+/// [`authenticate`] without running the rest of the stack: the request with
+/// its principal (if any) to continue with, or the response that ends it.
+// The `Err` is the response that ends the request, returned at once.
+#[allow(clippy::result_large_err)]
+pub async fn authenticate_request(
+    auth_state: &AuthMiddlewareState,
+    mut request: Request,
+) -> Result<Request, Response> {
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
 
     // Skip auth for exempt paths
     if is_exempt_path(&path) {
         debug!(path = %path, "Exempt path, skipping authentication");
-        return next.run(request).await;
+        return Ok(request);
     }
 
     // Extract Authorization header
@@ -436,10 +450,10 @@ pub async fn authenticate(
                         .extensions_mut()
                         .insert(crate::audit::audit_agent(&principal));
                     request.extensions_mut().insert(principal);
-                    return next.run(request).await;
+                    return Ok(request);
                 }
                 Err(helios_admin_auth::Denial::CrossOrigin) => {
-                    return forbidden_response("cross-site request refused");
+                    return Err(forbidden_response("cross-site request refused"));
                 }
                 Err(helios_admin_auth::Denial::RateLimited(left)) => {
                     let mut response = (
@@ -454,13 +468,13 @@ pub async fn authenticate(
                     if let Ok(v) = left.as_secs().max(1).to_string().parse() {
                         response.headers_mut().insert(header::RETRY_AFTER, v);
                     }
-                    return response;
+                    return Err(response);
                 }
                 Err(_) if credential => {
-                    return unauthorized_response_with(
+                    return Err(unauthorized_response_with(
                         "invalid administrator credentials",
                         Some("invalid_token"),
-                    );
+                    ));
                 }
                 // A cookie whose session just lapsed: carry on as anonymous.
                 Err(_) => {}
@@ -476,7 +490,7 @@ pub async fn authenticate(
             if auth_state.config.effective_mode() == helios_auth::AuthMode::WriteProtect
                 && anonymous_read_allowed(&method, &path)
             {
-                return next.run(request).await;
+                return Ok(request);
             }
             if !auth_state
                 .audit_exclusion_filter
@@ -489,7 +503,7 @@ pub async fn authenticate(
                     .build();
                 auth_state.audit_sink.record(event).await;
             }
-            return unauthorized_response("Missing Authorization header");
+            return Err(unauthorized_response("Missing Authorization header"));
         }
     };
 
@@ -524,7 +538,7 @@ pub async fn authenticate(
                         .build();
                     auth_state.audit_sink.record(event).await;
                 }
-                return forbidden_response(&reason);
+                return Err(forbidden_response(&reason));
             }
             debug!(
                 sub = %principal.subject(),
@@ -546,7 +560,7 @@ pub async fn authenticate(
                 .extensions_mut()
                 .insert(crate::audit::audit_agent(&principal));
             request.extensions_mut().insert(principal);
-            next.run(request).await
+            Ok(request)
         }
         Err(err) => {
             warn!(error = %err, path = %path, "Authentication failed");
@@ -564,11 +578,14 @@ pub async fn authenticate(
             if let AuthError::JwksFetchError(_) = err {
                 // The IdP's keys are unreachable: the token may be fine, so
                 // do not tell the client to throw it away.
-                return service_unavailable_response(
+                return Err(service_unavailable_response(
                     "the identity provider's signing keys are unavailable; retry shortly",
-                );
+                ));
             }
-            unauthorized_response_with(&err.to_string(), Some("invalid_token"))
+            Err(unauthorized_response_with(
+                &err.to_string(),
+                Some("invalid_token"),
+            ))
         }
     }
 }
@@ -600,15 +617,26 @@ pub async fn authz_middleware(
 }
 
 /// The body of [`authz_middleware`] for a given state (see [`authenticate`]).
-pub async fn authorize(
+pub async fn authorize(auth_state: &AuthMiddlewareState, request: Request, next: Next) -> Response {
+    match authorize_request(auth_state, request).await {
+        Ok((request, shared_types)) => run_authorized(request, shared_types, next).await,
+        Err(response) => response,
+    }
+}
+
+/// [`authorize`] without running the rest of the stack: the admitted request
+/// and the patient shared reference types to serve it with (see
+/// [`run_authorized`]), or the refusal.
+// The `Err` is the response that ends the request, returned at once.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_request(
     auth_state: &AuthMiddlewareState,
     mut request: Request,
-    next: Next,
-) -> Response {
+) -> Result<(Request, Option<Vec<String>>), Response> {
     // If no principal, pass through (exempt path or auth disabled)
     let principal = match request.extensions().get::<Principal>() {
         Some(p) => p.clone(),
-        None => return next.run(request).await,
+        None => return Ok((request, None)),
     };
 
     // The shared reference types a `patient/`-confined request may read, for
@@ -646,9 +674,9 @@ pub async fn authorize(
             .agent(principal.subject(), None, true)
             .build();
         auth_state.audit_sink.record(event).await;
-        return forbidden_response(&format!(
+        return Err(forbidden_response(&format!(
             "{what} needs a system/*.r or user/*.r scope (it reads every resource type)"
-        ));
+        )));
     }
 
     // Determine the FHIR operation and resource type from the path. Under
@@ -679,7 +707,7 @@ pub async fn authorize(
                             .resource(&resource_type, "")
                             .build();
                         auth_state.audit_sink.record(event).await;
-                        return forbidden_response(&reason);
+                        return Err(forbidden_response(&reason));
                     }
                     debug!(
                         sub = %principal.subject(),
@@ -713,7 +741,7 @@ pub async fn authorize(
                         .resource(&resource_type, "")
                         .build();
                     auth_state.audit_sink.record(event).await;
-                    return forbidden_response(&err.to_string());
+                    return Err(forbidden_response(&err.to_string()));
                 }
             }
         }
@@ -738,11 +766,21 @@ pub async fn authorize(
                 .principal(&principal)
                 .build();
             auth_state.audit_sink.record(event).await;
-            return forbidden_response(PATIENT_SCOPE_ENDPOINT_REFUSED);
+            return Err(forbidden_response(PATIENT_SCOPE_ENDPOINT_REFUSED));
         }
         None => {}
     }
 
+    Ok((request, shared_types))
+}
+
+/// Runs `next` with the request [`authorize_request`] admitted, inside the
+/// patient shared-types scope it returned.
+pub(crate) async fn run_authorized(
+    request: Request,
+    shared_types: Option<Vec<String>>,
+    next: Next,
+) -> Response {
     match shared_types {
         Some(types) => {
             crate::patient_compartment::with_request_shared_types(types, next.run(request)).await
