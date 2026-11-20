@@ -3479,11 +3479,14 @@ dependencies = [
  "helios-fhirpath",
  "indexmap 2.14.2",
  "regex",
+ "ring",
  "roxmltree",
  "serde",
  "serde_json",
  "sha1 0.10.7",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

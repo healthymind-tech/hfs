@@ -99,6 +99,12 @@ pub enum ErrorKind {
     /// URI, CodeSystem/ValueSet authoring rules (HL7 validator
     /// `CodeSystemValidator` / `ValueSetValidator`).
     ResourceRule,
+    /// A `Bundle.signature` that does not verify, or cannot be checked
+    /// (HL7 validator BUNDLE_SIGNATURE_*).
+    Signature,
+    /// A uri / url value in an HL7 namespace that names nothing (HL7
+    /// validator Type_Specific_Checks_DT_URL_Resolve).
+    UrlUnresolved,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the

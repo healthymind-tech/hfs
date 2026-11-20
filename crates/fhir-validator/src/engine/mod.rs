@@ -42,6 +42,146 @@ pub(crate) mod messages {
 }
 
 use crate::effects::{Deferred, EffectHandlers};
+
+thread_local! {
+    static ON_LARGE_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Stack of the threads validation runs its recursive parts on (virtual
+/// reservation; only the pages touched become resident).
+const VALIDATION_STACK: usize = 16 * 1024 * 1024;
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// See [`on_large_stack`].
+fn use_large_stack_pool() -> bool {
+    static USE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USE.get_or_init(|| {
+        match std::env::var("HFS_VALIDATION_STACK_THREAD").as_deref() {
+            Ok("always") => true,
+            Ok("never") => false,
+            _ => cfg!(debug_assertions),
+        }
+    })
+}
+
+/// A bounded pool of large-stack threads, grown on demand up to the number
+/// of CPUs (at least 2, at most 64). Threads stay alive, so their
+/// allocator caches stay warm and no thread is created per call.
+struct LargeStackPool {
+    state: std::sync::Mutex<PoolState>,
+    work: std::sync::Condvar,
+    limit: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    queue: std::collections::VecDeque<Job>,
+    threads: usize,
+    idle: usize,
+}
+
+impl LargeStackPool {
+    fn global() -> &'static LargeStackPool {
+        static POOL: std::sync::OnceLock<LargeStackPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| LargeStackPool {
+            state: Default::default(),
+            work: std::sync::Condvar::new(),
+            limit: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 64),
+        })
+    }
+
+    fn submit(&'static self, job: Job) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.queue.push_back(job);
+        if state.idle == 0 && state.threads < self.limit {
+            let spawned = std::thread::Builder::new()
+                .name("hfs-validation".to_string())
+                .stack_size(VALIDATION_STACK)
+                .spawn(move || self.run());
+            match spawned {
+                Ok(_) => state.threads += 1,
+                // No thread at all to run it (thread limits): run it here,
+                // on the caller's stack, as before the pool existed.
+                Err(_) if state.threads == 0 => {
+                    let job = state.queue.pop_back().expect("just queued");
+                    drop(state);
+                    job();
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        drop(state);
+        self.work.notify_one();
+    }
+
+    fn run(&'static self) {
+        ON_LARGE_STACK.with(|flag| flag.set(true));
+        loop {
+            let job = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = state.queue.pop_front() {
+                        break job;
+                    }
+                    state.idle += 1;
+                    state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                    state.idle -= 1;
+                }
+            };
+            job();
+        }
+    }
+}
+
+/// Run `f` on a large-stack thread of a bounded pool, and wait for it.
+///
+/// The structural walk and above all the FHIRPath evaluator recurse with
+/// large frames: in a debug build validating a Bundle needed ~1.3 MiB of
+/// stack on its own (the walk ~260 KiB, FHIRPath invariants the rest),
+/// independent of the Bundle's size — too close to a Tokio worker's 2 MiB
+/// once the HTTP stack sits below it. The calling (async) thread now only
+/// waits (it blocked on this CPU-bound work before too); the recursion
+/// happens on a pool thread whose stack does not depend on the caller's.
+/// Calls already on a pool thread run inline, so nested validation never
+/// waits for the pool. A panic in `f` is re-raised on the caller.
+///
+/// Only debug builds need this: a release build validates a Bundle in
+/// ~230 KiB of stack, and the hand-over to the pool costs ~0.2–0.6 ms per
+/// call on a loaded host — measurable on a 20-entry transaction, which
+/// validates every entry. So release builds recurse inline unless
+/// `HFS_VALIDATION_STACK_THREAD=always` (`never` disables the pool in debug
+/// builds too; the default is `debug`).
+pub(crate) fn on_large_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if ON_LARGE_STACK.with(std::cell::Cell::get) || !use_large_stack_pool() {
+        return f();
+    }
+    let (done, wait) = std::sync::mpsc::sync_channel::<std::thread::Result<R>>(1);
+    let job = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = done.send(result);
+    };
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
+    // SAFETY: `f` (and so the job) may borrow from this stack frame. This
+    // function does not return until the job has run to completion and sent
+    // its result (`catch_unwind` guarantees the send also after a panic),
+    // so nothing borrowed is used after the borrow ends. The `'static` is
+    // only what the pool's queue type asks for.
+    let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) };
+    LargeStackPool::global().submit(job);
+    match wait.recv() {
+        Ok(Ok(value)) => value,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        // The job was dropped unrun (cannot happen: the pool never drops
+        // queued jobs) — never return while a borrow could still be live.
+        Err(_) => std::process::abort(),
+    }
+}
+
 use crate::resolver::SchemaResolver;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
@@ -87,6 +227,12 @@ pub struct ValidationOptions {
     /// the HL7 validator applies the global profiles of its loaded IGs.
     /// An unresolvable one follows [`Self::unknown_profile`].
     pub global_profiles: Vec<(String, String)>,
+    /// uri / url values in the HL7 FHIR namespace (`http://hl7.org/fhir…`)
+    /// that cannot name a definition — no path segment is a resource type,
+    /// so no canonical resource can have that URL — reported at this
+    /// severity (the HL7 validator: Type_Specific_Checks_DT_URL_Resolve,
+    /// error). `None` skips the check.
+    pub hl7_urls: Option<Severity>,
 }
 
 /// Policy for extensions whose url resolves to no StructureDefinition.
@@ -113,6 +259,7 @@ impl Default for ValidationOptions {
             unknown_profile: UnknownProfilePolicy::default(),
             unknown_extensions: UnknownExtensionPolicy::default(),
             global_profiles: Vec::new(),
+            hl7_urls: None,
         }
     }
 }
@@ -124,6 +271,10 @@ pub struct SyncOutcome {
     pub errors: Vec<ValidationError>,
     /// Constraint/binding obligations for the async effects pass (Phase 4).
     pub deferred: Vec<Deferred>,
+    /// References to Bundle entries that conform structurally to one of
+    /// their target profiles; judged again once the effects pass has found
+    /// every issue of the entry (see [`Validator::validate`]).
+    pub(crate) cascades: Vec<walk::Cascade>,
 }
 
 /// `batch`/`transaction` entries whose `request.url` addresses a different
@@ -278,6 +429,44 @@ fn bundle_unresolved_urns(resource: &Value) -> Vec<ValidationError> {
     errors
 }
 
+/// The HL7 validator decides whether a Bundle entry matches a reference's
+/// target profile by validating it fully against the profile, invariants and
+/// terminology included, so an entry that fails on those is also reported at
+/// every reference to it (Reference_REF_CantMatchChoice). The walk can only
+/// judge structure; here, after the effects pass, a reference whose target
+/// entry ended up with error-severity issues of its own is reported the same
+/// way, when the entry claims one of the candidate profiles (so its issues
+/// were found against that profile) or has an issue no profile is blamed
+/// for. This never changes a verdict: the entry's own errors already make
+/// the resource invalid.
+fn cascade_target_failures(cascades: &[walk::Cascade], errors: &mut Vec<ValidationError>) {
+    let mut found = Vec::new();
+    for cascade in cascades {
+        let prefix = format!("{}.", cascade.target_path);
+        let failing = errors.iter().any(|e| {
+            e.severity == Severity::Error
+                && (e.path == cascade.target_path || e.path.starts_with(&prefix))
+                && (cascade.claims_candidate || e.source.is_none())
+        });
+        if failing
+            && !found
+                .iter()
+                .any(|f: &ValidationError| f.path == cascade.path && f.message.contains(&cascade.reference))
+        {
+            found.push(ValidationError::new(
+                ErrorKind::ReferenceInvalid,
+                cascade.path.clone(),
+                format!(
+                    "Unable to find a profile match for {} among choices: {}",
+                    cascade.reference,
+                    cascade.candidates.join(", ")
+                ),
+            ));
+        }
+    }
+    errors.extend(found);
+}
+
 /// The validator: a resolver plus the walk.
 pub struct Validator {
     resolver: Arc<dyn SchemaResolver>,
@@ -292,7 +481,7 @@ impl Validator {
     /// constraint/binding obligations are returned as [`Deferred`] entries
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
-        self.validate_sync_with(resource, opts, None)
+        on_large_stack(|| self.validate_sync_with(resource, opts, None))
     }
 
     /// [`Self::validate_sync`], with invariants evaluated where the walk
@@ -350,10 +539,20 @@ impl Validator {
             .constraints
             .is_some()
             .then_some(&check as &walk::InvariantCheck<'_>);
-        let SyncOutcome {
-            mut errors,
-            deferred,
-        } = self.validate_sync_with(resource, opts, invariants);
+        let timing =
+            tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::DEBUG);
+        let started = std::time::Instant::now();
+        let (
+            SyncOutcome {
+                mut errors,
+                deferred,
+                cascades,
+            },
+            walk,
+        ) = on_large_stack(|| {
+            let outcome = self.validate_sync_with(resource, opts, invariants);
+            (outcome, started.elapsed())
+        });
         if effects.narrative_links {
             errors.extend(narrative::narrative_link_errors(resource));
         }
@@ -363,6 +562,10 @@ impl Validator {
         if effects.best_practice {
             errors.extend(narrative::best_practice_warnings(resource));
         }
+        if let Some(signatures) = effects.signatures {
+            errors.extend(crate::signature::signature_issues(resource, signatures));
+        }
+        let rules = started.elapsed() - walk;
         let resolver = Arc::clone(&self.resolver);
         let conformance: crate::effects::Conformance = Arc::new(move |value, profile| {
             let opts = ValidationOptions {
@@ -390,6 +593,24 @@ impl Validator {
             &mut errors,
         )
         .await;
+        cascade_target_failures(&cascades, &mut errors);
+        if timing {
+            let resource_type = resource
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "helios_fhir_validator::timing",
+                resource_type,
+                walk_us = walk.as_micros() as u64,
+                rules_us = rules.as_micros() as u64,
+                effects_us = (started.elapsed() - walk - rules).as_micros() as u64,
+                total_us = started.elapsed().as_micros() as u64,
+                deferred = deferred.len(),
+                issues = errors.len(),
+                "validation stages"
+            );
+        }
         errors
     }
 }

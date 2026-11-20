@@ -83,8 +83,36 @@ impl SchemaSet {
     }
 }
 
+/// See [`super::SyncOutcome::cascades`].
+#[derive(Debug, Clone)]
+pub(crate) struct Cascade {
+    /// The reference element.
+    pub(crate) path: String,
+    pub(crate) reference: String,
+    pub(crate) candidates: Vec<String>,
+    /// The target entry's resource (`Bundle.entry.3.resource`).
+    pub(crate) target_path: String,
+    /// The entry claims one of the candidates in `meta.profile`.
+    pub(crate) claims_candidate: bool,
+}
+
+/// A reference to an entry of the root Bundle that claims one of the
+/// reference's target profiles, judged once the walk is done (see
+/// [`resolve_pending_targets`]).
+pub(super) struct PendingTarget<'a> {
+    pub(super) cascade: Cascade,
+    pub(super) target: &'a Value,
+}
+
 pub(super) struct WalkCtx<'a> {
     resolver: &'a dyn SchemaResolver,
+    /// See [`Cascade`].
+    pub(super) cascades: Vec<Cascade>,
+    /// See [`PendingTarget`].
+    pub(super) pending_targets: Vec<PendingTarget<'a>>,
+    /// Paths of nested resources whose resourceType is unknown (reported
+    /// once there).
+    pub(super) unknown_resource_paths: HashSet<String>,
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
     pub(super) path: PathTracker,
@@ -97,6 +125,8 @@ pub(super) struct WalkCtx<'a> {
     unknown_extensions: UnknownExtensionPolicy,
     /// `ImplementationGuide.global` profiles, `(resource type, canonical)`.
     global_profiles: Vec<(String, String)>,
+    /// See [`ValidationOptions::hl7_urls`].
+    pub(super) hl7_urls: Option<Severity>,
     /// Issues already emitted, by `(kind, severity, path, message)`. A
     /// profile compiled from its snapshot repeats every keyword it inherits
     /// (`required`, `min`, slice cardinalities, ...), and each layer of the
@@ -227,8 +257,21 @@ impl<'a> WalkCtx<'a> {
             return true;
         }
         self.conformance.borrow_mut().insert(key.clone(), true);
+        let started = std::time::Instant::now();
         let outcome = self.nested_outcome(value, profile);
         let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
+        if tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::TRACE) {
+            let at = self.path.render_dotted();
+            tracing::trace!(
+                target: "helios_fhir_validator::timing",
+                at = %at,
+                profile,
+                nesting = self.nesting,
+                conforms,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "nested conformance walk"
+            );
+        }
         self.conformance.borrow_mut().insert(key, conforms);
         conforms
     }
@@ -243,9 +286,13 @@ impl<'a> WalkCtx<'a> {
             check_extension_context: false,
             unknown_extensions: self.unknown_extensions,
             global_profiles: Vec::new(),
+            hl7_urls: None,
         };
         let mut nested = WalkCtx {
             resolver: self.resolver,
+            cascades: Vec::new(),
+            pending_targets: Vec::new(),
+            unknown_resource_paths: HashSet::new(),
             errors: Vec::new(),
             deferred: Vec::new(),
             path: PathTracker::new(
@@ -259,6 +306,7 @@ impl<'a> WalkCtx<'a> {
             unknown_profile: UnknownProfilePolicy::Ignore,
             unknown_extensions: self.unknown_extensions,
             global_profiles: Vec::new(),
+            hl7_urls: None,
             emitted: HashSet::new(),
             deferred_bindings: HashSet::new(),
             contained: Vec::new(),
@@ -282,6 +330,23 @@ impl<'a> WalkCtx<'a> {
             .rev()
             .take(2)
             .any(|level| level.iter().any(|(cid, _)| cid == id))
+    }
+
+    /// The path of `target` when it is an entry resource of the root Bundle
+    /// of a top-level walk (`Bundle.entry.3.resource`).
+    pub(super) fn root_entry_path(&self, target: &Value) -> Option<String> {
+        if self.nesting > 0 {
+            return None;
+        }
+        let root = self.resources.first()?;
+        if root.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
+            return None;
+        }
+        root.get("entry")?
+            .as_array()?
+            .iter()
+            .position(|e| e.get("resource").is_some_and(|r| std::ptr::eq(r, target)))
+            .map(|i| format!("Bundle.entry.{i}.resource"))
     }
 
     pub(super) fn contained_type(&self, id: &str) -> Option<String> {
@@ -347,8 +412,43 @@ impl<'a> WalkCtx<'a> {
     }
 }
 
+/// Judge the deferred reference targets (Reference_REF_CantMatchChoice).
+/// The walk validated each such entry against the profiles it claims, a
+/// candidate among them: without an error-severity issue on the entry it
+/// conforms to the candidate. Only an entry with errors is walked again
+/// against each candidate, exactly as an immediate check would have.
+fn resolve_pending_targets(ctx: &mut WalkCtx<'_>) {
+    let pending = std::mem::take(&mut ctx.pending_targets);
+    for PendingTarget { cascade, target } in pending {
+        let prefix = format!("{}.", cascade.target_path);
+        let clean = !ctx.errors.iter().any(|e| {
+            e.severity == Severity::Error
+                && (e.path == cascade.target_path || e.path.starts_with(&prefix))
+        });
+        if clean || cascade.candidates.iter().any(|p| ctx.conforms_to(target, p)) {
+            ctx.cascades.push(cascade);
+        } else {
+            let message = format!(
+                "Unable to find a profile match for {} among choices: {}",
+                cascade.reference,
+                cascade.candidates.join(", ")
+            );
+            if ctx
+                .emitted
+                .insert((ErrorKind::ReferenceInvalid, Severity::Error, cascade.path.clone(), message.clone()))
+            {
+                ctx.errors.push(ValidationError::new(
+                    ErrorKind::ReferenceInvalid,
+                    cascade.path,
+                    message,
+                ));
+            }
+        }
+    }
+}
+
 /// See [`WalkCtx::invariants`].
-pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + 'a;
+pub(super) type InvariantCheck<'a> = dyn Fn(&Value, &str, &str, &str) -> bool + Sync + 'a;
 
 pub(super) fn validate<'a>(
     resolver: &'a dyn SchemaResolver,
@@ -363,6 +463,9 @@ pub(super) fn validate<'a>(
 
     let mut ctx = WalkCtx {
         resolver,
+        cascades: Vec::new(),
+        pending_targets: Vec::new(),
+        unknown_resource_paths: HashSet::new(),
         errors: Vec::new(),
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
@@ -371,6 +474,7 @@ pub(super) fn validate<'a>(
         unknown_profile: opts.unknown_profile,
         unknown_extensions: opts.unknown_extensions,
         global_profiles: opts.global_profiles.clone(),
+        hl7_urls: opts.hl7_urls,
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),
@@ -419,10 +523,12 @@ fn run<'a>(ctx: &mut WalkCtx<'a>, resource: &'a Value, opts: &ValidationOptions)
     }
 
     validate_node(ctx, &set, resource);
+    resolve_pending_targets(ctx);
 
     SyncOutcome {
         errors: std::mem::take(&mut ctx.errors),
         deferred: std::mem::take(&mut ctx.deferred),
+        cascades: std::mem::take(&mut ctx.cascades),
     }
 }
 
@@ -676,6 +782,9 @@ pub(super) fn add_schemas_to_set(
     {
         match ctx.resolver.resolve(&type_ref) {
             Some(type_schema) => add_schemas_to_set(ctx, set, type_schema, &type_ref),
+            // An unknown nested resource type is reported once, where the
+            // node's resourceType is read (see `validate_node`).
+            None if ctx.unknown_resource_paths.contains(&ctx.path.render_dotted()) => {}
             None => ctx.error(
                 ErrorKind::UnknownSchema,
                 errors::msg_unknown_schema(&type_ref),
@@ -809,7 +918,25 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         if let Some(rt) = data.get("resourceType").and_then(Value::as_str) {
             match ctx.resolver.resolve(rt) {
                 Some(schema) => add_schemas_to_set(ctx, &mut extended, schema, rt),
-                None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(rt)),
+                None => {
+                    // Not a resource of this FHIR version (an R4B
+                    // SubscriptionStatus in an R4 Bundle): the HL7 validator
+                    // reports it once and does not look inside, so neither
+                    // is every member reported as unknown.
+                    let message = format!(
+                        "Contained resource does not appear to be a FHIR resource (unknown name '{rt}')"
+                    );
+                    let here = ctx.path.render_dotted();
+                    // A type profile of the element may have tried the type
+                    // already ("could not resolve schema"): one report.
+                    let unresolved = errors::msg_unknown_schema(rt);
+                    ctx.errors.retain(|e| {
+                        !(e.kind == ErrorKind::UnknownSchema && e.path == here && e.message == unresolved)
+                    });
+                    ctx.error(ErrorKind::ResourceRule, message);
+                    ctx.unknown_resource_paths.insert(here);
+                    return;
+                }
             }
             // A nested resource (Bundle entry, contained, Parameters part)
             // is held to the profiles it claims, as the root resource is: a
@@ -2270,6 +2397,97 @@ fn element_types(resolver: &dyn SchemaResolver, set: &SchemaSet) -> Vec<String> 
 /// layer declares `foo` with a primitive type, it mirrors `foo`'s
 /// array-vs-singular shape, and its content (per item for arrays, with
 /// `null` gaps allowed) validates against the resolver's `Element` schema.
+/// `mustHaveValue` / `valueAlternatives` on a primitive present only
+/// through its sidecar (HL7 validator: the R5 value controls, also read from
+/// the 5.0 cross-version extensions in R4 profiles).
+fn value_controls(
+    ctx: &mut WalkCtx<'_>,
+    elset: &SchemaSet,
+    base_key: &str,
+    key: &str,
+    value: &Value,
+    base_value: Option<&Value>,
+) {
+    let must = elset
+        .iter()
+        .find(|(_, s)| s.must_have_value == Some(true))
+        .map(|(k, _)| k.to_string());
+    let alternatives: Option<(String, Vec<String>)> = elset
+        .iter()
+        .find_map(|(k, s)| s.value_alternatives.clone().map(|a| (k.to_string(), a)));
+    if must.is_none() && alternatives.is_none() {
+        return;
+    }
+    // (sidecar item, its index) for every item without a value.
+    let missing: Vec<(&Value, Option<usize>)> = match value {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| {
+                !item.is_null()
+                    && base_value
+                        .and_then(Value::as_array)
+                        .and_then(|b| b.get(*i))
+                        .is_none_or(Value::is_null)
+            })
+            .map(|(i, item)| (item, Some(i)))
+            .collect(),
+        Value::Null => Vec::new(),
+        side if base_value.is_none_or(Value::is_null) => vec![(side, None)],
+        _ => Vec::new(),
+    };
+    if missing.is_empty() {
+        return;
+    }
+    let profile_of = |k: &str| k.split('#').next().unwrap_or(k).to_string();
+    ctx.path.pop();
+    ctx.path.push_key(base_key);
+    let element: String = ctx
+        .path
+        .render_dotted()
+        .split('.')
+        .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(".");
+    for (side, index) in missing {
+        if let Some(i) = index {
+            ctx.path.push_index(i);
+        }
+        if let Some(profile) = &must {
+            ctx.error(
+                ErrorKind::Required,
+                format!(
+                    "The element definition ``{element}`` in the profile '{}' requires that a value be present in this element",
+                    profile_of(profile)
+                ),
+            );
+        } else if let Some((profile, allowed)) = &alternatives {
+            let present = side
+                .get("extension")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("url").and_then(Value::as_str))
+                .any(|u| allowed.iter().any(|a| a.split('|').next() == Some(u)));
+            if !present {
+                ctx.error(
+                    ErrorKind::Required,
+                    format!(
+                        "The element definition ``{element}`` in the profile '{}' requires that if a value is not present, one of the extensions {} must be present",
+                        profile_of(profile),
+                        allowed.join(", ")
+                    ),
+                );
+            }
+        }
+        if index.is_some() {
+            ctx.path.pop();
+        }
+    }
+    ctx.path.pop();
+    ctx.path.push_key(key);
+}
+
 fn handle_sidecar<'a>(
     ctx: &mut WalkCtx<'a>,
     set: &SchemaSet,
@@ -2339,6 +2557,7 @@ fn handle_sidecar<'a>(
             ctx.path.push_key(key);
         }
     }
+    value_controls(ctx, &base_elset, base_key, key, value, base_value);
     match (expect_array, value.is_array()) {
         (true, false) => ctx.error(ErrorKind::NotArray, errors::msg_not_array(key)),
         (false, true) => ctx.error(ErrorKind::NotSingular, errors::msg_not_singular(key)),
@@ -2653,6 +2872,8 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         max_length,
         min_length,
         max_size,
+        must_have_value,
+        value_alternatives,
         binding,
         constraints,
         refers,

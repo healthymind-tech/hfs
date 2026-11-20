@@ -816,6 +816,35 @@ pub struct ValidationConfig {
     /// (`HFS_VALIDATION_PROFILE_CACHE`: a path, or `off`). Unset: next to
     /// the package cache; see [`crate::validation_cache::cache_dir`].
     pub profile_cache: Option<String>,
+    /// `Bundle.signature` verification (`HFS_VALIDATION_SIGNATURES`):
+    /// `verify` (default — JWS signatures are checked against the
+    /// certificate they carry, as the HL7 validator does; one that does not
+    /// verify is an error) or `off`.
+    pub signatures: String,
+    /// Certificate / key files (`HFS_VALIDATION_SIGNATURE_CERTS`,
+    /// comma-separated: PEM or DER certificates, JWK or JWK Set JSON): the
+    /// keys a JWS `kid` is looked up in, and the trust anchors of
+    /// `signature_trust = listed`.
+    pub signature_certs: Vec<String>,
+    /// Who must have issued the signing certificate
+    /// (`HFS_VALIDATION_SIGNATURE_TRUST`): `any` (default, the HL7
+    /// validator's behaviour — the certificate is not judged) or `listed`
+    /// (one of `signature_certs`, or signed by one, and valid at the signing
+    /// time).
+    pub signature_trust: String,
+    /// Severity of an untrusted signing certificate under `listed`
+    /// (`HFS_VALIDATION_SIGNATURE_UNTRUSTED`): `warning` (default) or `error`.
+    pub signature_untrusted: String,
+    /// uri / url values in the HL7 namespaces (`http://hl7.org/fhir…`) that
+    /// cannot name anything (`HFS_VALIDATION_HL7_URLS`): `error` (default,
+    /// the HL7 validator's Type_Specific_Checks_DT_URL_Resolve), `warning`
+    /// or `off`.
+    pub hl7_urls: String,
+    /// An invariant whose expression evaluates to an empty collection
+    /// (`HFS_VALIDATION_EMPTY_INVARIANT`): `pass` (FHIRPath boolean
+    /// coercion; the HFS default) or `fail` (the HL7 Java validator's
+    /// `evaluateToBoolean`).
+    pub empty_invariant: String,
 }
 
 impl Default for ValidationConfig {
@@ -840,6 +869,12 @@ impl Default for ValidationConfig {
             rehydrate_batch_size: 100,
             rehydrate_wait_ms: 60_000,
             profile_cache: None,
+            signatures: "verify".to_string(),
+            signature_certs: Vec::new(),
+            signature_trust: "any".to_string(),
+            signature_untrusted: "warning".to_string(),
+            hl7_urls: "error".to_string(),
+            empty_invariant: "pass".to_string(),
         }
     }
 }
@@ -907,6 +942,30 @@ impl ValidationConfig {
             .clamp(1, u64::from(u32::MAX)) as u32,
             rehydrate_wait_ms: env_u64("HFS_VALIDATION_REHYDRATE_WAIT_MS", d.rehydrate_wait_ms),
             profile_cache: std::env::var("HFS_VALIDATION_PROFILE_CACHE").ok(),
+            signatures: std::env::var("HFS_VALIDATION_SIGNATURES")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.signatures),
+            signature_certs: std::env::var("HFS_VALIDATION_SIGNATURE_CERTS")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or(d.signature_certs),
+            signature_trust: std::env::var("HFS_VALIDATION_SIGNATURE_TRUST")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.signature_trust),
+            signature_untrusted: std::env::var("HFS_VALIDATION_SIGNATURE_UNTRUSTED")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.signature_untrusted),
+            hl7_urls: std::env::var("HFS_VALIDATION_HL7_URLS")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.hl7_urls),
+            empty_invariant: std::env::var("HFS_VALIDATION_EMPTY_INVARIANT")
+                .map(|s| s.to_lowercase())
+                .unwrap_or(d.empty_invariant),
         }
     }
 
@@ -969,6 +1028,25 @@ impl ValidationConfig {
         }
         if self.terminology_timeout_ms == 0 {
             errors.push("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS must be > 0".to_string());
+        }
+        for (key, value, allowed) in [
+            ("HFS_VALIDATION_SIGNATURES", &self.signatures, &["verify", "off"][..]),
+            ("HFS_VALIDATION_SIGNATURE_TRUST", &self.signature_trust, &["any", "listed"][..]),
+            ("HFS_VALIDATION_SIGNATURE_UNTRUSTED", &self.signature_untrusted, &["warning", "error"][..]),
+            ("HFS_VALIDATION_HL7_URLS", &self.hl7_urls, &["error", "warning", "off"][..]),
+            ("HFS_VALIDATION_EMPTY_INVARIANT", &self.empty_invariant, &["pass", "fail"][..]),
+        ] {
+            if !allowed.contains(&value.as_str()) {
+                errors.push(format!(
+                    "{key} '{value}' invalid (expected {})",
+                    allowed.join("|")
+                ));
+            }
+        }
+        if self.signature_trust == "listed" && self.signature_certs.is_empty() {
+            errors.push(
+                "HFS_VALIDATION_SIGNATURE_TRUST=listed needs HFS_VALIDATION_SIGNATURE_CERTS".to_string(),
+            );
         }
         if errors.is_empty() {
             Ok(())
