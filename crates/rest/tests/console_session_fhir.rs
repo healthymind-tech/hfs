@@ -144,6 +144,7 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
     let s = app(&issuer).await;
 
     let mut cookies = std::collections::HashMap::new();
+    let mut tokens = std::collections::HashMap::new();
     for (who, role) in [
         ("viewer", ConsoleRole::Viewer),
         ("editor", ConsoleRole::Editor),
@@ -151,8 +152,9 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
         ("bound", ConsoleRole::Viewer),
     ] {
         let subject = format!("oidc:https://idp|{who}");
-        let (cookie, _) = session(&rt, &subject, role, ConsoleVia::Oidc, None).await;
+        let (cookie, csrf) = session(&rt, &subject, role, ConsoleVia::Oidc, None).await;
         cookies.insert(who, cookie);
+        tokens.insert(who, csrf);
     }
     // A viewer bound as editor on `alpha`.
     store
@@ -162,7 +164,7 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
 
     let cookie = |who: &str| HeaderValue::from_str(&cookies[who]).unwrap();
     let get = |p: &'static str, who: &'static str| s.get(p).add_header(header::COOKIE, cookie(who));
-    let post = |p: &'static str, who: &'static str, origin: Option<&'static str>| {
+    let post_raw = |p: &'static str, who: &'static str, origin: Option<&'static str>| {
         let mut r = s
             .post(p)
             .add_header(header::COOKIE, cookie(who))
@@ -176,6 +178,13 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
             r = r.add_header(header::ORIGIN, HeaderValue::from_static(o));
         }
         r
+    };
+    // Console JS (csrf.js) sends the session's synchronizer token on writes.
+    let post = |p: &'static str, who: &'static str, origin: Option<&'static str>| {
+        post_raw(p, who, origin).add_header(
+            "x-csrf-token",
+            HeaderValue::from_str(&tokens[who]).unwrap(),
+        )
     };
     const SITE: Option<&str> = Some("http://hfs.test");
 
@@ -205,6 +214,12 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
             "{who} without Origin"
         );
     }
+    // Same-site but without the session's CSRF token: refused.
+    assert_eq!(
+        post_raw("/alpha/Patient", "editor", SITE).await.status_code(),
+        StatusCode::FORBIDDEN,
+        "no CSRF token"
+    );
     // Per-endpoint binding: editor on alpha only.
     let r = post("/alpha/Patient", "bound", SITE).await;
     assert_eq!(r.status_code(), StatusCode::CREATED, "{}", r.text());
