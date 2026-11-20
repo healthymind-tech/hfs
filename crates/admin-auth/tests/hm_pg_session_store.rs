@@ -233,7 +233,10 @@ async fn the_lockout_ends_after_its_duration() {
         .await
         .unwrap()
         .expect("locked");
-    assert!(until > now() && until <= now() + 2);
+    // The database's clock decides; allow a second of skew and rounding
+    // either way against this process's clock.
+    let t = now();
+    assert!(until >= t && until <= t + 3, "until {until}, now {t}");
     std::thread::sleep(std::time::Duration::from_millis(3100));
     assert!(pg.locked_until("c").await.unwrap().is_none());
     // The next failure in the same window locks again (max 1).
