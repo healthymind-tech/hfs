@@ -1246,3 +1246,34 @@ Later packages: rebase on these.
   `$validate` under `HFS_MANAGER=on` + audit + auth.
 - **Patient shared types** follow the endpoint's policy, in batch/transaction
   entries too (task-local set by the authorization layer).
+
+### Integration (`hm/manager-integ`, 2026-11-20)
+
+Merge order on top of `hm/main` 57eb29b36: `hm/tests-ci` → P1 (a06de3355)
+→ P2 → P3 → P4 → P5 (`hm/m-p5-on-p4`) → P6. The P3–P6 contract notes are in
+`eval/results-manager/P3.md`..`P6.md` (hfs-eval); the integration line added:
+
+- **CSRF type.** `helios_ui::manager::CsrfToken` is a re-export of P3's
+  `helios_admin_auth::console::guard::CsrfToken`; every console form posts the
+  token as `_csrf` (P6's sync forms used `csrf`, renamed).
+- **FHIR API writes with the console cookie** need the session's synchronizer
+  token as `X-CSRF-Token` besides the same-site `Origin` (design §7.3).
+  `ConsoleSessionResolver::resolve_with_csrf` (default method: no token, for
+  test fakes) returns it; `ConsoleAuth` implements it.
+- **Console audit.** `helios_admin_auth::console::{ConsoleAuditHook,
+  ConsoleAuditEvent}`; `ConsoleAuth::set_audit_hook`, `audit`, `audit_by`,
+  and audited `set_binding` / `remove_binding` (the admin API and the users
+  page use them instead of the store). Audited: sign-in (success, failure,
+  lock-out, break-glass), sign-out, OIDC no-role refusal, user create /
+  update / reset / own password change / delete, role bindings, session
+  revocation, console settings, secret re-wrap. HFS installs
+  `manager::console_auth::ConsoleAudit` over the server's audit sink: events
+  are DICOM 110100 in the default tenant, agent = console subject, `via` and
+  `source=console` details, `entity.what` = `ConsoleUser/{name}`,
+  `Endpoint/{name}` (bindings) or `ConsoleSettings/console`. Endpoint edits
+  from the console are audited by P4's shared admin service; sync actions by
+  the sync service.
+- **Navigation.** Settings → Console sign-in (`/ui/settings/auth`), Users &
+  roles (`/ui/settings/users`) — admin only — and My account (`/ui/account`)
+  are built-in sidebar items; the three P3 pages use P5's page header,
+  form-section, field and notice components.

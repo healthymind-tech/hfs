@@ -1627,10 +1627,18 @@ async fn serve(
     #[cfg(feature = "ui")]
     helios_ui::set_admin_gate(admin_gate.clone());
     // Console sign-in (P3): `HFS_MANAGER=on` or `HFS_CONSOLE_AUTH_MODE`.
+    let console_audit = audit_state.as_ref().map(|a| {
+        manager::console_auth::ConsoleAudit::new(
+            Arc::clone(&a.sink),
+            a.config.source_observer.clone(),
+            config.default_tenant.clone(),
+        )
+    });
     let console = manager::console_auth::build(
         &config.base_url,
         effective_ui_enabled(config.ui_enabled),
         admin_gate.clone(),
+        console_audit,
     )
     .await;
 

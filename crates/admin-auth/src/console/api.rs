@@ -444,19 +444,11 @@ async fn put_binding(
     Path((subject, endpoint)): Path<(String, String)>,
     Json(b): Json<BindingBody>,
 ) -> Response {
-    match c
-        .store()
-        .set_role_binding(&subject, &endpoint, b.role, &actor.0)
-        .await
-    {
-        Ok(()) => {
-            c.invalidate_subject(&subject);
-            tracing::info!(actor = %actor.0, subject, endpoint, role = b.role.as_str(), "console role binding set");
-            json_response(
-                StatusCode::OK,
-                json!({"subject": subject, "endpoint": endpoint, "role": b.role}),
-            )
-        }
+    match c.set_binding(&actor.0, &subject, &endpoint, b.role).await {
+        Ok(()) => json_response(
+            StatusCode::OK,
+            json!({"subject": subject, "endpoint": endpoint, "role": b.role}),
+        ),
         Err(e) => error_response(e.into()),
     }
 }
@@ -466,12 +458,8 @@ async fn delete_binding(
     Extension(actor): Extension<AdminUser>,
     Path((subject, endpoint)): Path<(String, String)>,
 ) -> Response {
-    match c.store().delete_role_binding(&subject, &endpoint).await {
-        Ok(()) => {
-            c.invalidate_subject(&subject);
-            tracing::info!(actor = %actor.0, subject, endpoint, "console role binding removed");
-            StatusCode::NO_CONTENT.into_response()
-        }
+    match c.remove_binding(&actor.0, &subject, &endpoint).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e.into()),
     }
 }

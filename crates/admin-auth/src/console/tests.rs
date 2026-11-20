@@ -1720,3 +1720,49 @@ async fn admin_api_viewers_read_endpoints_only() {
     );
     let _ = v;
 }
+
+#[tokio::test]
+async fn console_actions_reach_the_audit_hook() {
+    let (rt, _) = local_rt(&[]).await;
+    let hook = Arc::new(audit::MemoryAuditHook::default());
+    assert!(rt.set_audit_hook(hook.clone()));
+    assert!(!rt.set_audit_hook(hook.clone()), "installed once");
+    let bob = add_user(&rt, "bob", ConsoleRole::Editor, "tidy-Lantern-41-orbit").await;
+    assert!(matches!(
+        rt.login_password(&site_headers(), None, "bob", "wrong")
+            .await,
+        LoginResult::Invalid
+    ));
+    let _ = sign_in(&rt, "bob", "tidy-Lantern-41-orbit").await;
+    rt.set_binding("local:root", "local:bob", "lab", ConsoleRole::Admin)
+        .await
+        .unwrap();
+    rt.remove_binding("local:root", "local:bob", "lab")
+        .await
+        .unwrap();
+    rt.delete_user("local:root", &bob.id).await.unwrap();
+    let got = hook.descriptions();
+    for want in [
+        "console user created",
+        "console sign-in failed",
+        "console sign-in",
+        "console role binding set",
+        "console role binding removed",
+        "console user deleted",
+    ] {
+        assert!(got.iter().any(|d| d == want), "{want} not in {got:?}");
+    }
+    let events = hook.0.lock().unwrap();
+    let failed = events
+        .iter()
+        .find(|e| e.description == "console sign-in failed")
+        .unwrap();
+    assert!(!failed.success);
+    assert_eq!(failed.actor, "bob");
+    let signed_in = events
+        .iter()
+        .find(|e| e.description == "console sign-in")
+        .unwrap();
+    assert_eq!(signed_in.actor, "local:bob");
+    assert_eq!(signed_in.via, "local");
+}

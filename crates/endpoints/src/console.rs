@@ -350,6 +350,18 @@ pub trait ConsoleSessionResolver: Send + Sync {
     /// The principal of a valid session, else `None` (also for anonymous
     /// `none`-mode visitors: callers apply `anonymous_role` themselves).
     async fn resolve(&self, cookie_header: &str) -> Option<ConsolePrincipal>;
+
+    /// Like [`resolve`](Self::resolve), plus the session's synchronizer CSRF
+    /// token (design §7.3) when the session has one. FHIR API writes made
+    /// with the console cookie must present it as `X-CSRF-Token`. The
+    /// default (resolvers without tokens, e.g. test fakes) returns `None`,
+    /// and callers then fall back to the same-site `Origin` check alone.
+    async fn resolve_with_csrf(
+        &self,
+        cookie_header: &str,
+    ) -> Option<(ConsolePrincipal, Option<String>)> {
+        self.resolve(cookie_header).await.map(|p| (p, None))
+    }
 }
 
 /// Store failures for console settings and users.

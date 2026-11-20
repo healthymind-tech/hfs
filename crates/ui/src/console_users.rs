@@ -358,14 +358,10 @@ pub(crate) async fn bind(
     };
     let result = ctx
         .console
-        .store()
-        .set_role_binding(&subject, &endpoint, role, &actor(&ctx))
+        .set_binding(&actor(&ctx), &subject, &endpoint, role)
         .await
         .map_err(ConsoleError::from)
-        .map(|_| {
-            ctx.console.invalidate_subject(&subject);
-            "console-bindings-saved".to_string()
-        });
+        .map(|_| "console-bindings-saved".to_string());
     outcome(&ctx, result, None).await
 }
 
@@ -387,13 +383,9 @@ pub(crate) async fn unbind(
     let endpoint = f.get("endpoint").cloned().unwrap_or_default();
     let result = ctx
         .console
-        .store()
-        .delete_role_binding(&subject, &endpoint)
+        .remove_binding(&actor(&ctx), &subject, &endpoint)
         .await
         .map_err(ConsoleError::from)
-        .map(|_| {
-            ctx.console.invalidate_subject(&subject);
-            "console-bindings-saved".to_string()
-        });
+        .map(|_| "console-bindings-saved".to_string());
     outcome(&ctx, result, None).await
 }

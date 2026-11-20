@@ -29,6 +29,7 @@
 
 pub mod access;
 pub mod api;
+pub mod audit;
 pub mod guard;
 pub mod memory;
 pub mod oidc;
@@ -57,6 +58,7 @@ use crate::store::AdminSessionStore;
 use crate::{AdminGate, LoginOutcome};
 
 pub use access::Requirement;
+pub use audit::{ConsoleAuditAction, ConsoleAuditEvent, ConsoleAuditHook};
 pub use password::PolicyViolation;
 pub use sessions::{ConsoleSession, ConsoleSessionStore, MemorySessionStore};
 pub use settings::{EnvBootstrap, SettingsError};
@@ -340,6 +342,7 @@ pub struct ConsoleAuth {
     reloading: tokio::sync::Mutex<()>,
     cache: Mutex<HashMap<String, Cached>>,
     oidc: tokio::sync::Mutex<Option<Arc<oidc::OidcRuntime>>>,
+    audit_hook: std::sync::OnceLock<audit::SharedAuditHook>,
 }
 
 impl std::fmt::Debug for ConsoleAuth {
@@ -385,6 +388,7 @@ impl ConsoleAuth {
             reloading: tokio::sync::Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
             oidc: tokio::sync::Mutex::new(None),
+            audit_hook: std::sync::OnceLock::new(),
         });
         this.reload().await;
         let s = this.settings();
@@ -572,6 +576,32 @@ impl ConsoleAuth {
         )
     }
 
+    // --------------------------------------------------------------- audit
+
+    /// Installs the hook console actions are reported to (FHIR AuditEvents
+    /// in HFS). Returns `false` when one was installed already.
+    pub fn set_audit_hook(&self, hook: audit::SharedAuditHook) -> bool {
+        self.audit_hook.set(hook).is_ok()
+    }
+
+    /// Reports a console action to the audit hook (no hook: nothing; the
+    /// action is logged by its caller).
+    pub async fn audit(&self, event: ConsoleAuditEvent) {
+        if let Some(hook) = self.audit_hook.get() {
+            hook.record(event).await;
+        }
+    }
+
+    /// Reports `event` as done by the console session `resolved`.
+    pub async fn audit_by(&self, resolved: &Resolved, event: ConsoleAuditEvent) {
+        self.audit(
+            event
+                .via(via_str(resolved.session.via))
+                .display(resolved.session.display_name.clone()),
+        )
+        .await;
+    }
+
     // ------------------------------------------------------------ sessions
 
     fn expires(&self, s: &ConsoleSession) -> i64 {
@@ -609,6 +639,18 @@ impl ConsoleAuth {
             client = session.client.as_deref().unwrap_or(""),
             "console sign-in"
         );
+        self.audit(
+            ConsoleAuditEvent::new(
+                session.subject.clone(),
+                ConsoleAuditAction::Execute,
+                "console sign-in",
+            )
+            .via(via_str(session.via))
+            .display(session.display_name.clone())
+            .detail("role", session.role.as_str())
+            .detail("client", session.client.clone().unwrap_or_default()),
+        )
+        .await;
         Ok((key, cookies))
     }
 
@@ -899,9 +941,33 @@ impl ConsoleAuth {
                         Err(e) => LoginResult::Unavailable(e),
                     }
                 }
-                LoginOutcome::RateLimited(d) => LoginResult::RateLimited(d),
+                LoginOutcome::RateLimited(d) => {
+                    self.audit(
+                        ConsoleAuditEvent::new(
+                            username.to_string(),
+                            ConsoleAuditAction::Execute,
+                            "break-glass sign-in refused: locked out",
+                        )
+                        .via("break-glass")
+                        .failed(),
+                    )
+                    .await;
+                    LoginResult::RateLimited(d)
+                }
                 LoginOutcome::CrossOrigin => LoginResult::CrossOrigin,
-                LoginOutcome::Invalid | LoginOutcome::NotConfigured => LoginResult::Invalid,
+                LoginOutcome::Invalid | LoginOutcome::NotConfigured => {
+                    self.audit(
+                        ConsoleAuditEvent::new(
+                            username.to_string(),
+                            ConsoleAuditAction::Execute,
+                            "break-glass sign-in failed",
+                        )
+                        .via("break-glass")
+                        .failed(),
+                    )
+                    .await;
+                    LoginResult::Invalid
+                }
             };
         }
         if self.mode() != ConsoleAuthMode::Local {
@@ -924,6 +990,17 @@ impl ConsoleAuth {
             match self.lockout.locked_until(k).await {
                 Ok(Some(until)) => {
                     tracing::warn!(key = %k, "console sign-in refused: locked out");
+                    self.audit(
+                        ConsoleAuditEvent::new(
+                            username.to_string(),
+                            ConsoleAuditAction::Execute,
+                            "console sign-in refused: locked out",
+                        )
+                        .via("local")
+                        .failed()
+                        .detail("client", ip_key.clone()),
+                    )
+                    .await;
                     return LoginResult::RateLimited(Duration::from_secs(
                         (until - unix_now()).max(1) as u64,
                     ));
@@ -955,6 +1032,18 @@ impl ConsoleAuth {
                 }
             }
             tracing::warn!(client = %ip_key, locked_out = locked.is_some(), "console sign-in failed");
+            self.audit(
+                ConsoleAuditEvent::new(
+                    username.to_string(),
+                    ConsoleAuditAction::Execute,
+                    "console sign-in failed",
+                )
+                .via("local")
+                .failed()
+                .detail("client", ip_key.clone())
+                .detail("lockedOut", locked.is_some().to_string()),
+            )
+            .await;
             return match locked {
                 Some(until) => LoginResult::RateLimited(Duration::from_secs(
                     (until - unix_now()).max(1) as u64,
@@ -997,6 +1086,15 @@ impl ConsoleAuth {
         if let Some(resolved) = self.resolve(headers).await {
             self.end_session(&resolved.key).await;
             tracing::info!(subject = %resolved.session.subject, "console sign-out");
+            self.audit_by(
+                &resolved,
+                ConsoleAuditEvent::new(
+                    resolved.session.subject.clone(),
+                    ConsoleAuditAction::Execute,
+                    "console sign-out",
+                ),
+            )
+            .await;
             if let Some(tokens) = &resolved.session.oidc
                 && let Ok(runtime) = self.oidc_runtime().await
                 && let Some(url) = runtime.client.end_session_url(
@@ -1231,6 +1329,16 @@ impl ConsoleAuth {
         );
         let Some(role) = role else {
             tracing::warn!(user = %who, "console OIDC sign-in: no role maps; refused");
+            self.audit(
+                ConsoleAuditEvent::new(
+                    who.clone(),
+                    ConsoleAuditAction::Execute,
+                    "console OIDC sign-in refused: no role maps",
+                )
+                .via("oidc")
+                .failed(),
+            )
+            .await;
             return OidcOutcome::NoAccess {
                 display: who,
                 cookies: vec![clear],
@@ -1340,6 +1448,12 @@ impl ConsoleAuth {
             })
             .await?;
         tracing::info!(actor, user = %user.username, role = user.role.as_str(), "console user created");
+        self.audit(
+            ConsoleAuditEvent::new(actor, ConsoleAuditAction::Create, "console user created")
+                .entity("ConsoleUser", user.username.clone())
+                .detail("role", user.role.as_str()),
+        )
+        .await;
         Ok((user, generated))
     }
 
@@ -1379,6 +1493,14 @@ impl ConsoleAuth {
             self.invalidate_subject(&subject);
         }
         tracing::info!(actor, user = %updated.username, role = updated.role.as_str(), disabled = updated.disabled, "console user updated");
+        self.audit(
+            ConsoleAuditEvent::new(actor, ConsoleAuditAction::Update, "console user updated")
+                .entity("ConsoleUser", updated.username.clone())
+                .detail("role", updated.role.as_str())
+                .detail("disabled", updated.disabled.to_string())
+                .detail("revision", updated.revision.to_string()),
+        )
+        .await;
         Ok(updated)
     }
 
@@ -1398,6 +1520,15 @@ impl ConsoleAuth {
         self.end_sessions_of(&local_subject(&updated.username))
             .await;
         tracing::info!(actor, user = %updated.username, "console user password reset");
+        self.audit(
+            ConsoleAuditEvent::new(
+                actor,
+                ConsoleAuditAction::Update,
+                "console user password reset",
+            )
+            .entity("ConsoleUser", updated.username.clone()),
+        )
+        .await;
         Ok(generated)
     }
 
@@ -1454,6 +1585,16 @@ impl ConsoleAuth {
         let _ = self.put_session(&resolved.key, &s).await;
         self.cache_lock().remove(&resolved.key);
         tracing::info!(user = %updated.username, "console user changed their password");
+        self.audit_by(
+            resolved,
+            ConsoleAuditEvent::new(
+                resolved.session.subject.clone(),
+                ConsoleAuditAction::Update,
+                "console user changed their password",
+            )
+            .entity("ConsoleUser", updated.username.clone()),
+        )
+        .await;
         Ok(())
     }
 
@@ -1467,6 +1608,68 @@ impl ConsoleAuth {
         self.store.delete_user(id).await?;
         self.end_sessions_of(&local_subject(&user.username)).await;
         tracing::info!(actor, user = %user.username, "console user deleted");
+        self.audit(
+            ConsoleAuditEvent::new(actor, ConsoleAuditAction::Delete, "console user deleted")
+                .entity("ConsoleUser", user.username.clone()),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Sets a per-endpoint role binding (audited; the subject's cached
+    /// sessions pick it up on their next request).
+    pub async fn set_binding(
+        &self,
+        actor: &str,
+        subject: &str,
+        endpoint: &str,
+        role: ConsoleRole,
+    ) -> Result<(), ConsoleStoreError> {
+        self.store
+            .set_role_binding(subject, endpoint, role, actor)
+            .await?;
+        self.invalidate_subject(subject);
+        tracing::info!(
+            actor,
+            subject,
+            endpoint,
+            role = role.as_str(),
+            "console role binding set"
+        );
+        self.audit(
+            ConsoleAuditEvent::new(
+                actor,
+                ConsoleAuditAction::Update,
+                "console role binding set",
+            )
+            .entity("Endpoint", endpoint)
+            .detail("subject", subject)
+            .detail("role", role.as_str()),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Removes a per-endpoint role binding (audited).
+    pub async fn remove_binding(
+        &self,
+        actor: &str,
+        subject: &str,
+        endpoint: &str,
+    ) -> Result<(), ConsoleStoreError> {
+        self.store.delete_role_binding(subject, endpoint).await?;
+        self.invalidate_subject(subject);
+        tracing::info!(actor, subject, endpoint, "console role binding removed");
+        self.audit(
+            ConsoleAuditEvent::new(
+                actor,
+                ConsoleAuditAction::Delete,
+                "console role binding removed",
+            )
+            .entity("Endpoint", endpoint)
+            .detail("subject", subject),
+        )
+        .await;
         Ok(())
     }
 
@@ -1496,6 +1699,12 @@ impl ConsoleAuth {
             return Err(ConsoleError::NotFound);
         }
         tracing::info!(actor, "console session revoked");
+        self.audit(ConsoleAuditEvent::new(
+            actor,
+            ConsoleAuditAction::Delete,
+            "console session revoked",
+        ))
+        .await;
         Ok(())
     }
 
@@ -1612,6 +1821,13 @@ impl ConsoleAuth {
             .await?;
         self.reload().await;
         tracing::info!(actor, mode = ?self.mode(), revision = rev, "console settings saved");
+        self.audit(
+            ConsoleAuditEvent::new(actor, ConsoleAuditAction::Update, "console settings saved")
+                .entity("ConsoleSettings", "console")
+                .detail("mode", format!("{:?}", self.mode()).to_lowercase())
+                .detail("revision", rev.to_string()),
+        )
+        .await;
         Ok(rev)
     }
 
@@ -1644,6 +1860,15 @@ impl ConsoleAuth {
         self.store.save_settings(&stored, revision, actor).await?;
         self.reload().await;
         tracing::info!(actor, "console OIDC client secret re-sealed");
+        self.audit(
+            ConsoleAuditEvent::new(
+                actor,
+                ConsoleAuditAction::Update,
+                "console OIDC client secret re-sealed",
+            )
+            .entity("ConsoleSettings", "console"),
+        )
+        .await;
         Ok(1)
     }
 
@@ -1703,6 +1928,16 @@ pub fn local_subject(username: &str) -> String {
     format!("local:{}", username.to_lowercase())
 }
 
+/// `ConsoleVia` as the audit `via` detail.
+fn via_str(via: ConsoleVia) -> &'static str {
+    match via {
+        ConsoleVia::Anonymous => "anonymous",
+        ConsoleVia::Local => "local",
+        ConsoleVia::Oidc => "oidc",
+        ConsoleVia::BreakGlass => "break-glass",
+    }
+}
+
 fn display_of(u: &ConsoleUser) -> String {
     u.display_name.clone().unwrap_or_else(|| u.username.clone())
 }
@@ -1724,6 +1959,20 @@ impl ConsoleSessionResolver for ConsoleAuth {
         ConsoleAuth::resolve(self, &headers)
             .await
             .map(|r| r.principal)
+    }
+
+    async fn resolve_with_csrf(
+        &self,
+        cookie_header: &str,
+    ) -> Option<(ConsolePrincipal, Option<String>)> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(cookie_header).ok()?,
+        );
+        ConsoleAuth::resolve(self, &headers)
+            .await
+            .map(|r| (r.principal, Some(r.session.csrf)))
     }
 }
 

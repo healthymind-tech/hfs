@@ -94,6 +94,7 @@ pub async fn build(
     base_url: &str,
     ui_enabled: bool,
     break_glass: AdminGate,
+    audit: Option<ConsoleAudit>,
 ) -> Option<Arc<ConsoleAuth>> {
     if let Some(c) = CONSOLE.get() {
         return c.clone();
@@ -107,6 +108,10 @@ pub async fn build(
     } else {
         Some(build_runtime(env, base_url, break_glass).await)
     };
+    if let (Some(c), Some(audit)) = (&console, audit) {
+        // Console actions become FHIR AuditEvents in the server's sink.
+        c.set_audit_hook(Arc::new(audit));
+    }
     if let Some(c) = &console {
         // P2: console sessions act on the FHIR API as console principals.
         let resolver: Arc<dyn helios_endpoints::ConsoleSessionResolver> = c.clone();
@@ -285,6 +290,70 @@ pub fn layer(app: axum::Router, console: Option<&Arc<ConsoleAuth>>) -> axum::Rou
     }
 }
 
+/// Console actions as FHIR `AuditEvent`s (design §5.2): same shape as the
+/// endpoint admin API's events (DICOM 110100 "Application Activity", agent =
+/// the console subject with a `via` detail), recorded in the **default**
+/// tenant; `entity.what` is the object (`ConsoleUser/{name}`,
+/// `Endpoint/{name}` for role bindings, `ConsoleSettings/console`).
+pub struct ConsoleAudit {
+    sink: Arc<dyn helios_audit::AuditSink>,
+    source: String,
+    default_tenant: String,
+}
+
+impl ConsoleAudit {
+    /// Events into `sink`, observer `source`, tenant `default_tenant`.
+    pub fn new(
+        sink: Arc<dyn helios_audit::AuditSink>,
+        source: impl Into<String>,
+        default_tenant: impl Into<String>,
+    ) -> Self {
+        Self {
+            sink,
+            source: source.into(),
+            default_tenant: default_tenant.into(),
+        }
+    }
+
+    /// The `AuditEvent` of one console action.
+    pub fn build_event(
+        &self,
+        event: &helios_admin_auth::console::ConsoleAuditEvent,
+    ) -> helios_audit::AuditEvent {
+        use helios_admin_auth::console::ConsoleAuditAction as A;
+        use helios_audit::AuditAction;
+        let action = match event.action {
+            A::Create => AuditAction::Create,
+            A::Update => AuditAction::Update,
+            A::Delete => AuditAction::Delete,
+            A::Execute => AuditAction::Execute,
+        };
+        let mut b = helios_audit::AuditEventBuilder::new(self.source.clone())
+            .action(action)
+            .outcome(if event.success { "0" } else { "4" })
+            .outcome_desc(event.description.clone())
+            .event_type("http://dicom.nema.org/resources/ontology/DCM", "110100")
+            .agent(&event.actor, event.actor_display.clone(), true)
+            .detail("via", event.via.clone())
+            .detail("source", "console");
+        if let Some((kind, id)) = &event.entity {
+            b = b.resource(kind, id);
+        }
+        for (k, v) in &event.details {
+            b = b.detail(k, v.clone());
+        }
+        b.tenant(self.default_tenant.clone()).build()
+    }
+}
+
+#[async_trait::async_trait]
+impl helios_admin_auth::console::ConsoleAuditHook for ConsoleAudit {
+    async fn record(&self, event: helios_admin_auth::console::ConsoleAuditEvent) {
+        let built = self.build_event(&event);
+        self.sink.record_in(Some(&self.default_tenant), built).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +372,41 @@ mod tests {
             public_origin("http://localhost:8080"),
             "http://localhost:8080"
         );
+    }
+
+    #[test]
+    fn console_events_are_admin_audit_events_in_the_default_tenant() {
+        use helios_admin_auth::console::{ConsoleAuditAction, ConsoleAuditEvent};
+        let audit = ConsoleAudit::new(Arc::new(helios_audit::NullSink), "Device/hfs", "default");
+        let ok = audit.build_event(
+            &ConsoleAuditEvent::new(
+                "local:root",
+                ConsoleAuditAction::Create,
+                "console user created",
+            )
+            .via("local")
+            .entity("ConsoleUser", "alice")
+            .detail("role", "editor"),
+        );
+        let v = serde_json::to_value(&ok).unwrap().to_string();
+        for needle in [
+            "ConsoleUser/alice",
+            "local:root",
+            "console user created",
+            "110100",
+            "editor",
+        ] {
+            assert!(v.contains(needle), "{needle} missing in {v}");
+        }
+        let refused = audit.build_event(
+            &ConsoleAuditEvent::new(
+                "mallory",
+                ConsoleAuditAction::Execute,
+                "console sign-in failed",
+            )
+            .failed(),
+        );
+        let v = serde_json::to_value(&refused).unwrap();
+        assert_eq!(v["outcome"], "4", "{v}");
     }
 }

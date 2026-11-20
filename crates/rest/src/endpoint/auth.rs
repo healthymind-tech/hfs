@@ -634,6 +634,14 @@ impl AuthHook {
 }
 
 /// `scheme://host[:port]` of a URL, lower-cased, default ports dropped.
+/// Whether `X-CSRF-Token` carries the console session's token (constant time).
+fn csrf_header_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(helios_admin_auth::console::CSRF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| !p.is_empty() && helios_admin_auth::console::ct_eq(p, expected))
+}
+
 fn origin_of(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url.trim()).ok()?;
     let host = parsed.host_str()?.to_ascii_lowercase();
@@ -728,14 +736,24 @@ async fn authenticate_endpoint(
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
-        && let Some(console) = resolver.resolve(&cookie).await
+        && let Some((console, csrf)) = resolver.resolve_with_csrf(&cookie).await
         && let Some(scopes) = console
             .role_for(effective.endpoint_name())
             .data_scopes(effective.console_access)
     {
-        if !is_safe(request.method()) && !hook.same_origin(request.headers()) {
-            warn!(sub = %console.subject, "cross-site console write refused");
-            return Err(forbidden_response("cross-site request refused"));
+        if !is_safe(request.method()) {
+            if !hook.same_origin(request.headers()) {
+                warn!(sub = %console.subject, "cross-site console write refused");
+                return Err(forbidden_response("cross-site request refused"));
+            }
+            // Synchronizer token (design §7.3): the console's csrf.js sends
+            // the session's token as `X-CSRF-Token` on same-origin writes.
+            if let Some(expected) = csrf.as_deref()
+                && !csrf_header_matches(request.headers(), expected)
+            {
+                warn!(sub = %console.subject, "console write without a valid CSRF token refused");
+                return Err(forbidden_response("missing or invalid CSRF token"));
+            }
         }
         let principal = console_principal(&console, scopes);
         let path = request.uri().path().to_string();

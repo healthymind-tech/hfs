@@ -771,7 +771,9 @@ struct FakeConsole;
 #[async_trait]
 impl ConsoleSessionResolver for FakeConsole {
     async fn resolve(&self, cookie_header: &str) -> Option<ConsolePrincipal> {
-        let role = if cookie_header.contains("hfs_console=editor") {
+        let role = if cookie_header.contains("hfs_console=editor")
+            || cookie_header.contains("hfs_console=tokened")
+        {
             ConsoleRole::Editor
         } else if cookie_header.contains("hfs_console=viewer") {
             ConsoleRole::Viewer
@@ -785,6 +787,17 @@ impl ConsoleSessionResolver for FakeConsole {
             endpoint_roles: Default::default(),
             via: helios_endpoints::console::ConsoleVia::Local,
         })
+    }
+
+    /// `tokened` sessions carry a synchronizer CSRF token, like real ones.
+    async fn resolve_with_csrf(
+        &self,
+        cookie_header: &str,
+    ) -> Option<(ConsolePrincipal, Option<String>)> {
+        let csrf = cookie_header
+            .contains("hfs_console=tokened")
+            .then(|| "tok-123".to_string());
+        self.resolve(cookie_header).await.map(|p| (p, csrf))
     }
 }
 
@@ -847,6 +860,27 @@ async fn a_console_session_acts_on_the_fhir_api_by_role_and_console_access() {
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "cross-site write");
     let r = post("/alpha/Patient", "editor").await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "no Origin: refused");
+    // A session with a synchronizer token: same-site writes also need it.
+    let same_site = HeaderValue::from_static("http://hfs.test");
+    let r = post("/alpha/Patient", "tokened")
+        .add_header(header::ORIGIN, same_site.clone())
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "no CSRF token");
+    let r = post("/alpha/Patient", "tokened")
+        .add_header(header::ORIGIN, same_site.clone())
+        .add_header("x-csrf-token", HeaderValue::from_static("wrong"))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "wrong CSRF token");
+    let r = post("/alpha/Patient", "tokened")
+        .add_header(header::ORIGIN, same_site)
+        .add_header("x-csrf-token", HeaderValue::from_static("tok-123"))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        get("/alpha/Patient", "tokened").await.status_code(),
+        StatusCode::OK,
+        "reads need no token"
+    );
 
     // consoleAccess=off: the session is no credential.
     assert_eq!(
