@@ -3179,6 +3179,7 @@ async fn start_sqlite(
             copier: None,
             observer: Some(observability.observers.clone()),
             audit: audit_state.clone(),
+            pg: None,
         },
     )
     .await?;
@@ -4450,6 +4451,7 @@ async fn start_postgres(
             copier: Some(backend.clone()),
             observer: Some(observability.observers.clone()),
             audit: audit_state.clone(),
+            pg: Some(manager::PgHandle::from_backend(&backend)),
         },
     )
     .await?;

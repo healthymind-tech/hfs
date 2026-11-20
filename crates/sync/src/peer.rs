@@ -113,7 +113,9 @@ pub enum WriteResult {
     Deleted,
     /// Precondition failed (target changed concurrently).
     Conflict(String),
-    /// Refused (validation, permission…).
+    /// Refused by the target endpoint's write validation (`enforce`).
+    Invalid(String),
+    /// Refused (permission, storage…).
     Failed(String),
 }
 
@@ -127,6 +129,12 @@ pub trait TargetWriter: Send + Sync {
     /// Applies writes; one result per op, in order. An `Err` means nothing
     /// usable came back (the whole batch failed and may be retried).
     async fn apply(&self, ops: Vec<WriteOp>) -> Result<Vec<WriteResult>, PeerError>;
+
+    /// Validation findings of written resources since the last call
+    /// (`log` mode of a local target), for the run log.
+    fn take_findings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl WriteOp {

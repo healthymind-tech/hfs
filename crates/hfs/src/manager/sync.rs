@@ -83,6 +83,9 @@ pub struct SyncInstall {
     pub observer: Option<Arc<dyn WriteObserver>>,
     /// Audit pipeline.
     pub audit: Option<Arc<AuditMiddlewareState>>,
+    /// PostgreSQL primary (pool + dedicated `LISTEN` connection settings):
+    /// cross-instance wake-ups of continuous / subscription runs.
+    pub pg: Option<super::PgHandle>,
 }
 
 /// Builds, starts and registers the sync service. `Ok(None)` when the
@@ -119,13 +122,25 @@ pub async fn install_sync(
             local: Some(i.local),
             copier: i.copier,
             key_ring,
-            observer: i.observer,
+            observer: i.observer.clone(),
             audit: i
                 .audit
                 .map(|a| Arc::new(AuditSinkAuditor::new(a)) as Arc<dyn SyncAuditor>),
             instance: helios_rest::cluster_sync::instance_id().to_string(),
         },
     );
+    // Local writes wake the continuous jobs reading that endpoint at once.
+    if let Some(fan_out) = i.observer.as_deref().and_then(|o| o.fan_out()) {
+        fan_out.subscribe(Arc::new(helios_sync::runtime::SyncWriteWaker(
+            Arc::downgrade(service.runtime()),
+        )));
+    }
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = i.pg {
+        let _listener = helios_sync::pg_wake::install(service.runtime(), pg.pool, pg.listen);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = i.pg;
     if !helios_sync::install_global(service.clone()) {
         warn!("sync service already installed; keeping the first one");
     }

@@ -505,6 +505,147 @@ pub async fn rewrap(State(api): State<SyncApi>) -> Response {
     )
 }
 
+// ------------------------------------------------- local target write path
+
+/// Sync writes into a local endpoint through the server's normal write
+/// path: write-time validation under that endpoint's settings (the same
+/// `ValidationService::prepare_write` a REST write runs, scoped to the
+/// endpoint so its mode, required profiles and terminology apply) and the
+/// profile-registry follow-up of a committed StructureDefinition.
+pub struct EndpointWriteHooks {
+    validation: Arc<crate::validation::ValidationService>,
+    registry: Arc<helios_endpoints::EndpointRegistry>,
+    default_version: helios_fhir::FhirVersion,
+}
+
+impl EndpointWriteHooks {
+    /// Over the server's validation service and endpoint registry.
+    pub fn new(
+        validation: Arc<crate::validation::ValidationService>,
+        registry: Arc<helios_endpoints::EndpointRegistry>,
+        default_version: helios_fhir::FhirVersion,
+    ) -> Self {
+        Self {
+            validation,
+            registry,
+            default_version,
+        }
+    }
+
+    fn resolve(&self, endpoint: &str, resource_type: &str) -> Option<helios_endpoints::ResolvedEndpoint> {
+        let snap = self.registry.snapshot();
+        let ep = snap.by_name(endpoint)?.clone();
+        let prefix = ep.prefix();
+        Some(helios_endpoints::ResolvedEndpoint {
+            prefix: prefix.clone(),
+            remaining_path: format!("/{resource_type}"),
+            original_path: format!("{prefix}/{resource_type}"),
+            epoch: snap.epoch(),
+            endpoint: ep,
+        })
+    }
+
+    fn version_of(&self, r: &helios_endpoints::ResolvedEndpoint) -> helios_fhir::FhirVersion {
+        crate::endpoint::fhir_version_of(r.endpoint.spec.fhir_version).unwrap_or(self.default_version)
+    }
+}
+
+fn outcome_summary(outcome: &Value) -> String {
+    let issues: Vec<String> = outcome
+        .get("issue")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|i| i.get("severity").and_then(Value::as_str) == Some("error"))
+        .take(5)
+        .map(|i| {
+            let path = i
+                .get("expression")
+                .and_then(|e| e.get(0))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let msg = i
+                .get("diagnostics")
+                .or_else(|| i.get("details").and_then(|d| d.get("text")))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if path.is_empty() { msg.to_string() } else { format!("{path}: {msg}") }
+        })
+        .collect();
+    format!("validation failed (enforce): {}", issues.join("; "))
+}
+
+#[async_trait::async_trait]
+impl helios_sync::local::LocalWriteHooks for EndpointWriteHooks {
+    async fn check(
+        &self,
+        endpoint: &str,
+        resource_type: &str,
+        resource: &mut Value,
+    ) -> helios_sync::local::GateVerdict {
+        use helios_sync::local::GateVerdict;
+        let Some(resolved) = self.resolve(endpoint, resource_type) else {
+            return GateVerdict::Reject {
+                reason: format!("endpoint {endpoint:?} does not exist"),
+                outcome: Value::Null,
+            };
+        };
+        let version = self.version_of(&resolved);
+        let tenant = resolved.endpoint.tenant_id().to_string();
+        let required: Vec<String> = resolved
+            .endpoint
+            .spec
+            .validation
+            .as_ref()
+            .map(|v| {
+                v.required_profiles
+                    .iter()
+                    .filter(|r| r.resource_type == resource_type)
+                    .map(|r| r.profile.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let validation = Arc::clone(&self.validation);
+        let rt = resource_type.to_string();
+        crate::endpoint::scope(resolved, async move {
+            let mode = validation.effective_mode();
+            match validation.prepare_write(&tenant, version, &rt, resource).await {
+                Err(crate::error::RestError::ValidationFailed { outcome }) => GateVerdict::Reject {
+                    reason: outcome_summary(&outcome),
+                    outcome,
+                },
+                Err(e) => GateVerdict::Reject {
+                    reason: e.to_string(),
+                    outcome: Value::Null,
+                },
+                Ok(()) if mode == crate::validation::ValidationMode::Log => {
+                    let findings = validation
+                        .validate_resource(version, resource, required, Some(&tenant))
+                        .await
+                        .into_iter()
+                        .filter(|i| i.severity != helios_fhir_validator::Severity::Information)
+                        .map(|i| format!("{:?} {}: {}", i.severity, i.path, i.message))
+                        .collect();
+                    GateVerdict::Accept { findings }
+                }
+                Ok(()) => GateVerdict::Accept { findings: vec![] },
+            }
+        })
+        .await
+    }
+
+    fn written(&self, endpoint: &str, resource_type: &str, resource: &Value) {
+        if resource_type != "StructureDefinition" {
+            return;
+        }
+        if let Some(r) = self.resolve(endpoint, resource_type) {
+            let version = self.version_of(&r);
+            self.validation
+                .upsert_stored_profile(r.endpoint.tenant_id(), version, resource);
+        }
+    }
+}
+
 // ------------------------------------------------- P4 endpoint API hooks
 
 use crate::handlers::admin_endpoints::error::{ApiError, Issue};

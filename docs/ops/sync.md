@@ -62,6 +62,32 @@ servers, and endpoint duplication. Design: `docs/design/fhir-server-manager.md`
 - **Audit**: job create/update/delete/run/cancel/retry/resolve and every run's
   end are AuditEvents (agent `Device/hfs-sync`); local target writes go
   through the server's write observers (subscriptions, counters).
+- **Validation of local target writes**: every write into an endpoint of this
+  server goes through that endpoint's normal write path
+  (`ValidationService::prepare_write` scoped to the target endpoint: its mode,
+  required profiles and terminology, or the server's `HFS_VALIDATION_*` when
+  inherited). `enforce`: the resource is not written; the run counts it as
+  failed, logs it and lists it with the conflicts (reason `rejected by target
+  validation: …` carrying the OperationOutcome). `log`: written; the findings
+  go to the run log (`validation (log): Type/id: …`, at most 50 lines per
+  batch). `off`: written. A written StructureDefinition joins the target's
+  validation profile registry at once.
+- **In-database copy exemption**: `storage-copy` (and duplication on
+  PostgreSQL) skips write validation **only when source and target endpoints
+  have identical `validation` and `terminology` sections** (inherited counts as
+  equal) — the data then already passed the same rules at the source. A
+  duplicate copies the source's sections, so it qualifies. Otherwise the job
+  logs `source and target endpoints validate differently` and loads through
+  the target's validation path (paged read) instead. After an in-database copy
+  the copied StructureDefinitions are registered with this instance's profile
+  registry immediately; other instances pick them up through the
+  `resource_change_feed` trigger (cluster profile sync), and copied
+  SearchParameters through the `search_parameter_epochs` trigger.
+- **Wake-ups**: a committed local write wakes the continuous jobs reading that
+  endpoint at once (write observer), so local→local latency is the pass time,
+  not the poll period. Subscription notifications and job edits are published
+  with `NOTIFY hfs_sync_wake` (PostgreSQL) and wake the run on whichever
+  instance holds it.
 
 ## API
 
@@ -110,7 +136,6 @@ A failed copy leaves the endpoint `provisioning`; retry the job's run.
 - Per-type `filters` only for external sources (applied to the initial read and
   to the incremental search of the filtered types; deletes of filtered types are
   not propagated).
-- Local target writes go through storage, not the HTTP validation layer (an
-  endpoint's `enforce` validation is not applied to sync writes).
-- A subscription notification wakes the run immediately only on the instance
-  that holds it; elsewhere the fallback poll picks it up.
+- A local write made on another instance wakes a continuous run only at its
+  next poll (the instant wake-up is per instance; notifications and job
+  edits are cluster-wide).

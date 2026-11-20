@@ -170,6 +170,7 @@ async fn resume_after_lost_lease_without_duplicates_and_fencing() {
         http: base.http.clone(),
         key_ring: base.key_ring.clone(),
         observer: Some(Arc::new(Crash(stop.clone(), Default::default()))),
+        hooks: Default::default(),
         settings: base.settings.clone(),
         wake: Default::default(),
     };
@@ -481,6 +482,9 @@ async fn continuous_sync_latency() {
     for i in 0..3 {
         let id = format!("live{i}");
         f.put("a", "Patient", &id, json!({"n": i})).await;
+        // What the server's write observer does on a committed write
+        // (`SyncWriteWaker`): wake the continuous jobs reading tenant `a`.
+        f.svc.runtime().wake_tenant("a");
         let t0 = Instant::now();
         loop {
             if f.get("b", "Patient", &id).await.is_some() {
@@ -496,7 +500,7 @@ async fn continuous_sync_latency() {
         worst = worst.max(t0.elapsed());
     }
     println!("continuous local->local worst latency: {worst:?}");
-    assert!(worst <= Duration::from_millis(2500), "latency {worst:?}");
+    assert!(worst <= Duration::from_secs(2), "latency {worst:?}");
     // Disabling the job ends the continuous run.
     let j = f.svc.job(&job).await.unwrap();
     let mut spec = serde_json::to_value(&j.spec).unwrap();
@@ -629,4 +633,37 @@ async fn store_conformance_in_memory() {
     helios_sync::memory::conformance::run_all(&helios_sync::memory::MemorySyncStore::new()).await;
     let _ = JobKind::EndpointSync.as_str();
     assert_eq!(JobKind::parse("endpoint-sync"), Some(JobKind::EndpointSync));
+}
+
+#[tokio::test]
+async fn write_waker_wakes_continuous_jobs_of_the_written_tenant() {
+    use helios_persistence::core::WriteObserver;
+    let f = fixture(config(&[])).await;
+    let mut body = local_job("woken", "a", "b");
+    body["initialLoad"] = json!("none");
+    body["trigger"] = json!({"type": "continuous", "pollSecs": 3600});
+    let job = f.create_job(body).await;
+    let notify = f.svc.runtime().env.wake.get(&job);
+    let waker = helios_sync::runtime::SyncWriteWaker(Arc::downgrade(f.svc.runtime()));
+    let write = |tenant: &str| {
+        helios_persistence::core::WriteEvent::Resource(helios_persistence::core::ResourceWrite {
+            tenant: helios_persistence::tenant::TenantId::new(tenant),
+            fhir_version: helios_fhir::FhirVersion::R4,
+            resource_type: "Patient".into(),
+            live_delta: 1,
+            notice: None,
+            at: chrono::Utc::now(),
+        })
+    };
+    // A write elsewhere does not wake it.
+    waker.on_write(&write("c"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), notify.notified()).await.is_err()
+    );
+    // A write in its source tenant does.
+    waker.on_write(&write("a"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), notify.notified()).await.is_ok()
+    );
+    assert!(!waker.retired());
 }

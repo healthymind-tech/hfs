@@ -252,6 +252,7 @@ async fn strict_outbound_policy_refuses_loopback_at_run_time() {
         )),
         key_ring: env.key_ring.clone(),
         observer: None,
+        hooks: Default::default(),
         settings: env.settings.clone(),
         wake: Default::default(),
     };

@@ -33,6 +33,8 @@ pub mod http;
 pub mod local;
 pub mod memory;
 pub mod peer;
+#[cfg(feature = "postgres")]
+pub mod pg_wake;
 pub mod runtime;
 pub mod secrets;
 pub mod service;
@@ -167,6 +169,7 @@ pub fn build(
         http,
         key_ring: deps.key_ring,
         observer: deps.observer,
+        hooks: Default::default(),
         settings: cfg.engine.clone(),
         wake: Default::default(),
     });

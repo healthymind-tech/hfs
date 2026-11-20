@@ -201,6 +201,12 @@ impl SyncService {
         &self.runtime
     }
 
+    /// Installs the server's normal write path for local targets
+    /// (validation, profile registry). First call wins.
+    pub fn set_local_write_hooks(&self, hooks: Arc<dyn crate::local::LocalWriteHooks>) -> bool {
+        self.runtime.env.hooks.set(hooks).is_ok()
+    }
+
     fn store(&self) -> &Arc<dyn helios_endpoints::sync::SyncStore> {
         &self.runtime.env.store
     }
@@ -333,6 +339,7 @@ impl SyncService {
         let (spec, notify) = spec_from_body(body, &id, None, self.runtime.env.key_ring.as_deref())?;
         self.validate(&spec, None).await?;
         let job = self.store().create_job_with_id(&id, spec, actor).await?;
+        self.runtime.refresh_wake_index().await;
         self.audit("create", &job, actor, true, "sync job created")
             .await;
         let notify_path = matches!(job.spec.trigger, SyncTrigger::Subscription { .. })
@@ -367,7 +374,8 @@ impl SyncService {
         if disabled && let Some(r) = self.active_run(id).await? {
             self.runtime.cancel_run(&r, "job disabled").await?;
         }
-        self.runtime.env.wake.wake(id);
+        self.runtime.refresh_wake_index().await;
+        self.runtime.wake_everywhere(id).await;
         self.audit("update", &job, actor, true, "sync job updated")
             .await;
         Ok(job)
@@ -555,7 +563,7 @@ impl SyncService {
         }
         if job.spec.enabled {
             match self.active_run(job_id).await? {
-                Some(_) => self.runtime.env.wake.wake(job_id),
+                Some(_) => self.runtime.wake_everywhere(job_id).await,
                 None => match self.runtime.start_run(&job, RunReason::Notification).await {
                     Ok(_) | Err(SyncError::Conflict(_)) => {}
                     Err(e) => return Err(e),

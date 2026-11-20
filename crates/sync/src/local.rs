@@ -112,6 +112,40 @@ where
     }
 }
 
+/// What the target endpoint's write validation says about one resource.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GateVerdict {
+    /// Write it. `findings` are the validator's issues in `log` mode
+    /// (recorded in the run log), empty otherwise.
+    Accept {
+        /// Issue summaries (`path: message`).
+        findings: Vec<String>,
+    },
+    /// Do not write (`enforce` mode with errors): the reason and the
+    /// OperationOutcome a normal write would have answered with.
+    Reject {
+        /// Short summary.
+        reason: String,
+        /// The OperationOutcome.
+        outcome: Value,
+    },
+}
+
+/// The server's normal write path for a local target endpoint: write-time
+/// validation under the endpoint's settings (`off` / `log` / `enforce`,
+/// required profiles, terminology) and the follow-ups of a committed write
+/// (a StructureDefinition joins the endpoint's validation profile registry).
+/// Implemented by `helios-rest` over its `ValidationService`; installed with
+/// [`crate::SyncService::set_local_write_hooks`].
+#[async_trait]
+pub trait LocalWriteHooks: Send + Sync {
+    /// Validates `resource` (may clean it, as a normal write does) for
+    /// endpoint `endpoint`.
+    async fn check(&self, endpoint: &str, resource_type: &str, resource: &mut Value) -> GateVerdict;
+    /// A resource was committed at `endpoint`.
+    fn written(&self, endpoint: &str, resource_type: &str, resource: &Value);
+}
+
 /// A tenant context with full access.
 pub fn tenant_context(tenant: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant), TenantPermissions::full_access())
@@ -284,6 +318,9 @@ pub struct LocalTarget {
     tenant: TenantContext,
     version: FhirVersion,
     observer: Option<Arc<dyn WriteObserver>>,
+    endpoint: String,
+    hooks: Option<Arc<dyn LocalWriteHooks>>,
+    findings: std::sync::Mutex<Vec<String>>,
 }
 
 impl LocalTarget {
@@ -299,7 +336,17 @@ impl LocalTarget {
             tenant: tenant_context(tenant),
             version,
             observer,
+            endpoint: String::new(),
+            hooks: None,
+            findings: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Routes every write through the endpoint's normal write path.
+    pub fn with_hooks(mut self, endpoint: &str, hooks: Option<Arc<dyn LocalWriteHooks>>) -> Self {
+        self.endpoint = endpoint.to_string();
+        self.hooks = hooks;
+        self
     }
 
     fn notify(
@@ -331,6 +378,10 @@ impl LocalTarget {
 
 #[async_trait]
 impl TargetWriter for LocalTarget {
+    fn take_findings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.findings.lock().unwrap())
+    }
+
     async fn current(
         &self,
         resource_type: &str,
@@ -358,7 +409,7 @@ impl TargetWriter for LocalTarget {
                 WriteOp::Put {
                     resource_type,
                     id,
-                    mut resource,
+                    resource,
                     if_match,
                 } => {
                     if let Some(expected) = &if_match {
@@ -373,11 +424,33 @@ impl TargetWriter for LocalTarget {
                             _ => {}
                         }
                     }
+                    // The target stamps its own version; an emptied `meta`
+                    // would be an empty element (`ele-1`) to the validator.
+                    let mut resource = crate::hash::strip_volatile(&resource);
                     if let Some(o) = resource.as_object_mut() {
                         o.insert("id".into(), Value::String(id.clone()));
-                        if let Some(meta) = o.get_mut("meta").and_then(Value::as_object_mut) {
-                            meta.remove("versionId");
-                            meta.remove("lastUpdated");
+                    }
+                    if let Some(h) = &self.hooks {
+                        match h.check(&self.endpoint, &resource_type, &mut resource).await {
+                            GateVerdict::Reject { reason, outcome } => {
+                                let mut text = format!("{reason} | OperationOutcome: {outcome}");
+                                if text.len() > 4000 {
+                                    let mut cut = 4000;
+                                    while !text.is_char_boundary(cut) {
+                                        cut -= 1;
+                                    }
+                                    text.truncate(cut);
+                                }
+                                out.push(WriteResult::Invalid(text));
+                                continue;
+                            }
+                            GateVerdict::Accept { findings } if !findings.is_empty() => {
+                                let mut f = self.findings.lock().unwrap();
+                                for x in findings {
+                                    f.push(format!("{resource_type}/{id}: {x}"));
+                                }
+                            }
+                            GateVerdict::Accept { .. } => {}
                         }
                     }
                     match self
@@ -387,6 +460,9 @@ impl TargetWriter for LocalTarget {
                     {
                         Ok((stored, created)) => {
                             let v = stored.version_id().to_string();
+                            if let Some(h) = &self.hooks {
+                                h.written(&self.endpoint, &resource_type, &stored.content_with_meta());
+                            }
                             let kind = if created {
                                 WriteKind::Create
                             } else {

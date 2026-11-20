@@ -26,6 +26,23 @@ pub fn routes() -> Router {
     routes_with(SyncApi::Global)
 }
 
+/// [`routes`], and installs the server's write path for local sync targets
+/// (`EndpointWriteHooks` over this app's validation service and endpoint
+/// registry) into the process-global sync service.
+pub fn routes_for<S>(state: &crate::state::AppState<S>) -> Router
+where
+    S: helios_persistence::core::ResourceStorage + Send + Sync + 'static,
+{
+    if let (Some(svc), Some(runtime)) = (helios_sync::global(), state.endpoint_runtime()) {
+        svc.set_local_write_hooks(Arc::new(h::EndpointWriteHooks::new(
+            state.validation_shared(),
+            Arc::clone(&runtime.registry),
+            state.config().default_fhir_version,
+        )));
+    }
+    routes()
+}
+
 /// Admin routes over a given service (tests).
 pub fn routes_with(api: SyncApi) -> Router {
     routes_with_scope(api, AdminTokenScope::from_env())

@@ -1260,8 +1260,8 @@ where
             &package_manager,
             package_upload_limit,
         ))
+        .merge(routing::admin_sync::routes_for(&admin_tenants_state))
         .merge(routing::admin_tenants::routes(admin_tenants_state))
-        .merge(routing::admin_sync::routes())
         .merge(routing::admin_packages::routes(
             package_manager,
             package_upload_limit,

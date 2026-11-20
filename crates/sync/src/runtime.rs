@@ -90,6 +90,18 @@ pub struct SyncRuntime {
     shutdown: Arc<AtomicBool>,
     /// Wakes idle local workers when this instance enqueues a run.
     queued: tokio::sync::Notify,
+    /// Source tenant → continuous jobs reading it (local writes wake them).
+    tenant_jobs: std::sync::RwLock<std::collections::HashMap<String, Vec<String>>>,
+    /// Cross-instance wake-ups (PostgreSQL NOTIFY).
+    remote_wake: std::sync::OnceLock<Arc<dyn RemoteWake>>,
+}
+
+/// Publishes a job wake-up to every instance (the one holding the run
+/// acts on it).
+#[async_trait]
+pub trait RemoteWake: Send + Sync {
+    /// Announces `job_id`.
+    async fn publish(&self, job_id: &str);
 }
 
 /// The tenant `cluster_jobs` rows of sync runs belong to.
@@ -116,6 +128,8 @@ impl SyncRuntime {
             audit,
             shutdown: Arc::new(AtomicBool::new(false)),
             queued: tokio::sync::Notify::new(),
+            tenant_jobs: Default::default(),
+            remote_wake: std::sync::OnceLock::new(),
         }
     }
 
@@ -127,6 +141,48 @@ impl SyncRuntime {
     /// The auditor.
     pub fn auditor(&self) -> Option<&Arc<dyn SyncAuditor>> {
         self.audit.as_ref()
+    }
+
+    /// Installs the cross-instance wake publisher.
+    pub fn set_remote_wake(&self, w: Arc<dyn RemoteWake>) -> bool {
+        self.remote_wake.set(w).is_ok()
+    }
+
+    /// Wakes a job's run here and, through the publisher, on every instance.
+    pub async fn wake_everywhere(&self, job_id: &str) {
+        self.env.wake.wake(job_id);
+        if let Some(w) = self.remote_wake.get() {
+            w.publish(job_id).await;
+        }
+    }
+
+    /// A local write committed in `tenant`: wakes the continuous jobs that
+    /// read it (cheap; called from a write observer).
+    pub fn wake_tenant(&self, tenant: &str) {
+        let map = self.tenant_jobs.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(jobs) = map.get(tenant) {
+            for j in jobs {
+                self.env.wake.wake(j);
+            }
+        }
+    }
+
+    /// Rebuilds the tenant → continuous-job index.
+    pub async fn refresh_wake_index(&self) {
+        let Ok(jobs) = self.env.store.jobs().await else {
+            return;
+        };
+        let snap = self.env.registry.snapshot();
+        let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for j in jobs.iter().filter(|j| j.spec.enabled) {
+            if let (SyncTrigger::Continuous { .. }, helios_endpoints::sync::SyncPeer::Endpoint { name }) =
+                (&j.spec.trigger, &j.spec.source)
+                && let Some(ep) = snap.by_name(name)
+            {
+                map.entry(ep.tenant_id().to_string()).or_default().push(j.id.clone());
+            }
+        }
+        *self.tenant_jobs.write().unwrap_or_else(|p| p.into_inner()) = map;
     }
 
     /// Stops claiming new runs; running ones stop at their next check.
@@ -397,6 +453,7 @@ impl SyncRuntime {
 
     /// One scheduler pass (public for tests).
     pub async fn schedule_once(&self) -> Result<(), SyncError> {
+        self.refresh_wake_index().await;
         let now = Utc::now();
         for job in self.env.store.jobs().await? {
             if !job.spec.enabled {
@@ -472,5 +529,20 @@ pub fn sync_actor() -> Actor {
         subject: "system:sync".into(),
         display: Some("HFS sync".into()),
         via: "sync".into(),
+    }
+}
+
+/// Write observer waking continuous jobs whose local source was written.
+pub struct SyncWriteWaker(pub std::sync::Weak<SyncRuntime>);
+
+impl helios_persistence::core::WriteObserver for SyncWriteWaker {
+    fn on_write(&self, event: &helios_persistence::core::WriteEvent) {
+        if let Some(rt) = self.0.upgrade() {
+            rt.wake_tenant(event.tenant().as_str());
+        }
+    }
+
+    fn retired(&self) -> bool {
+        self.0.strong_count() == 0
     }
 }

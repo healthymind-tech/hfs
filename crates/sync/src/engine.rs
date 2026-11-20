@@ -30,7 +30,7 @@ use crate::error::EngineError;
 use crate::external::{ExternalSource, ExternalTarget};
 use crate::hash::content_hash;
 use crate::http::{FhirClient, GuardedHttp};
-use crate::local::{LocalSource, LocalStore, LocalTarget, fhir_version_of};
+use crate::local::{LocalSource, LocalStore, LocalTarget, LocalWriteHooks, fhir_version_of};
 use crate::peer::{SourceReader, TargetWriter, WriteOp, WriteResult};
 use crate::secrets::open_auth;
 
@@ -97,6 +97,9 @@ pub struct EngineEnv {
     pub key_ring: Option<Arc<SecretKeyRing>>,
     /// Write observers of local target writes.
     pub observer: Option<Arc<dyn WriteObserver>>,
+    /// The server's normal write path for local targets (validation,
+    /// profile registry); set by the REST layer once its state exists.
+    pub hooks: std::sync::OnceLock<Arc<dyn LocalWriteHooks>>,
     /// Knobs.
     pub settings: EngineSettings,
     /// Wake-ups.
@@ -198,12 +201,10 @@ pub fn build_peers(env: &EngineEnv, job: &SyncJob) -> Result<Peers, EngineError>
                 EngineError::Failed(format!("FHIR {release:?} is not compiled into this server"))
             })?;
             (
-                Box::new(LocalTarget::new(
-                    local()?,
-                    &tenant,
-                    version,
-                    env.observer.clone(),
-                )),
+                Box::new(
+                    LocalTarget::new(local()?, &tenant, version, env.observer.clone())
+                        .with_hooks(name, env.hooks.get().cloned()),
+                ),
                 Some(tenant),
             )
         }
@@ -381,6 +382,31 @@ impl RunState<'_> {
                         self.record_conflict(c, None, reason).await?;
                         continue;
                     }
+                    WriteResult::Invalid(reason) => {
+                        // A write the endpoint's validation refused: a run
+                        // error, listed with the conflicts (with its
+                        // OperationOutcome) so an operator can act on it.
+                        self.progress.failed += 1;
+                        self.env
+                            .store
+                            .conflict(&SyncConflict {
+                                run_id: self.handle.run_id.clone(),
+                                resource_type: c.resource_type.clone(),
+                                resource_id: c.id.clone(),
+                                source_version: c.version.clone(),
+                                target_version: None,
+                                reason: format!("rejected by target validation: {reason}"),
+                                at: Utc::now(),
+                            })
+                            .await?;
+                        let short: String = reason.chars().take(300).collect();
+                        self.log(
+                            LogLevel::Error,
+                            format!("{}: rejected by target validation: {short}", c.token()),
+                        )
+                        .await;
+                        continue;
+                    }
                     WriteResult::Failed(reason) => {
                         self.progress.failed += 1;
                         self.log(LogLevel::Error, format!("{}: {reason}", c.token()))
@@ -398,6 +424,18 @@ impl RunState<'_> {
                     applied_at: now,
                 });
             }
+        }
+        let findings = target.take_findings();
+        let total = findings.len();
+        for f in findings.into_iter().take(50) {
+            self.log(LogLevel::Warn, format!("validation (log): {f}")).await;
+        }
+        if total > 50 {
+            self.log(
+                LogLevel::Warn,
+                format!("validation (log): {} more findings not shown", total - 50),
+            )
+            .await;
         }
         self.env
             .store
@@ -434,10 +472,75 @@ impl RunState<'_> {
 /// A write decided for one change, with the change and its content hash.
 type PlannedWrite<'a> = (WriteOp, &'a Change, Option<[u8; 32]>);
 
+/// Whether source and target endpoints apply the same write policy
+/// (validation and terminology sections, inherited counting as equal).
+pub fn same_write_policy(env: &EngineEnv, spec: &helios_endpoints::sync::SyncJobSpec) -> bool {
+    let (SyncPeer::Endpoint { name: a }, SyncPeer::Endpoint { name: b }) = (&spec.source, &spec.target)
+    else {
+        return false;
+    };
+    let snap = env.registry.snapshot();
+    match (snap.by_name(a), snap.by_name(b)) {
+        (Some(x), Some(y)) => {
+            x.spec.validation == y.spec.validation && x.spec.terminology == y.spec.terminology
+        }
+        _ => false,
+    }
+}
+
+/// After an in-database copy: hand the copied StructureDefinitions to the
+/// target's write hooks so this instance's validation profile registry has
+/// them at once (other instances follow the database change feed).
+async fn register_copied_definitions(st: &RunState<'_>, tenant: &str) -> Result<(), EngineError> {
+    let (Some(hooks), Some(local), SyncPeer::Endpoint { name }) =
+        (st.env.hooks.get(), st.env.local.clone(), &st.job.spec.target)
+    else {
+        return Ok(());
+    };
+    let source = LocalSource::new(local, tenant);
+    let mut page: Option<String> = None;
+    let mut n = 0usize;
+    loop {
+        let p = source
+            .initial_page("StructureDefinition", page.as_deref(), None, 200)
+            .await
+            .map_err(|e| EngineError::Failed(format!("reading copied definitions: {e}")))?;
+        for c in &p.changes {
+            if let Some(r) = &c.resource {
+                hooks.written(name, "StructureDefinition", r);
+                n += 1;
+            }
+        }
+        match p.next {
+            Some(next) => page = Some(next),
+            None => break,
+        }
+    }
+    if n > 0 {
+        st.log(
+            LogLevel::Info,
+            format!("{n} copied StructureDefinitions registered for validation"),
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Runs the initial load until done (or stopped).
 async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), EngineError> {
     let spec = &st.job.spec;
-    if spec.initial_load == InitialLoad::StorageCopy {
+    let mut in_db = spec.initial_load == InitialLoad::StorageCopy;
+    if in_db && st.env.hooks.get().is_some() && !same_write_policy(st.env, spec) {
+        // The in-database copy skips write validation; that is only sound
+        // when the target validates exactly like the source did.
+        st.log(
+            LogLevel::Warn,
+            "source and target endpoints validate differently: copying through the target's validation path (paged read) instead of the in-database copy",
+        )
+        .await;
+        in_db = false;
+    }
+    if in_db {
         let copier = st.env.copier.clone().ok_or_else(|| {
             EngineError::Failed("storage-copy needs the PostgreSQL backend".into())
         })?;
@@ -472,6 +575,7 @@ async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), Engine
             ),
         )
         .await;
+        register_copied_definitions(st, dst).await?;
         install_plan(&mut st.cursor, vec![]);
         st.checkpoint(SyncRunState::Running, None).await?;
         return Ok(());
