@@ -23,14 +23,18 @@
 //!    endpoint's authentication off.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::http::{Extensions, HeaderMap, Method, StatusCode};
+use helios_admin_auth::console::{CSRF_HEADER, ConsoleAuth, access};
 use helios_admin_auth::{AdminGate, AdminUser, Denial};
 use helios_auth::{Principal, SmartPermissions};
-use helios_endpoints::Actor;
+use helios_endpoints::console::{ConsolePrincipal, ConsoleVia};
+use helios_endpoints::{Actor, SecretKeyRing};
 
 use super::error::ApiError;
+use super::{RewrapParticipant, RewrapReport};
 use crate::middleware::auth::ADMIN_ISSUER;
 
 /// Environment variable naming the scope an admin bearer token needs.
@@ -264,6 +268,132 @@ impl AdminAuthorizer for AdminCredentialAuthorizer {
             "login",
             "the endpoint admin API needs an administrator (HFS_ADMIN_PASSWORD credential, an admin console session, or an admin-scoped token)",
         ))
+    }
+}
+
+/// Console sign-in (P3) in front of [`AdminCredentialAuthorizer`].
+///
+/// A request with a live console session (`hfs_console` cookie) is decided
+/// by the console's role rules (`helios_admin_auth::console::access::admin_api_allows`:
+/// reads of `/admin/endpoints[/{name}/…]` need viewer; writes under
+/// `/admin/endpoints/{name}/…` except DELETE need admin on that endpoint —
+/// a binding may grant it; everything else needs global admin). A
+/// cookie-authenticated write must also be same-site and carry the session's
+/// `X-CSRF-Token` (checked here too, so the API is safe without the hfs
+/// guard in front). Requests without a console session fall through to the
+/// credential authorizer (break-glass password, admin tokens).
+///
+/// The runtime is the one given at construction, else the
+/// `Extension<Arc<ConsoleAuth>>` the hfs wiring puts on every request.
+#[derive(Clone)]
+pub struct ConsoleAdminAuthorizer {
+    console: Option<Arc<ConsoleAuth>>,
+    fallback: AdminCredentialAuthorizer,
+}
+
+impl std::fmt::Debug for ConsoleAdminAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleAdminAuthorizer")
+            .field("console", &self.console.is_some())
+            .field("fallback", &self.fallback)
+            .finish()
+    }
+}
+
+impl ConsoleAdminAuthorizer {
+    /// Console sessions decided by `console` (or the request's
+    /// `Extension<Arc<ConsoleAuth>>` when `None`), everything else by `fallback`.
+    pub fn new(console: Option<Arc<ConsoleAuth>>, fallback: AdminCredentialAuthorizer) -> Self {
+        Self { console, fallback }
+    }
+}
+
+fn console_actor(p: &ConsolePrincipal) -> Actor {
+    let via = match p.via {
+        ConsoleVia::Local => "console-session",
+        ConsoleVia::Oidc => "console-oidc",
+        ConsoleVia::BreakGlass => "admin-session",
+        ConsoleVia::Anonymous => "anonymous",
+    };
+    Actor {
+        subject: p.subject.clone(),
+        display: (!p.display_name.is_empty()).then(|| p.display_name.clone()),
+        via: via.into(),
+    }
+}
+
+#[async_trait]
+impl AdminAuthorizer for ConsoleAdminAuthorizer {
+    async fn authorize(&self, request: AdminRequest<'_>) -> Result<Actor, ApiError> {
+        let console = self
+            .console
+            .clone()
+            .or_else(|| request.extensions.get::<Arc<ConsoleAuth>>().cloned());
+        let Some(console) = console else {
+            return self.fallback.authorize(request).await;
+        };
+        // An explicit credential (Basic / bearer) is not a console session.
+        if request
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            return self.fallback.authorize(request).await;
+        }
+        let Some(resolved) = console.resolve(request.headers).await else {
+            return self.fallback.authorize(request).await;
+        };
+        let p = &resolved.principal;
+        if request.is_write() {
+            let token = request
+                .headers
+                .get(CSRF_HEADER)
+                .and_then(|v| v.to_str().ok());
+            if !console.same_origin(request.headers)
+                || !ConsoleAuth::csrf_ok(&resolved.session, token)
+            {
+                return Err(denied(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "cross-site request refused (same-site Origin and X-CSRF-Token required)",
+                ));
+            }
+        }
+        if access::admin_api_allows(p, request.method, request.path) {
+            Ok(console_actor(p))
+        } else {
+            let (role, endpoint) = access::admin_api_requirement(request.method, request.path);
+            Err(denied(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                &match endpoint {
+                    Some(e) => format!("this needs the {} role on endpoint {e}", role.as_str()),
+                    None => format!("this needs the {} role", role.as_str()),
+                },
+            ))
+        }
+    }
+}
+
+/// `$rewrap` participant re-sealing the console's OIDC client secret
+/// (`ConsoleAuth::rewrap_secrets`, AAD `console:oidc.clientSecret`).
+#[derive(Clone)]
+pub struct ConsoleRewrap(pub Arc<ConsoleAuth>);
+
+#[async_trait]
+impl RewrapParticipant for ConsoleRewrap {
+    async fn rewrap(&self, _ring: &SecretKeyRing, actor: &Actor) -> RewrapReport {
+        match self.0.rewrap_secrets(&actor.subject).await {
+            Ok(n) => RewrapReport {
+                scope: "console".into(),
+                rewrapped: n,
+                ..RewrapReport::default()
+            },
+            Err(e) => RewrapReport {
+                scope: "console".into(),
+                failed: vec![format!("console/oidc.clientSecret: {e}")],
+                ..RewrapReport::default()
+            },
+        }
     }
 }
 

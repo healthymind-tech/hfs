@@ -464,6 +464,12 @@ pub async fn audit_handler(
 pub async fn rewrap_handler(
     State(state): State<AdminEndpointsState>,
     Extension(actor): Extension<Actor>,
+    console: Option<Extension<std::sync::Arc<helios_admin_auth::console::ConsoleAuth>>>,
 ) -> ApiResult<Response> {
-    Ok(Json(json!(state.rewrap_secrets(&actor).await?)).into_response())
+    let console = console.map(|Extension(c)| super::authz::ConsoleRewrap(c));
+    let extra: Vec<&dyn super::RewrapParticipant> = console
+        .iter()
+        .map(|c| c as &dyn super::RewrapParticipant)
+        .collect();
+    Ok(Json(json!(state.rewrap_secrets_with(&actor, &extra).await?)).into_response())
 }

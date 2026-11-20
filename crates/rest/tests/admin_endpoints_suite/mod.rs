@@ -33,7 +33,9 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_rest::ServerConfig;
 use helios_rest::config::{PackageConfig, RegistryMode};
 use helios_rest::handlers::admin_endpoints::AdminEndpointsState;
-use helios_rest::handlers::admin_endpoints::authz::AdminCredentialAuthorizer;
+use helios_rest::handlers::admin_endpoints::authz::{
+    AdminCredentialAuthorizer, ConsoleAdminAuthorizer,
+};
 use helios_rest::handlers::admin_endpoints::error::ApiError;
 use helios_rest::handlers::admin_endpoints::hooks::{
     DuplicateService, DuplicateStarted, EndpointAuthProbe, P2Probe,
@@ -269,6 +271,9 @@ pub struct Options {
     pub max_endpoints: usize,
     pub racy: bool,
     pub token_layer: Option<&'static str>,
+    /// Console sign-in runtime: put on every request (as the hfs wiring
+    /// does) and decided by `ConsoleAdminAuthorizer`.
+    pub console: Option<Arc<helios_admin_auth::console::ConsoleAuth>>,
 }
 
 impl Default for Options {
@@ -284,6 +289,7 @@ impl Default for Options {
             max_endpoints: 200,
             racy: false,
             token_layer: None,
+            console: None,
         }
     }
 }
@@ -371,7 +377,13 @@ impl Harness {
             .key_ring(opts.key_ring.clone())
             .outbound(opts.outbound)
             .resolver(Arc::new(FakeResolver::default()))
-            .authorizer(Arc::new(AdminCredentialAuthorizer::new(Some(gate))))
+            .authorizer(match &opts.console {
+                Some(_) => Arc::new(ConsoleAdminAuthorizer::new(
+                    None,
+                    AdminCredentialAuthorizer::new(Some(gate)),
+                )),
+                None => Arc::new(AdminCredentialAuthorizer::new(Some(gate))),
+            })
             .packages(manager, 16 * 1024 * 1024)
             .storage(storage, Some(observers))
             .audit(Some(sink.clone()), "Device/hfs", "default")
@@ -384,6 +396,9 @@ impl Harness {
             builder = builder.auth_probe(p);
         }
         let mut app = routes(builder.build());
+        if let Some(rt) = &opts.console {
+            app = app.layer(axum::Extension(rt.clone()));
+        }
         if let Some(scopes) = opts.token_layer {
             // Stands in for the FHIR auth layer: every request carries a
             // validated bearer principal with these scopes.

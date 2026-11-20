@@ -715,6 +715,16 @@ impl AdminEndpointsState {
     /// Re-seals every endpoint secret (and those of the registered
     /// participants) under the active key.
     pub async fn rewrap_secrets(&self, actor: &Actor) -> ApiResult<RewrapOutcome> {
+        self.rewrap_secrets_with(actor, &[]).await
+    }
+
+    /// [`Self::rewrap_secrets`] plus `extra` participants known only per
+    /// request (the console runtime of the hfs wiring).
+    pub async fn rewrap_secrets_with(
+        &self,
+        actor: &Actor,
+        extra: &[&dyn super::RewrapParticipant],
+    ) -> ApiResult<RewrapOutcome> {
         let i = self.inner();
         let ring = i.key_ring.clone().ok_or_else(secrets::no_key_ring)?;
         let mut report = RewrapReport {
@@ -747,6 +757,9 @@ impl AdminEndpointsState {
         }
         let mut reports = vec![report];
         for p in &i.rewrap_participants {
+            reports.push(p.rewrap(&ring, actor).await);
+        }
+        for p in extra {
             reports.push(p.rewrap(&ring, actor).await);
         }
         let rewrapped: usize = reports.iter().map(|r| r.rewrapped).sum();

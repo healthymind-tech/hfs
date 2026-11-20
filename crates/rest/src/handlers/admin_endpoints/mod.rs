@@ -217,7 +217,8 @@ impl AdminEndpointsStateBuilder {
     /// (`HFS_SECRET_KEYS[_FILE]`; a broken one is logged and treated as
     /// absent, so secrets are refused rather than stored), the outbound
     /// policy (`HFS_OUTBOUND_ALLOW`), the P2 auth probe under that policy and
-    /// the admin-credential authorizer
+    /// the authorizer: console sign-in roles (P3, from the request's
+    /// `Extension<Arc<ConsoleAuth>>`) in front of the admin-credential authorizer
     /// (`HFS_ADMIN_TOKEN_SCOPE`, `HFS_CONSOLE_ALLOW_ANONYMOUS_ADMIN`) over
     /// `gate`, the server's administrator sign-in.
     pub fn env_defaults(mut self, gate: Option<helios_admin_auth::AdminGate>) -> Self {
@@ -229,7 +230,10 @@ impl AdminEndpointsStateBuilder {
             }
         };
         self.inner.outbound = OutboundPolicy::from_env();
-        self.inner.authorizer = Arc::new(AdminCredentialAuthorizer::from_env(gate));
+        self.inner.authorizer = Arc::new(authz::ConsoleAdminAuthorizer::new(
+            None,
+            AdminCredentialAuthorizer::from_env(gate),
+        ));
         self.inner.auth_probe =
             Arc::new(hooks::P2Probe::new(Arc::new(self.inner.outbound.clone())));
         self
