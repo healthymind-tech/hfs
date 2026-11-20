@@ -1030,11 +1030,31 @@ impl ValidationConfig {
             errors.push("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS must be > 0".to_string());
         }
         for (key, value, allowed) in [
-            ("HFS_VALIDATION_SIGNATURES", &self.signatures, &["verify", "off"][..]),
-            ("HFS_VALIDATION_SIGNATURE_TRUST", &self.signature_trust, &["any", "listed"][..]),
-            ("HFS_VALIDATION_SIGNATURE_UNTRUSTED", &self.signature_untrusted, &["warning", "error"][..]),
-            ("HFS_VALIDATION_HL7_URLS", &self.hl7_urls, &["error", "warning", "off"][..]),
-            ("HFS_VALIDATION_EMPTY_INVARIANT", &self.empty_invariant, &["pass", "fail"][..]),
+            (
+                "HFS_VALIDATION_SIGNATURES",
+                &self.signatures,
+                &["verify", "off"][..],
+            ),
+            (
+                "HFS_VALIDATION_SIGNATURE_TRUST",
+                &self.signature_trust,
+                &["any", "listed"][..],
+            ),
+            (
+                "HFS_VALIDATION_SIGNATURE_UNTRUSTED",
+                &self.signature_untrusted,
+                &["warning", "error"][..],
+            ),
+            (
+                "HFS_VALIDATION_HL7_URLS",
+                &self.hl7_urls,
+                &["error", "warning", "off"][..],
+            ),
+            (
+                "HFS_VALIDATION_EMPTY_INVARIANT",
+                &self.empty_invariant,
+                &["pass", "fail"][..],
+            ),
         ] {
             if !allowed.contains(&value.as_str()) {
                 errors.push(format!(
@@ -1045,7 +1065,8 @@ impl ValidationConfig {
         }
         if self.signature_trust == "listed" && self.signature_certs.is_empty() {
             errors.push(
-                "HFS_VALIDATION_SIGNATURE_TRUST=listed needs HFS_VALIDATION_SIGNATURE_CERTS".to_string(),
+                "HFS_VALIDATION_SIGNATURE_TRUST=listed needs HFS_VALIDATION_SIGNATURE_CERTS"
+                    .to_string(),
             );
         }
         if errors.is_empty() {
