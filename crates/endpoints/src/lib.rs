@@ -25,6 +25,8 @@ pub mod name;
 pub mod outbound;
 #[cfg(feature = "postgres")]
 pub mod pg;
+#[cfg(feature = "postgres")]
+pub mod pg_console;
 pub mod registry;
 pub mod secret;
 pub mod snapshot;
