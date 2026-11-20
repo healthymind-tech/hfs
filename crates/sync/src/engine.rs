@@ -136,7 +136,10 @@ pub struct Peers {
     pub target_tenant: Option<String>,
 }
 
-fn local_endpoint(env: &EngineEnv, name: &str) -> Result<(String, helios_endpoints::FhirRelease), EngineError> {
+fn local_endpoint(
+    env: &EngineEnv,
+    name: &str,
+) -> Result<(String, helios_endpoints::FhirRelease), EngineError> {
     let snap = env.registry.snapshot();
     let ep = snap
         .by_name(name)
@@ -148,21 +151,30 @@ fn local_endpoint(env: &EngineEnv, name: &str) -> Result<(String, helios_endpoin
 pub fn build_peers(env: &EngineEnv, job: &SyncJob) -> Result<Peers, EngineError> {
     let spec = &job.spec;
     let ring = env.key_ring.as_deref();
-    let client = |side: &str, x: &helios_endpoints::sync::ExternalServer| -> Result<Arc<FhirClient>, EngineError> {
+    let client = |side: &str,
+                  x: &helios_endpoints::sync::ExternalServer|
+     -> Result<Arc<FhirClient>, EngineError> {
         if !env.settings.external_allowed {
             return Err(EngineError::Failed(
                 "external sync peers are disabled on this server (HFS_SYNC_EXTERNAL=off)".into(),
             ));
         }
-        let auth = open_auth(&x.auth, &job.id, side, ring).map_err(|e| EngineError::Failed(e.to_string()))?;
-        FhirClient::new(env.http.clone(), &x.base_url, auth, x.headers.clone(), x.max_requests_per_second)
-            .map(Arc::new)
-            .map_err(|e| EngineError::Failed(e.to_string()))
+        let auth = open_auth(&x.auth, &job.id, side, ring)
+            .map_err(|e| EngineError::Failed(e.to_string()))?;
+        FhirClient::new(
+            env.http.clone(),
+            &x.base_url,
+            auth,
+            x.headers.clone(),
+            x.max_requests_per_second,
+        )
+        .map(Arc::new)
+        .map_err(|e| EngineError::Failed(e.to_string()))
     };
     let local = || {
-        env.local
-            .clone()
-            .ok_or_else(|| EngineError::Failed("this server has no storage access for local endpoints".into()))
+        env.local.clone().ok_or_else(|| {
+            EngineError::Failed("this server has no storage access for local endpoints".into())
+        })
     };
     let (source, source_tenant): (Box<dyn SourceReader>, Option<String>) = match &spec.source {
         SyncPeer::Endpoint { name } => {
@@ -186,7 +198,12 @@ pub fn build_peers(env: &EngineEnv, job: &SyncJob) -> Result<Peers, EngineError>
                 EngineError::Failed(format!("FHIR {release:?} is not compiled into this server"))
             })?;
             (
-                Box::new(LocalTarget::new(local()?, &tenant, version, env.observer.clone())),
+                Box::new(LocalTarget::new(
+                    local()?,
+                    &tenant,
+                    version,
+                    env.observer.clone(),
+                )),
                 Some(tenant),
             )
         }
@@ -212,10 +229,21 @@ pub struct RunState<'a> {
 }
 
 impl RunState<'_> {
-    async fn checkpoint(&self, state: SyncRunState, error: Option<&str>) -> Result<(), EngineError> {
+    async fn checkpoint(
+        &self,
+        state: SyncRunState,
+        error: Option<&str>,
+    ) -> Result<(), EngineError> {
         self.env
             .store
-            .checkpoint(&self.handle.run_id, self.handle.token, state, &self.cursor, &self.progress, error)
+            .checkpoint(
+                &self.handle.run_id,
+                self.handle.token,
+                state,
+                &self.cursor,
+                &self.progress,
+                error,
+            )
             .await
             .map_err(EngineError::from)
     }
@@ -228,7 +256,11 @@ impl RunState<'_> {
     }
 
     /// Applies one batch of changes (oldest first) at the target.
-    async fn apply(&mut self, target: &dyn TargetWriter, changes: &[Change]) -> Result<(), EngineError> {
+    async fn apply(
+        &mut self,
+        target: &dyn TargetWriter,
+        changes: &[Change],
+    ) -> Result<(), EngineError> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -271,7 +303,14 @@ impl RunState<'_> {
             } else {
                 None
             };
-            match decide(policy, state, c.deleted, hash.as_ref(), c.last_updated, target_info.as_ref()) {
+            match decide(
+                policy,
+                state,
+                c.deleted,
+                hash.as_ref(),
+                c.last_updated,
+                target_info.as_ref(),
+            ) {
                 Decision::Skip => {
                     self.progress.skipped += 1;
                     if state.is_none() {
@@ -287,8 +326,12 @@ impl RunState<'_> {
                     }
                 }
                 Decision::Conflict(reason) => {
-                    self.record_conflict(c, target_info.as_ref().and_then(|t| t.version.clone()), &reason)
-                        .await?;
+                    self.record_conflict(
+                        c,
+                        target_info.as_ref().and_then(|t| t.version.clone()),
+                        &reason,
+                    )
+                    .await?;
                 }
                 Decision::Apply { if_match } => {
                     let op = if c.deleted {
@@ -336,7 +379,8 @@ impl RunState<'_> {
                     }
                     WriteResult::Failed(reason) => {
                         self.progress.failed += 1;
-                        self.log(LogLevel::Error, format!("{}: {reason}", c.token())).await;
+                        self.log(LogLevel::Error, format!("{}: {reason}", c.token()))
+                            .await;
                         continue;
                     }
                 };
@@ -351,11 +395,19 @@ impl RunState<'_> {
                 });
             }
         }
-        self.env.store.put_item_states(&self.job.id, &new_states).await?;
+        self.env
+            .store
+            .put_item_states(&self.job.id, &new_states)
+            .await?;
         Ok(())
     }
 
-    async fn record_conflict(&mut self, c: &Change, target_version: Option<String>, reason: &str) -> Result<(), EngineError> {
+    async fn record_conflict(
+        &mut self,
+        c: &Change,
+        target_version: Option<String>,
+        reason: &str,
+    ) -> Result<(), EngineError> {
         self.progress.conflicts += 1;
         self.env
             .store
@@ -369,7 +421,8 @@ impl RunState<'_> {
                 at: Utc::now(),
             })
             .await?;
-        self.log(LogLevel::Warn, format!("conflict {}: {reason}", c.token())).await;
+        self.log(LogLevel::Warn, format!("conflict {}: {reason}", c.token()))
+            .await;
         Ok(())
     }
 }
@@ -381,21 +434,26 @@ type PlannedWrite<'a> = (WriteOp, &'a Change, Option<[u8; 32]>);
 async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), EngineError> {
     let spec = &st.job.spec;
     if spec.initial_load == InitialLoad::StorageCopy {
-        let copier = st
-            .env
-            .copier
-            .clone()
-            .ok_or_else(|| EngineError::Failed("storage-copy needs the PostgreSQL backend".into()))?;
+        let copier = st.env.copier.clone().ok_or_else(|| {
+            EngineError::Failed("storage-copy needs the PostgreSQL backend".into())
+        })?;
         let (Some(src), Some(dst)) = (&peers.source_tenant, &peers.target_tenant) else {
-            return Err(EngineError::Failed("storage-copy works only between local endpoints".into()));
+            return Err(EngineError::Failed(
+                "storage-copy works only between local endpoints".into(),
+            ));
         };
-        st.log(LogLevel::Info, format!("storage copy of tenant {src} into {dst} started")).await;
+        st.log(
+            LogLevel::Info,
+            format!("storage copy of tenant {src} into {dst} started"),
+        )
+        .await;
         let report = copier
             .copy(CopyRequest {
                 source_tenant: src.clone(),
                 target_tenant: dst.clone(),
                 include_history: spec.include_history,
-                resource_types: (!spec.resource_types.is_empty()).then(|| spec.resource_types.clone()),
+                resource_types: (!spec.resource_types.is_empty())
+                    .then(|| spec.resource_types.clone()),
                 copy_packages: true,
             })
             .await
@@ -404,7 +462,10 @@ async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), Engine
         st.progress.created += report.resources;
         st.log(
             LogLevel::Info,
-            format!("storage copy finished: {} resources ({})", report.resources, report.summary),
+            format!(
+                "storage copy finished: {} resources ({})",
+                report.resources, report.summary
+            ),
         )
         .await;
         install_plan(&mut st.cursor, vec![]);
@@ -418,7 +479,11 @@ async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), Engine
             .await
             .map_err(|e| EngineError::Failed(format!("listing source types: {e}")))?;
         let plan = plan_types(spec, &available);
-        st.log(LogLevel::Info, format!("initial load planned: {}", plan.join(", "))).await;
+        st.log(
+            LogLevel::Info,
+            format!("initial load planned: {}", plan.join(", ")),
+        )
+        .await;
         install_plan(&mut st.cursor, plan);
         st.checkpoint(SyncRunState::Running, None).await?;
     }
@@ -443,7 +508,8 @@ async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), Engine
         match page.next {
             Some(n) => st.cursor.page = Some(n),
             None => {
-                st.log(LogLevel::Info, format!("initial load of {rt} finished")).await;
+                st.log(LogLevel::Info, format!("initial load of {rt} finished"))
+                    .await;
                 next_type(&mut st.cursor);
             }
         }
@@ -470,7 +536,10 @@ async fn incremental_pass(st: &mut RunState<'_>, peers: &Peers) -> Result<u64, E
             .map_err(|e| EngineError::Failed(format!("reading changes: {e}")))?;
         if first && !w.neutral.is_empty() {
             let neutral: Vec<Change> = order_and_dedupe(
-                w.neutral.into_iter().filter(|c| spec.includes_type(&c.resource_type)).collect(),
+                w.neutral
+                    .into_iter()
+                    .filter(|c| spec.includes_type(&c.resource_type))
+                    .collect(),
             );
             for b in batches(neutral, spec.batch_size as usize) {
                 st.apply(peers.target.as_ref(), &b).await?;
@@ -479,7 +548,10 @@ async fn incremental_pass(st: &mut RunState<'_>, peers: &Peers) -> Result<u64, E
         first = false;
         let admitted = admit(
             &st.cursor,
-            w.changes.into_iter().filter(|c| spec.includes_type(&c.resource_type)).collect(),
+            w.changes
+                .into_iter()
+                .filter(|c| spec.includes_type(&c.resource_type))
+                .collect(),
         );
         for b in batches(order_and_dedupe(admitted), spec.batch_size as usize) {
             st.apply(peers.target.as_ref(), &b).await?;
@@ -498,10 +570,12 @@ async fn incremental_pass(st: &mut RunState<'_>, peers: &Peers) -> Result<u64, E
 
 fn poll_period(job: &SyncJob, min: Duration) -> Option<Duration> {
     match job.spec.trigger {
-        SyncTrigger::Continuous { poll_secs } => Some(Duration::from_secs(poll_secs.into()).max(min)),
-        SyncTrigger::Subscription { fallback_poll_secs, .. } => {
-            Some(Duration::from_secs(fallback_poll_secs.max(1).into()).max(min))
+        SyncTrigger::Continuous { poll_secs } => {
+            Some(Duration::from_secs(poll_secs.into()).max(min))
         }
+        SyncTrigger::Subscription {
+            fallback_poll_secs, ..
+        } => Some(Duration::from_secs(fallback_poll_secs.max(1).into()).max(min)),
         _ => None,
     }
 }
@@ -509,8 +583,19 @@ fn poll_period(job: &SyncJob, min: Duration) -> Option<Duration> {
 /// Executes a run to its end and writes the final checkpoint. `Ok(state)`
 /// is the terminal state recorded; `Err(Stopped)` means the run was taken
 /// away (cancel / lease loss) and nothing more may be written.
-pub async fn execute(env: &EngineEnv, job: &SyncJob, run: &SyncRun, handle: &RunHandle) -> Result<SyncRunState, EngineError> {
-    let cursor = start_cursor(&job.spec, Some(&run.cursor), Utc::now(), job.created_at, env.settings.safety_lag);
+pub async fn execute(
+    env: &EngineEnv,
+    job: &SyncJob,
+    run: &SyncRun,
+    handle: &RunHandle,
+) -> Result<SyncRunState, EngineError> {
+    let cursor = start_cursor(
+        &job.spec,
+        Some(&run.cursor),
+        Utc::now(),
+        job.created_at,
+        env.settings.safety_lag,
+    );
     let mut st = RunState {
         env,
         job,
@@ -563,7 +648,11 @@ async fn drive(st: &mut RunState<'_>, run: &SyncRun) -> Result<(), EngineError> 
     loop {
         let n = incremental_pass(st, &peers).await?;
         if n > 0 {
-            st.log(LogLevel::Info, format!("incremental pass applied {n} changes")).await;
+            st.log(
+                LogLevel::Info,
+                format!("incremental pass applied {n} changes"),
+            )
+            .await;
         }
         let Some(period) = poll_period(&job, st.env.settings.min_poll) else {
             return Ok(());
@@ -585,7 +674,8 @@ async fn drive(st: &mut RunState<'_>, run: &SyncRun) -> Result<(), EngineError> 
         match st.env.store.job(&job.id).await? {
             Some(j) if j.spec.enabled => job = j,
             Some(_) => {
-                st.log(LogLevel::Info, "job disabled; continuous run ends").await;
+                st.log(LogLevel::Info, "job disabled; continuous run ends")
+                    .await;
                 return Ok(());
             }
             None => return Err(EngineError::Stopped("job deleted".into())),
@@ -595,7 +685,12 @@ async fn drive(st: &mut RunState<'_>, run: &SyncRun) -> Result<(), EngineError> 
 
 /// Resolves one recorded conflict by writing the source's current state to
 /// the target unconditionally ("overwrite"). Returns what was written.
-pub async fn overwrite_one(env: &EngineEnv, job: &SyncJob, resource_type: &str, id: &str) -> Result<WriteResult, EngineError> {
+pub async fn overwrite_one(
+    env: &EngineEnv,
+    job: &SyncJob,
+    resource_type: &str,
+    id: &str,
+) -> Result<WriteResult, EngineError> {
     let peers = build_peers(env, job)?;
     let current = peers
         .source
@@ -653,7 +748,12 @@ pub async fn overwrite_one(env: &EngineEnv, job: &SyncJob, resource_type: &str, 
 /// Accepts the target's current state for one conflict ("keep"): the item
 /// state records it, so a `fail` job stops reporting it until either side
 /// changes again.
-pub async fn keep_target(env: &EngineEnv, job: &SyncJob, resource_type: &str, id: &str) -> Result<(), EngineError> {
+pub async fn keep_target(
+    env: &EngineEnv,
+    job: &SyncJob,
+    resource_type: &str,
+    id: &str,
+) -> Result<(), EngineError> {
     let peers = build_peers(env, job)?;
     let t = peers
         .target
@@ -673,7 +773,10 @@ pub async fn keep_target(env: &EngineEnv, job: &SyncJob, resource_type: &str, id
                 resource_id: id.into(),
                 source_version: s.as_ref().and_then(|c| c.version.clone()),
                 target_version: t.as_ref().and_then(|t| t.version.clone()),
-                content_sha256: s.as_ref().and_then(|c| c.resource.as_ref()).map(|r| content_hash(r).to_vec()),
+                content_sha256: s
+                    .as_ref()
+                    .and_then(|c| c.resource.as_ref())
+                    .map(|r| content_hash(r).to_vec()),
                 deleted: s.is_none(),
                 applied_at: Utc::now(),
             }],
@@ -696,9 +799,18 @@ mod tests {
         .unwrap();
         assert_eq!(poll_period(&job, Duration::from_secs(1)), None);
         job.spec.trigger = SyncTrigger::Continuous { poll_secs: 0 };
-        assert_eq!(poll_period(&job, Duration::from_secs(1)), Some(Duration::from_secs(1)));
-        job.spec.trigger = SyncTrigger::Subscription { fallback_poll_secs: 30, notify_secret: None };
-        assert_eq!(poll_period(&job, Duration::from_millis(10)), Some(Duration::from_secs(30)));
+        assert_eq!(
+            poll_period(&job, Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        job.spec.trigger = SyncTrigger::Subscription {
+            fallback_poll_secs: 30,
+            notify_secret: None,
+        };
+        assert_eq!(
+            poll_period(&job, Duration::from_millis(10)),
+            Some(Duration::from_secs(30))
+        );
         let w = WakeMap::default();
         let n = w.get("j");
         w.wake("j");

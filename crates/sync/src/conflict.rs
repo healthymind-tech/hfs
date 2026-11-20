@@ -114,9 +114,9 @@ pub fn decide(
                     ))
                 }
             }
-            (Some(_), _) => {
-                Decision::Conflict("target holds a different resource this job did not write".into())
-            }
+            (Some(_), _) => Decision::Conflict(
+                "target holds a different resource this job did not write".into(),
+            ),
         },
     }
 }
@@ -155,15 +155,36 @@ mod tests {
         let now = Utc::now();
         let s = state(1, Some("4"), false);
         assert_eq!(
-            decide(ConflictPolicy::SourceWins, Some(&s), false, Some(&h(1)), now, None),
+            decide(
+                ConflictPolicy::SourceWins,
+                Some(&s),
+                false,
+                Some(&h(1)),
+                now,
+                None
+            ),
             Decision::Skip
         );
         assert_eq!(
-            decide(ConflictPolicy::SourceWins, Some(&s), false, Some(&h(2)), now, None),
+            decide(
+                ConflictPolicy::SourceWins,
+                Some(&s),
+                false,
+                Some(&h(2)),
+                now,
+                None
+            ),
             Decision::Apply { if_match: None }
         );
         assert_eq!(
-            decide(ConflictPolicy::SourceWins, None, false, Some(&h(2)), now, None),
+            decide(
+                ConflictPolicy::SourceWins,
+                None,
+                false,
+                Some(&h(2)),
+                now,
+                None
+            ),
             Decision::Apply { if_match: None }
         );
         assert!(!needs_target(ConflictPolicy::SourceWins, false));
@@ -176,7 +197,14 @@ mod tests {
         let now = Utc::now();
         let gone = state(1, None, true);
         assert_eq!(
-            decide(ConflictPolicy::SourceWins, Some(&gone), true, None, now, None),
+            decide(
+                ConflictPolicy::SourceWins,
+                Some(&gone),
+                true,
+                None,
+                now,
+                None
+            ),
             Decision::Skip
         );
         // Target does not have it: nothing to delete.
@@ -200,7 +228,10 @@ mod tests {
             ConflictPolicy::SkipIfTargetNewer,
             ConflictPolicy::Fail,
         ] {
-            assert_eq!(decide(p, None, false, Some(&h(5)), now, Some(&t)), Decision::Skip);
+            assert_eq!(
+                decide(p, None, false, Some(&h(5)), now, Some(&t)),
+                Decision::Skip
+            );
         }
     }
 
@@ -210,15 +241,36 @@ mod tests {
         let newer = target("3", 9, now + Duration::seconds(5));
         let older = target("3", 9, now - Duration::seconds(5));
         assert!(matches!(
-            decide(ConflictPolicy::SkipIfTargetNewer, None, false, Some(&h(1)), now, Some(&newer)),
+            decide(
+                ConflictPolicy::SkipIfTargetNewer,
+                None,
+                false,
+                Some(&h(1)),
+                now,
+                Some(&newer)
+            ),
             Decision::Conflict(_)
         ));
         assert_eq!(
-            decide(ConflictPolicy::SkipIfTargetNewer, None, false, Some(&h(1)), now, Some(&older)),
+            decide(
+                ConflictPolicy::SkipIfTargetNewer,
+                None,
+                false,
+                Some(&h(1)),
+                now,
+                Some(&older)
+            ),
             Decision::Apply { if_match: None }
         );
         assert_eq!(
-            decide(ConflictPolicy::SkipIfTargetNewer, None, false, Some(&h(1)), now, None),
+            decide(
+                ConflictPolicy::SkipIfTargetNewer,
+                None,
+                false,
+                Some(&h(1)),
+                now,
+                None
+            ),
             Decision::Apply { if_match: None }
         );
     }
@@ -230,7 +282,14 @@ mod tests {
         // Target still at the version we wrote: apply with If-Match.
         let same = target("4", 1, now);
         assert_eq!(
-            decide(ConflictPolicy::Fail, Some(&s), false, Some(&h(2)), now, Some(&same)),
+            decide(
+                ConflictPolicy::Fail,
+                Some(&s),
+                false,
+                Some(&h(2)),
+                now,
+                Some(&same)
+            ),
             Decision::Apply {
                 if_match: Some("4".into())
             }
@@ -243,22 +302,50 @@ mod tests {
         ));
         // Unchanged source but edited target: not a silent skip.
         assert!(matches!(
-            decide(ConflictPolicy::Fail, Some(&s), false, Some(&h(1)), now, Some(&edited)),
+            decide(
+                ConflictPolicy::Fail,
+                Some(&s),
+                false,
+                Some(&h(1)),
+                now,
+                Some(&edited)
+            ),
             Decision::Conflict(_)
         ));
         // Unchanged source and untouched target: skip.
         assert_eq!(
-            decide(ConflictPolicy::Fail, Some(&s), false, Some(&h(1)), now, Some(&same)),
+            decide(
+                ConflictPolicy::Fail,
+                Some(&s),
+                false,
+                Some(&h(1)),
+                now,
+                Some(&same)
+            ),
             Decision::Skip
         );
         // A resource the job never wrote, different content at the target.
         assert!(matches!(
-            decide(ConflictPolicy::Fail, None, false, Some(&h(2)), now, Some(&edited)),
+            decide(
+                ConflictPolicy::Fail,
+                None,
+                false,
+                Some(&h(2)),
+                now,
+                Some(&edited)
+            ),
             Decision::Conflict(_)
         ));
         // Target missing: create.
         assert_eq!(
-            decide(ConflictPolicy::Fail, Some(&s), false, Some(&h(2)), now, None),
+            decide(
+                ConflictPolicy::Fail,
+                Some(&s),
+                false,
+                Some(&h(2)),
+                now,
+                None
+            ),
             Decision::Apply { if_match: None }
         );
     }

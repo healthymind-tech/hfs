@@ -113,14 +113,23 @@ mod tests {
     fn bucket_arithmetic() {
         let t0 = Instant::now();
         let (mut tokens, mut last) = (2.0, t0);
-        assert_eq!(TokenBucket::reserve(2.0, &mut tokens, &mut last, t0), Duration::ZERO);
-        assert_eq!(TokenBucket::reserve(2.0, &mut tokens, &mut last, t0), Duration::ZERO);
+        assert_eq!(
+            TokenBucket::reserve(2.0, &mut tokens, &mut last, t0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            TokenBucket::reserve(2.0, &mut tokens, &mut last, t0),
+            Duration::ZERO
+        );
         // Third request in the same instant waits half a second.
         let w = TokenBucket::reserve(2.0, &mut tokens, &mut last, t0);
         assert!((w.as_secs_f64() - 0.5).abs() < 1e-9, "{w:?}");
         // After a second, refilled (capped at the rate).
         let t1 = t0 + Duration::from_secs(10);
-        assert_eq!(TokenBucket::reserve(2.0, &mut tokens, &mut last, t1), Duration::ZERO);
+        assert_eq!(
+            TokenBucket::reserve(2.0, &mut tokens, &mut last, t1),
+            Duration::ZERO
+        );
         assert!(tokens <= 2.0);
     }
 
@@ -142,8 +151,14 @@ mod tests {
         assert_eq!(b.delay(1, None), Duration::from_millis(500));
         assert_eq!(b.delay(3, None), Duration::from_secs(2));
         assert_eq!(b.delay(30, None), Duration::from_secs(60));
-        assert_eq!(b.delay(1, Some(Duration::from_secs(7))), Duration::from_secs(7));
-        assert_eq!(b.delay(1, Some(Duration::from_secs(700))), Duration::from_secs(60));
+        assert_eq!(
+            b.delay(1, Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            b.delay(1, Some(Duration::from_secs(700))),
+            Duration::from_secs(60)
+        );
         assert!(b.should_retry(4));
         assert!(!b.should_retry(5));
     }

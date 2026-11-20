@@ -129,8 +129,8 @@ impl SyncStore for PgSyncStore {
         actor: &str,
     ) -> Result<SyncJob, SyncStoreError> {
         let c = self.client().await?;
-        let json = serde_json::to_value(&spec)
-            .map_err(|e| SyncStoreError::Unavailable(e.to_string()))?;
+        let json =
+            serde_json::to_value(&spec).map_err(|e| SyncStoreError::Unavailable(e.to_string()))?;
         let row = c
             .query_one(
                 &format!(
@@ -157,8 +157,8 @@ impl SyncStore for PgSyncStore {
         spec: SyncJobSpec,
     ) -> Result<SyncJob, SyncStoreError> {
         let c = self.client().await?;
-        let json = serde_json::to_value(&spec)
-            .map_err(|e| SyncStoreError::Unavailable(e.to_string()))?;
+        let json =
+            serde_json::to_value(&spec).map_err(|e| SyncStoreError::Unavailable(e.to_string()))?;
         let expected = expected_revision as i64;
         let row = c
             .query_opt(

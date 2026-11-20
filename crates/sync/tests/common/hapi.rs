@@ -53,7 +53,12 @@ fn oo(status: StatusCode, msg: &str) -> Response {
 }
 
 fn ok_json(status: StatusCode, v: Value, extra: &[(&str, String)]) -> Response {
-    let mut r = (status, [("content-type", "application/fhir+json")], v.to_string()).into_response();
+    let mut r = (
+        status,
+        [("content-type", "application/fhir+json")],
+        v.to_string(),
+    )
+        .into_response();
     for (k, val) in extra {
         r.headers_mut().insert(
             axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
@@ -65,7 +70,11 @@ fn ok_json(status: StatusCode, v: Value, extra: &[(&str, String)]) -> Response {
 
 fn query(uri: &Uri) -> BTreeMap<String, String> {
     uri.query()
-        .map(|q| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -90,7 +99,11 @@ impl State {
         body["resourceType"] = json!(rt);
         body["id"] = json!(id);
         body["meta"] = json!({"versionId": version.to_string(), "lastUpdated": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)});
-        versions.push(Version { resource: Some(body), at, version });
+        versions.push(Version {
+            resource: Some(body),
+            at,
+            version,
+        });
         (version, created)
     }
 
@@ -100,7 +113,11 @@ impl State {
         match self.data.get_mut(&key) {
             Some(v) if v.last().is_some_and(|x| x.resource.is_some()) => {
                 let version = v.last().unwrap().version + 1;
-                v.push(Version { resource: None, at, version });
+                v.push(Version {
+                    resource: None,
+                    at,
+                    version,
+                });
                 true
             }
             _ => false,
@@ -108,7 +125,11 @@ impl State {
     }
 
     pub fn current(&self, rt: &str, id: &str) -> Option<Value> {
-        self.data.get(&format!("{rt}/{id}"))?.last()?.resource.clone()
+        self.data
+            .get(&format!("{rt}/{id}"))?
+            .last()?
+            .resource
+            .clone()
     }
 }
 
@@ -121,25 +142,43 @@ impl Hapi {
             state: Arc::new(Mutex::new(State::default())),
         };
         let h = hapi.clone();
-        let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
-            let h = h.clone();
-            async move { h.handle(method, uri, headers, body) }
-        });
+        let app = Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let h = h.clone();
+                async move { h.handle(method, uri, headers, body) }
+            },
+        );
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         hapi
     }
 
-    fn page(&self, items: Vec<Value>, offset: usize, count: usize, kind: &str, token: &str) -> Value {
+    fn page(
+        &self,
+        items: Vec<Value>,
+        offset: usize,
+        count: usize,
+        kind: &str,
+        token: &str,
+    ) -> Value {
         let total = items.len();
         let slice: Vec<Value> = items.into_iter().skip(offset).take(count).collect();
-        let mut links = vec![json!({"relation": "self", "url": format!("{}?_getpages={token}&_getpagesoffset={offset}", self.base)})];
+        let mut links = vec![
+            json!({"relation": "self", "url": format!("{}?_getpages={token}&_getpagesoffset={offset}", self.base)}),
+        ];
         if offset + count < total {
             let next = if self.state.lock().unwrap().evil_next {
-                format!("http://127.0.0.2:1/fhir?_getpages={token}&_getpagesoffset={}&_count={count}", offset + count)
+                format!(
+                    "http://127.0.0.2:1/fhir?_getpages={token}&_getpagesoffset={}&_count={count}",
+                    offset + count
+                )
             } else {
-                format!("{}?_getpages={token}&_getpagesoffset={}&_count={count}", self.base, offset + count)
+                format!(
+                    "{}?_getpages={token}&_getpagesoffset={}&_count={count}",
+                    self.base,
+                    offset + count
+                )
             };
             links.push(json!({"relation": "next", "url": next}));
         }
@@ -157,7 +196,10 @@ impl Hapi {
             .data
             .iter()
             .filter(|(k, _)| k.starts_with(&format!("{rt}/")))
-            .filter_map(|(_, vs)| vs.last().and_then(|x| x.resource.clone().map(|r| (x.at, r))))
+            .filter_map(|(_, vs)| {
+                vs.last()
+                    .and_then(|x| x.resource.clone().map(|r| (x.at, r)))
+            })
             .filter(|(at, _)| ge.is_none_or(|g| *at >= g))
             .collect();
         v.sort_by_key(|x| x.0);
@@ -178,9 +220,11 @@ impl Hapi {
                     Some(r) => json!({"fullUrl": format!("{}/{key}", self.base), "resource": r,
                                       "request": {"method": "PUT", "url": key},
                                       "response": {"status": "200 OK", "etag": format!("W/\"{}\"", x.version)}}),
-                    None => json!({"request": {"method": "DELETE", "url": format!("{key}/_history/{}", x.version)},
+                    None => {
+                        json!({"request": {"method": "DELETE", "url": format!("{key}/_history/{}", x.version)},
                                    "response": {"status": "204 No Content", "etag": format!("W/\"{}\"", x.version),
-                                                "lastModified": x.at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)}}),
+                                                "lastModified": x.at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)}})
+                    }
                 };
                 v.push((x.at, entry));
             }
@@ -189,19 +233,38 @@ impl Hapi {
         v.into_iter().map(|x| x.1).collect()
     }
 
-    fn write(&self, method: &str, rt: &str, id: &str, body: Option<Value>, if_match: Option<&str>) -> (u16, Option<u64>, Value) {
+    fn write(
+        &self,
+        method: &str,
+        rt: &str,
+        id: &str,
+        body: Option<Value>,
+        if_match: Option<&str>,
+    ) -> (u16, Option<u64>, Value) {
         let mut st = self.state.lock().unwrap();
         if let Some(m) = if_match {
             let want = m.trim_start_matches("W/").trim_matches('"');
-            let cur = st.data.get(&format!("{rt}/{id}")).and_then(|v| v.last()).map(|v| v.version.to_string());
+            let cur = st
+                .data
+                .get(&format!("{rt}/{id}"))
+                .and_then(|v| v.last())
+                .map(|v| v.version.to_string());
             if cur.as_deref() != Some(want) {
-                return (412, None, json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "conflict", "diagnostics": "version mismatch"}]}));
+                return (
+                    412,
+                    None,
+                    json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "conflict", "diagnostics": "version mismatch"}]}),
+                );
             }
         }
         match method {
             "PUT" => {
                 let (v, created) = st.put(rt, id, body.unwrap_or(json!({})));
-                (if created { 201 } else { 200 }, Some(v), st.current(rt, id).unwrap())
+                (
+                    if created { 201 } else { 200 },
+                    Some(v),
+                    st.current(rt, id).unwrap(),
+                )
             }
             _ => {
                 st.delete(rt, id);
@@ -231,10 +294,25 @@ impl Hapi {
                 return r;
             }
         }
-        let path = uri.path().trim_start_matches("/fhir").trim_matches('/').to_string();
-        let segs: Vec<&str> = if path.is_empty() { vec![] } else { path.split('/').collect() };
-        let count: usize = q.get("_count").and_then(|c| c.parse().ok()).unwrap_or(20).min(2);
-        let offset: usize = q.get("_getpagesoffset").and_then(|c| c.parse().ok()).unwrap_or(0);
+        let path = uri
+            .path()
+            .trim_start_matches("/fhir")
+            .trim_matches('/')
+            .to_string();
+        let segs: Vec<&str> = if path.is_empty() {
+            vec![]
+        } else {
+            path.split('/').collect()
+        };
+        let count: usize = q
+            .get("_count")
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(20)
+            .min(2);
+        let offset: usize = q
+            .get("_getpagesoffset")
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
         match (method.as_str(), segs.as_slice()) {
             ("GET", ["metadata"]) => ok_json(
                 StatusCode::OK,
@@ -245,28 +323,50 @@ impl Hapi {
             ("GET", []) if q.contains_key("_getpages") => {
                 let token = q["_getpages"].clone();
                 let items = if let Some(since) = token.strip_prefix("history:") {
-                    let since = DateTime::parse_from_rfc3339(since).ok().map(|d| d.with_timezone(&Utc));
+                    let since = DateTime::parse_from_rfc3339(since)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc));
                     self.history_items(since)
                 } else {
                     let rt = token.split(':').next().unwrap_or("").to_string();
                     let mut qq = BTreeMap::new();
                     if let Some(ge) = token.split(':').nth(1).filter(|s| !s.is_empty()) {
-                        qq.insert("_lastUpdated".to_string(), format!("ge{}", ge.replace('_', ":")));
+                        qq.insert(
+                            "_lastUpdated".to_string(),
+                            format!("ge{}", ge.replace('_', ":")),
+                        );
                     }
                     self.search_items(&rt, &qq)
                 };
-                let kind = if token.starts_with("history:") { "history" } else { "searchset" };
-                ok_json(StatusCode::OK, self.page(items, offset, count, kind, &token), &[])
+                let kind = if token.starts_with("history:") {
+                    "history"
+                } else {
+                    "searchset"
+                };
+                ok_json(
+                    StatusCode::OK,
+                    self.page(items, offset, count, kind, &token),
+                    &[],
+                )
             }
             ("GET", ["_history"]) => {
                 let since_raw = q.get("_since").cloned().unwrap_or_default();
-                let since = DateTime::parse_from_rfc3339(&since_raw).ok().map(|d| d.with_timezone(&Utc));
+                let since = DateTime::parse_from_rfc3339(&since_raw)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc));
                 let items = self.history_items(since);
-                ok_json(StatusCode::OK, self.page(items, 0, count, "history", &format!("history:{since_raw}")), &[])
+                ok_json(
+                    StatusCode::OK,
+                    self.page(items, 0, count, "history", &format!("history:{since_raw}")),
+                    &[],
+                )
             }
             ("GET", ["$export"]) => {
                 let mut r = StatusCode::ACCEPTED.into_response();
-                r.headers_mut().insert("content-location", format!("{}/export-status/1", self.base).parse().unwrap());
+                r.headers_mut().insert(
+                    "content-location",
+                    format!("{}/export-status/1", self.base).parse().unwrap(),
+                );
                 r
             }
             ("GET", ["export-status", _]) => {
@@ -297,19 +397,38 @@ impl Hapi {
                     .filter(|(k, _)| k.starts_with("Patient/"))
                     .filter_map(|(_, v)| v.last()?.resource.as_ref().map(|r| r.to_string()))
                     .collect();
-                (StatusCode::OK, [("content-type", "application/fhir+ndjson")], lines.join("\n") + "\n").into_response()
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/fhir+ndjson")],
+                    lines.join("\n") + "\n",
+                )
+                    .into_response()
             }
             ("GET", [rt]) => {
                 let items = self.search_items(rt, &q);
-                let ge = q.get("_lastUpdated").and_then(|v| v.strip_prefix("ge")).unwrap_or("").replace(':', "_");
-                ok_json(StatusCode::OK, self.page(items, 0, count, "searchset", &format!("{rt}:{ge}")), &[])
+                let ge = q
+                    .get("_lastUpdated")
+                    .and_then(|v| v.strip_prefix("ge"))
+                    .unwrap_or("")
+                    .replace(':', "_");
+                ok_json(
+                    StatusCode::OK,
+                    self.page(items, 0, count, "searchset", &format!("{rt}:{ge}")),
+                    &[],
+                )
             }
             ("GET", [rt, id]) => {
                 let st = self.state.lock().unwrap();
                 match st.data.get(&format!("{rt}/{id}")).and_then(|v| v.last()) {
-                    Some(Version { resource: Some(r), version, .. }) => {
-                        ok_json(StatusCode::OK, r.clone(), &[("etag", format!("W/\"{version}\""))])
-                    }
+                    Some(Version {
+                        resource: Some(r),
+                        version,
+                        ..
+                    }) => ok_json(
+                        StatusCode::OK,
+                        r.clone(),
+                        &[("etag", format!("W/\"{version}\""))],
+                    ),
                     Some(_) => oo(StatusCode::GONE, "deleted"),
                     None => oo(StatusCode::NOT_FOUND, "not found"),
                 }
@@ -332,7 +451,10 @@ impl Hapi {
                     st.refuse_bundles
                 };
                 if refuse {
-                    return oo(StatusCode::BAD_REQUEST, "batch processing is disabled on this server");
+                    return oo(
+                        StatusCode::BAD_REQUEST,
+                        "batch processing is disabled on this server",
+                    );
                 }
                 let b: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
                 let mut out = Vec::new();
@@ -340,14 +462,24 @@ impl Hapi {
                     let m = e["request"]["method"].as_str().unwrap_or("").to_string();
                     let url = e["request"]["url"].as_str().unwrap_or("").to_string();
                     let (rt, id) = url.split_once('/').unwrap_or(("", ""));
-                    let (status, v, _) = self.write(&m, rt, id, e.get("resource").cloned(), e["request"]["ifMatch"].as_str());
+                    let (status, v, _) = self.write(
+                        &m,
+                        rt,
+                        id,
+                        e.get("resource").cloned(),
+                        e["request"]["ifMatch"].as_str(),
+                    );
                     let mut resp = json!({"status": format!("{status}")});
                     if let Some(v) = v {
                         resp["etag"] = json!(format!("W/\"{v}\""));
                     }
                     out.push(json!({"response": resp}));
                 }
-                ok_json(StatusCode::OK, json!({"resourceType": "Bundle", "type": "batch-response", "entry": out}), &[])
+                ok_json(
+                    StatusCode::OK,
+                    json!({"resourceType": "Bundle", "type": "batch-response", "entry": out}),
+                    &[],
+                )
             }
             _ => Response::builder().status(404).body(Body::empty()).unwrap(),
         }

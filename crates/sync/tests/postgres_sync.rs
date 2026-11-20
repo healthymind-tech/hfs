@@ -61,12 +61,18 @@ async fn shared() -> &'static SharedPg {
             use testcontainers::ImageExt;
             use testcontainers::runners::AsyncRunner;
             let (host, port, container) = if let Ok(host) = std::env::var("HFS_TEST_PG_HOST") {
-                let port = std::env::var("HFS_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5432);
+                let port = std::env::var("HFS_TEST_PG_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(5432);
                 (host, port, None)
             } else {
                 let c = testcontainers_modules::postgres::Postgres::default()
                     .with_tag("16-alpine")
-                    .with_label("github.run_id", std::env::var("GITHUB_RUN_ID").unwrap_or_default())
+                    .with_label(
+                        "github.run_id",
+                        std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                    )
                     .start()
                     .await
                     .expect("postgres container");
@@ -80,7 +86,11 @@ async fn shared() -> &'static SharedPg {
                 .init_schema()
                 .await
                 .expect("schema");
-            SharedPg { host, port, _container: container }
+            SharedPg {
+                host,
+                port,
+                _container: container,
+            }
         })
         .await
 }
@@ -88,26 +98,38 @@ async fn shared() -> &'static SharedPg {
 /// A fresh handle on the shared database (two calls = two instances).
 async fn backend() -> Arc<PostgresBackend> {
     let s = shared().await;
-    Arc::new(PostgresBackend::new(pg_config(&s.host, s.port)).await.expect("backend"))
+    Arc::new(
+        PostgresBackend::new(pg_config(&s.host, s.port))
+            .await
+            .expect("backend"),
+    )
 }
 
 fn uniq(prefix: &str) -> String {
-    format!("{prefix}{}", &uuid::Uuid::new_v4().simple().to_string()[..10])
+    format!(
+        "{prefix}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..10]
+    )
 }
 
 async fn put(b: &PostgresBackend, tenant: &str, rt: &str, id: &str, body: Value) {
     let mut r = body;
     r["resourceType"] = json!(rt);
     r["id"] = json!(id);
-    ResourceStorage::create_or_update(b, &tenant_context(tenant), rt, id, r, FhirVersion::R4).await.unwrap();
+    ResourceStorage::create_or_update(b, &tenant_context(tenant), rt, id, r, FhirVersion::R4)
+        .await
+        .unwrap();
 }
 
 async fn count(b: &PostgresBackend, table: &str, tenant: &str) -> i64 {
     let c = b.get_client().await.unwrap();
-    c.query_one(&format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1"), &[&tenant])
-        .await
-        .unwrap()
-        .get(0)
+    c.query_one(
+        &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1"),
+        &[&tenant],
+    )
+    .await
+    .unwrap()
+    .get(0)
 }
 
 /// One instance's sync service over a backend handle.
@@ -157,12 +179,28 @@ async fn postgres_integration_tenant_copy() {
     let b = backend().await;
     let (src, dst, dst2) = (uniq("cs"), uniq("cd"), uniq("ch"));
     for i in 0..10 {
-        put(&b, &src, "Patient", &format!("p{i}"), json!({"name": [{"family": format!("Fam{i}")}], "gender": "female"})).await;
+        put(
+            &b,
+            &src,
+            "Patient",
+            &format!("p{i}"),
+            json!({"name": [{"family": format!("Fam{i}")}], "gender": "female"}),
+        )
+        .await;
     }
-    put(&b, &src, "Patient", "p0", json!({"name": [{"family": "Changed"}], "gender": "male"})).await;
+    put(
+        &b,
+        &src,
+        "Patient",
+        "p0",
+        json!({"name": [{"family": "Changed"}], "gender": "male"}),
+    )
+    .await;
     put(&b, &src, "Observation", "o1", json!({"status": "final", "code": {"coding": [{"system": "http://loinc.org", "code": "1-1"}]},
         "subject": {"reference": "Patient/p1"}})).await;
-    ResourceStorage::delete(b.as_ref(), &tenant_context(&src), "Patient", "p9").await.unwrap();
+    ResourceStorage::delete(b.as_ref(), &tenant_context(&src), "Patient", "p9")
+        .await
+        .unwrap();
     // A package registry row to carry along.
     let c = b.get_client().await.unwrap();
     c.batch_execute(
@@ -180,20 +218,44 @@ async fn postgres_integration_tenant_copy() {
     .unwrap();
 
     let report = b
-        .copy_tenant(&src, &dst, &TenantCopyOptions { copy_packages: true, require_empty_target: true, ..Default::default() })
+        .copy_tenant(
+            &src,
+            &dst,
+            &TenantCopyOptions {
+                copy_packages: true,
+                require_empty_target: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(report.resources(), 11, "{report:?}"); // 10 live + 1 tombstone
-    assert_eq!(count(&b, "resources", &dst).await, count(&b, "resources", &src).await);
-    assert_eq!(count(&b, "search_index", &dst).await, count(&b, "search_index", &src).await);
-    assert_eq!(count(&b, "resource_history", &dst).await, 11, "current versions only");
+    assert_eq!(
+        count(&b, "resources", &dst).await,
+        count(&b, "resources", &src).await
+    );
+    assert_eq!(
+        count(&b, "search_index", &dst).await,
+        count(&b, "search_index", &src).await
+    );
+    assert_eq!(
+        count(&b, "resource_history", &dst).await,
+        11,
+        "current versions only"
+    );
     assert_eq!(count(&b, "hfs_packages", &dst).await, 1);
     // The copy serves reads and searches.
-    let p0 = ResourceStorage::read(b.as_ref(), &tenant_context(&dst), "Patient", "p0").await.unwrap().unwrap();
+    let p0 = ResourceStorage::read(b.as_ref(), &tenant_context(&dst), "Patient", "p0")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(p0.version_id(), "2");
     assert_eq!(p0.content()["name"][0]["family"], "Changed");
     let gone = ResourceStorage::read(b.as_ref(), &tenant_context(&dst), "Patient", "p9").await;
-    assert!(!matches!(gone, Ok(Some(ref r)) if !r.is_deleted()), "tombstone copied");
+    assert!(
+        !matches!(gone, Ok(Some(ref r)) if !r.is_deleted()),
+        "tombstone copied"
+    );
     let males: i64 = c
         .query_one(
             "SELECT COUNT(DISTINCT resource_id) FROM search_index WHERE tenant_id = $1 AND resource_type = 'Patient'
@@ -206,20 +268,60 @@ async fn postgres_integration_tenant_copy() {
     assert_eq!(males, 1);
     // Isolation: the source is unchanged and the copy is independent.
     put(&b, &dst, "Patient", "p1", json!({"gender": "other"})).await;
-    assert_eq!(ResourceStorage::read(b.as_ref(), &tenant_context(&src), "Patient", "p1").await.unwrap().unwrap().content()["gender"], "female");
+    assert_eq!(
+        ResourceStorage::read(b.as_ref(), &tenant_context(&src), "Patient", "p1")
+            .await
+            .unwrap()
+            .unwrap()
+            .content()["gender"],
+        "female"
+    );
 
     // History copy; non-empty targets are refused.
     let full = b
-        .copy_tenant(&src, &dst2, &TenantCopyOptions { include_history: true, require_empty_target: true, ..Default::default() })
+        .copy_tenant(
+            &src,
+            &dst2,
+            &TenantCopyOptions {
+                include_history: true,
+                require_empty_target: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(full.rows.get("resource_history").copied(), Some(count(&b, "resource_history", &src).await as u64));
-    assert!(b.copy_tenant(&src, &dst, &TenantCopyOptions { require_empty_target: true, ..Default::default() }).await.is_err());
-    assert!(b.copy_tenant(&src, &src, &TenantCopyOptions::default()).await.is_err());
+    assert_eq!(
+        full.rows.get("resource_history").copied(),
+        Some(count(&b, "resource_history", &src).await as u64)
+    );
+    assert!(
+        b.copy_tenant(
+            &src,
+            &dst,
+            &TenantCopyOptions {
+                require_empty_target: true,
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        b.copy_tenant(&src, &src, &TenantCopyOptions::default())
+            .await
+            .is_err()
+    );
     // Type filter.
     let only = uniq("co");
     let r = b
-        .copy_tenant(&src, &only, &TenantCopyOptions { resource_types: Some(vec!["Observation".into()]), ..Default::default() })
+        .copy_tenant(
+            &src,
+            &only,
+            &TenantCopyOptions {
+                resource_types: Some(vec!["Observation".into()]),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(r.resources(), 1);
@@ -232,7 +334,14 @@ async fn postgres_integration_two_instances_storage_copy_incremental_and_fencing
     let (src, dst) = (uniq("s"), uniq("d"));
     let (endpoints, registry) = common::endpoints_with(&[&src, &dst]).await;
     for i in 0..6 {
-        put(&a, &src, "Patient", &format!("p{i}"), json!({"active": true})).await;
+        put(
+            &a,
+            &src,
+            "Patient",
+            &format!("p{i}"),
+            json!({"active": true}),
+        )
+        .await;
     }
     let svc_a = instance(a.clone(), endpoints.clone(), registry.clone(), "inst-a").await;
     let svc_b = instance(b.clone(), endpoints.clone(), registry.clone(), "inst-b").await;
@@ -266,27 +375,55 @@ async fn postgres_integration_two_instances_storage_copy_incremental_and_fencing
     drain(&svc_a, "a-worker").await;
     let done2 = svc_b.run(&run2.id).await.unwrap();
     assert_eq!(done2.state, SyncRunState::Succeeded, "{:?}", done2.error);
-    assert_eq!((done2.progress.created, done2.progress.updated), (1, 1), "{:?}", done2.progress);
-    let p1 = ResourceStorage::read(a.as_ref(), &tenant_context(&dst), "Patient", "p1").await.unwrap().unwrap();
+    assert_eq!(
+        (done2.progress.created, done2.progress.updated),
+        (1, 1),
+        "{:?}",
+        done2.progress
+    );
+    let p1 = ResourceStorage::read(a.as_ref(), &tenant_context(&dst), "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(p1.content()["active"], json!(false));
 
     // Fencing across instances: A takes a short lease and stalls; B reclaims.
     let run3 = svc_a.run_now(&job, "t").await.unwrap();
     let cluster_a = a.cluster_job_store().unwrap();
     let (lease_a, _) = cluster_a
-        .claim_next(JobKind::EndpointSync, &WorkerId::new("stalled"), Duration::from_millis(200))
+        .claim_next(
+            JobKind::EndpointSync,
+            &WorkerId::new("stalled"),
+            Duration::from_millis(200),
+        )
         .await
         .unwrap()
         .unwrap();
     let store_a = PgSyncStore::new(a.shared_pool());
     let token_a = lease_a.fencing_token as i64;
-    store_a.claim_run(&run3.id, lease_a.job_id.as_str(), token_a).await.unwrap();
+    store_a
+        .claim_run(&run3.id, lease_a.job_id.as_str(), token_a)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    assert_eq!(drain(&svc_b, "b-worker").await, 1, "expired lease reclaimed");
+    assert_eq!(
+        drain(&svc_b, "b-worker").await,
+        1,
+        "expired lease reclaimed"
+    );
     let r3 = svc_b.run(&run3.id).await.unwrap();
     assert_eq!(r3.state, SyncRunState::Succeeded, "{:?}", r3.error);
     assert!(matches!(
-        store_a.checkpoint(&run3.id, token_a, SyncRunState::Running, &r3.cursor, &SyncProgress::default(), None).await,
+        store_a
+            .checkpoint(
+                &run3.id,
+                token_a,
+                SyncRunState::Running,
+                &r3.cursor,
+                &SyncProgress::default(),
+                None
+            )
+            .await,
         Err(SyncStoreError::LeaseLost)
     ));
     svc_a.delete(&job, "t").await.unwrap();
@@ -313,9 +450,19 @@ async fn postgres_integration_duplicate_with_history() {
     assert_eq!(drain(&svc, "w").await, 1);
     let run = svc.run(out.run_id.as_deref().unwrap()).await.unwrap();
     assert_eq!(run.state, SyncRunState::Succeeded, "{:?}", run.error);
-    assert_eq!(count(&b, "resource_history", &copy).await, 2, "history copied");
+    assert_eq!(
+        count(&b, "resource_history", &copy).await,
+        2,
+        "history copied"
+    );
     let ep = endpoints.get(&copy).await.unwrap().unwrap();
-    assert_eq!(ep.spec.status, helios_endpoints::model::EndpointStatus::Enabled);
+    assert_eq!(
+        ep.spec.status,
+        helios_endpoints::model::EndpointStatus::Enabled
+    );
     let log = svc.log(&run.id, 0, 50).await.unwrap();
-    assert!(log.iter().any(|l| l.message.contains("storage copy finished")));
+    assert!(
+        log.iter()
+            .any(|l| l.message.contains("storage copy finished"))
+    );
 }

@@ -20,7 +20,9 @@ use crate::change::{Change, valid_id, valid_type};
 use crate::conflict::TargetInfo;
 use crate::hash::content_hash;
 use crate::http::{FhirClient, HttpError, display_url, outcome_detail};
-use crate::peer::{ChangeWindow, InitialPage, PeerError, SourceReader, TargetWriter, WriteOp, WriteResult};
+use crate::peer::{
+    ChangeWindow, InitialPage, PeerError, SourceReader, TargetWriter, WriteOp, WriteResult,
+};
 
 /// Initial-load "type" that drives a Bulk `$export`.
 pub const BULK_EXPORT: &str = "$export";
@@ -82,7 +84,10 @@ pub fn bundle_changes(bundle: &Value, fallback_time: DateTime<Utc>) -> Vec<Chang
         return out;
     };
     for e in entries {
-        let mode = e.get("search").and_then(|s| s.get("mode")).and_then(Value::as_str);
+        let mode = e
+            .get("search")
+            .and_then(|s| s.get("mode"))
+            .and_then(Value::as_str);
         if matches!(mode, Some("include") | Some("outcome")) {
             continue;
         }
@@ -90,9 +95,9 @@ pub fn bundle_changes(bundle: &Value, fallback_time: DateTime<Utc>) -> Vec<Chang
             .get("request")
             .and_then(|r| r.get("method"))
             .and_then(Value::as_str);
-        let resource = e.get("resource").filter(|r| {
-            r.get("resourceType").and_then(Value::as_str) != Some("OperationOutcome")
-        });
+        let resource = e
+            .get("resource")
+            .filter(|r| r.get("resourceType").and_then(Value::as_str) != Some("OperationOutcome"));
         let ts = e
             .get("response")
             .and_then(|r| r.get("lastModified"))
@@ -131,7 +136,12 @@ pub fn capability_types(cs: &Value) -> Vec<String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .flat_map(|r| r.get("resource").and_then(Value::as_array).into_iter().flatten())
+        .flat_map(|r| {
+            r.get("resource")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
         .filter_map(|r| r.get("type").and_then(Value::as_str))
         .filter(|t| valid_type(t))
         .map(str::to_string)
@@ -211,7 +221,12 @@ impl ExternalSource {
         Ok(self.client.get_json(self.client.url("metadata")).await?)
     }
 
-    async fn search_all(&self, first: Url, cap: usize, out: &mut Vec<Change>) -> Result<(), PeerError> {
+    async fn search_all(
+        &self,
+        first: Url,
+        cap: usize,
+        out: &mut Vec<Change>,
+    ) -> Result<(), PeerError> {
         let mut url = Some(first);
         while let Some(u) = url {
             let b = self.client.get_json(u).await?;
@@ -221,12 +236,19 @@ impl ExternalSource {
                     "more than {cap} changes in one incremental window; poll more often"
                 )));
             }
-            url = next_link(&b).map(|l| self.client.check_link(&l)).transpose()?;
+            url = next_link(&b)
+                .map(|l| self.client.check_link(&l))
+                .transpose()?;
         }
         Ok(())
     }
 
-    async fn export_page(&self, page: Option<&str>, since: Option<DateTime<Utc>>, count: u32) -> Result<InitialPage, PeerError> {
+    async fn export_page(
+        &self,
+        page: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        count: u32,
+    ) -> Result<InitialPage, PeerError> {
         let mut st: ExportState = match page {
             Some(p) => serde_json::from_str(p).map_err(|_| PeerError("bad export state".into()))?,
             None => {
@@ -267,7 +289,10 @@ impl ExternalSource {
         };
         if let Some(poll) = st.poll.clone() {
             let url = self.client.check_link(&poll)?;
-            let resp = self.client.send(reqwest::Method::GET, url.clone(), None, &[]).await?;
+            let resp = self
+                .client
+                .send(reqwest::Method::GET, url.clone(), None, &[])
+                .await?;
             match resp.status {
                 202 => {
                     let wait = resp
@@ -313,10 +338,15 @@ impl ExternalSource {
             return Ok(InitialPage::default());
         };
         let body = self.download(&file_url, st.auth).await?;
-        let text = std::str::from_utf8(&body).map_err(|_| PeerError("export file is not UTF-8".into()))?;
+        let text =
+            std::str::from_utf8(&body).map_err(|_| PeerError("export file is not UTF-8".into()))?;
         let mut changes = Vec::new();
         let mut consumed = 0usize;
-        let mut lines = text.lines().filter(|l| !l.trim().is_empty()).skip(st.skip).peekable();
+        let mut lines = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .skip(st.skip)
+            .peekable();
         while consumed < count as usize {
             let Some(line) = lines.next() else { break };
             consumed += 1;
@@ -399,7 +429,9 @@ impl SourceReader for ExternalSource {
             .into_iter()
             .filter(|c| c.resource_type == resource_type)
             .collect();
-        let next = next_link(&b).map(|l| self.client.check_link(&l)).transpose()?;
+        let next = next_link(&b)
+            .map(|l| self.client.check_link(&l))
+            .transpose()?;
         Ok(InitialPage {
             changes,
             next: next.map(|u| u.to_string()),
@@ -415,7 +447,8 @@ impl SourceReader for ExternalSource {
         let mut changes = Vec::new();
         let s = enc(&fhir_instant(since));
         self.search_all(
-            self.client.url(&format!("_history?_since={s}&_count={count}")),
+            self.client
+                .url(&format!("_history?_since={s}&_count={count}")),
             MAX_WINDOW_ENTRIES,
             &mut changes,
         )
@@ -429,7 +462,8 @@ impl SourceReader for ExternalSource {
                     "{t}?_lastUpdated=ge{s}&_count={count}&{}",
                     f.trim_start_matches(['?', '&'])
                 );
-                self.search_all(self.client.url(&q), MAX_WINDOW_ENTRIES, &mut changes).await?;
+                self.search_all(self.client.url(&q), MAX_WINDOW_ENTRIES, &mut changes)
+                    .await?;
             }
         }
         Ok(ChangeWindow {
@@ -441,7 +475,10 @@ impl SourceReader for ExternalSource {
 
     async fn read(&self, resource_type: &str, id: &str) -> Result<Option<Change>, PeerError> {
         let url = self.client.url(&format!("{resource_type}/{id}"));
-        let resp = self.client.send(reqwest::Method::GET, url.clone(), None, &[]).await?;
+        let resp = self
+            .client
+            .send(reqwest::Method::GET, url.clone(), None, &[])
+            .await?;
         match resp.status {
             404 | 410 => Ok(None),
             s if (200..300).contains(&s) => Ok(Change::from_resource(resp.json(&url)?, Utc::now())),
@@ -475,8 +512,16 @@ impl ExternalTarget {
         self.individual.load(Ordering::Relaxed)
     }
 
-    fn result_of(status: u16, etag: Option<&str>, location: Option<&str>, delete: bool, detail: String) -> WriteResult {
-        let version = etag.and_then(etag_version).or_else(|| location.and_then(location_version));
+    fn result_of(
+        status: u16,
+        etag: Option<&str>,
+        location: Option<&str>,
+        delete: bool,
+        detail: String,
+    ) -> WriteResult {
+        let version = etag
+            .and_then(etag_version)
+            .or_else(|| location.and_then(location_version));
         match status {
             201 if !delete => WriteResult::Created(version),
             200..=299 if !delete => WriteResult::Updated(version),
@@ -488,12 +533,23 @@ impl ExternalTarget {
 
     async fn apply_one(&self, op: &WriteOp) -> Result<WriteResult, PeerError> {
         let (method, rt, id, body, if_match) = match op {
-            WriteOp::Put { resource_type, id, resource, if_match } => {
-                (reqwest::Method::PUT, resource_type, id, Some(resource), if_match)
-            }
-            WriteOp::Delete { resource_type, id, if_match } => {
-                (reqwest::Method::DELETE, resource_type, id, None, if_match)
-            }
+            WriteOp::Put {
+                resource_type,
+                id,
+                resource,
+                if_match,
+            } => (
+                reqwest::Method::PUT,
+                resource_type,
+                id,
+                Some(resource),
+                if_match,
+            ),
+            WriteOp::Delete {
+                resource_type,
+                id,
+                if_match,
+            } => (reqwest::Method::DELETE, resource_type, id, None, if_match),
         };
         let url = self.client.url(&format!("{rt}/{id}"));
         let mut headers = Vec::new();
@@ -505,7 +561,8 @@ impl ExternalTarget {
         Ok(Self::result_of(
             resp.status,
             resp.header("etag"),
-            resp.header("location").or_else(|| resp.header("content-location")),
+            resp.header("location")
+                .or_else(|| resp.header("content-location")),
             delete,
             outcome_detail(&resp.body),
         ))
@@ -515,7 +572,12 @@ impl ExternalTarget {
         let entries: Vec<Value> = ops
             .iter()
             .map(|op| match op {
-                WriteOp::Put { resource_type, id, resource, if_match } => {
+                WriteOp::Put {
+                    resource_type,
+                    id,
+                    resource,
+                    if_match,
+                } => {
                     let mut req = json!({"method": "PUT", "url": format!("{resource_type}/{id}")});
                     if let Some(v) = if_match {
                         req["ifMatch"] = json!(format!("W/\"{v}\""));
@@ -523,8 +585,13 @@ impl ExternalTarget {
                     json!({"fullUrl": self.client.url(&format!("{resource_type}/{id}")).to_string(),
                            "resource": resource, "request": req})
                 }
-                WriteOp::Delete { resource_type, id, if_match } => {
-                    let mut req = json!({"method": "DELETE", "url": format!("{resource_type}/{id}")});
+                WriteOp::Delete {
+                    resource_type,
+                    id,
+                    if_match,
+                } => {
+                    let mut req =
+                        json!({"method": "DELETE", "url": format!("{resource_type}/{id}")});
                     if let Some(v) = if_match {
                         req["ifMatch"] = json!(format!("W/\"{v}\""));
                     }
@@ -534,7 +601,10 @@ impl ExternalTarget {
             .collect();
         let bundle = json!({"resourceType": "Bundle", "type": "batch", "entry": entries});
         let url = self.client.base().clone();
-        let resp = self.client.send(reqwest::Method::POST, url.clone(), Some(&bundle), &[]).await?;
+        let resp = self
+            .client
+            .send(reqwest::Method::POST, url.clone(), Some(&bundle), &[])
+            .await?;
         if !resp.ok() {
             if matches!(resp.status, 400 | 403 | 404 | 405 | 415 | 422 | 501) {
                 return Ok(None);
@@ -546,12 +616,18 @@ impl ExternalTarget {
             }
             .into());
         }
-        let Ok(out) = resp.json(&url) else { return Ok(None) };
+        let Ok(out) = resp.json(&url) else {
+            return Ok(None);
+        };
         let ok_type = matches!(
             out.get("type").and_then(Value::as_str),
             Some("batch-response") | Some("transaction-response")
         );
-        let Some(rs) = out.get("entry").and_then(Value::as_array).filter(|e| ok_type && e.len() == ops.len()) else {
+        let Some(rs) = out
+            .get("entry")
+            .and_then(Value::as_array)
+            .filter(|e| ok_type && e.len() == ops.len())
+        else {
             return Ok(None);
         };
         Ok(Some(
@@ -584,9 +660,16 @@ impl ExternalTarget {
 
 #[async_trait]
 impl TargetWriter for ExternalTarget {
-    async fn current(&self, resource_type: &str, id: &str) -> Result<Option<TargetInfo>, PeerError> {
+    async fn current(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<TargetInfo>, PeerError> {
         let url = self.client.url(&format!("{resource_type}/{id}"));
-        let resp = self.client.send(reqwest::Method::GET, url.clone(), None, &[]).await?;
+        let resp = self
+            .client
+            .send(reqwest::Method::GET, url.clone(), None, &[])
+            .await?;
         match resp.status {
             404 | 410 => Ok(None),
             s if (200..300).contains(&s) => {
@@ -677,33 +760,79 @@ mod tests {
         assert_eq!(etag_version("W/\"12\"").as_deref(), Some("12"));
         assert_eq!(etag_version("\"a\"").as_deref(), Some("a"));
         assert_eq!(etag_version("W/\"\""), None);
-        assert_eq!(location_version("https://s/Patient/1/_history/4").as_deref(), Some("4"));
+        assert_eq!(
+            location_version("https://s/Patient/1/_history/4").as_deref(),
+            Some("4")
+        );
         assert_eq!(location_version("https://s/Patient/1"), None);
-        let t = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.123456Z").unwrap().with_timezone(&Utc);
+        let t = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert_eq!(fhir_instant(t), "2026-01-01T00:00:00.123Z");
         let cs = json!({"fhirVersion": "4.0.1", "rest": [{"resource": [{"type": "Patient"}, {"type": "Observation"}, {"type": "bad1"}]}]});
         assert_eq!(capability_types(&cs), vec!["Observation", "Patient"]);
-        assert_eq!(capability_release(&cs), Some(helios_endpoints::FhirRelease::R4));
-        assert_eq!(capability_release(&json!({"fhirVersion": "5.0.0"})), Some(helios_endpoints::FhirRelease::R5));
-        assert_eq!(capability_release(&json!({"fhirVersion": "4.3.0"})), Some(helios_endpoints::FhirRelease::R4B));
-        assert_eq!(capability_release(&json!({"fhirVersion": "6.0.0-ballot3"})), Some(helios_endpoints::FhirRelease::R6));
+        assert_eq!(
+            capability_release(&cs),
+            Some(helios_endpoints::FhirRelease::R4)
+        );
+        assert_eq!(
+            capability_release(&json!({"fhirVersion": "5.0.0"})),
+            Some(helios_endpoints::FhirRelease::R5)
+        );
+        assert_eq!(
+            capability_release(&json!({"fhirVersion": "4.3.0"})),
+            Some(helios_endpoints::FhirRelease::R4B)
+        );
+        assert_eq!(
+            capability_release(&json!({"fhirVersion": "6.0.0-ballot3"})),
+            Some(helios_endpoints::FhirRelease::R6)
+        );
         assert_eq!(capability_release(&json!({"fhirVersion": "3.0.2"})), None);
     }
 
     #[test]
     fn write_results() {
         use ExternalTarget as T;
-        assert_eq!(T::result_of(201, Some("W/\"1\""), None, false, String::new()), WriteResult::Created(Some("1".into())));
-        assert_eq!(T::result_of(200, None, Some("x/Patient/1/_history/7"), false, String::new()), WriteResult::Updated(Some("7".into())));
-        assert_eq!(T::result_of(204, None, None, true, String::new()), WriteResult::Deleted);
-        assert_eq!(T::result_of(404, None, None, true, String::new()), WriteResult::Deleted);
-        assert!(matches!(T::result_of(412, None, None, false, String::new()), WriteResult::Conflict(_)));
-        assert!(matches!(T::result_of(422, None, None, false, ": bad".into()), WriteResult::Failed(m) if m.contains("bad")));
+        assert_eq!(
+            T::result_of(201, Some("W/\"1\""), None, false, String::new()),
+            WriteResult::Created(Some("1".into()))
+        );
+        assert_eq!(
+            T::result_of(
+                200,
+                None,
+                Some("x/Patient/1/_history/7"),
+                false,
+                String::new()
+            ),
+            WriteResult::Updated(Some("7".into()))
+        );
+        assert_eq!(
+            T::result_of(204, None, None, true, String::new()),
+            WriteResult::Deleted
+        );
+        assert_eq!(
+            T::result_of(404, None, None, true, String::new()),
+            WriteResult::Deleted
+        );
+        assert!(matches!(
+            T::result_of(412, None, None, false, String::new()),
+            WriteResult::Conflict(_)
+        ));
+        assert!(
+            matches!(T::result_of(422, None, None, false, ": bad".into()), WriteResult::Failed(m) if m.contains("bad"))
+        );
     }
 
     #[test]
     fn export_state_roundtrip() {
-        let s = ExportState { poll: None, files: vec!["a".into()], auth: true, file: 0, skip: 5 };
+        let s = ExportState {
+            poll: None,
+            files: vec!["a".into()],
+            auth: true,
+            file: 0,
+            skip: 5,
+        };
         let back: ExportState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
     }

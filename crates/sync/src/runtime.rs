@@ -15,8 +15,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use helios_endpoints::model::EndpointStatus;
 use helios_endpoints::store::{Actor, EndpointStore};
-use helios_endpoints::sync::{RunReason, SyncJob, SyncRun, SyncRunState, SyncStoreError, SyncTrigger};
-use helios_persistence::core::{ClusterJobId, ClusterJobLease, ClusterJobStore, ClusterLeaseError, JobKind, WorkerId};
+use helios_endpoints::sync::{
+    RunReason, SyncJob, SyncRun, SyncRunState, SyncStoreError, SyncTrigger,
+};
+use helios_persistence::core::{
+    ClusterJobId, ClusterJobLease, ClusterJobStore, ClusterLeaseError, JobKind, WorkerId,
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -30,7 +34,15 @@ use crate::error::{EngineError, SyncError};
 pub trait SyncAuditor: Send + Sync {
     /// Records `action` (`create`, `update`, `delete`, `run`, `cancel`,
     /// `run-finished`…) on `job` by `actor` with outcome and description.
-    async fn record(&self, action: &str, job_id: &str, job_name: &str, actor: &str, success: bool, description: &str);
+    async fn record(
+        &self,
+        action: &str,
+        job_id: &str,
+        job_name: &str,
+        actor: &str,
+        success: bool,
+        description: &str,
+    );
 }
 
 /// Worker / scheduler knobs (env `HFS_SYNC_*`).
@@ -126,10 +138,17 @@ impl SyncRuntime {
     pub async fn enqueue(&self, run: &SyncRun) -> Result<(), SyncError> {
         let id = self
             .cluster
-            .enqueue(&queue_tenant(), JobKind::EndpointSync, json!({"runId": run.id, "jobId": run.job_id}))
+            .enqueue(
+                &queue_tenant(),
+                JobKind::EndpointSync,
+                json!({"runId": run.id, "jobId": run.job_id}),
+            )
             .await
             .map_err(|e| SyncError::Unavailable(format!("job queue: {e}")))?;
-        self.env.store.attach_cluster_job(&run.id, id.as_str()).await?;
+        self.env
+            .store
+            .attach_cluster_job(&run.id, id.as_str())
+            .await?;
         self.queued.notify_one();
         Ok(())
     }
@@ -147,7 +166,10 @@ impl SyncRuntime {
     pub async fn cancel_run(&self, run: &SyncRun, reason: &str) -> Result<bool, SyncError> {
         let changed = self.env.store.cancel_run(&run.id, reason).await?;
         if let Some(cj) = &run.cluster_job_id {
-            let _ = self.cluster.cancel(&queue_tenant(), &ClusterJobId::from_string(cj.clone())).await;
+            let _ = self
+                .cluster
+                .cancel(&queue_tenant(), &ClusterJobId::from_string(cj.clone()))
+                .await;
         }
         self.env.wake.wake(&run.job_id);
         Ok(changed)
@@ -171,7 +193,8 @@ impl SyncRuntime {
             match self.work_next(&worker).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    let _ = tokio::time::timeout(self.settings.idle_poll, self.queued.notified()).await;
+                    let _ =
+                        tokio::time::timeout(self.settings.idle_poll, self.queued.notified()).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "sync worker: claim failed");
@@ -191,18 +214,30 @@ impl SyncRuntime {
         else {
             return Ok(false);
         };
-        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let run_id = payload
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         self.work(lease, &run_id).await;
         Ok(true)
     }
 
     async fn work(&self, lease: ClusterJobLease, run_id: &str) {
         let token = lease.fencing_token as i64;
-        let run = match self.env.store.claim_run(run_id, lease.job_id.as_str(), token).await {
+        let run = match self
+            .env
+            .store
+            .claim_run(run_id, lease.job_id.as_str(), token)
+            .await
+        {
             Ok(r) => r,
             Err(SyncStoreError::LeaseLost) | Err(SyncStoreError::NotFound) => {
                 // Superseded (re-enqueued elsewhere), cancelled or deleted.
-                let _ = self.cluster.complete(&lease, json!({"superseded": true})).await;
+                let _ = self
+                    .cluster
+                    .complete(&lease, json!({"superseded": true}))
+                    .await;
                 return;
             }
             Err(e) => {
@@ -213,7 +248,10 @@ impl SyncRuntime {
         };
         let Some(job) = self.env.store.job(&run.job_id).await.ok().flatten() else {
             let _ = self.env.store.cancel_run(&run.id, "job deleted").await;
-            let _ = self.cluster.complete(&lease, json!({"jobDeleted": true})).await;
+            let _ = self
+                .cluster
+                .complete(&lease, json!({"jobDeleted": true}))
+                .await;
             return;
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -237,7 +275,9 @@ impl SyncRuntime {
                         stop.store(true, Ordering::Relaxed);
                     }
                     match cluster.heartbeat(&lease).await {
-                        Err(ClusterLeaseError::LeaseLost { .. }) => stop.store(true, Ordering::Relaxed),
+                        Err(ClusterLeaseError::LeaseLost { .. }) => {
+                            stop.store(true, Ordering::Relaxed)
+                        }
                         Err(e) => tracing::warn!(error = %e, "sync heartbeat failed"),
                         Ok(_) => {}
                     }
@@ -270,7 +310,8 @@ impl SyncRuntime {
                 } else {
                     let _ = self.cluster.fail(&lease, &why).await;
                     if let Some(a) = &self.audit {
-                        a.record("run-stopped", &job.id, &job.spec.name, "system", true, &why).await;
+                        a.record("run-stopped", &job.id, &job.spec.name, "system", true, &why)
+                            .await;
                     }
                 }
             }
@@ -293,12 +334,23 @@ impl SyncRuntime {
                 r.progress.deleted,
                 r.progress.conflicts,
                 r.progress.failed,
-                r.error.as_deref().map(|e| format!(" — {e}")).unwrap_or_default()
+                r.error
+                    .as_deref()
+                    .map(|e| format!(" — {e}"))
+                    .unwrap_or_default()
             ),
             None => format!("run {} {state:?}", run.id),
         };
         if let Some(a) = &self.audit {
-            a.record("run-finished", &job.id, &job.spec.name, "Device/hfs-sync", ok, &desc).await;
+            a.record(
+                "run-finished",
+                &job.id,
+                &job.spec.name,
+                "Device/hfs-sync",
+                ok,
+                &desc,
+            )
+            .await;
         }
         if run.reason == RunReason::Duplicate && ok {
             self.finish_duplicate(job).await;
@@ -308,7 +360,8 @@ impl SyncRuntime {
     /// After a successful duplication copy: enable the new endpoint and
     /// the follow-up continuous job (if any).
     async fn finish_duplicate(&self, job: &SyncJob) {
-        if let (Some(store), helios_endpoints::sync::SyncPeer::Endpoint { name }) = (&self.endpoints, &job.spec.target)
+        if let (Some(store), helios_endpoints::sync::SyncPeer::Endpoint { name }) =
+            (&self.endpoints, &job.spec.target)
             && let Ok(Some(ep)) = store.get(name).await
             && ep.spec.status == EndpointStatus::Provisioning
         {
@@ -319,7 +372,9 @@ impl SyncRuntime {
                 Ok(_) => {
                     let _ = self.env.registry.reload_if_stale(store.as_ref()).await;
                 }
-                Err(e) => tracing::warn!(endpoint = %name, error = %e, "enabling the duplicated endpoint failed"),
+                Err(e) => {
+                    tracing::warn!(endpoint = %name, error = %e, "enabling the duplicated endpoint failed")
+                }
             }
         }
         if let Some(follow) = crate::service::follow_up_job(job)
@@ -354,7 +409,9 @@ impl SyncRuntime {
                     if due {
                         match self.start_run(&job, RunReason::Schedule).await {
                             Ok(_) | Err(SyncError::Conflict(_)) => {}
-                            Err(e) => tracing::warn!(job = %job.id, error = %e, "scheduling a sync run failed"),
+                            Err(e) => {
+                                tracing::warn!(job = %job.id, error = %e, "scheduling a sync run failed")
+                            }
                         }
                         let next = now + chrono::Duration::seconds(i64::from(*every_secs));
                         self.env.store.set_next_run_at(&job.id, Some(next)).await?;
@@ -365,15 +422,20 @@ impl SyncRuntime {
                     let restart = match &last {
                         None => true,
                         Some(r) if !r.state.is_terminal() => false,
-                        Some(r) if r.state == SyncRunState::Failed => r.finished_at.is_none_or(|f| {
-                            (now - f).to_std().unwrap_or_default() >= self.settings.continuous_retry
-                        }),
+                        Some(r) if r.state == SyncRunState::Failed => {
+                            r.finished_at.is_none_or(|f| {
+                                (now - f).to_std().unwrap_or_default()
+                                    >= self.settings.continuous_retry
+                            })
+                        }
                         Some(_) => true,
                     };
                     if restart {
                         match self.start_run(&job, RunReason::Continuous).await {
                             Ok(_) | Err(SyncError::Conflict(_)) => {}
-                            Err(e) => tracing::warn!(job = %job.id, error = %e, "starting a continuous run failed"),
+                            Err(e) => {
+                                tracing::warn!(job = %job.id, error = %e, "starting a continuous run failed")
+                            }
                         }
                     }
                 }
@@ -383,7 +445,8 @@ impl SyncRuntime {
     }
 
     async fn sweep_orphans(&self) -> Result<(), SyncError> {
-        let before = Utc::now() - chrono::Duration::from_std(self.settings.orphan_after).unwrap_or_default();
+        let before =
+            Utc::now() - chrono::Duration::from_std(self.settings.orphan_after).unwrap_or_default();
         for run in self.env.store.stale_queued_runs(before).await? {
             let alive = match &run.cluster_job_id {
                 None => false,

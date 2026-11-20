@@ -104,7 +104,10 @@ mod tests {
             SyncError::from(SyncStoreError::DuplicateName("x".into())),
             SyncError::Conflict(m) if m.contains("x")
         ));
-        assert!(matches!(SyncError::from(SyncStoreError::NotFound), SyncError::NotFound(_)));
+        assert!(matches!(
+            SyncError::from(SyncStoreError::NotFound),
+            SyncError::NotFound(_)
+        ));
         assert!(matches!(
             SyncError::from(SyncStoreError::LeaseLost),
             SyncError::Conflict(_)
@@ -113,8 +116,14 @@ mod tests {
             SyncError::from(SyncStoreError::Unavailable("db".into())),
             SyncError::Unavailable(_)
         ));
-        assert!(matches!(SyncError::from(SecretError::NoKeyRing), SyncError::NoKeyRing));
-        assert!(matches!(SyncError::from(SecretError::Open), SyncError::Unavailable(_)));
+        assert!(matches!(
+            SyncError::from(SecretError::NoKeyRing),
+            SyncError::NoKeyRing
+        ));
+        assert!(matches!(
+            SyncError::from(SecretError::Open),
+            SyncError::Unavailable(_)
+        ));
         assert!(matches!(invalid("name", "bad"), SyncError::Invalid(e) if e.0[0].field == "name"));
         assert!(matches!(
             EngineError::from(SyncStoreError::LeaseLost),

@@ -21,7 +21,9 @@ use crate::change::Change;
 use crate::conflict::TargetInfo;
 use crate::cursor::ALL_TYPES;
 use crate::hash::content_hash;
-use crate::peer::{ChangeWindow, InitialPage, PeerError, SourceReader, TargetWriter, WriteOp, WriteResult};
+use crate::peer::{
+    ChangeWindow, InitialPage, PeerError, SourceReader, TargetWriter, WriteOp, WriteResult,
+};
 
 /// The storage operations sync needs, object-safe over any backend that
 /// has versioned history and differential reads (SQLite, PostgreSQL,
@@ -29,7 +31,12 @@ use crate::peer::{ChangeWindow, InitialPage, PeerError, SourceReader, TargetWrit
 #[async_trait]
 pub trait LocalStore: Send + Sync {
     /// Read the current version.
-    async fn read(&self, tenant: &TenantContext, rt: &str, id: &str) -> StorageResult<Option<StoredResource>>;
+    async fn read(
+        &self,
+        tenant: &TenantContext,
+        rt: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>>;
     /// PUT semantics.
     async fn put(
         &self,
@@ -50,7 +57,11 @@ pub trait LocalStore: Send + Sync {
         pagination: &Pagination,
     ) -> StorageResult<Page<StoredResource>>;
     /// System history, newest first.
-    async fn history(&self, tenant: &TenantContext, params: &HistoryParams) -> StorageResult<HistoryPage>;
+    async fn history(
+        &self,
+        tenant: &TenantContext,
+        params: &HistoryParams,
+    ) -> StorageResult<HistoryPage>;
 }
 
 #[async_trait]
@@ -58,7 +69,12 @@ impl<S> LocalStore for S
 where
     S: ResourceStorage + SystemHistoryProvider + DifferentialHistoryProvider + Send + Sync,
 {
-    async fn read(&self, tenant: &TenantContext, rt: &str, id: &str) -> StorageResult<Option<StoredResource>> {
+    async fn read(
+        &self,
+        tenant: &TenantContext,
+        rt: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
         ResourceStorage::read(self, tenant, rt, id).await
     }
 
@@ -87,7 +103,11 @@ where
         DifferentialHistoryProvider::modified_since(self, tenant, rt, since, pagination).await
     }
 
-    async fn history(&self, tenant: &TenantContext, params: &HistoryParams) -> StorageResult<HistoryPage> {
+    async fn history(
+        &self,
+        tenant: &TenantContext,
+        params: &HistoryParams,
+    ) -> StorageResult<HistoryPage> {
         SystemHistoryProvider::history_system(self, tenant, params).await
     }
 }
@@ -167,13 +187,19 @@ impl SourceReader for LocalSource {
             Some(c) => Pagination::with_cursor(count, c.to_string()),
             None => Pagination::new(count),
         };
-        let since = since.map(|s| s - Duration::microseconds(1)).unwrap_or_else(epoch);
+        let since = since
+            .map(|s| s - Duration::microseconds(1))
+            .unwrap_or_else(epoch);
         let p = self
             .store
             .modified_since(&self.tenant, rt, since, &pagination)
             .await
             .map_err(storage_err)?;
-        let next = if p.page_info.has_next { p.page_info.next_cursor.clone() } else { None };
+        let next = if p.page_info.has_next {
+            p.page_info.next_cursor.clone()
+        } else {
+            None
+        };
         Ok(InitialPage {
             changes: p.items.into_iter().map(change_of).collect(),
             next,
@@ -197,15 +223,26 @@ impl SourceReader for LocalSource {
             .modified_since(&self.tenant, None, from, &pagination)
             .await
             .map_err(storage_err)?;
-        let next = if p.page_info.has_next { p.page_info.next_cursor.clone() } else { None };
+        let next = if p.page_info.has_next {
+            p.page_info.next_cursor.clone()
+        } else {
+            None
+        };
         let changes = p.items.into_iter().map(change_of).collect();
         // Deletes are not in the differential read: take them from history
         // once per window (first page), newest first, bounded.
         let mut neutral = Vec::new();
         if page.is_none() {
-            let mut hp = HistoryParams::new().since(from).count(500).include_deleted(true);
+            let mut hp = HistoryParams::new()
+                .since(from)
+                .count(500)
+                .include_deleted(true);
             for _ in 0..200 {
-                let h = self.store.history(&self.tenant, &hp).await.map_err(storage_err)?;
+                let h = self
+                    .store
+                    .history(&self.tenant, &hp)
+                    .await
+                    .map_err(storage_err)?;
                 for e in &h.items {
                     if e.method == HistoryMethod::Delete || e.resource.is_deleted() {
                         neutral.push(Change::delete(
@@ -265,7 +302,15 @@ impl LocalTarget {
         }
     }
 
-    fn notify(&self, rt: &str, kind: WriteKind, id: &str, version: &str, resource: Option<Value>, delta: i64) {
+    fn notify(
+        &self,
+        rt: &str,
+        kind: WriteKind,
+        id: &str,
+        version: &str,
+        resource: Option<Value>,
+        delta: i64,
+    ) {
         let Some(o) = &self.observer else { return };
         o.on_write(&WriteEvent::Resource(ResourceWrite {
             tenant: self.tenant.tenant_id().clone(),
@@ -286,7 +331,11 @@ impl LocalTarget {
 
 #[async_trait]
 impl TargetWriter for LocalTarget {
-    async fn current(&self, resource_type: &str, id: &str) -> Result<Option<TargetInfo>, PeerError> {
+    async fn current(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<TargetInfo>, PeerError> {
         match self.store.read(&self.tenant, resource_type, id).await {
             Ok(Some(s)) if !s.is_deleted() => {
                 let content = s.content_with_meta();
@@ -331,10 +380,18 @@ impl TargetWriter for LocalTarget {
                             meta.remove("lastUpdated");
                         }
                     }
-                    match self.store.put(&self.tenant, &resource_type, &id, resource, self.version).await {
+                    match self
+                        .store
+                        .put(&self.tenant, &resource_type, &id, resource, self.version)
+                        .await
+                    {
                         Ok((stored, created)) => {
                             let v = stored.version_id().to_string();
-                            let kind = if created { WriteKind::Create } else { WriteKind::Update };
+                            let kind = if created {
+                                WriteKind::Create
+                            } else {
+                                WriteKind::Update
+                            };
                             self.notify(
                                 &resource_type,
                                 kind,
@@ -363,7 +420,9 @@ impl TargetWriter for LocalTarget {
                             out.push(WriteResult::Deleted);
                             continue;
                         }
-                        (Some(t), Some(expected)) if t.version.as_deref() != Some(expected.as_str()) => {
+                        (Some(t), Some(expected))
+                            if t.version.as_deref() != Some(expected.as_str()) =>
+                        {
                             out.push(WriteResult::Conflict(format!(
                                 "target version is {} not {expected}",
                                 t.version.as_deref().unwrap_or("?")

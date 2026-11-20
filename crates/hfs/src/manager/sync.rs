@@ -40,7 +40,15 @@ impl AuditSinkAuditor {
 
 #[async_trait]
 impl SyncAuditor for AuditSinkAuditor {
-    async fn record(&self, action: &str, job_id: &str, job_name: &str, actor: &str, success: bool, description: &str) {
+    async fn record(
+        &self,
+        action: &str,
+        job_id: &str,
+        job_name: &str,
+        actor: &str,
+        success: bool,
+        description: &str,
+    ) {
         let audit_action = match action {
             "create" => AuditAction::Create,
             "update" => AuditAction::Update,
@@ -97,7 +105,9 @@ pub async fn install_sync(
         .pg_store
         .unwrap_or_else(|| Arc::new(helios_sync::memory::MemorySyncStore::new()));
     let cluster: Arc<dyn ClusterJobStore> = i.cluster.unwrap_or_else(|| {
-        Arc::new(helios_persistence::core::cluster_job_store::testing::InMemoryClusterJobStore::new())
+        Arc::new(
+            helios_persistence::core::cluster_job_store::testing::InMemoryClusterJobStore::new(),
+        )
     });
     let (service, _handles) = helios_sync::build(
         &cfg,

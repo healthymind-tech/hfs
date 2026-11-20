@@ -122,7 +122,9 @@ fn trigger_label(t: &SyncTrigger) -> String {
         SyncTrigger::Manual => "manual".into(),
         SyncTrigger::Interval { every_secs } => format!("every {every_secs} s"),
         SyncTrigger::Continuous { poll_secs } => format!("continuous ({poll_secs} s)"),
-        SyncTrigger::Subscription { fallback_poll_secs, .. } => {
+        SyncTrigger::Subscription {
+            fallback_poll_secs, ..
+        } => {
             format!("subscription (poll {fallback_poll_secs} s)")
         }
     }
@@ -154,7 +156,10 @@ fn job_row(job: &SyncJob, last: Option<&SyncRun>) -> JobRow {
         target: peer_label(&job.spec.target),
         trigger: trigger_label(&job.spec.trigger),
         enabled: job.spec.enabled,
-        state: last.map(|r| state_label(r.state)).unwrap_or("never run").to_string(),
+        state: last
+            .map(|r| state_label(r.state))
+            .unwrap_or("never run")
+            .to_string(),
         progress: last.map(progress_label).unwrap_or_default(),
         percent: last.and_then(run_percent),
         run_id: last.map(|r| r.id.clone()).unwrap_or_default(),
@@ -176,7 +181,12 @@ pub(crate) struct SyncJobsPage {
     pub error: Option<String>,
 }
 
-async fn list_page(State(state): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant) -> Response {
+async fn list_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
     let i18n = I18n::new(locale);
     let mut page = SyncJobsPage {
         status: current_status(&state, rv.0, &rt),
@@ -191,7 +201,9 @@ async fn list_page(State(state): State<WebState>, locale: RequestLocale, rv: Req
         match s.list().await {
             Ok(list) => {
                 for item in list {
-                    if let Ok(job) = serde_json::from_value::<SyncJob>(item.job.clone()).or_else(|_| redacted_to_job(&item.job)) {
+                    if let Ok(job) = serde_json::from_value::<SyncJob>(item.job.clone())
+                        .or_else(|_| redacted_to_job(&item.job))
+                    {
                         page.rows.push(job_row(&job, item.last_run.as_ref()));
                     }
                 }
@@ -262,7 +274,11 @@ impl SyncNewPage {
 
     /// Localized fieldset title of a side.
     pub fn side_title(&self, side: &str) -> String {
-        if side == "source" { self.i18n.t("sync-source") } else { self.i18n.t("sync-target") }
+        if side == "source" {
+            self.i18n.t("sync-source")
+        } else {
+            self.i18n.t("sync-target")
+        }
     }
 
     /// `{side}_{field}` as a form field name.
@@ -280,7 +296,11 @@ impl SyncNewPage {
 
     /// A checkbox: `default` on a fresh form, else whether it was sent.
     pub fn checked_or(&self, key: &str, default: bool) -> bool {
-        if self.form.is_empty() { default } else { self.v(key) == "on" }
+        if self.form.is_empty() {
+            default
+        } else {
+            self.v(key) == "on"
+        }
     }
 }
 
@@ -293,7 +313,12 @@ fn endpoint_options(s: &SyncService) -> Vec<EndpointOption> {
         .iter()
         .map(|e| EndpointOption {
             name: e.name().to_string(),
-            label: format!("{} — {} ({:?})", e.name(), e.spec.display_name, e.spec.fhir_version),
+            label: format!(
+                "{} — {} ({:?})",
+                e.name(),
+                e.spec.display_name,
+                e.spec.fhir_version
+            ),
         })
         .collect()
 }
@@ -368,11 +393,18 @@ pub(crate) fn body_from_form(f: &HashMap<String, String>) -> Value {
     let trigger = match get("trigger").unwrap_or("manual") {
         "interval" => json!({"type": "interval", "everySecs": num("every_secs", 3600)}),
         "continuous" => json!({"type": "continuous", "pollSecs": num("poll_secs", 30)}),
-        "subscription" => json!({"type": "subscription", "fallbackPollSecs": num("poll_secs", 300)}),
+        "subscription" => {
+            json!({"type": "subscription", "fallbackPollSecs": num("poll_secs", 300)})
+        }
         _ => json!({"type": "manual"}),
     };
     let types: Vec<String> = get("resource_types")
-        .map(|s| s.split([',', ' ']).filter(|t| !t.is_empty()).map(str::to_string).collect())
+        .map(|s| {
+            s.split([',', ' '])
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     json!({
         "name": get("name").unwrap_or(""),
@@ -398,17 +430,25 @@ pub(crate) fn parse_form(body: &[u8]) -> HashMap<String, String> {
 
 fn error_lines(e: &SyncError) -> Vec<String> {
     match e {
-        SyncError::Invalid(v) => v
-            .0
-            .iter()
-            .map(|f| if f.field.is_empty() { f.message.clone() } else { format!("{}: {}", f.field, f.message) })
-            .collect(),
+        SyncError::Invalid(v) => {
+            v.0.iter()
+                .map(|f| {
+                    if f.field.is_empty() {
+                        f.message.clone()
+                    } else {
+                        format!("{}: {}", f.field, f.message)
+                    }
+                })
+                .collect()
+        }
         other => vec![other.to_string()],
     }
 }
 
 fn ui_actor(admin: Option<&helios_admin_auth::AdminUser>) -> String {
-    admin.map(|a| format!("admin:{}", a.0)).unwrap_or_else(|| "console".into())
+    admin
+        .map(|a| format!("admin:{}", a.0))
+        .unwrap_or_else(|| "console".into())
 }
 
 async fn create(
@@ -423,9 +463,20 @@ async fn create(
         return (StatusCode::SERVICE_UNAVAILABLE, "sync is not enabled").into_response();
     };
     let mut form = parse_form(&body);
-    match s.create(body_from_form(&form), &ui_actor(admin.as_ref().map(|e| &e.0))).await {
+    match s
+        .create(
+            body_from_form(&form),
+            &ui_actor(admin.as_ref().map(|e| &e.0)),
+        )
+        .await
+    {
         Ok(created) => {
-            let id = created.job.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let id = created
+                .job
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             Redirect::to(&format!("/ui/sync/{id}")).into_response()
         }
         Err(e) => {
@@ -505,8 +556,9 @@ async fn job_page(
         return crate::render_not_found(status, i18n, "sync", "/ui/sync", "Sync");
     };
     let runs = s.runs(&id, 50).await.unwrap_or_default();
-    let definition = serde_json::to_string_pretty(&helios_sync::secrets::redacted_job(&job)["spec"])
-        .unwrap_or_default();
+    let definition =
+        serde_json::to_string_pretty(&helios_sync::secrets::redacted_job(&job)["spec"])
+            .unwrap_or_default();
     let last = runs.first();
     let row = job_row(&job, last);
     let mut lede = format!("{} → {} · {}", row.source, row.target, row.trigger);
@@ -521,7 +573,8 @@ async fn job_page(
         row,
         definition,
         active: last.is_some_and(|r| !r.state.is_terminal()),
-        retryable: last.is_some_and(|r| matches!(r.state, SyncRunState::Failed | SyncRunState::Cancelled)),
+        retryable: last
+            .is_some_and(|r| matches!(r.state, SyncRunState::Failed | SyncRunState::Cancelled)),
         runs: runs.iter().map(run_row).collect(),
     })
 }
@@ -549,7 +602,12 @@ async fn job_action(
     match r {
         Ok(Some(run)) => Redirect::to(&format!("/ui/sync/runs/{run}")).into_response(),
         Ok(None) => Redirect::to(&format!("/ui/sync/{id}")).into_response(),
-        Err(e) => (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], e.to_string()).into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            e.to_string(),
+        )
+            .into_response(),
     }
 }
 
@@ -600,7 +658,12 @@ pub(crate) struct SyncRunPage {
     pub fragment_html: String,
 }
 
-async fn fragment(s: &SyncService, run: &SyncRun, i18n: I18n, csrf: Option<String>) -> RunStatusFragment {
+async fn fragment(
+    s: &SyncService,
+    run: &SyncRun,
+    i18n: I18n,
+    csrf: Option<String>,
+) -> RunStatusFragment {
     let mut log = s.log(&run.id, 0, 1000).await.unwrap_or_default();
     let tail = log.len().saturating_sub(100);
     let log: Vec<LogView> = log.drain(tail..).rev().map(|l| log_view(&l)).collect();
@@ -642,7 +705,11 @@ async fn run_page(
     let Ok(run) = s.run(&run_id).await else {
         return crate::render_not_found(status, I18n::new(locale), "sync", "/ui/sync", "Sync");
     };
-    let job_name = s.job(&run.job_id).await.map(|j| j.spec.name).unwrap_or_default();
+    let job_name = s
+        .job(&run.job_id)
+        .await
+        .map(|j| j.spec.name)
+        .unwrap_or_default();
     let csrf = status.csrf_token().map(str::to_string);
     render(SyncRunPage {
         status,
@@ -650,7 +717,10 @@ async fn run_page(
         active_page: "sync",
         job_id: run.job_id.clone(),
         job_name,
-        fragment_html: fragment(&s, &run, I18n::new(locale), csrf).await.render().unwrap_or_default(),
+        fragment_html: fragment(&s, &run, I18n::new(locale), csrf)
+            .await
+            .render()
+            .unwrap_or_default(),
     })
 }
 
@@ -664,7 +734,9 @@ async fn run_status(
     let Some(s) = service() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let csrf = current_status(&state, rv.0, &rt).csrf_token().map(str::to_string);
+    let csrf = current_status(&state, rv.0, &rt)
+        .csrf_token()
+        .map(str::to_string);
     match s.run(&run_id).await {
         Ok(run) => render(fragment(&s, &run, I18n::new(locale), csrf).await),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -679,7 +751,13 @@ async fn resolve(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match s
-        .resolve_conflict(&run, &rtype, &rid, &action, &ui_actor(admin.as_ref().map(|e| &e.0)))
+        .resolve_conflict(
+            &run,
+            &rtype,
+            &rid,
+            &action,
+            &ui_actor(admin.as_ref().map(|e| &e.0)),
+        )
         .await
     {
         Ok(_) => Redirect::to(&format!("/ui/sync/runs/{run}")).into_response(),
@@ -703,7 +781,10 @@ mod tests {
         assert_eq!(b["source"], json!({"kind": "endpoint", "name": "default"}));
         assert_eq!(b["target"]["baseUrl"], "https://hapi.example.org/fhir");
         assert_eq!(b["target"]["auth"]["type"], "bearer");
-        assert!(b["target"]["auth"].get("token").is_none(), "secrets travel in `secrets` only");
+        assert!(
+            b["target"]["auth"].get("token").is_none(),
+            "secrets travel in `secrets` only"
+        );
         assert_eq!(b["secrets"]["target.auth.token"], json!({"set": "t0k"}));
         assert_eq!(b["trigger"], json!({"type": "interval", "everySecs": 600}));
         assert_eq!(b["resourceTypes"], json!(["Patient", "Observation"]));
@@ -726,7 +807,10 @@ mod tests {
         let b = body_from_form(&f);
         assert_eq!(b["source"]["auth"]["clientId"], "c");
         assert_eq!(b["source"]["auth"]["scope"], "system/*.rs");
-        assert_eq!(b["secrets"]["source.auth.clientSecret"], json!({"set": "cs"}));
+        assert_eq!(
+            b["secrets"]["source.auth.clientSecret"],
+            json!({"set": "cs"})
+        );
         assert_eq!(b["trigger"], json!({"type": "continuous", "pollSecs": 15}));
         assert_eq!(b["enabled"], false);
         let f = parse_form(b"source_kind=external&source_auth=basic&source_username=u&source_secret=p&trigger=subscription");
@@ -738,12 +822,24 @@ mod tests {
 
     #[test]
     fn labels() {
-        assert_eq!(trigger_label(&SyncTrigger::Interval { every_secs: 60 }), "every 60 s");
+        assert_eq!(
+            trigger_label(&SyncTrigger::Interval { every_secs: 60 }),
+            "every 60 s"
+        );
         assert_eq!(trigger_label(&SyncTrigger::Manual), "manual");
         assert!(trigger_label(&SyncTrigger::Continuous { poll_secs: 5 }).contains('5'));
-        assert!(trigger_label(&SyncTrigger::Subscription { fallback_poll_secs: 9, notify_secret: None }).contains('9'));
+        assert!(
+            trigger_label(&SyncTrigger::Subscription {
+                fallback_poll_secs: 9,
+                notify_secret: None
+            })
+            .contains('9')
+        );
         assert_eq!(state_label(SyncRunState::Cancelled), "cancelled");
-        assert_eq!(peer_label(&SyncPeer::Endpoint { name: "a".into() }), "endpoint a");
+        assert_eq!(
+            peer_label(&SyncPeer::Endpoint { name: "a".into() }),
+            "endpoint a"
+        );
         let job = redacted_to_job(&json!({
             "id": "j", "revision": 1, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
             "spec": {"name": "n", "source": {"kind": "endpoint", "name": "a"},
@@ -761,7 +857,10 @@ mod tests {
         let mut v = helios_endpoints::model::ValidationErrors::default();
         v.push("name", "bad");
         v.push("", "whole body");
-        assert_eq!(error_lines(&SyncError::Invalid(v)), vec!["name: bad", "whole body"]);
+        assert_eq!(
+            error_lines(&SyncError::Invalid(v)),
+            vec!["name: bad", "whole body"]
+        );
         assert_eq!(error_lines(&SyncError::NoKeyRing).len(), 1);
     }
 

@@ -8,7 +8,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use helios_endpoints::{
-    Actor, EndpointName, EndpointRegistry, EndpointSpec, EndpointStore, FhirRelease, MemoryEndpointStore,
+    Actor, EndpointName, EndpointRegistry, EndpointSpec, EndpointStore, FhirRelease,
+    MemoryEndpointStore,
 };
 use helios_persistence::backends::sqlite::SqliteBackend;
 use helios_persistence::core::cluster_job_store::testing::InMemoryClusterJobStore;
@@ -25,7 +26,9 @@ fn app() -> Router {
         None,
         None,
         "default".to_string(),
-        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))),
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
         helios_fhir::FhirVersion::R4,
         None,
         "http://localhost:8080/fhir".to_string(),
@@ -70,16 +73,29 @@ async fn sync_pages_end_to_end() {
     backend.init_schema().unwrap();
     let store: Arc<dyn EndpointStore> = Arc::new(MemoryEndpointStore::new());
     store
-        .create(EndpointSpec::default_endpoint("default", FhirRelease::R4), &Actor::bootstrap())
+        .create(
+            EndpointSpec::default_endpoint("default", FhirRelease::R4),
+            &Actor::bootstrap(),
+        )
         .await
         .unwrap();
     store
-        .create(EndpointSpec::named(EndpointName::parse("lab").unwrap(), "Lab"), &Actor::bootstrap())
+        .create(
+            EndpointSpec::named(EndpointName::parse("lab").unwrap(), "Lab"),
+            &Actor::bootstrap(),
+        )
         .await
         .unwrap();
     let registry = Arc::new(EndpointRegistry::load(store.as_ref()).await.unwrap());
-    let env = [("HFS_SYNC_ENABLED", "false"), ("HFS_SYNC_SAFETY_LAG_MS", "0")];
-    let cfg = helios_sync::SyncConfig::from_lookup(&|k| env.iter().find(|(a, _)| *a == k).map(|(_, v)| v.to_string()));
+    let env = [
+        ("HFS_SYNC_ENABLED", "false"),
+        ("HFS_SYNC_SAFETY_LAG_MS", "0"),
+    ];
+    let cfg = helios_sync::SyncConfig::from_lookup(&|k| {
+        env.iter()
+            .find(|(a, _)| *a == k)
+            .map(|(_, v)| v.to_string())
+    });
     let (svc, _) = helios_sync::build(
         &cfg,
         helios_sync::SyncDeps {
@@ -157,7 +173,8 @@ async fn sync_pages_end_to_end() {
 
     // zh-Hant.
     let mut req = get("/ui/sync");
-    req.headers_mut().insert(header::ACCEPT_LANGUAGE, "zh-Hant".parse().unwrap());
+    req.headers_mut()
+        .insert(header::ACCEPT_LANGUAGE, "zh-Hant".parse().unwrap());
     let (_, _, html) = send(&app, req).await;
     assert!(html.contains("同步工作"));
 

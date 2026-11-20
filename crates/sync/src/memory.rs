@@ -39,7 +39,12 @@ const MAX_LOG: usize = 10_000;
 
 #[async_trait]
 impl SyncStore for MemorySyncStore {
-    async fn create_job_with_id(&self, id: &str, spec: SyncJobSpec, actor: &str) -> Result<SyncJob, SyncStoreError> {
+    async fn create_job_with_id(
+        &self,
+        id: &str,
+        spec: SyncJobSpec,
+        actor: &str,
+    ) -> Result<SyncJob, SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         if g.jobs.values().any(|j| j.spec.name == spec.name) {
             return Err(SyncStoreError::DuplicateName(spec.name));
@@ -58,17 +63,27 @@ impl SyncStore for MemorySyncStore {
         Ok(job)
     }
 
-    async fn update_job(&self, id: &str, expected_revision: u64, spec: SyncJobSpec) -> Result<SyncJob, SyncStoreError> {
+    async fn update_job(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        spec: SyncJobSpec,
+    ) -> Result<SyncJob, SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         if !g.jobs.contains_key(id) {
             return Err(SyncStoreError::NotFound);
         }
-        if g.jobs.values().any(|j| j.id != id && j.spec.name == spec.name) {
+        if g.jobs
+            .values()
+            .any(|j| j.id != id && j.spec.name == spec.name)
+        {
             return Err(SyncStoreError::DuplicateName(spec.name));
         }
         let job = g.jobs.get_mut(id).ok_or(SyncStoreError::NotFound)?;
         if job.revision != expected_revision {
-            return Err(SyncStoreError::Conflict { current: job.revision });
+            return Err(SyncStoreError::Conflict {
+                current: job.revision,
+            });
         }
         job.spec = spec;
         job.revision += 1;
@@ -89,7 +104,12 @@ impl SyncStore for MemorySyncStore {
     async fn delete_job(&self, id: &str) -> Result<(), SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         g.jobs.remove(id).ok_or(SyncStoreError::NotFound)?;
-        let runs: Vec<String> = g.runs.values().filter(|(r, _)| r.job_id == id).map(|(r, _)| r.id.clone()).collect();
+        let runs: Vec<String> = g
+            .runs
+            .values()
+            .filter(|(r, _)| r.job_id == id)
+            .map(|(r, _)| r.id.clone())
+            .collect();
         for r in runs {
             g.runs.remove(&r);
             g.logs.remove(&r);
@@ -99,12 +119,20 @@ impl SyncStore for MemorySyncStore {
         Ok(())
     }
 
-    async fn create_run(&self, job_id: &str, reason: RunReason, resume_from: Option<SyncCursor>) -> Result<SyncRun, SyncStoreError> {
+    async fn create_run(
+        &self,
+        job_id: &str,
+        reason: RunReason,
+        resume_from: Option<SyncCursor>,
+    ) -> Result<SyncRun, SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         if !g.jobs.contains_key(job_id) {
             return Err(SyncStoreError::NotFound);
         }
-        if g.runs.values().any(|(r, _)| r.job_id == job_id && !r.state.is_terminal()) {
+        if g.runs
+            .values()
+            .any(|(r, _)| r.job_id == job_id && !r.state.is_terminal())
+        {
             return Err(SyncStoreError::ActiveRun(job_id.to_string()));
         }
         let run = SyncRun {
@@ -125,13 +153,28 @@ impl SyncStore for MemorySyncStore {
     }
 
     async fn run(&self, id: &str) -> Result<Option<SyncRun>, SyncStoreError> {
-        Ok(self.inner.lock().unwrap().runs.get(id).map(|(r, _)| r.clone()))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .runs
+            .get(id)
+            .map(|(r, _)| r.clone()))
     }
 
     async fn runs(&self, job_id: &str, limit: usize) -> Result<Vec<SyncRun>, SyncStoreError> {
         let g = self.inner.lock().unwrap();
-        let mut v: Vec<SyncRun> = g.runs.values().filter(|(r, _)| r.job_id == job_id).map(|(r, _)| r.clone()).collect();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        let mut v: Vec<SyncRun> = g
+            .runs
+            .values()
+            .filter(|(r, _)| r.job_id == job_id)
+            .map(|(r, _)| r.clone())
+            .collect();
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         v.truncate(limit);
         Ok(v)
     }
@@ -160,7 +203,12 @@ impl SyncStore for MemorySyncStore {
         Ok(())
     }
 
-    async fn log(&self, run_id: &str, level: LogLevel, message: &str) -> Result<(), SyncStoreError> {
+    async fn log(
+        &self,
+        run_id: &str,
+        level: LogLevel,
+        message: &str,
+    ) -> Result<(), SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         if !g.runs.contains_key(run_id) {
             return Err(SyncStoreError::NotFound);
@@ -181,11 +229,22 @@ impl SyncStore for MemorySyncStore {
         Ok(())
     }
 
-    async fn log_lines(&self, run_id: &str, after_seq: u64, limit: usize) -> Result<Vec<SyncLogLine>, SyncStoreError> {
+    async fn log_lines(
+        &self,
+        run_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SyncLogLine>, SyncStoreError> {
         let g = self.inner.lock().unwrap();
         Ok(g.logs
             .get(run_id)
-            .map(|l| l.iter().filter(|x| x.seq > after_seq).take(limit).cloned().collect())
+            .map(|l| {
+                l.iter()
+                    .filter(|x| x.seq > after_seq)
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -200,20 +259,38 @@ impl SyncStore for MemorySyncStore {
         Ok(())
     }
 
-    async fn conflicts(&self, run_id: &str, limit: usize) -> Result<Vec<SyncConflict>, SyncStoreError> {
+    async fn conflicts(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SyncConflict>, SyncStoreError> {
         let g = self.inner.lock().unwrap();
-        Ok(g.conflicts.get(run_id).map(|l| l.iter().take(limit).cloned().collect()).unwrap_or_default())
+        Ok(g.conflicts
+            .get(run_id)
+            .map(|l| l.iter().take(limit).cloned().collect())
+            .unwrap_or_default())
     }
 
-    async fn delete_conflict(&self, run_id: &str, resource_type: &str, resource_id: &str) -> Result<bool, SyncStoreError> {
+    async fn delete_conflict(
+        &self,
+        run_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<bool, SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
-        let Some(list) = g.conflicts.get_mut(run_id) else { return Ok(false) };
+        let Some(list) = g.conflicts.get_mut(run_id) else {
+            return Ok(false);
+        };
         let before = list.len();
         list.retain(|x| !(x.resource_type == resource_type && x.resource_id == resource_id));
         Ok(list.len() < before)
     }
 
-    async fn attach_cluster_job(&self, run_id: &str, cluster_job_id: &str) -> Result<(), SyncStoreError> {
+    async fn attach_cluster_job(
+        &self,
+        run_id: &str,
+        cluster_job_id: &str,
+    ) -> Result<(), SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         match g.runs.get_mut(run_id) {
             Some((r, _)) if r.state == SyncRunState::Queued => {
@@ -224,10 +301,18 @@ impl SyncStore for MemorySyncStore {
         }
     }
 
-    async fn claim_run(&self, run_id: &str, cluster_job_id: &str, fencing_token: i64) -> Result<SyncRun, SyncStoreError> {
+    async fn claim_run(
+        &self,
+        run_id: &str,
+        cluster_job_id: &str,
+        fencing_token: i64,
+    ) -> Result<SyncRun, SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         let (r, token) = g.runs.get_mut(run_id).ok_or(SyncStoreError::LeaseLost)?;
-        if r.state.is_terminal() || r.cluster_job_id.as_deref() != Some(cluster_job_id) || *token >= fencing_token {
+        if r.state.is_terminal()
+            || r.cluster_job_id.as_deref() != Some(cluster_job_id)
+            || *token >= fencing_token
+        {
             return Err(SyncStoreError::LeaseLost);
         }
         *token = fencing_token;
@@ -249,7 +334,10 @@ impl SyncStore for MemorySyncStore {
         }
     }
 
-    async fn stale_queued_runs(&self, before: DateTime<Utc>) -> Result<Vec<SyncRun>, SyncStoreError> {
+    async fn stale_queued_runs(
+        &self,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<SyncRun>, SyncStoreError> {
         let g = self.inner.lock().unwrap();
         Ok(g.runs
             .values()
@@ -258,27 +346,53 @@ impl SyncStore for MemorySyncStore {
             .collect())
     }
 
-    async fn set_next_run_at(&self, job_id: &str, at: Option<DateTime<Utc>>) -> Result<(), SyncStoreError> {
+    async fn set_next_run_at(
+        &self,
+        job_id: &str,
+        at: Option<DateTime<Utc>>,
+    ) -> Result<(), SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
-        g.jobs.get_mut(job_id).ok_or(SyncStoreError::NotFound)?.next_run_at = at;
+        g.jobs
+            .get_mut(job_id)
+            .ok_or(SyncStoreError::NotFound)?
+            .next_run_at = at;
         Ok(())
     }
 
-    async fn item_states(&self, job_id: &str, keys: &[(String, String)]) -> Result<Vec<SyncItemState>, SyncStoreError> {
+    async fn item_states(
+        &self,
+        job_id: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<SyncItemState>, SyncStoreError> {
         let g = self.inner.lock().unwrap();
         Ok(keys
             .iter()
-            .filter_map(|(t, i)| g.items.get(&(job_id.to_string(), t.clone(), i.clone())).cloned())
+            .filter_map(|(t, i)| {
+                g.items
+                    .get(&(job_id.to_string(), t.clone(), i.clone()))
+                    .cloned()
+            })
             .collect())
     }
 
-    async fn put_item_states(&self, job_id: &str, items: &[SyncItemState]) -> Result<(), SyncStoreError> {
+    async fn put_item_states(
+        &self,
+        job_id: &str,
+        items: &[SyncItemState],
+    ) -> Result<(), SyncStoreError> {
         let mut g = self.inner.lock().unwrap();
         if !g.jobs.contains_key(job_id) {
             return Err(SyncStoreError::NotFound);
         }
         for i in items {
-            g.items.insert((job_id.to_string(), i.resource_type.clone(), i.resource_id.clone()), i.clone());
+            g.items.insert(
+                (
+                    job_id.to_string(),
+                    i.resource_type.clone(),
+                    i.resource_id.clone(),
+                ),
+                i.clone(),
+            );
         }
         Ok(())
     }
@@ -307,7 +421,10 @@ pub mod conformance {
     }
 
     async fn jobs(store: &dyn SyncStore, tag: &str) {
-        let j = store.create_job(spec(&format!("j1-{tag}")), "admin").await.unwrap();
+        let j = store
+            .create_job(spec(&format!("j1-{tag}")), "admin")
+            .await
+            .unwrap();
         assert_eq!(j.revision, 1);
         assert_eq!(j.created_by.as_deref(), Some("admin"));
         assert!(matches!(
@@ -329,77 +446,152 @@ pub mod conformance {
             store.update_job(&j.id, 1, s.clone()).await,
             Err(SyncStoreError::Conflict { current: 2 })
         ));
-        assert!(matches!(store.update_job("nope", 1, s.clone()).await, Err(SyncStoreError::NotFound)));
+        assert!(matches!(
+            store.update_job("nope", 1, s.clone()).await,
+            Err(SyncStoreError::NotFound)
+        ));
         let mut clash = s.clone();
         clash.name = format!("j2-{tag}");
-        assert!(matches!(store.update_job(&j.id, 2, clash).await, Err(SyncStoreError::DuplicateName(_))));
+        assert!(matches!(
+            store.update_job(&j.id, 2, clash).await,
+            Err(SyncStoreError::DuplicateName(_))
+        ));
         assert_eq!(store.job(&j.id).await.unwrap().unwrap().spec, s);
         assert!(store.job("nope").await.unwrap().is_none());
-        let names: Vec<String> = store.jobs().await.unwrap().into_iter().map(|j| j.spec.name).collect();
+        let names: Vec<String> = store
+            .jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.spec.name)
+            .collect();
         assert!(names.contains(&format!("j1-{tag}")) && names.contains(&format!("j2-{tag}")));
         let at = Utc::now();
         store.set_next_run_at(&j.id, Some(at)).await.unwrap();
         let got = store.job(&j.id).await.unwrap().unwrap();
         assert_eq!(got.revision, 2, "next_run_at does not bump the revision");
-        assert!(got.next_run_at.is_some_and(|t| (t - at).num_milliseconds().abs() < 5));
-        assert!(matches!(store.set_next_run_at("nope", None).await, Err(SyncStoreError::NotFound)));
+        assert!(
+            got.next_run_at
+                .is_some_and(|t| (t - at).num_milliseconds().abs() < 5)
+        );
+        assert!(matches!(
+            store.set_next_run_at("nope", None).await,
+            Err(SyncStoreError::NotFound)
+        ));
         store.delete_job(&fixed.id).await.unwrap();
-        assert!(matches!(store.delete_job(&fixed.id).await, Err(SyncStoreError::NotFound)));
+        assert!(matches!(
+            store.delete_job(&fixed.id).await,
+            Err(SyncStoreError::NotFound)
+        ));
         store.delete_job(&j.id).await.unwrap();
     }
 
     async fn runs_and_fencing(store: &dyn SyncStore, tag: &str) {
-        let j = store.create_job(spec(&format!("runs-{tag}")), "admin").await.unwrap();
+        let j = store
+            .create_job(spec(&format!("runs-{tag}")), "admin")
+            .await
+            .unwrap();
         let cursor = SyncCursor {
             phase: "incremental".into(),
             high_water: Some(Utc::now()),
             boundary: vec!["Patient/1/1".into()],
             ..Default::default()
         };
-        let r = store.create_run(&j.id, RunReason::Retry, Some(cursor.clone())).await.unwrap();
+        let r = store
+            .create_run(&j.id, RunReason::Retry, Some(cursor.clone()))
+            .await
+            .unwrap();
         assert_eq!(r.state, SyncRunState::Queued);
         assert_eq!(r.cursor, cursor);
         assert!(matches!(
             store.create_run(&j.id, RunReason::Manual, None).await,
             Err(SyncStoreError::ActiveRun(_))
         ));
-        assert!(matches!(store.create_run("nope", RunReason::Manual, None).await, Err(SyncStoreError::NotFound)));
+        assert!(matches!(
+            store.create_run("nope", RunReason::Manual, None).await,
+            Err(SyncStoreError::NotFound)
+        ));
         // Stale queued (orphan) sweep.
         let later = Utc::now() + chrono::Duration::seconds(5);
-        assert!(store.stale_queued_runs(later).await.unwrap().iter().any(|x| x.id == r.id));
+        assert!(
+            store
+                .stale_queued_runs(later)
+                .await
+                .unwrap()
+                .iter()
+                .any(|x| x.id == r.id)
+        );
         // Claim needs the attached cluster job and an increasing token.
-        assert!(matches!(store.claim_run(&r.id, "cj1", 1).await, Err(SyncStoreError::LeaseLost)));
+        assert!(matches!(
+            store.claim_run(&r.id, "cj1", 1).await,
+            Err(SyncStoreError::LeaseLost)
+        ));
         store.attach_cluster_job(&r.id, "cj1").await.unwrap();
-        assert_eq!(store.run(&r.id).await.unwrap().unwrap().cluster_job_id.as_deref(), Some("cj1"));
+        assert_eq!(
+            store
+                .run(&r.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cluster_job_id
+                .as_deref(),
+            Some("cj1")
+        );
         let c = store.claim_run(&r.id, "cj1", 1).await.unwrap();
         assert_eq!(c.state, SyncRunState::Running);
         assert!(c.started_at.is_some());
-        assert!(matches!(store.claim_run(&r.id, "cj1", 1).await, Err(SyncStoreError::LeaseLost)));
-        assert!(matches!(store.claim_run(&r.id, "other", 9).await, Err(SyncStoreError::LeaseLost)));
-        let mut p = SyncProgress { read: 5, created: 3, ..Default::default() };
-        store.checkpoint(&r.id, 1, SyncRunState::Running, &cursor, &p, None).await.unwrap();
+        assert!(matches!(
+            store.claim_run(&r.id, "cj1", 1).await,
+            Err(SyncStoreError::LeaseLost)
+        ));
+        assert!(matches!(
+            store.claim_run(&r.id, "other", 9).await,
+            Err(SyncStoreError::LeaseLost)
+        ));
+        let mut p = SyncProgress {
+            read: 5,
+            created: 3,
+            ..Default::default()
+        };
+        store
+            .checkpoint(&r.id, 1, SyncRunState::Running, &cursor, &p, None)
+            .await
+            .unwrap();
         // A newer worker reclaims (expired lease): the old token is fenced.
         store.claim_run(&r.id, "cj1", 2).await.unwrap();
         assert!(matches!(
-            store.checkpoint(&r.id, 1, SyncRunState::Running, &cursor, &p, None).await,
+            store
+                .checkpoint(&r.id, 1, SyncRunState::Running, &cursor, &p, None)
+                .await,
             Err(SyncStoreError::LeaseLost)
         ));
         p.updated = 1;
-        store.checkpoint(&r.id, 2, SyncRunState::Running, &cursor, &p, None).await.unwrap();
+        store
+            .checkpoint(&r.id, 2, SyncRunState::Running, &cursor, &p, None)
+            .await
+            .unwrap();
         assert_eq!(store.run(&r.id).await.unwrap().unwrap().progress, p);
         // Cancel: the worker's next checkpoint is refused.
         assert!(store.cancel_run(&r.id, "cancelled by admin").await.unwrap());
         assert!(!store.cancel_run(&r.id, "again").await.unwrap());
         assert!(matches!(
-            store.checkpoint(&r.id, 2, SyncRunState::Succeeded, &cursor, &p, None).await,
+            store
+                .checkpoint(&r.id, 2, SyncRunState::Succeeded, &cursor, &p, None)
+                .await,
             Err(SyncStoreError::LeaseLost)
         ));
         let done = store.run(&r.id).await.unwrap().unwrap();
         assert_eq!(done.state, SyncRunState::Cancelled);
         assert!(done.finished_at.is_some());
-        assert!(matches!(store.attach_cluster_job(&r.id, "x").await, Err(SyncStoreError::NotFound)));
+        assert!(matches!(
+            store.attach_cluster_job(&r.id, "x").await,
+            Err(SyncStoreError::NotFound)
+        ));
         // Terminal: a new run can start; finishing records the state.
-        let r2 = store.create_run(&j.id, RunReason::Manual, None).await.unwrap();
+        let r2 = store
+            .create_run(&j.id, RunReason::Manual, None)
+            .await
+            .unwrap();
         store.attach_cluster_job(&r2.id, "cj2").await.unwrap();
         store.claim_run(&r2.id, "cj2", 1).await.unwrap();
         store
@@ -407,7 +599,10 @@ pub mod conformance {
             .await
             .unwrap();
         let f = store.run(&r2.id).await.unwrap().unwrap();
-        assert_eq!((f.state, f.error.as_deref()), (SyncRunState::Failed, Some("boom")));
+        assert_eq!(
+            (f.state, f.error.as_deref()),
+            (SyncRunState::Failed, Some("boom"))
+        );
         let listed = store.runs(&j.id, 10).await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, r2.id, "newest first");
@@ -418,20 +613,38 @@ pub mod conformance {
     }
 
     async fn logs_conflicts_items(store: &dyn SyncStore, tag: &str) {
-        let j = store.create_job(spec(&format!("logs-{tag}")), "admin").await.unwrap();
-        let r = store.create_run(&j.id, RunReason::Manual, None).await.unwrap();
+        let j = store
+            .create_job(spec(&format!("logs-{tag}")), "admin")
+            .await
+            .unwrap();
+        let r = store
+            .create_run(&j.id, RunReason::Manual, None)
+            .await
+            .unwrap();
         for i in 0..5 {
-            store.log(&r.id, LogLevel::Info, &format!("line {i}")).await.unwrap();
+            store
+                .log(&r.id, LogLevel::Info, &format!("line {i}"))
+                .await
+                .unwrap();
         }
-        store.log(&r.id, LogLevel::Error, &"x".repeat(5000)).await.unwrap();
+        store
+            .log(&r.id, LogLevel::Error, &"x".repeat(5000))
+            .await
+            .unwrap();
         let all = store.log_lines(&r.id, 0, 100).await.unwrap();
         assert_eq!(all.len(), 6);
         assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
         assert_eq!(all[5].level, LogLevel::Error);
         assert!(all[5].message.len() <= 2000);
         let tail = store.log_lines(&r.id, all[2].seq, 2).await.unwrap();
-        assert_eq!(tail.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(), vec!["line 3", "line 4"]);
-        assert!(matches!(store.log("nope", LogLevel::Info, "x").await, Err(SyncStoreError::NotFound)));
+        assert_eq!(
+            tail.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(),
+            vec!["line 3", "line 4"]
+        );
+        assert!(matches!(
+            store.log("nope", LogLevel::Info, "x").await,
+            Err(SyncStoreError::NotFound)
+        ));
 
         let c = SyncConflict {
             run_id: r.id.clone(),
@@ -491,7 +704,10 @@ pub mod conformance {
         assert!(store.item_states(&j.id, &[]).await.unwrap().is_empty());
         store.put_item_states(&j.id, &[]).await.unwrap();
         store.delete_job(&j.id).await.unwrap();
-        assert!(store.item_states(&j.id, &keys).await.unwrap().is_empty(), "items cascade");
+        assert!(
+            store.item_states(&j.id, &keys).await.unwrap().is_empty(),
+            "items cascade"
+        );
     }
 }
 
@@ -507,9 +723,16 @@ mod tests {
     #[tokio::test]
     async fn log_is_bounded() {
         let s = MemorySyncStore::new();
-        let j = s.create_job(serde_json::from_value(serde_json::json!({
+        let j = s
+            .create_job(
+                serde_json::from_value(serde_json::json!({
             "name": "n", "source": {"kind": "endpoint", "name": "a"},
-            "target": {"kind": "endpoint", "name": "b"}})).unwrap(), "a").await.unwrap();
+            "target": {"kind": "endpoint", "name": "b"}}))
+                .unwrap(),
+                "a",
+            )
+            .await
+            .unwrap();
         let r = s.create_run(&j.id, RunReason::Manual, None).await.unwrap();
         for i in 0..(MAX_LOG + 5) {
             s.log(&r.id, LogLevel::Info, &i.to_string()).await.unwrap();

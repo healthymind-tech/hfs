@@ -268,7 +268,10 @@ mod tests {
         assert_eq!(c.phase, PHASE_INCREMENTAL);
         assert_eq!(c.high_water, Some(ts(40)));
         s.since = Some(ts(5));
-        assert_eq!(start_cursor(&s, None, now, ts(40), lag).high_water, Some(ts(5)));
+        assert_eq!(
+            start_cursor(&s, None, now, ts(40), lag).high_water,
+            Some(ts(5))
+        );
 
         let prev = SyncCursor {
             phase: PHASE_INCREMENTAL.into(),
@@ -354,7 +357,10 @@ mod tests {
             ch("Patient", "b", "1", 1),
         ]);
         let tokens: Vec<String> = got.iter().map(Change::token).collect();
-        assert_eq!(tokens, vec!["Patient/b/1", "Observation/o/1", "Patient/a/3"]);
+        assert_eq!(
+            tokens,
+            vec!["Patient/b/1", "Observation/o/1", "Patient/a/3"]
+        );
         assert!(got[2].deleted);
         // Same instant: the higher version wins.
         let got = order_and_dedupe(vec![ch("P", "x", "2", 5), ch("P", "x", "1", 5)]);
@@ -371,7 +377,11 @@ mod tests {
         // Batch past the limit: advance only to the newest change ≤ limit.
         advance(
             &mut c,
-            &[ch("P", "a", "1", 11), ch("P", "b", "1", 12), ch("P", "c", "1", 20)],
+            &[
+                ch("P", "a", "1", 11),
+                ch("P", "b", "1", 12),
+                ch("P", "c", "1", 20),
+            ],
             ts(15),
         );
         assert_eq!(c.high_water, Some(ts(12)));

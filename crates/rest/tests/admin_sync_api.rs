@@ -30,16 +30,32 @@ async fn service() -> (Arc<SyncService>, Arc<SqliteBackend>) {
     let backend = Arc::new(SqliteBackend::in_memory().unwrap());
     backend.init_schema().unwrap();
     let endpoints: Arc<dyn EndpointStore> = Arc::new(MemoryEndpointStore::new());
-    ensure_default_endpoint(endpoints.as_ref(), "default", helios_endpoints::FhirRelease::R4).await.unwrap();
+    ensure_default_endpoint(
+        endpoints.as_ref(),
+        "default",
+        helios_endpoints::FhirRelease::R4,
+    )
+    .await
+    .unwrap();
     for n in ["lab", "copy"] {
         endpoints
-            .create(EndpointSpec::named(EndpointName::parse(n).unwrap(), n), &Actor::bootstrap())
+            .create(
+                EndpointSpec::named(EndpointName::parse(n).unwrap(), n),
+                &Actor::bootstrap(),
+            )
             .await
             .unwrap();
     }
     let registry = Arc::new(EndpointRegistry::load(endpoints.as_ref()).await.unwrap());
-    let env = [("HFS_SYNC_ENABLED", "false"), ("HFS_SYNC_SAFETY_LAG_MS", "0")];
-    let cfg = SyncConfig::from_lookup(&|k| env.iter().find(|(a, _)| *a == k).map(|(_, v)| v.to_string()));
+    let env = [
+        ("HFS_SYNC_ENABLED", "false"),
+        ("HFS_SYNC_SAFETY_LAG_MS", "0"),
+    ];
+    let cfg = SyncConfig::from_lookup(&|k| {
+        env.iter()
+            .find(|(a, _)| *a == k)
+            .map(|(_, v)| v.to_string())
+    });
     let (svc, _) = helios_sync::build(
         &cfg,
         SyncDeps {
@@ -49,7 +65,9 @@ async fn service() -> (Arc<SyncService>, Arc<SqliteBackend>) {
             endpoints: Some(endpoints),
             local: Some(backend.clone()),
             copier: None,
-            key_ring: Some(Arc::new(SecretKeyRing::parse(&SecretKeyRing::generate_spec("k")).unwrap())),
+            key_ring: Some(Arc::new(
+                SecretKeyRing::parse(&SecretKeyRing::generate_spec("k")).unwrap(),
+            )),
             observer: None,
             audit: None,
             instance: "api-test".into(),
@@ -62,13 +80,22 @@ fn app(svc: &Arc<SyncService>) -> Router {
     routes_with(SyncApi::Fixed(svc.clone())).merge(notify_routes_with(SyncApi::Fixed(svc.clone())))
 }
 
-async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>, headers: &[(&str, &str)]) -> (StatusCode, axum::http::HeaderMap, Value) {
+async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Value) {
     let mut req = Request::builder().method(method).uri(uri);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
     let req = match body {
-        Some(b) => req.header("content-type", "application/json").body(Body::from(b.to_string())).unwrap(),
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(b.to_string()))
+            .unwrap(),
         None => req.body(Body::empty()).unwrap(),
     };
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -83,14 +110,29 @@ async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>, header
 async fn job_lifecycle_over_the_api() {
     let (svc, backend) = service().await;
     backend
-        .create_or_update(&tenant_context("default"), "Patient", "p1", json!({"resourceType": "Patient", "id": "p1"}), FhirVersion::R4)
+        .create_or_update(
+            &tenant_context("default"),
+            "Patient",
+            "p1",
+            json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::R4,
+        )
         .await
         .unwrap();
     let app = app(&svc);
 
     // Create (422 first).
-    let (s, _, oo) = call(&app, "POST", "/admin/sync/jobs", Some(json!({"name": "x", "source": {"kind": "endpoint", "name": "default"},
-        "target": {"kind": "endpoint", "name": "nope"}})), &[]).await;
+    let (s, _, oo) = call(
+        &app,
+        "POST",
+        "/admin/sync/jobs",
+        Some(
+            json!({"name": "x", "source": {"kind": "endpoint", "name": "default"},
+        "target": {"kind": "endpoint", "name": "nope"}}),
+        ),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(oo["resourceType"], "OperationOutcome");
     assert_eq!(oo["issue"][0]["expression"][0], "target.name");
@@ -113,46 +155,151 @@ async fn job_lifecycle_over_the_api() {
     // PUT with a stale If-Match → 412; with the right one → 200 + new ETag.
     let mut spec = job["spec"].clone();
     spec["description"] = json!("nightly");
-    let (s, _, _) = call(&app, "PUT", &format!("/admin/sync/jobs/{id}"), Some(spec.clone()), &[("if-match", "\"7\"")]).await;
+    let (s, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/admin/sync/jobs/{id}"),
+        Some(spec.clone()),
+        &[("if-match", "\"7\"")],
+    )
+    .await;
     assert_eq!(s, StatusCode::PRECONDITION_FAILED);
-    let (s, h, upd) = call(&app, "PUT", &format!("/admin/sync/jobs/{id}"), Some(spec), &[("if-match", "W/\"1\"")]).await;
+    let (s, h, upd) = call(
+        &app,
+        "PUT",
+        &format!("/admin/sync/jobs/{id}"),
+        Some(spec),
+        &[("if-match", "W/\"1\"")],
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{upd}");
     assert_eq!(h["etag"], "\"2\"");
-    let (s, _, _) = call(&app, "PUT", &format!("/admin/sync/jobs/{id}"), Some(json!({})), &[("if-match", "bogus")]).await;
+    let (s, _, _) = call(
+        &app,
+        "PUT",
+        &format!("/admin/sync/jobs/{id}"),
+        Some(json!({})),
+        &[("if-match", "bogus")],
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
     // Run → 202 + Location; second run while queued → 409.
-    let (s, h, run) = call(&app, "POST", &format!("/admin/sync/jobs/{id}/$run"), None, &[]).await;
+    let (s, h, run) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$run"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::ACCEPTED);
     let run_id = run["id"].as_str().unwrap().to_string();
     assert_eq!(h["location"], format!("/admin/sync/runs/{run_id}"));
-    let (s, _, _) = call(&app, "POST", &format!("/admin/sync/jobs/{id}/$run"), None, &[]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$run"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::CONFLICT);
     while svc.runtime().work_next(&WorkerId::new("w")).await.unwrap() {}
-    let (s, _, r) = call(&app, "GET", &format!("/admin/sync/runs/{run_id}"), None, &[]).await;
+    let (s, _, r) = call(
+        &app,
+        "GET",
+        &format!("/admin/sync/runs/{run_id}"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(r["state"], "succeeded", "{r}");
     assert_eq!(r["progress"]["created"], 1);
-    let (_, _, runs) = call(&app, "GET", &format!("/admin/sync/jobs/{id}/runs?limit=5"), None, &[]).await;
+    let (_, _, runs) = call(
+        &app,
+        "GET",
+        &format!("/admin/sync/jobs/{id}/runs?limit=5"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(runs["runs"].as_array().unwrap().len(), 1);
-    let (_, _, log) = call(&app, "GET", &format!("/admin/sync/runs/{run_id}/log?after=0&limit=50"), None, &[]).await;
+    let (_, _, log) = call(
+        &app,
+        "GET",
+        &format!("/admin/sync/runs/{run_id}/log?after=0&limit=50"),
+        None,
+        &[],
+    )
+    .await;
     assert!(!log["lines"].as_array().unwrap().is_empty());
-    let (_, _, c) = call(&app, "GET", &format!("/admin/sync/runs/{run_id}/conflicts"), None, &[]).await;
+    let (_, _, c) = call(
+        &app,
+        "GET",
+        &format!("/admin/sync/runs/{run_id}/conflicts"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(c["conflicts"], json!([]));
-    let (s, _, _) = call(&app, "POST", &format!("/admin/sync/runs/{run_id}/conflicts/Patient/p1/$resolve"), Some(json!({"action": "keep"})), &[]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/runs/{run_id}/conflicts/Patient/p1/$resolve"),
+        Some(json!({"action": "keep"})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
     // Cancel with nothing active → 409; retry after success → 409.
-    let (s, _, _) = call(&app, "POST", &format!("/admin/sync/jobs/{id}/$cancel"), None, &[]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$cancel"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::CONFLICT);
-    let (s, _, _) = call(&app, "POST", &format!("/admin/sync/jobs/{id}/$retry"), None, &[]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$retry"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::CONFLICT);
     // Queue one and cancel it.
-    call(&app, "POST", &format!("/admin/sync/jobs/{id}/$run"), None, &[]).await;
-    let (s, _, cancelled) = call(&app, "POST", &format!("/admin/sync/jobs/{id}/$cancel"), None, &[]).await;
+    call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$run"),
+        None,
+        &[],
+    )
+    .await;
+    let (s, _, cancelled) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$cancel"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(cancelled["state"], "cancelled");
-    let (s, _, _) = call(&app, "POST", &format!("/admin/sync/jobs/{id}/$retry"), None, &[]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/admin/sync/jobs/{id}/$retry"),
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::ACCEPTED);
 
     // Unknown ids → 404 OperationOutcome.
@@ -186,28 +333,65 @@ async fn secrets_are_write_only_and_notify_receiver() {
     let id = created["job"]["id"].as_str().unwrap().to_string();
     let (_, _, job) = call(&app, "GET", &format!("/admin/sync/jobs/{id}"), None, &[]).await;
     let text = job.to_string();
-    assert!(!text.contains("very-secret-token") && !text.contains("hmsec:") && !text.contains(&secret));
+    assert!(
+        !text.contains("very-secret-token") && !text.contains("hmsec:") && !text.contains(&secret)
+    );
     assert_eq!(job["spec"]["source"]["auth"]["token"], json!({"set": true}));
     // Plaintext in the peer is refused.
-    let (s, _, _) = call(&app, "POST", "/admin/sync/jobs", Some(json!({
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        "/admin/sync/jobs",
+        Some(json!({
         "name": "bad", "source": {"kind": "external", "baseUrl": "https://fhir.example.org/r4",
                                   "auth": {"type": "bearer", "token": "plain"}},
-        "target": {"kind": "endpoint", "name": "copy"}})), &[]).await;
+        "target": {"kind": "endpoint", "name": "copy"}})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
 
-    let (s, _, _) = call(&app, "POST", &format!("/sync/notify/{id}"), Some(json!({})), &[("x-sync-notify-secret", "wrong")]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/sync/notify/{id}"),
+        Some(json!({})),
+        &[("x-sync-notify-secret", "wrong")],
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-    let (s, _, _) = call(&app, "POST", &format!("/sync/notify/{id}"), Some(json!({})), &[("x-sync-notify-secret", &secret)]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        &format!("/sync/notify/{id}"),
+        Some(json!({})),
+        &[("x-sync-notify-secret", &secret)],
+    )
+    .await;
     assert_eq!(s, StatusCode::ACCEPTED);
 
     // Rewrap (same key) and duplicate through the API.
     let (s, _, r) = call(&app, "POST", "/admin/sync/$rewrap", None, &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(r["rewrapped"], 0);
-    let (s, _, d) = call(&app, "POST", "/admin/sync/duplicates", Some(json!({"source": "lab", "name": "lab2", "packages": false})), &[]).await;
+    let (s, _, d) = call(
+        &app,
+        "POST",
+        "/admin/sync/duplicates",
+        Some(json!({"source": "lab", "name": "lab2", "packages": false})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::ACCEPTED, "{d}");
     assert_eq!(d["endpoint"]["status"], "enabled");
-    let (s, _, _) = call(&app, "POST", "/admin/sync/duplicates", Some(json!({"source": "nope", "name": "x"})), &[]).await;
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        "/admin/sync/duplicates",
+        Some(json!({"source": "nope", "name": "x"})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     // Connection test of a local pair needs no network.
     let (s, _, t) = call(&app, "POST", "/admin/sync/jobs/$test", Some(json!({"name": "t",

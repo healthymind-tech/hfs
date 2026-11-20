@@ -121,7 +121,8 @@ pub enum WriteResult {
 #[async_trait]
 pub trait TargetWriter: Send + Sync {
     /// The target's current state of one resource.
-    async fn current(&self, resource_type: &str, id: &str) -> Result<Option<TargetInfo>, PeerError>;
+    async fn current(&self, resource_type: &str, id: &str)
+    -> Result<Option<TargetInfo>, PeerError>;
 
     /// Applies writes; one result per op, in order. An `Err` means nothing
     /// usable came back (the whole batch failed and may be retried).
@@ -132,7 +133,12 @@ impl WriteOp {
     /// `type/id` of the op.
     pub fn key(&self) -> String {
         match self {
-            WriteOp::Put { resource_type, id, .. } | WriteOp::Delete { resource_type, id, .. } => {
+            WriteOp::Put {
+                resource_type, id, ..
+            }
+            | WriteOp::Delete {
+                resource_type, id, ..
+            } => {
                 format!("{resource_type}/{id}")
             }
         }

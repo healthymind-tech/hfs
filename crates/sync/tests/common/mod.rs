@@ -103,18 +103,29 @@ impl Fixture {
         let mut r = body;
         r["resourceType"] = json!(rt);
         r["id"] = json!(id);
-        ResourceStorage::create_or_update(self.backend.as_ref(), &tenant_context(tenant), rt, id, r, FhirVersion::R4)
+        ResourceStorage::create_or_update(
+            self.backend.as_ref(),
+            &tenant_context(tenant),
+            rt,
+            id,
+            r,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap();
+    }
+
+    pub async fn delete(&self, tenant: &str, rt: &str, id: &str) {
+        ResourceStorage::delete(self.backend.as_ref(), &tenant_context(tenant), rt, id)
             .await
             .unwrap();
     }
 
-    pub async fn delete(&self, tenant: &str, rt: &str, id: &str) {
-        ResourceStorage::delete(self.backend.as_ref(), &tenant_context(tenant), rt, id).await.unwrap();
-    }
-
     pub async fn get(&self, tenant: &str, rt: &str, id: &str) -> Option<(String, Value)> {
         match ResourceStorage::read(self.backend.as_ref(), &tenant_context(tenant), rt, id).await {
-            Ok(Some(s)) if !s.is_deleted() => Some((s.version_id().to_string(), s.content().clone())),
+            Ok(Some(s)) if !s.is_deleted() => {
+                Some((s.version_id().to_string(), s.content().clone()))
+            }
             _ => None,
         }
     }

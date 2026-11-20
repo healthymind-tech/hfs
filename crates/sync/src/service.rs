@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
-use helios_endpoints::model::{EndpointSpec, EndpointStatus, ManagedBy, StorageBinding, ValidationErrors};
+use helios_endpoints::model::{
+    EndpointSpec, EndpointStatus, ManagedBy, StorageBinding, ValidationErrors,
+};
 use helios_endpoints::name::{EndpointName, EndpointPath};
 use helios_endpoints::store::{Actor, StoreError};
 use helios_endpoints::sync::{
@@ -46,7 +48,12 @@ pub fn follow_up_job(job: &SyncJob) -> Option<String> {
     let d = job.spec.description.as_deref()?;
     let i = d.find(FOLLOW_UP)?;
     let rest = &d[i + FOLLOW_UP.len()..];
-    Some(rest.split_whitespace().next()?.trim_end_matches('.').to_string())
+    Some(
+        rest.split_whitespace()
+            .next()?
+            .trim_end_matches('.')
+            .to_string(),
+    )
 }
 
 /// A job with its latest run, for lists.
@@ -137,7 +144,10 @@ pub fn global() -> Option<Arc<SyncService>> {
 fn peer_key(p: &SyncPeer) -> String {
     match p {
         SyncPeer::Endpoint { name } => format!("endpoint:{name}"),
-        SyncPeer::External(x) => format!("external:{}", x.base_url.trim_end_matches('/').to_ascii_lowercase()),
+        SyncPeer::External(x) => format!(
+            "external:{}",
+            x.base_url.trim_end_matches('/').to_ascii_lowercase()
+        ),
     }
 }
 
@@ -173,7 +183,9 @@ fn store_err(e: StoreError) -> SyncError {
         StoreError::NotFound(n) => SyncError::NotFound(format!("endpoint {n}")),
         StoreError::Conflict { current } => SyncError::Revision { current },
         StoreError::Invalid(v) => SyncError::Invalid(v),
-        StoreError::Duplicate { .. } | StoreError::Forbidden(_) => SyncError::Conflict(e.to_string()),
+        StoreError::Duplicate { .. } | StoreError::Forbidden(_) => {
+            SyncError::Conflict(e.to_string())
+        }
         StoreError::Unavailable(m) => SyncError::Unavailable(m),
     }
 }
@@ -201,12 +213,17 @@ impl SyncService {
 
     async fn audit(&self, action: &str, job: &SyncJob, actor: &str, ok: bool, desc: &str) {
         if let Some(a) = self.runtime.auditor() {
-            a.record(action, &job.id, &job.spec.name, actor, ok, desc).await;
+            a.record(action, &job.id, &job.spec.name, actor, ok, desc)
+                .await;
         }
     }
 
     /// Checks a spec against the registry, the policy and the other jobs.
-    pub async fn validate(&self, spec: &SyncJobSpec, job_id: Option<&str>) -> Result<(), SyncError> {
+    pub async fn validate(
+        &self,
+        spec: &SyncJobSpec,
+        job_id: Option<&str>,
+    ) -> Result<(), SyncError> {
         let mut e = match spec.validate() {
             Ok(()) => ValidationErrors::default(),
             Err(v) => v,
@@ -220,21 +237,33 @@ impl SyncService {
                     Some(ep) => {
                         releases.push(Some(ep.spec.fhir_version));
                         if env.local.is_none() {
-                            e.push(&format!("{field}.name"), "this server has no storage access for local endpoints");
+                            e.push(
+                                &format!("{field}.name"),
+                                "this server has no storage access for local endpoints",
+                            );
                         }
                     }
-                    None => e.push(&format!("{field}.name"), format!("endpoint {name:?} does not exist")),
+                    None => e.push(
+                        &format!("{field}.name"),
+                        format!("endpoint {name:?} does not exist"),
+                    ),
                 },
                 SyncPeer::External(x) => {
                     releases.push(x.fhir_version);
                     if !env.settings.external_allowed {
-                        e.push(&format!("{field}.kind"), "external peers are disabled (HFS_SYNC_EXTERNAL=off)");
+                        e.push(
+                            &format!("{field}.kind"),
+                            "external peers are disabled (HFS_SYNC_EXTERNAL=off)",
+                        );
                     }
                     if let Err(d) = env.http.policy().check_url(&x.base_url) {
                         e.push(&format!("{field}.baseUrl"), d.to_string());
                     }
-                    if let helios_endpoints::sync::ExternalAuth::ClientCredentials { token_url, .. }
-                    | helios_endpoints::sync::ExternalAuth::PrivateKeyJwt { token_url, .. } = &x.auth
+                    if let helios_endpoints::sync::ExternalAuth::ClientCredentials {
+                        token_url, ..
+                    }
+                    | helios_endpoints::sync::ExternalAuth::PrivateKeyJwt { token_url, .. } =
+                        &x.auth
                         && let Err(d) = env.http.policy().check_url(token_url)
                     {
                         e.push(&format!("{field}.auth.tokenUrl"), d.to_string());
@@ -245,7 +274,12 @@ impl SyncService {
         if let [Some(a), Some(b)] = releases.as_slice()
             && a != b
         {
-            e.push("target", format!("FHIR releases differ ({a:?} → {b:?}); version conversion is not supported"));
+            e.push(
+                "target",
+                format!(
+                    "FHIR releases differ ({a:?} → {b:?}); version conversion is not supported"
+                ),
+            );
         }
         if !spec.filters.is_empty() && matches!(spec.source, SyncPeer::Endpoint { .. }) {
             e.push("filters", "filters are supported for external sources only");
@@ -299,7 +333,8 @@ impl SyncService {
         let (spec, notify) = spec_from_body(body, &id, None, self.runtime.env.key_ring.as_deref())?;
         self.validate(&spec, None).await?;
         let job = self.store().create_job_with_id(&id, spec, actor).await?;
-        self.audit("create", &job, actor, true, "sync job created").await;
+        self.audit("create", &job, actor, true, "sync job created")
+            .await;
         let notify_path = matches!(job.spec.trigger, SyncTrigger::Subscription { .. })
             .then(|| format!("/admin/sync/jobs/{}/notify", job.id));
         Ok(CreatedJob {
@@ -311,9 +346,20 @@ impl SyncService {
 
     /// Replaces a job's spec (`expected_revision` from `If-Match`, or the
     /// current one when absent).
-    pub async fn update(&self, id: &str, expected_revision: Option<u64>, body: Value, actor: &str) -> Result<SyncJob, SyncError> {
+    pub async fn update(
+        &self,
+        id: &str,
+        expected_revision: Option<u64>,
+        body: Value,
+        actor: &str,
+    ) -> Result<SyncJob, SyncError> {
         let current = self.job(id).await?;
-        let (spec, _) = spec_from_body(body, id, Some(&current.spec), self.runtime.env.key_ring.as_deref())?;
+        let (spec, _) = spec_from_body(
+            body,
+            id,
+            Some(&current.spec),
+            self.runtime.env.key_ring.as_deref(),
+        )?;
         self.validate(&spec, Some(id)).await?;
         let rev = expected_revision.unwrap_or(current.revision);
         let disabled = current.spec.enabled && !spec.enabled;
@@ -322,7 +368,8 @@ impl SyncService {
             self.runtime.cancel_run(&r, "job disabled").await?;
         }
         self.runtime.env.wake.wake(id);
-        self.audit("update", &job, actor, true, "sync job updated").await;
+        self.audit("update", &job, actor, true, "sync job updated")
+            .await;
         Ok(job)
     }
 
@@ -333,7 +380,8 @@ impl SyncService {
             self.runtime.cancel_run(&r, "job deleted").await?;
         }
         self.store().delete_job(id).await?;
-        self.audit("delete", &job, actor, true, "sync job deleted").await;
+        self.audit("delete", &job, actor, true, "sync job deleted")
+            .await;
         Ok(())
     }
 
@@ -351,7 +399,8 @@ impl SyncService {
     pub async fn run_now(&self, id: &str, actor: &str) -> Result<SyncRun, SyncError> {
         let job = self.job(id).await?;
         let run = self.runtime.start_run(&job, RunReason::Manual).await?;
-        self.audit("run", &job, actor, true, &format!("run {} started", run.id)).await;
+        self.audit("run", &job, actor, true, &format!("run {} started", run.id))
+            .await;
         Ok(run)
     }
 
@@ -360,10 +409,21 @@ impl SyncService {
         let job = self.job(id).await?;
         match self.store().runs(id, 1).await?.into_iter().next() {
             Some(r) if matches!(r.state, SyncRunState::Failed | SyncRunState::Cancelled) => {}
-            _ => return Err(SyncError::Conflict("the latest run did not fail; nothing to retry".into())),
+            _ => {
+                return Err(SyncError::Conflict(
+                    "the latest run did not fail; nothing to retry".into(),
+                ));
+            }
         }
         let run = self.runtime.start_run(&job, RunReason::Retry).await?;
-        self.audit("retry", &job, actor, true, &format!("run {} resumes", run.id)).await;
+        self.audit(
+            "retry",
+            &job,
+            actor,
+            true,
+            &format!("run {} resumes", run.id),
+        )
+        .await;
         Ok(run)
     }
 
@@ -373,8 +433,17 @@ impl SyncService {
         let Some(r) = self.active_run(id).await? else {
             return Ok(None);
         };
-        self.runtime.cancel_run(&r, &format!("cancelled by {actor}")).await?;
-        self.audit("cancel", &job, actor, true, &format!("run {} cancelled", r.id)).await;
+        self.runtime
+            .cancel_run(&r, &format!("cancelled by {actor}"))
+            .await?;
+        self.audit(
+            "cancel",
+            &job,
+            actor,
+            true,
+            &format!("run {} cancelled", r.id),
+        )
+        .await;
         Ok(self.store().run(&r.id).await?)
     }
 
@@ -393,13 +462,25 @@ impl SyncService {
     }
 
     /// Log lines after `after`.
-    pub async fn log(&self, run_id: &str, after: u64, limit: usize) -> Result<Vec<SyncLogLine>, SyncError> {
+    pub async fn log(
+        &self,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<SyncLogLine>, SyncError> {
         self.run(run_id).await?;
-        Ok(self.store().log_lines(run_id, after, limit.min(1000)).await?)
+        Ok(self
+            .store()
+            .log_lines(run_id, after, limit.min(1000))
+            .await?)
     }
 
     /// A run's conflicts.
-    pub async fn conflicts(&self, run_id: &str, limit: usize) -> Result<Vec<SyncConflict>, SyncError> {
+    pub async fn conflicts(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SyncConflict>, SyncError> {
         self.run(run_id).await?;
         Ok(self.store().conflicts(run_id, limit.min(1000)).await?)
     }
@@ -423,21 +504,29 @@ impl SyncService {
             .iter()
             .any(|c| c.resource_type == resource_type && c.resource_id == resource_id);
         if !exists {
-            return Err(SyncError::NotFound(format!("conflict {resource_type}/{resource_id}")));
+            return Err(SyncError::NotFound(format!(
+                "conflict {resource_type}/{resource_id}"
+            )));
         }
         let env = &self.runtime.env;
         let result = match action {
             "overwrite" => {
-                let r = overwrite_one(env, &job, resource_type, resource_id).await.map_err(engine_err)?;
+                let r = overwrite_one(env, &job, resource_type, resource_id)
+                    .await
+                    .map_err(engine_err)?;
                 format!("{r:?}")
             }
             "keep" => {
-                keep_target(env, &job, resource_type, resource_id).await.map_err(engine_err)?;
+                keep_target(env, &job, resource_type, resource_id)
+                    .await
+                    .map_err(engine_err)?;
                 "kept".to_string()
             }
             _ => return Err(invalid("action", "must be overwrite or keep")),
         };
-        self.store().delete_conflict(run_id, resource_type, resource_id).await?;
+        self.store()
+            .delete_conflict(run_id, resource_type, resource_id)
+            .await?;
         self.audit(
             "resolve-conflict",
             &job,
@@ -455,7 +544,9 @@ impl SyncService {
         let Some(job) = self.store().job(job_id).await? else {
             return Ok(false);
         };
-        let Some(expected) = open_notify_secret(&job.spec, &job.id, self.runtime.env.key_ring.as_deref()) else {
+        let Some(expected) =
+            open_notify_secret(&job.spec, &job.id, self.runtime.env.key_ring.as_deref())
+        else {
             return Ok(false);
         };
         let ok = secret.is_some_and(|s| secrets_equal(s.as_bytes(), expected.expose()));
@@ -497,9 +588,16 @@ impl SyncService {
                 },
                 SyncPeer::External(x) => {
                     let r: Result<Value, String> = async {
-                        let auth = open_auth(&x.auth, &id, side, env.key_ring.as_deref()).map_err(|e| e.to_string())?;
-                        let c = FhirClient::new(env.http.clone(), &x.base_url, auth, x.headers.clone(), x.max_requests_per_second)
+                        let auth = open_auth(&x.auth, &id, side, env.key_ring.as_deref())
                             .map_err(|e| e.to_string())?;
+                        let c = FhirClient::new(
+                            env.http.clone(),
+                            &x.base_url,
+                            auth,
+                            x.headers.clone(),
+                            x.max_requests_per_second,
+                        )
+                        .map_err(|e| e.to_string())?;
                         ExternalSource::new(Arc::new(c), BTreeMap::new(), false, vec![])
                             .capability()
                             .await
@@ -509,7 +607,8 @@ impl SyncService {
                     match r {
                         Ok(cs) => {
                             t.ok = true;
-                            t.fhir_version = capability_release(&cs).map(|r| r.fhir_version_string().to_string());
+                            t.fhir_version = capability_release(&cs)
+                                .map(|r| r.fhir_version_string().to_string());
                             t.resource_types = capability_types(&cs).len();
                             t.software = cs
                                 .get("software")
@@ -528,13 +627,21 @@ impl SyncService {
 
     /// Re-seals every job secret under the active key of the server's ring.
     pub async fn rewrap_secrets(&self) -> Result<usize, SyncError> {
-        let ring = self.runtime.env.key_ring.clone().ok_or(SyncError::NoKeyRing)?;
+        let ring = self
+            .runtime
+            .env
+            .key_ring
+            .clone()
+            .ok_or(SyncError::NoKeyRing)?;
         Ok(self.rewrap_with(&ring).await?.rewrapped)
     }
 
     /// Re-seals every job secret not under `ring`'s active key (the
     /// `POST /admin/secrets/$rewrap` participant).
-    pub async fn rewrap_with(&self, ring: &helios_endpoints::secret::SecretKeyRing) -> Result<RewrapCounts, SyncError> {
+    pub async fn rewrap_with(
+        &self,
+        ring: &helios_endpoints::secret::SecretKeyRing,
+    ) -> Result<RewrapCounts, SyncError> {
         let mut out = RewrapCounts::default();
         for mut j in self.store().jobs().await? {
             let total = crate::secrets::sealed_count(&j.spec);
@@ -557,23 +664,30 @@ impl SyncService {
     /// endpoints exist) — used by the console's job page.
     pub async fn check_job(&self, id: &str) -> Result<(), SyncError> {
         let job = self.job(id).await?;
-        build_peers(&self.runtime.env, &job).map(|_| ()).map_err(engine_err)
+        build_peers(&self.runtime.env, &job)
+            .map(|_| ())
+            .map_err(engine_err)
     }
 
     /// Duplicates endpoint `source` (design §9.3).
-    pub async fn duplicate(&self, source: &str, req: DuplicateRequest, actor: &Actor) -> Result<DuplicateOutcome, SyncError> {
-        let endpoints = self
-            .runtime
-            .endpoints()
-            .cloned()
-            .ok_or_else(|| SyncError::Unavailable("this server has no endpoint store".into()))?;
+    pub async fn duplicate(
+        &self,
+        source: &str,
+        req: DuplicateRequest,
+        actor: &Actor,
+    ) -> Result<DuplicateOutcome, SyncError> {
+        let endpoints =
+            self.runtime.endpoints().cloned().ok_or_else(|| {
+                SyncError::Unavailable("this server has no endpoint store".into())
+            })?;
         let src = endpoints
             .get(source)
             .await
             .map_err(store_err)?
             .ok_or_else(|| SyncError::NotFound(format!("endpoint {source}")))?;
         let name = EndpointName::parse(&req.name).map_err(|e| invalid("name", e.to_string()))?;
-        let path = EndpointPath::parse(req.path.as_deref().unwrap_or(&req.name)).map_err(|e| invalid("path", e.to_string()))?;
+        let path = EndpointPath::parse(req.path.as_deref().unwrap_or(&req.name))
+            .map_err(|e| invalid("path", e.to_string()))?;
         let mut spec: EndpointSpec = src.spec.clone();
         spec.name = name.clone();
         spec.path = path;
@@ -597,22 +711,43 @@ impl SyncService {
         if req.secrets
             && let Some(sealed) = token
         {
-            let ring = self.runtime.env.key_ring.clone().ok_or(SyncError::NoKeyRing)?;
+            let ring = self
+                .runtime
+                .env
+                .key_ring
+                .clone()
+                .ok_or(SyncError::NoKeyRing)?;
             let plain = ring.open(&sealed, &format!("endpoint:{}:terminology.token", src.id))?;
             let mut s = created.spec.clone();
             if let Some(t) = s.terminology.as_mut() {
-                t.token = Some(ring.seal(plain.expose(), &format!("endpoint:{}:terminology.token", created.id)));
+                t.token = Some(ring.seal(
+                    plain.expose(),
+                    &format!("endpoint:{}:terminology.token", created.id),
+                ));
             }
-            created = endpoints.update(created.name(), created.revision, s, actor).await.map_err(store_err)?;
+            created = endpoints
+                .update(created.name(), created.revision, s, actor)
+                .await
+                .map_err(store_err)?;
         }
-        let _ = self.runtime.env.registry.reload_if_stale(endpoints.as_ref()).await;
+        let _ = self
+            .runtime
+            .env
+            .registry
+            .reload_if_stale(endpoints.as_ref())
+            .await;
         let new_name = created.name().to_string();
         if req.data == DuplicateData::None && !req.packages {
             let enabled = endpoints
                 .set_status(&new_name, created.revision, EndpointStatus::Enabled, actor)
                 .await
                 .map_err(store_err)?;
-            let _ = self.runtime.env.registry.reload_if_stale(endpoints.as_ref()).await;
+            let _ = self
+                .runtime
+                .env
+                .registry
+                .reload_if_stale(endpoints.as_ref())
+                .await;
             return Ok(DuplicateOutcome {
                 endpoint: enabled.redacted(),
                 job_id: None,
@@ -673,7 +808,10 @@ impl SyncService {
             &job,
             &actor.subject,
             true,
-            &format!("endpoint {source} duplicated into {new_name} (data {:?})", req.data),
+            &format!(
+                "endpoint {source} duplicated into {new_name} (data {:?})",
+                req.data
+            ),
         )
         .await;
         Ok(DuplicateOutcome {
@@ -708,10 +846,17 @@ mod tests {
 
     #[test]
     fn peer_keys_normalise() {
-        let a: SyncPeer = serde_json::from_value(json!({"kind": "external", "baseUrl": "https://X.org/fhir/"})).unwrap();
-        let b: SyncPeer = serde_json::from_value(json!({"kind": "external", "baseUrl": "https://x.org/fhir"})).unwrap();
+        let a: SyncPeer =
+            serde_json::from_value(json!({"kind": "external", "baseUrl": "https://X.org/fhir/"}))
+                .unwrap();
+        let b: SyncPeer =
+            serde_json::from_value(json!({"kind": "external", "baseUrl": "https://x.org/fhir"}))
+                .unwrap();
         assert_eq!(peer_key(&a), peer_key(&b));
-        assert_eq!(peer_key(&SyncPeer::Endpoint { name: "lab".into() }), "endpoint:lab");
+        assert_eq!(
+            peer_key(&SyncPeer::Endpoint { name: "lab".into() }),
+            "endpoint:lab"
+        );
     }
 
     #[test]
@@ -729,11 +874,29 @@ mod tests {
 
     #[test]
     fn error_mapping() {
-        assert!(matches!(store_err(StoreError::NotFound("x".into())), SyncError::NotFound(_)));
-        assert!(matches!(store_err(StoreError::Conflict { current: 2 }), SyncError::Revision { current: 2 }));
-        assert!(matches!(store_err(StoreError::Forbidden("no".into())), SyncError::Conflict(_)));
-        assert!(matches!(store_err(StoreError::Unavailable("db".into())), SyncError::Unavailable(_)));
-        assert!(matches!(store_err(StoreError::Invalid(ValidationErrors::default())), SyncError::Invalid(_)));
-        assert!(matches!(engine_err(EngineError::Failed("x".into())), SyncError::Unavailable(_)));
+        assert!(matches!(
+            store_err(StoreError::NotFound("x".into())),
+            SyncError::NotFound(_)
+        ));
+        assert!(matches!(
+            store_err(StoreError::Conflict { current: 2 }),
+            SyncError::Revision { current: 2 }
+        ));
+        assert!(matches!(
+            store_err(StoreError::Forbidden("no".into())),
+            SyncError::Conflict(_)
+        ));
+        assert!(matches!(
+            store_err(StoreError::Unavailable("db".into())),
+            SyncError::Unavailable(_)
+        ));
+        assert!(matches!(
+            store_err(StoreError::Invalid(ValidationErrors::default())),
+            SyncError::Invalid(_)
+        ));
+        assert!(matches!(
+            engine_err(EngineError::Failed("x".into())),
+            SyncError::Unavailable(_)
+        ));
     }
 }

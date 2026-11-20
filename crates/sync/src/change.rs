@@ -79,7 +79,9 @@ impl Change {
             "{}/{}/{}",
             self.resource_type,
             self.id,
-            self.version.as_deref().unwrap_or(if self.deleted { "deleted" } else { "-" })
+            self.version
+                .as_deref()
+                .unwrap_or(if self.deleted { "deleted" } else { "-" })
         )
     }
 }
@@ -119,10 +121,14 @@ mod tests {
         assert_eq!(c.last_updated.to_rfc3339(), "2026-01-02T03:04:05.678+00:00");
         assert_eq!(c.key(), "Patient/p-1");
         assert_eq!(c.token(), "Patient/p-1/3");
-        let bare = Change::from_resource(json!({"resourceType": "Patient", "id": "x"}), t0).unwrap();
+        let bare =
+            Change::from_resource(json!({"resourceType": "Patient", "id": "x"}), t0).unwrap();
         assert_eq!(bare.last_updated, t0);
         assert_eq!(bare.token(), "Patient/x/-");
-        assert_eq!(Change::delete("Patient", "x", None, t0).token(), "Patient/x/deleted");
+        assert_eq!(
+            Change::delete("Patient", "x", None, t0).token(),
+            "Patient/x/deleted"
+        );
     }
 
     #[test]
@@ -132,9 +138,7 @@ mod tests {
         assert!(
             Change::from_resource(json!({"resourceType": "Patient", "id": "../x"}), t0).is_none()
         );
-        assert!(
-            Change::from_resource(json!({"resourceType": "patient", "id": "x"}), t0).is_none()
-        );
+        assert!(Change::from_resource(json!({"resourceType": "patient", "id": "x"}), t0).is_none());
         assert!(valid_id("a.b-C9"));
         assert!(!valid_id(&"a".repeat(65)));
         assert!(!valid_type("Pa1"));

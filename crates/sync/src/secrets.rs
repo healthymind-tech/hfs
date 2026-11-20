@@ -37,7 +37,11 @@ pub fn aad(job_id: &str, path: &str) -> String {
     format!("sync-job:{job_id}:{path}")
 }
 
-fn current_secret(current: Option<&SyncJobSpec>, side: &str, auth_type: &str) -> Option<SealedSecret> {
+fn current_secret(
+    current: Option<&SyncJobSpec>,
+    side: &str,
+    auth_type: &str,
+) -> Option<SealedSecret> {
     let peer = match side {
         "source" => &current?.source,
         _ => &current?.target,
@@ -51,9 +55,12 @@ fn current_secret(current: Option<&SyncJobSpec>, side: &str, auth_type: &str) ->
         (ExternalAuth::ClientCredentials { client_secret, .. }, "client-credentials") => {
             Some(client_secret.clone())
         }
-        (ExternalAuth::PrivateKeyJwt { private_key_jwk, .. }, "private-key-jwt") => {
-            Some(private_key_jwk.clone())
-        }
+        (
+            ExternalAuth::PrivateKeyJwt {
+                private_key_jwk, ..
+            },
+            "private-key-jwt",
+        ) => Some(private_key_jwk.clone()),
         _ => None,
     }
 }
@@ -76,7 +83,15 @@ pub fn spec_from_body(
             .map_err(|e| crate::error::invalid("secrets", format!("invalid secret inputs: {e}")))?,
     };
     // Server-maintained fields are never taken from a body.
-    for k in ["id", "revision", "createdAt", "updatedAt", "createdBy", "nextRunAt", "spec"] {
+    for k in [
+        "id",
+        "revision",
+        "createdAt",
+        "updatedAt",
+        "createdBy",
+        "nextRunAt",
+        "spec",
+    ] {
         obj.remove(k);
     }
     let mut errors = ValidationErrors::default();
@@ -117,7 +132,10 @@ pub fn spec_from_body(
         let now = current_secret(current, side, &auth_type);
         match input.apply(now, ring, &aad(job_id, &path)) {
             Ok(Some(sealed)) => {
-                auth.insert(field.to_string(), Value::String(sealed.envelope().to_string()));
+                auth.insert(
+                    field.to_string(),
+                    Value::String(sealed.envelope().to_string()),
+                );
             }
             Ok(None) => errors.push(&path, "is required for this auth type"),
             Err(_) => return Err(SyncError::NoKeyRing),
@@ -296,16 +314,26 @@ pub fn open_notify_secret(
 }
 
 /// Re-seals every secret of `spec` under the active key (key rotation).
-pub fn rewrap(spec: &mut SyncJobSpec, job_id: &str, ring: &SecretKeyRing) -> Result<usize, SyncError> {
+pub fn rewrap(
+    spec: &mut SyncJobSpec,
+    job_id: &str,
+    ring: &SecretKeyRing,
+) -> Result<usize, SyncError> {
     let mut n = 0;
     for (side, peer) in [("source", &mut spec.source), ("target", &mut spec.target)] {
-        let SyncPeer::External(x) = peer else { continue };
+        let SyncPeer::External(x) = peer else {
+            continue;
+        };
         let (field, s): (&str, &mut SealedSecret) = match &mut x.auth {
             ExternalAuth::None => continue,
             ExternalAuth::Bearer { token } => ("token", token),
             ExternalAuth::Basic { password, .. } => ("password", password),
-            ExternalAuth::ClientCredentials { client_secret, .. } => ("clientSecret", client_secret),
-            ExternalAuth::PrivateKeyJwt { private_key_jwk, .. } => ("privateKeyJwk", private_key_jwk),
+            ExternalAuth::ClientCredentials { client_secret, .. } => {
+                ("clientSecret", client_secret)
+            }
+            ExternalAuth::PrivateKeyJwt {
+                private_key_jwk, ..
+            } => ("privateKeyJwk", private_key_jwk),
         };
         if ring.needs_rewrap(s) {
             *s = ring.rewrap(s, &aad(job_id, &format!("{side}.auth.{field}")))?;
@@ -344,7 +372,10 @@ pub fn sealed_count(spec: &SyncJobSpec) -> usize {
 pub fn secrets_equal(a: &[u8], b: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     let (x, y) = (Sha256::digest(a), Sha256::digest(b));
-    x.iter().zip(y.iter()).fold(0u8, |acc, (p, q)| acc | (p ^ q)) == 0
+    x.iter()
+        .zip(y.iter())
+        .fold(0u8, |acc, (p, q)| acc | (p ^ q))
+        == 0
 }
 
 #[cfg(test)]
@@ -371,16 +402,27 @@ mod tests {
         let r = ring();
         let (spec, notify) = spec_from_body(body(), "job1", None, Some(&r)).unwrap();
         assert!(notify.is_none());
-        let SyncPeer::External(x) = &spec.target else { panic!() };
-        let ExternalAuth::Bearer { token } = &x.auth else { panic!() };
+        let SyncPeer::External(x) = &spec.target else {
+            panic!()
+        };
+        let ExternalAuth::Bearer { token } = &x.auth else {
+            panic!()
+        };
         assert!(!token.envelope().contains("tok-123"));
         let opened = open_auth(&x.auth, "job1", "target", Some(&r)).unwrap();
-        let ResolvedAuth::Bearer(p) = opened else { panic!() };
+        let ResolvedAuth::Bearer(p) = opened else {
+            panic!()
+        };
         assert_eq!(p.expose_str(), Some("tok-123"));
         // Bound to the job id: another job's AAD does not open it.
         assert!(open_auth(&x.auth, "job2", "target", Some(&r)).is_err());
-        assert!(format!("{:?}", open_auth(&x.auth, "job1", "target", Some(&r)).unwrap())
-            .contains("redacted"));
+        assert!(
+            format!(
+                "{:?}",
+                open_auth(&x.auth, "job1", "target", Some(&r)).unwrap()
+            )
+            .contains("redacted")
+        );
 
         let job = SyncJob {
             id: "job1".into(),
@@ -394,7 +436,10 @@ mod tests {
         let shown = redacted_job(&job);
         let text = shown.to_string();
         assert!(!contains_envelope(&text));
-        assert_eq!(shown["spec"]["target"]["auth"]["token"], json!({"set": true}));
+        assert_eq!(
+            shown["spec"]["target"]["auth"]["token"],
+            json!({"set": true})
+        );
 
         // PUT back the GET response (marker = keep): the secret survives.
         let mut back = shown["spec"].clone();
@@ -415,15 +460,24 @@ mod tests {
         // Missing secret.
         let mut b = body();
         b.as_object_mut().unwrap().remove("secrets");
-        assert!(matches!(spec_from_body(b, "j", None, Some(&r)), Err(SyncError::Invalid(_))));
+        assert!(matches!(
+            spec_from_body(b, "j", None, Some(&r)),
+            Err(SyncError::Invalid(_))
+        ));
         // Plaintext in the peer itself.
         let mut b = body();
         b["target"]["auth"]["token"] = json!("plain");
-        assert!(matches!(spec_from_body(b, "j", None, Some(&r)), Err(SyncError::Invalid(_))));
+        assert!(matches!(
+            spec_from_body(b, "j", None, Some(&r)),
+            Err(SyncError::Invalid(_))
+        ));
         // Unknown secret path.
         let mut b = body();
         b["secrets"]["source.auth.token"] = json!({"set": "x"});
-        assert!(matches!(spec_from_body(b, "j", None, Some(&r)), Err(SyncError::Invalid(_))));
+        assert!(matches!(
+            spec_from_body(b, "j", None, Some(&r)),
+            Err(SyncError::Invalid(_))
+        ));
         // Not an object.
         assert!(spec_from_body(json!([1]), "j", None, Some(&r)).is_err());
         // Clear on a required secret.
@@ -453,7 +507,9 @@ mod tests {
         let (mut spec, notify) = spec_from_body(b, "j", None, Some(&r1)).unwrap();
         let notify = notify.expect("fresh notify secret");
         assert_eq!(
-            open_notify_secret(&spec, "j", Some(&r1)).unwrap().expose_str(),
+            open_notify_secret(&spec, "j", Some(&r1))
+                .unwrap()
+                .expose_str(),
             Some(notify.as_str())
         );
         // Updating keeps the notify secret (no new plaintext).
@@ -482,11 +538,15 @@ mod tests {
         assert_eq!(sealed_count(&s3), 1);
         assert_eq!(rewrap(&mut s3, "j3", &both).unwrap(), 1);
         let only_new = SecretKeyRing::parse(&k2).unwrap();
-        let SyncPeer::External(x) = &s3.target else { panic!() };
+        let SyncPeer::External(x) = &s3.target else {
+            panic!()
+        };
         assert!(open_auth(&x.auth, "j3", "target", Some(&only_new)).is_ok());
         assert_eq!(rewrap(&mut s3, "j3", &both).unwrap(), 0);
         assert_eq!(rewrap(&mut spec, "j", &r1).unwrap(), 0);
-        let SyncPeer::External(src) = &spec.source else { panic!() };
+        let SyncPeer::External(src) = &spec.source else {
+            panic!()
+        };
         assert!(matches!(
             open_auth(&src.auth, "j", "source", Some(&r1)).unwrap(),
             ResolvedAuth::ClientCredentials { .. }

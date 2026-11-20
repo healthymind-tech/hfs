@@ -111,8 +111,14 @@ impl SyncConfig {
             enabled: flag(get, "HFS_SYNC_ENABLED", true),
             engine,
             runtime,
-            outbound: OutboundPolicy::parse(&get(helios_endpoints::outbound::ALLOW_ENV).unwrap_or_default()),
-            http_timeout: Duration::from_secs(num::<u64>(get, "HFS_SYNC_HTTP_TIMEOUT_SECS").unwrap_or(60).clamp(5, 600)),
+            outbound: OutboundPolicy::parse(
+                &get(helios_endpoints::outbound::ALLOW_ENV).unwrap_or_default(),
+            ),
+            http_timeout: Duration::from_secs(
+                num::<u64>(get, "HFS_SYNC_HTTP_TIMEOUT_SECS")
+                    .unwrap_or(60)
+                    .clamp(5, 600),
+            ),
         }
     }
 }
@@ -142,7 +148,10 @@ pub struct SyncDeps {
 }
 
 /// Builds the service (and starts workers + scheduler when enabled).
-pub fn build(cfg: &SyncConfig, deps: SyncDeps) -> (Arc<SyncService>, Vec<tokio::task::JoinHandle<()>>) {
+pub fn build(
+    cfg: &SyncConfig,
+    deps: SyncDeps,
+) -> (Arc<SyncService>, Vec<tokio::task::JoinHandle<()>>) {
     let http = Arc::new(http::GuardedHttp::new(
         cfg.outbound.clone(),
         http::HttpSettings {
@@ -169,7 +178,11 @@ pub fn build(cfg: &SyncConfig, deps: SyncDeps) -> (Arc<SyncService>, Vec<tokio::
         deps.endpoints,
         deps.audit,
     ));
-    let handles = if cfg.enabled { runtime.spawn() } else { Vec::new() };
+    let handles = if cfg.enabled {
+        runtime.spawn()
+    } else {
+        Vec::new()
+    };
     (Arc::new(SyncService::new(runtime)), handles)
 }
 

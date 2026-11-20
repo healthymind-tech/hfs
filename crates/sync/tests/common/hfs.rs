@@ -25,7 +25,8 @@ pub async fn start_hfs() -> String {
     )
     .expect("sqlite");
     backend.init_schema().expect("schema");
-    let cache = std::env::temp_dir().join(format!("hfs-sync-test-{}", uuid::Uuid::new_v4().simple()));
+    let cache =
+        std::env::temp_dir().join(format!("hfs-sync-test-{}", uuid::Uuid::new_v4().simple()));
     let base = format!("http://127.0.0.1:{port}");
     let config = ServerConfig {
         seed_conformance: false,

@@ -206,7 +206,10 @@ impl GuardedHttp {
                 return Ok(c.clone());
             }
         }
-        let bare = host.trim_start_matches('[').trim_end_matches(']').to_string();
+        let bare = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(self.settings.timeout)
@@ -301,7 +304,10 @@ pub fn outcome_detail(body: &[u8]) -> String {
     };
     let issue = v.get("issue").and_then(|i| i.get(0));
     let text = issue
-        .and_then(|i| i.get("diagnostics").or_else(|| i.get("details").and_then(|d| d.get("text"))))
+        .and_then(|i| {
+            i.get("diagnostics")
+                .or_else(|| i.get("details").and_then(|d| d.get("text")))
+        })
         .and_then(Value::as_str)
         .unwrap_or("");
     if text.is_empty() {
@@ -340,10 +346,11 @@ impl FhirClient {
         headers: BTreeMap<String, String>,
         max_requests_per_second: Option<u32>,
     ) -> Result<Self, HttpError> {
-        let mut base = Url::parse(base_url.trim_end_matches('/')).map_err(|e| HttpError::Denied {
-            url: base_url.to_string(),
-            reason: e.to_string(),
-        })?;
+        let mut base =
+            Url::parse(base_url.trim_end_matches('/')).map_err(|e| HttpError::Denied {
+                url: base_url.to_string(),
+                reason: e.to_string(),
+            })?;
         base.set_query(None);
         base.set_fragment(None);
         http.policy()
@@ -376,16 +383,22 @@ impl FhirClient {
 
     /// `{base}/{relative}` (relative may carry a query).
     pub fn url(&self, relative: &str) -> Url {
-        let s = format!("{}/{}", self.base.as_str().trim_end_matches('/'), relative.trim_start_matches('/'));
+        let s = format!(
+            "{}/{}",
+            self.base.as_str().trim_end_matches('/'),
+            relative.trim_start_matches('/')
+        );
         Url::parse(&s).unwrap_or_else(|_| self.base.clone())
     }
 
     /// Refuses a server-supplied link that leaves the server's origin.
     pub fn check_link(&self, link: &str) -> Result<Url, HttpError> {
-        let u = Url::parse(link).or_else(|_| self.base.join(link)).map_err(|e| HttpError::Body {
-            url: display_url(&self.base),
-            reason: format!("bad link {link:?}: {e}"),
-        })?;
+        let u = Url::parse(link)
+            .or_else(|_| self.base.join(link))
+            .map_err(|e| HttpError::Body {
+                url: display_url(&self.base),
+                reason: format!("bad link {link:?}: {e}"),
+            })?;
         if !same_origin(&u, &self.base) {
             return Err(HttpError::Denied {
                 url: display_url(&u),
@@ -427,7 +440,11 @@ impl FhirClient {
                     form.push(("scope".into(), s.clone()));
                 }
                 let secret = client_secret.expose_str().unwrap_or_default();
-                (token_url.clone(), form, Some(basic_header(client_id, secret)))
+                (
+                    token_url.clone(),
+                    form,
+                    Some(basic_header(client_id, secret)),
+                )
             }
             ResolvedAuth::PrivateKeyJwt {
                 token_url,
@@ -437,8 +454,9 @@ impl FhirClient {
                 kid,
                 scope,
             } => {
-                let assertion = client_assertion(client_id, token_url, key.expose(), alg, kid.as_deref())
-                    .map_err(HttpError::Auth)?;
+                let assertion =
+                    client_assertion(client_id, token_url, key.expose(), alg, kid.as_deref())
+                        .map_err(HttpError::Auth)?;
                 let mut form = vec![
                     ("grant_type".to_string(), "client_credentials".to_string()),
                     (
@@ -459,7 +477,10 @@ impl FhirClient {
             .extend_pairs(form.iter())
             .finish();
         let mut headers = vec![
-            ("content-type".to_string(), "application/x-www-form-urlencoded".to_string()),
+            (
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
             ("accept".to_string(), "application/json".to_string()),
         ];
         if let Some(b) = basic {
@@ -511,10 +532,8 @@ impl FhirClient {
         loop {
             attempt += 1;
             self.bucket.acquire().await;
-            let mut headers: Vec<(String, String)> = vec![(
-                "accept".into(),
-                "application/fhir+json".into(),
-            )];
+            let mut headers: Vec<(String, String)> =
+                vec![("accept".into(), "application/fhir+json".into())];
             if payload.is_some() {
                 headers.push(("content-type".into(), "application/fhir+json".into()));
             }
@@ -572,7 +591,9 @@ impl FhirClient {
 
     /// `GET` that must answer 2xx with JSON.
     pub async fn get_json(&self, url: Url) -> Result<Value, HttpError> {
-        let resp = self.send(reqwest::Method::GET, url.clone(), None, &[]).await?;
+        let resp = self
+            .send(reqwest::Method::GET, url.clone(), None, &[])
+            .await?;
         if !resp.ok() {
             return Err(HttpError::Status {
                 url: display_url(&url),
@@ -653,9 +674,12 @@ pub fn client_assertion(
 fn jwk_to_pem(jwk: &str, alg: &str) -> Result<String, String> {
     use base64::Engine as _;
     use p384::pkcs8::EncodePrivateKey;
-    let v: Value = serde_json::from_str(jwk).map_err(|_| "private key is neither PEM nor a JWK".to_string())?;
+    let v: Value = serde_json::from_str(jwk)
+        .map_err(|_| "private key is neither PEM nor a JWK".to_string())?;
     if alg != "ES384" || v.get("kty").and_then(Value::as_str) != Some("EC") {
-        return Err("a JWK private key is supported for ES384 (P-384) only; give RS384 keys as PEM".into());
+        return Err(
+            "a JWK private key is supported for ES384 (P-384) only; give RS384 keys as PEM".into(),
+        );
     }
     if v.get("crv").and_then(Value::as_str) != Some("P-384") {
         return Err("ES384 needs a P-384 key".into());
@@ -667,7 +691,8 @@ fn jwk_to_pem(jwk: &str, alg: &str) -> Result<String, String> {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(d.trim_end_matches('='))
         .map_err(|_| "JWK d is not base64url".to_string())?;
-    let sk = p384::SecretKey::from_slice(&raw).map_err(|_| "JWK d is not a P-384 scalar".to_string())?;
+    let sk =
+        p384::SecretKey::from_slice(&raw).map_err(|_| "JWK d is not a P-384 scalar".to_string())?;
     sk.to_pkcs8_pem(p384::pkcs8::LineEnding::LF)
         .map(|z| z.to_string())
         .map_err(|e| format!("encoding the key: {e}"))
@@ -722,19 +747,51 @@ mod tests {
         ));
         // Allow-listed loopback over http is permitted (tests, internal peers).
         let allowed = GuardedHttp::new(OutboundPolicy::parse("127.0.0.1"), HttpSettings::default());
-        assert!(allowed.client_for(&Url::parse("http://127.0.0.1:9/").unwrap()).await.is_ok());
+        assert!(
+            allowed
+                .client_for(&Url::parse("http://127.0.0.1:9/").unwrap())
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
     fn client_links_stay_on_origin() {
-        let http = Arc::new(GuardedHttp::new(OutboundPolicy::strict(), HttpSettings::default()));
-        let c = FhirClient::new(http.clone(), "https://fhir.example.org/base/", ResolvedAuth::None, BTreeMap::new(), None)
-            .unwrap();
-        assert_eq!(c.url("Patient?_count=2").as_str(), "https://fhir.example.org/base/Patient?_count=2");
-        assert!(c.check_link("https://fhir.example.org/base?_getpages=x").is_ok());
+        let http = Arc::new(GuardedHttp::new(
+            OutboundPolicy::strict(),
+            HttpSettings::default(),
+        ));
+        let c = FhirClient::new(
+            http.clone(),
+            "https://fhir.example.org/base/",
+            ResolvedAuth::None,
+            BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            c.url("Patient?_count=2").as_str(),
+            "https://fhir.example.org/base/Patient?_count=2"
+        );
+        assert!(
+            c.check_link("https://fhir.example.org/base?_getpages=x")
+                .is_ok()
+        );
         assert!(c.check_link("?page=2").is_ok());
-        assert!(matches!(c.check_link("https://evil.example.org/x"), Err(HttpError::Denied { .. })));
-        assert!(FhirClient::new(http, "http://fhir.example.org", ResolvedAuth::None, BTreeMap::new(), None).is_err());
+        assert!(matches!(
+            c.check_link("https://evil.example.org/x"),
+            Err(HttpError::Denied { .. })
+        ));
+        assert!(
+            FhirClient::new(
+                http,
+                "http://fhir.example.org",
+                ResolvedAuth::None,
+                BTreeMap::new(),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -747,9 +804,18 @@ mod tests {
                 break k;
             }
         };
-        let pem = sk.to_pkcs8_pem(p384::pkcs8::LineEnding::LF).unwrap().to_string();
-        let jwt = client_assertion("cid", "https://t.example.org/token", pem.as_bytes(), "ES384", Some("k"))
-            .unwrap();
+        let pem = sk
+            .to_pkcs8_pem(p384::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let jwt = client_assertion(
+            "cid",
+            "https://t.example.org/token",
+            pem.as_bytes(),
+            "ES384",
+            Some("k"),
+        )
+        .unwrap();
         assert_eq!(jwt.split('.').count(), 3);
         // Same key as a JWK.
         use base64::Engine as _;
