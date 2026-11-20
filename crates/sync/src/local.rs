@@ -141,7 +141,8 @@ pub enum GateVerdict {
 pub trait LocalWriteHooks: Send + Sync {
     /// Validates `resource` (may clean it, as a normal write does) for
     /// endpoint `endpoint`.
-    async fn check(&self, endpoint: &str, resource_type: &str, resource: &mut Value) -> GateVerdict;
+    async fn check(&self, endpoint: &str, resource_type: &str, resource: &mut Value)
+    -> GateVerdict;
     /// A resource was committed at `endpoint`.
     fn written(&self, endpoint: &str, resource_type: &str, resource: &Value);
 }
@@ -461,7 +462,11 @@ impl TargetWriter for LocalTarget {
                         Ok((stored, created)) => {
                             let v = stored.version_id().to_string();
                             if let Some(h) = &self.hooks {
-                                h.written(&self.endpoint, &resource_type, &stored.content_with_meta());
+                                h.written(
+                                    &self.endpoint,
+                                    &resource_type,
+                                    &stored.content_with_meta(),
+                                );
                             }
                             let kind = if created {
                                 WriteKind::Create

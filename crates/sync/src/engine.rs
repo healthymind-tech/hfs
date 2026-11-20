@@ -428,7 +428,8 @@ impl RunState<'_> {
         let findings = target.take_findings();
         let total = findings.len();
         for f in findings.into_iter().take(50) {
-            self.log(LogLevel::Warn, format!("validation (log): {f}")).await;
+            self.log(LogLevel::Warn, format!("validation (log): {f}"))
+                .await;
         }
         if total > 50 {
             self.log(
@@ -475,7 +476,8 @@ type PlannedWrite<'a> = (WriteOp, &'a Change, Option<[u8; 32]>);
 /// Whether source and target endpoints apply the same write policy
 /// (validation and terminology sections, inherited counting as equal).
 pub fn same_write_policy(env: &EngineEnv, spec: &helios_endpoints::sync::SyncJobSpec) -> bool {
-    let (SyncPeer::Endpoint { name: a }, SyncPeer::Endpoint { name: b }) = (&spec.source, &spec.target)
+    let (SyncPeer::Endpoint { name: a }, SyncPeer::Endpoint { name: b }) =
+        (&spec.source, &spec.target)
     else {
         return false;
     };
@@ -492,9 +494,11 @@ pub fn same_write_policy(env: &EngineEnv, spec: &helios_endpoints::sync::SyncJob
 /// target's write hooks so this instance's validation profile registry has
 /// them at once (other instances follow the database change feed).
 async fn register_copied_definitions(st: &RunState<'_>, tenant: &str) -> Result<(), EngineError> {
-    let (Some(hooks), Some(local), SyncPeer::Endpoint { name }) =
-        (st.env.hooks.get(), st.env.local.clone(), &st.job.spec.target)
-    else {
+    let (Some(hooks), Some(local), SyncPeer::Endpoint { name }) = (
+        st.env.hooks.get(),
+        st.env.local.clone(),
+        &st.job.spec.target,
+    ) else {
         return Ok(());
     };
     let source = LocalSource::new(local, tenant);

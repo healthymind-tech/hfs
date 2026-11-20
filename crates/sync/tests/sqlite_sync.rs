@@ -658,12 +658,16 @@ async fn write_waker_wakes_continuous_jobs_of_the_written_tenant() {
     // A write elsewhere does not wake it.
     waker.on_write(&write("c"));
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), notify.notified()).await.is_err()
+        tokio::time::timeout(Duration::from_millis(100), notify.notified())
+            .await
+            .is_err()
     );
     // A write in its source tenant does.
     waker.on_write(&write("a"));
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), notify.notified()).await.is_ok()
+        tokio::time::timeout(Duration::from_millis(500), notify.notified())
+            .await
+            .is_ok()
     );
     assert!(!waker.retired());
 }

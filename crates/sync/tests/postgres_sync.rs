@@ -488,7 +488,8 @@ impl helios_sync::local::LocalWriteHooks for StrictHooks {
 
     fn written(&self, _ep: &str, rt: &str, _r: &Value) {
         if rt == "StructureDefinition" {
-            self.written_definitions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.written_definitions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -500,9 +501,13 @@ async fn postgres_integration_storage_copy_only_between_identical_write_policies
     let (src, same, strict) = (uniq("v"), uniq("w"), uniq("x"));
     let store: Arc<dyn helios_endpoints::store::EndpointStore> =
         Arc::new(helios_endpoints::store::MemoryEndpointStore::new());
-    helios_endpoints::store::ensure_default_endpoint(store.as_ref(), "default", helios_endpoints::FhirRelease::R4)
-        .await
-        .unwrap();
+    helios_endpoints::store::ensure_default_endpoint(
+        store.as_ref(),
+        "default",
+        helios_endpoints::FhirRelease::R4,
+    )
+    .await
+    .unwrap();
     for (name, enforce) in [(&src, false), (&same, false), (&strict, true)] {
         let mut spec = helios_endpoints::model::EndpointSpec::named(
             helios_endpoints::name::EndpointName::parse(name).unwrap(),
@@ -514,13 +519,34 @@ async fn postgres_integration_storage_copy_only_between_identical_write_policies
                 ..Default::default()
             });
         }
-        store.create(spec, &helios_endpoints::store::Actor::bootstrap()).await.unwrap();
+        store
+            .create(spec, &helios_endpoints::store::Actor::bootstrap())
+            .await
+            .unwrap();
     }
-    let registry = Arc::new(helios_endpoints::registry::EndpointRegistry::load(store.as_ref()).await.unwrap());
+    let registry = Arc::new(
+        helios_endpoints::registry::EndpointRegistry::load(store.as_ref())
+            .await
+            .unwrap(),
+    );
     put(&b, &src, "Patient", "p1", json!({})).await;
-    put(&b, &src, "Observation", "o1", json!({"status": "final", "code": {"text": "x"}})).await;
-    put(&b, &src, "StructureDefinition", "sd1", json!({"url": "http://x/sd1", "name": "X", "status": "active",
-        "kind": "resource", "abstract": false, "type": "Patient"})).await;
+    put(
+        &b,
+        &src,
+        "Observation",
+        "o1",
+        json!({"status": "final", "code": {"text": "x"}}),
+    )
+    .await;
+    put(
+        &b,
+        &src,
+        "StructureDefinition",
+        "sd1",
+        json!({"url": "http://x/sd1", "name": "X", "status": "active",
+        "kind": "resource", "abstract": false, "type": "Patient"}),
+    )
+    .await;
     let svc = instance(b.clone(), store, registry, "policy").await;
     let hooks = Arc::new(StrictHooks::default());
     assert!(svc.set_local_write_hooks(hooks.clone()));
@@ -531,26 +557,52 @@ async fn postgres_integration_storage_copy_only_between_identical_write_policies
     };
     // Same policy: in-database copy (validation exempt), then the copied
     // definitions are registered with the target's write path.
-    let id = svc.create(copy_job(&same), "t").await.unwrap().job["id"].as_str().unwrap().to_string();
+    let id = svc.create(copy_job(&same), "t").await.unwrap().job["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let run = svc.run_now(&id, "t").await.unwrap();
     drain(&svc, "w").await;
     let r = svc.run(&run.id).await.unwrap();
     assert_eq!(r.state, SyncRunState::Succeeded, "{:?}", r.error);
-    assert_eq!(count(&b, "resources", &same).await, 3, "copied in the database, Observation included");
-    assert_eq!(hooks.written_definitions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        count(&b, "resources", &same).await,
+        3,
+        "copied in the database, Observation included"
+    );
+    assert_eq!(
+        hooks
+            .written_definitions
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     let log = svc.log(&run.id, 0, 50).await.unwrap();
-    assert!(log.iter().any(|l| l.message.contains("storage copy finished")));
+    assert!(
+        log.iter()
+            .any(|l| l.message.contains("storage copy finished"))
+    );
 
     // Different policy: copied through the target's validation path.
-    let id = svc.create(copy_job(&strict), "t").await.unwrap().job["id"].as_str().unwrap().to_string();
+    let id = svc.create(copy_job(&strict), "t").await.unwrap().job["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let run = svc.run_now(&id, "t").await.unwrap();
     drain(&svc, "w").await;
     let r = svc.run(&run.id).await.unwrap();
     assert_eq!(r.state, SyncRunState::Succeeded, "{:?}", r.error);
     assert_eq!(r.progress.failed, 1, "{:?}", r.progress);
-    assert_eq!(count(&b, "resources", &strict).await, 2, "Observation rejected");
+    assert_eq!(
+        count(&b, "resources", &strict).await,
+        2,
+        "Observation rejected"
+    );
     let log = svc.log(&run.id, 0, 50).await.unwrap();
-    assert!(log.iter().any(|l| l.message.contains("validate differently")), "{log:#?}");
+    assert!(
+        log.iter()
+            .any(|l| l.message.contains("validate differently")),
+        "{log:#?}"
+    );
 }
 
 #[tokio::test]
@@ -561,16 +613,25 @@ async fn postgres_integration_notify_wakes_the_run_on_another_instance() {
     let svc_a = instance(a.clone(), endpoints.clone(), registry.clone(), "wake-a").await;
     let s = shared().await;
     let mut listen = helios_endpoints::pg::tokio_postgres::Config::new();
-    listen.host(&s.host).port(s.port).dbname("postgres").user("postgres").password("postgres");
+    listen
+        .host(&s.host)
+        .port(s.port)
+        .dbname("postgres")
+        .user("postgres")
+        .password("postgres");
     let listener = helios_sync::pg_wake::install(svc_a.runtime(), a.shared_pool(), listen);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let job = uniq("job-");
     let notify = svc_a.runtime().env.wake.get(&job);
     // Published through instance B's pool.
     use helios_sync::runtime::RemoteWake;
-    helios_sync::pg_wake::PgRemoteWake::new(b.shared_pool()).publish(&job).await;
+    helios_sync::pg_wake::PgRemoteWake::new(b.shared_pool())
+        .publish(&job)
+        .await;
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), notify.notified()).await.is_ok(),
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .is_ok(),
         "woken through LISTEN/NOTIFY"
     );
     listener.abort();

@@ -175,11 +175,15 @@ impl SyncRuntime {
         let snap = self.env.registry.snapshot();
         let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
         for j in jobs.iter().filter(|j| j.spec.enabled) {
-            if let (SyncTrigger::Continuous { .. }, helios_endpoints::sync::SyncPeer::Endpoint { name }) =
-                (&j.spec.trigger, &j.spec.source)
+            if let (
+                SyncTrigger::Continuous { .. },
+                helios_endpoints::sync::SyncPeer::Endpoint { name },
+            ) = (&j.spec.trigger, &j.spec.source)
                 && let Some(ep) = snap.by_name(name)
             {
-                map.entry(ep.tenant_id().to_string()).or_default().push(j.id.clone());
+                map.entry(ep.tenant_id().to_string())
+                    .or_default()
+                    .push(j.id.clone());
             }
         }
         *self.tenant_jobs.write().unwrap_or_else(|p| p.into_inner()) = map;

@@ -93,16 +93,27 @@ async fn sync_writes_follow_target_validation_and_duplicates_validate_at_once() 
         .and_then(|p| p.parent())
         .map(|p| p.join("data"));
     let backend = Arc::new(
-        SqliteBackend::with_config(":memory:", SqliteBackendConfig { data_dir, ..Default::default() })
-            .unwrap(),
+        SqliteBackend::with_config(
+            ":memory:",
+            SqliteBackendConfig {
+                data_dir,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
     );
     backend.init_schema().unwrap();
 
     // The sync service, installed before the app (the app installs its
     // write path into it).
-    let env = [("HFS_SYNC_ENABLED", "false"), ("HFS_SYNC_SAFETY_LAG_MS", "0")];
+    let env = [
+        ("HFS_SYNC_ENABLED", "false"),
+        ("HFS_SYNC_SAFETY_LAG_MS", "0"),
+    ];
     let cfg = helios_sync::SyncConfig::from_lookup(&|k| {
-        env.iter().find(|(x, _)| *x == k).map(|(_, v)| v.to_string())
+        env.iter()
+            .find(|(x, _)| *x == k)
+            .map(|(_, v)| v.to_string())
     });
     let (svc, _) = helios_sync::build(
         &cfg,
@@ -145,8 +156,22 @@ async fn sync_writes_follow_target_validation_and_duplicates_validate_at_once() 
     let server = TestServer::new(app).unwrap();
 
     // Source data: one Observation that is not a vital-signs Observation.
-    put(&backend, "src", "Observation", "o1", json!({"status": "final", "code": {"text": "glucose"}})).await;
-    put(&backend, "src", "Patient", "p1", json!({"gender": "female"})).await;
+    put(
+        &backend,
+        "src",
+        "Observation",
+        "o1",
+        json!({"status": "final", "code": {"text": "glucose"}}),
+    )
+    .await;
+    put(
+        &backend,
+        "src",
+        "Patient",
+        "p1",
+        json!({"gender": "female"}),
+    )
+    .await;
 
     let worker = WorkerId::new("w");
     let run_job = |target: &'static str| {
@@ -174,36 +199,70 @@ async fn sync_writes_follow_target_validation_and_duplicates_validate_at_once() 
     assert_eq!(r.state, SyncRunState::Succeeded, "{:?}", r.error);
     assert_eq!(r.progress.failed, 1, "{:?}", r.progress);
     assert_eq!(r.progress.created, 1, "{:?}", r.progress);
-    assert!(!present(&backend, "enf", "Observation", "o1").await, "rejected under enforce");
+    assert!(
+        !present(&backend, "enf", "Observation", "o1").await,
+        "rejected under enforce"
+    );
     assert!(present(&backend, "enf", "Patient", "p1").await);
     let conflicts = svc.conflicts(&r.id, 10).await.unwrap();
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].resource_id, "o1");
-    assert!(conflicts[0].reason.contains("rejected by target validation"), "{}", conflicts[0].reason);
-    assert!(conflicts[0].reason.contains("OperationOutcome"), "{}", conflicts[0].reason);
+    assert!(
+        conflicts[0]
+            .reason
+            .contains("rejected by target validation"),
+        "{}",
+        conflicts[0].reason
+    );
+    assert!(
+        conflicts[0].reason.contains("OperationOutcome"),
+        "{}",
+        conflicts[0].reason
+    );
     let log = svc.log(&r.id, 0, 100).await.unwrap();
-    assert!(log.iter().any(|l| l.message.contains("Observation/o1") && l.message.contains("rejected")));
+    assert!(
+        log.iter()
+            .any(|l| l.message.contains("Observation/o1") && l.message.contains("rejected"))
+    );
 
     // log: written, findings recorded in the run log.
     let r = run_job("logep").await;
-    assert_eq!((r.progress.created, r.progress.failed), (2, 0), "{:?}", r.progress);
+    assert_eq!(
+        (r.progress.created, r.progress.failed),
+        (2, 0),
+        "{:?}",
+        r.progress
+    );
     assert!(present(&backend, "logep", "Observation", "o1").await);
     let log = svc.log(&r.id, 0, 200).await.unwrap();
     assert!(
-        log.iter().any(|l| l.message.starts_with("validation (log): Observation/o1")),
+        log.iter()
+            .any(|l| l.message.starts_with("validation (log): Observation/o1")),
         "{log:#?}"
     );
 
     // off: written, nothing recorded.
     let r = run_job("offep").await;
-    assert_eq!((r.progress.created, r.progress.failed), (2, 0), "{:?}", r.progress);
+    assert_eq!(
+        (r.progress.created, r.progress.failed),
+        (2, 0),
+        "{:?}",
+        r.progress
+    );
     assert!(present(&backend, "offep", "Observation", "o1").await);
     let log = svc.log(&r.id, 0, 200).await.unwrap();
     assert!(!log.iter().any(|l| l.message.contains("validation (log)")));
 
     // Duplicate an endpoint holding an IG profile: `$validate` on the copy
     // applies it immediately.
-    put(&backend, "igsrc", "StructureDefinition", "p-gender", gender_profile()).await;
+    put(
+        &backend,
+        "igsrc",
+        "StructureDefinition",
+        "p-gender",
+        gender_profile(),
+    )
+    .await;
     let out = svc
         .duplicate(
             "igsrc",
@@ -228,7 +287,9 @@ async fn sync_writes_follow_target_validation_and_duplicates_validate_at_once() 
     let issues = outcome["issue"].as_array().unwrap();
     assert!(
         issues.iter().any(|i| i["code"] == "required"
-            && i["expression"][0].as_str().is_some_and(|e| e.contains("gender"))),
+            && i["expression"][0]
+                .as_str()
+                .is_some_and(|e| e.contains("gender"))),
         "copied profile enforced on the duplicate: {outcome}"
     );
     // A conforming Patient passes the same check.

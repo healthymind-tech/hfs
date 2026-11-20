@@ -532,7 +532,11 @@ impl EndpointWriteHooks {
         }
     }
 
-    fn resolve(&self, endpoint: &str, resource_type: &str) -> Option<helios_endpoints::ResolvedEndpoint> {
+    fn resolve(
+        &self,
+        endpoint: &str,
+        resource_type: &str,
+    ) -> Option<helios_endpoints::ResolvedEndpoint> {
         let snap = self.registry.snapshot();
         let ep = snap.by_name(endpoint)?.clone();
         let prefix = ep.prefix();
@@ -546,7 +550,8 @@ impl EndpointWriteHooks {
     }
 
     fn version_of(&self, r: &helios_endpoints::ResolvedEndpoint) -> helios_fhir::FhirVersion {
-        crate::endpoint::fhir_version_of(r.endpoint.spec.fhir_version).unwrap_or(self.default_version)
+        crate::endpoint::fhir_version_of(r.endpoint.spec.fhir_version)
+            .unwrap_or(self.default_version)
     }
 }
 
@@ -569,7 +574,11 @@ fn outcome_summary(outcome: &Value) -> String {
                 .or_else(|| i.get("details").and_then(|d| d.get("text")))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if path.is_empty() { msg.to_string() } else { format!("{path}: {msg}") }
+            if path.is_empty() {
+                msg.to_string()
+            } else {
+                format!("{path}: {msg}")
+            }
         })
         .collect();
     format!("validation failed (enforce): {}", issues.join("; "))
@@ -609,7 +618,10 @@ impl helios_sync::local::LocalWriteHooks for EndpointWriteHooks {
         let rt = resource_type.to_string();
         crate::endpoint::scope(resolved, async move {
             let mode = validation.effective_mode();
-            match validation.prepare_write(&tenant, version, &rt, resource).await {
+            match validation
+                .prepare_write(&tenant, version, &rt, resource)
+                .await
+            {
                 Err(crate::error::RestError::ValidationFailed { outcome }) => GateVerdict::Reject {
                     reason: outcome_summary(&outcome),
                     outcome,
