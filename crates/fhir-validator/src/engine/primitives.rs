@@ -178,13 +178,18 @@ fn hl7_url_names_nothing(ctx: &WalkCtx<'_>, url: &str) -> bool {
     // names a resource type. Without one, the url names nothing.
     let resolver = ctx.resolver();
     let segments: Vec<&str> = url.split('/').collect();
-    let Some(index) = segments.iter().enumerate().skip(1).find_map(|(i, segment)| {
-        (segment.starts_with(|c: char| c.is_ascii_uppercase())
-            && resolver
-                .resolve(segment)
-                .is_some_and(|s| crate::editor::is_resource(&s)))
-        .then_some(i)
-    }) else {
+    let Some(index) = segments
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(i, segment)| {
+            (segment.starts_with(|c: char| c.is_ascii_uppercase())
+                && resolver
+                    .resolve(segment)
+                    .is_some_and(|s| crate::editor::is_resource(&s)))
+            .then_some(i)
+        })
+    else {
         // No base. Canonical resources of the core spec and of packages
         // live one or two segments below `…/fhir` (`…/fhir/concept-properties`,
         // a CodeSystem; a package canonical `…/fhir/us/core`), and the HL7

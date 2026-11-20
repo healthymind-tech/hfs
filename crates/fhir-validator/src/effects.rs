@@ -560,7 +560,7 @@ fn native_outcome(
     let items: Vec<(&Value, Option<&Value>)> = match (node, parent) {
         // A whole array as focus: every item.
         (Value::Array(items), Some((p, name, None))) => {
-            let side = p.get(&format!("_{name}")).and_then(Value::as_array);
+            let side = p.get(format!("_{name}")).and_then(Value::as_array);
             items
                 .iter()
                 .enumerate()
@@ -568,14 +568,17 @@ fn native_outcome(
                 .collect()
         }
         (node, Some((p, name, index))) => {
-            let side = p.get(&format!("_{name}"));
+            let side = p.get(format!("_{name}"));
             let side = match index {
                 Some(i) => side.and_then(Value::as_array).and_then(|s| s.get(i)),
                 None => side.filter(|s| s.is_object()),
             };
             // Reached through the sidecar key itself: the value may sit
             // under the plain name.
-            let value = match (node.is_object() && side.is_some_and(|s| std::ptr::eq(s, node)), index) {
+            let value = match (
+                node.is_object() && side.is_some_and(|s| std::ptr::eq(s, node)),
+                index,
+            ) {
                 (true, None) => p.get(name).unwrap_or(&Value::Null),
                 (true, Some(i)) => p
                     .get(name)
@@ -592,7 +595,9 @@ fn native_outcome(
         let non_id_member = |v: &Value| {
             v.as_object().is_some_and(|o| {
                 o.iter().any(|(k, v)| {
-                    k != "id" && k != "fhir_comments" && !v.is_null()
+                    k != "id"
+                        && k != "fhir_comments"
+                        && !v.is_null()
                         && !(v.is_array() && v.as_array().is_some_and(|a| a.is_empty()))
                 })
             })
@@ -605,7 +610,9 @@ fn native_outcome(
                 // its children. A sidecar with only an id is reported by the
                 // walk itself (it is an ele-1 failure the typed model never
                 // sees), so it passes here rather than twice.
-                _ => side.is_none_or(|s| non_id_member(s) || s.as_object().is_some_and(|o| o.keys().all(|k| k == "id"))),
+                _ => side.is_none_or(|s| {
+                    non_id_member(s) || s.as_object().is_some_and(|o| o.keys().all(|k| k == "id"))
+                }),
             }
         } else {
             let Some(obj) = value.as_object() else {
@@ -649,7 +656,10 @@ fn native_resource_rule(
         })
     }
     fn items<'v>(v: &'v Value, k: &str) -> &'v [Value] {
-        v.get(k).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+        v.get(k)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
     fn bundle_type(v: &Value) -> &str {
         v.get("type").and_then(Value::as_str).unwrap_or_default()
@@ -661,64 +671,72 @@ fn native_resource_rule(
         ("dom-4", "contained.meta.versionId.empty() and contained.meta.lastUpdated.empty()") => {
             |r| {
                 items(r, "contained").iter().all(|c| {
-                    c.get("meta").is_none_or(|m| !has(m, "versionId") && !has(m, "lastUpdated"))
+                    c.get("meta")
+                        .is_none_or(|m| !has(m, "versionId") && !has(m, "lastUpdated"))
                 })
             }
         }
-        ("dom-5", "contained.meta.security.empty()") => {
-            |r| items(r, "contained").iter().all(|c| c.get("meta").is_none_or(|m| !has(m, "security")))
-        }
+        ("dom-5", "contained.meta.security.empty()") => |r| {
+            items(r, "contained")
+                .iter()
+                .all(|c| c.get("meta").is_none_or(|m| !has(m, "security")))
+        },
         ("bdl-1", "total.empty() or (type = 'searchset') or (type = 'history')") => {
             |b| !has(b, "total") || matches!(bundle_type(b), "searchset" | "history")
         }
         ("bdl-2", "entry.search.empty() or (type = 'searchset')") => {
             |b| bundle_type(b) == "searchset" || items(b, "entry").iter().all(|e| !has(e, "search"))
         }
-        ("bdl-3", "entry.all(request.exists() = (%resource.type = 'batch' or %resource.type = 'transaction' or %resource.type = 'history'))") => {
-            |b| {
-                let wanted = matches!(bundle_type(b), "batch" | "transaction" | "history");
-                items(b, "entry").iter().all(|e| has(e, "request") == wanted)
-            }
-        }
-        ("bdl-4", "entry.all(response.exists() = (%resource.type = 'batch-response' or %resource.type = 'transaction-response' or %resource.type = 'history'))") => {
-            |b| {
-                let wanted = matches!(
-                    bundle_type(b),
-                    "batch-response" | "transaction-response" | "history"
-                );
-                items(b, "entry").iter().all(|e| has(e, "response") == wanted)
-            }
-        }
+        (
+            "bdl-3",
+            "entry.all(request.exists() = (%resource.type = 'batch' or %resource.type = 'transaction' or %resource.type = 'history'))",
+        ) => |b| {
+            let wanted = matches!(bundle_type(b), "batch" | "transaction" | "history");
+            items(b, "entry")
+                .iter()
+                .all(|e| has(e, "request") == wanted)
+        },
+        (
+            "bdl-4",
+            "entry.all(response.exists() = (%resource.type = 'batch-response' or %resource.type = 'transaction-response' or %resource.type = 'history'))",
+        ) => |b| {
+            let wanted = matches!(
+                bundle_type(b),
+                "batch-response" | "transaction-response" | "history"
+            );
+            items(b, "entry")
+                .iter()
+                .all(|e| has(e, "response") == wanted)
+        },
         ("bdl-5", "resource.exists() or request.exists() or response.exists()") => {
             |e| has(e, "resource") || has(e, "request") || has(e, "response")
         }
-        ("bdl-7", "(type = 'history') or entry.where(fullUrl.exists()).select(fullUrl&resource.meta.versionId).isDistinct()") => {
-            |b| {
-                if bundle_type(b) == "history" {
-                    return true;
-                }
-                let mut seen = HashSet::new();
-                items(b, "entry")
-                    .iter()
-                    .filter_map(|e| e.get("fullUrl").and_then(Value::as_str).map(|f| (f, e)))
-                    .all(|(full_url, e)| {
-                        let version = e
-                            .get("resource")
-                            .and_then(|r| r.get("meta"))
-                            .and_then(|m| m.get("versionId"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        seen.insert(format!("{full_url}{version}"))
-                    })
+        (
+            "bdl-7",
+            "(type = 'history') or entry.where(fullUrl.exists()).select(fullUrl&resource.meta.versionId).isDistinct()",
+        ) => |b| {
+            if bundle_type(b) == "history" {
+                return true;
             }
-        }
-        ("bdl-8", "fullUrl.contains('/_history/').not()") => {
-            |e| {
-                e.get("fullUrl")
-                    .and_then(Value::as_str)
-                    .is_none_or(|f| !f.contains("/_history/"))
-            }
-        }
+            let mut seen = HashSet::new();
+            items(b, "entry")
+                .iter()
+                .filter_map(|e| e.get("fullUrl").and_then(Value::as_str).map(|f| (f, e)))
+                .all(|(full_url, e)| {
+                    let version = e
+                        .get("resource")
+                        .and_then(|r| r.get("meta"))
+                        .and_then(|m| m.get("versionId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    seen.insert(format!("{full_url}{version}"))
+                })
+        },
+        ("bdl-8", "fullUrl.contains('/_history/').not()") => |e| {
+            e.get("fullUrl")
+                .and_then(Value::as_str)
+                .is_none_or(|f| !f.contains("/_history/"))
+        },
         _ => return None,
     };
     let mut node = resource;

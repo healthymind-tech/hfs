@@ -56,13 +56,13 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// See [`on_large_stack`].
 fn use_large_stack_pool() -> bool {
     static USE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *USE.get_or_init(|| {
-        match std::env::var("HFS_VALIDATION_STACK_THREAD").as_deref() {
+    *USE.get_or_init(
+        || match std::env::var("HFS_VALIDATION_STACK_THREAD").as_deref() {
             Ok("always") => true,
             Ok("never") => false,
             _ => cfg!(debug_assertions),
-        }
-    })
+        },
+    )
 }
 
 /// A bounded pool of large-stack threads, grown on demand up to the number
@@ -449,9 +449,9 @@ fn cascade_target_failures(cascades: &[walk::Cascade], errors: &mut Vec<Validati
                 && (cascade.claims_candidate || e.source.is_none())
         });
         if failing
-            && !found
-                .iter()
-                .any(|f: &ValidationError| f.path == cascade.path && f.message.contains(&cascade.reference))
+            && !found.iter().any(|f: &ValidationError| {
+                f.path == cascade.path && f.message.contains(&cascade.reference)
+            })
         {
             found.push(ValidationError::new(
                 ErrorKind::ReferenceInvalid,

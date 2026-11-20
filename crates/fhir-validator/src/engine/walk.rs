@@ -425,7 +425,12 @@ fn resolve_pending_targets(ctx: &mut WalkCtx<'_>) {
             e.severity == Severity::Error
                 && (e.path == cascade.target_path || e.path.starts_with(&prefix))
         });
-        if clean || cascade.candidates.iter().any(|p| ctx.conforms_to(target, p)) {
+        if clean
+            || cascade
+                .candidates
+                .iter()
+                .any(|p| ctx.conforms_to(target, p))
+        {
             ctx.cascades.push(cascade);
         } else {
             let message = format!(
@@ -433,10 +438,12 @@ fn resolve_pending_targets(ctx: &mut WalkCtx<'_>) {
                 cascade.reference,
                 cascade.candidates.join(", ")
             );
-            if ctx
-                .emitted
-                .insert((ErrorKind::ReferenceInvalid, Severity::Error, cascade.path.clone(), message.clone()))
-            {
+            if ctx.emitted.insert((
+                ErrorKind::ReferenceInvalid,
+                Severity::Error,
+                cascade.path.clone(),
+                message.clone(),
+            )) {
                 ctx.errors.push(ValidationError::new(
                     ErrorKind::ReferenceInvalid,
                     cascade.path,
@@ -784,7 +791,9 @@ pub(super) fn add_schemas_to_set(
             Some(type_schema) => add_schemas_to_set(ctx, set, type_schema, &type_ref),
             // An unknown nested resource type is reported once, where the
             // node's resourceType is read (see `validate_node`).
-            None if ctx.unknown_resource_paths.contains(&ctx.path.render_dotted()) => {}
+            None if ctx
+                .unknown_resource_paths
+                .contains(&ctx.path.render_dotted()) => {}
             None => ctx.error(
                 ErrorKind::UnknownSchema,
                 errors::msg_unknown_schema(&type_ref),
@@ -931,7 +940,9 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
                     // already ("could not resolve schema"): one report.
                     let unresolved = errors::msg_unknown_schema(rt);
                     ctx.errors.retain(|e| {
-                        !(e.kind == ErrorKind::UnknownSchema && e.path == here && e.message == unresolved)
+                        !(e.kind == ErrorKind::UnknownSchema
+                            && e.path == here
+                            && e.message == unresolved)
                     });
                     ctx.error(ErrorKind::ResourceRule, message);
                     ctx.unknown_resource_paths.insert(here);

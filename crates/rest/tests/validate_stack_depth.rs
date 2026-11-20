@@ -72,10 +72,14 @@ fn validate_of_a_large_bundle_fits_well_under_a_worker_stack() {
                 )
                 .unwrap();
                 backend.init_schema().unwrap();
-                let state = helios_rest::AppState::new(Arc::new(backend), ServerConfig::for_testing());
+                let state =
+                    helios_rest::AppState::new(Arc::new(backend), ServerConfig::for_testing());
                 let app = helios_rest::routing::fhir_routes::create_routes(state);
                 let server = TestServer::new(app).unwrap();
-                let response = server.post("/Bundle/$validate").json(&bundle(entries)).await;
+                let response = server
+                    .post("/Bundle/$validate")
+                    .json(&bundle(entries))
+                    .await;
                 let outcome: Value = response.json();
                 assert_eq!(outcome["resourceType"], "OperationOutcome");
                 response.status_code().as_u16()

@@ -95,8 +95,8 @@ pub use engine::{
     ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
-pub use signature::{SignatureOptions, SignatureTrust};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
+pub use signature::{SignatureOptions, SignatureTrust};
 pub use terminology::{
     CompositeTerminologyProvider, CoreTerminology, core_terminology, is_hl7_namespace,
 };

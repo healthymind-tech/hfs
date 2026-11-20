@@ -438,14 +438,20 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
                 }
                 let url = ext.get("url").and_then(serde_json::Value::as_str);
                 if url
-                    == Some("http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.mustHaveValue")
+                    == Some(
+                        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.mustHaveValue",
+                    )
                     && ext.get("valueBoolean").and_then(serde_json::Value::as_bool) == Some(true)
                 {
                     schema.must_have_value = Some(true);
                 }
                 if url
-                    == Some("http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.valueAlternatives")
-                    && let Some(alt) = ext.get("valueCanonical").and_then(serde_json::Value::as_str)
+                    == Some(
+                        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.valueAlternatives",
+                    )
+                    && let Some(alt) = ext
+                        .get("valueCanonical")
+                        .and_then(serde_json::Value::as_str)
                 {
                     schema
                         .value_alternatives

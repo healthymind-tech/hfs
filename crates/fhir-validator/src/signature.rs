@@ -96,7 +96,9 @@ impl SignatureOptions {
             match std::fs::read(path) {
                 Ok(bytes) => match parse_key_file(&bytes) {
                     Ok(mut found) if !found.is_empty() => keys.append(&mut found),
-                    Ok(_) => problems.push(format!("{}: no certificate or key found", path.display())),
+                    Ok(_) => {
+                        problems.push(format!("{}: no certificate or key found", path.display()))
+                    }
                     Err(e) => problems.push(format!("{}: {e}", path.display())),
                 },
                 Err(e) => problems.push(format!("{}: {e}", path.display())),
@@ -111,7 +113,8 @@ pub fn parse_key_file(bytes: &[u8]) -> Result<Vec<TrustedKey>, String> {
     let text = String::from_utf8_lossy(bytes);
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') {
-        let json: Value = serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {e}"))?;
+        let json: Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {e}"))?;
         let jwks: Vec<&Value> = match json.get("keys").and_then(Value::as_array) {
             Some(keys) => keys.iter().collect(),
             None => vec![&json],
@@ -144,7 +147,10 @@ fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
         let Some(stop) = after.find(&end) else {
             break;
         };
-        let body: String = after[..stop].chars().filter(|c| !c.is_whitespace()).collect();
+        let body: String = after[..stop]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         if let Ok(der) = STANDARD.decode(body.as_bytes()) {
             out.push(der);
         }
@@ -169,7 +175,7 @@ fn key_from_jwk(jwk: &Value) -> Option<TrustedKey> {
     let field = |name: &str| {
         jwk.get(name)
             .and_then(Value::as_str)
-            .and_then(|s| b64url_decode(s))
+            .and_then(b64url_decode)
     };
     let key = match jwk.get("kty").and_then(Value::as_str)? {
         "RSA" => PublicKey::Rsa {
@@ -254,7 +260,12 @@ pub fn signature_issues(resource: &Value, opts: &SignatureOptions) -> Vec<Valida
     out
 }
 
-fn find_signed(value: &Value, path: &mut String, opts: &SignatureOptions, out: &mut Vec<ValidationError>) {
+fn find_signed(
+    value: &Value,
+    path: &mut String,
+    opts: &SignatureOptions,
+    out: &mut Vec<ValidationError>,
+) {
     match value {
         Value::Object(map) => {
             if map.get("resourceType").and_then(Value::as_str) == Some("Bundle")
@@ -264,7 +275,10 @@ fn find_signed(value: &Value, path: &mut String, opts: &SignatureOptions, out: &
                 check_signature(value, signature, opts, &mut report);
             }
             for (key, child) in map {
-                if key == "signature" || key.starts_with('_') || !(child.is_object() || child.is_array()) {
+                if key == "signature"
+                    || key.starts_with('_')
+                    || !(child.is_object() || child.is_array())
+                {
                     continue;
                 }
                 let len = path.len();
@@ -291,16 +305,24 @@ fn str_at<'v>(value: &'v Value, key: &str) -> Option<&'v str> {
     value.get(key).and_then(Value::as_str)
 }
 
-fn check_signature(bundle: &Value, signature: &Value, opts: &SignatureOptions, report: &mut Report<'_>) {
+fn check_signature(
+    bundle: &Value,
+    signature: &Value,
+    opts: &SignatureOptions,
+    report: &mut Report<'_>,
+) {
     let data = str_at(signature, "data");
-    let mut format = str_at(signature, "sigFormat").filter(|s| !s.is_empty()).map(str::to_string);
-    if format.is_none() {
-        if data.is_some() {
-            report.info("There is no value for sigFormat. In the absence of a stated signature format, the signature cannot be interpreted reliably (or validated)".into());
-            if data.and_then(jose_header_of).is_some_and(|h| h.get("alg").is_some()) {
-                report.info("Signature looks like application/jose, so validating accordingly".into());
-                format = Some("application/jose".into());
-            }
+    let mut format = str_at(signature, "sigFormat")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if format.is_none() && data.is_some() {
+        report.info("There is no value for sigFormat. In the absence of a stated signature format, the signature cannot be interpreted reliably (or validated)".into());
+        if data
+            .and_then(jose_header_of)
+            .is_some_and(|h| h.get("alg").is_some())
+        {
+            report.info("Signature looks like application/jose, so validating accordingly".into());
+            format = Some("application/jose".into());
         }
     }
     let Some(format) = format else {
@@ -362,7 +384,13 @@ fn jose_header_of(data: &str) -> Option<Value> {
     serde_json::from_slice(&header).ok()
 }
 
-fn check_jose(bundle: &Value, signature: &Value, jws: &str, opts: &SignatureOptions, report: &mut Report<'_>) {
+fn check_jose(
+    bundle: &Value,
+    signature: &Value,
+    jws: &str,
+    opts: &SignatureOptions,
+    report: &mut Report<'_>,
+) {
     let parts: Vec<&str> = jws.split('.').collect();
     let header = parts
         .first()
@@ -479,7 +507,12 @@ fn check_jose(bundle: &Value, signature: &Value, jws: &str, opts: &SignatureOpti
     let mut purpose_ok = false;
     let mut purpose = purpose;
     let mut purpose_desc = purpose_desc;
-    for t in signature.get("type").and_then(Value::as_array).into_iter().flatten() {
+    for t in signature
+        .get("type")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let code = str_at(t, "code").unwrap_or_default();
         let p = if is_oid(code) {
             format!("urn:oid:{code}")
@@ -511,15 +544,19 @@ fn check_jose(bundle: &Value, signature: &Value, jws: &str, opts: &SignatureOpti
         .and_then(|c| c.first())
         .and_then(Value::as_str)
     {
-        match lenient_b64(first).and_then(|der| Certificate::parse(&der).map(|c| (c.public_key(), der.clone()))) {
+        match lenient_b64(first)
+            .and_then(|der| Certificate::parse(&der).map(|c| (c.public_key(), der.clone())))
+        {
             Some((Some(k), der)) => {
                 key = Some(k);
                 cert_der = Some(der);
             }
-            Some((None, _)) => report.error(
-                "Unable to parse X509 Certificate: unsupported public key type".into(),
-            ),
-            None => report.error("Unable to parse X509 Certificate: not a DER X.509 certificate".into()),
+            Some((None, _)) => {
+                report.error("Unable to parse X509 Certificate: unsupported public key type".into())
+            }
+            None => {
+                report.error("Unable to parse X509 Certificate: not a DER X.509 certificate".into())
+            }
         }
     } else if let Some(k) = header_string(&header, "kid") {
         match opts.keys.iter().find(|t| t.kids.iter().any(|id| id.eq_ignore_ascii_case(&k))) {
@@ -560,7 +597,8 @@ fn check_jose(bundle: &Value, signature: &Value, jws: &str, opts: &SignatureOpti
             }
         }
         None if who.is_none() => report.info(
-            "Neither the digital signature nor Signature.who are provided to identify the signer".into(),
+            "Neither the digital signature nor Signature.who are provided to identify the signer"
+                .into(),
         ),
         None => report.info("The Signature.who value is not found in the digital signature".into()),
     }
@@ -605,7 +643,9 @@ fn check_jose(bundle: &Value, signature: &Value, jws: &str, opts: &SignatureOpti
             Some(kid) => report.error(format!(
                 "The signature did not verify against the certificate using the key with id {kid}"
             )),
-            None => report.error("The signature did not verify against the provided certificate".into()),
+            None => {
+                report.error("The signature did not verify against the provided certificate".into())
+            }
         }
         if !parts[1].is_empty() {
             match b64url_decode(parts[1]) {
@@ -658,7 +698,9 @@ fn check_jose(bundle: &Value, signature: &Value, jws: &str, opts: &SignatureOpti
         report.info(if verified {
             verified_suffix(&format!("The content was signed by {by}"), true)
         } else {
-            format!("The content claims to have been signed by {by}, but this has not been verified")
+            format!(
+                "The content claims to have been signed by {by}, but this has not been verified"
+            )
         });
     }
     if let Some(t) = &sig_t {
@@ -701,9 +743,10 @@ fn check_trust(
     let severity = opts.untrusted_severity;
     let cert = cert_der.and_then(Certificate::parse);
     // The signing key itself is configured.
-    let listed = opts.keys.iter().any(|t| {
-        t.key == *key || (cert_der.is_some() && t.certificate.as_deref() == cert_der)
-    });
+    let listed = opts
+        .keys
+        .iter()
+        .any(|t| t.key == *key || (cert_der.is_some() && t.certificate.as_deref() == cert_der));
     let issued_by_listed = !listed
         && cert.as_ref().is_some_and(|c| {
             opts.keys.iter().any(|t| {
@@ -718,7 +761,13 @@ fn check_trust(
     if !listed && !issued_by_listed {
         let who = cert
             .as_ref()
-            .map(|c| format!(" (subject '{}', issuer '{}')", c.subject_dn(), c.issuer_dn()))
+            .map(|c| {
+                format!(
+                    " (subject '{}', issuer '{}')",
+                    c.subject_dn(),
+                    c.issuer_dn()
+                )
+            })
             .unwrap_or_default();
         report.push(
             severity,
@@ -763,15 +812,14 @@ fn header_purpose(header: &Value) -> (Option<String>, Option<String>) {
 
 fn is_oid(code: &str) -> bool {
     let mut parts = code.split('.');
-    code.contains('.')
-        && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    code.contains('.') && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn group_thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -786,12 +834,16 @@ fn json_difference(path: &str, mine: &Value, theirs: &Value) -> Option<String> {
         (Value::Object(a), Value::Object(b)) => {
             for key in b.keys() {
                 if !a.contains_key(key) {
-                    return Some(format!("properties differ at {path}: unexpected property {key}"));
+                    return Some(format!(
+                        "properties differ at {path}: unexpected property {key}"
+                    ));
                 }
             }
             for key in a.keys() {
                 if !b.contains_key(key) {
-                    return Some(format!("properties differ at {path}: missing property {key}"));
+                    return Some(format!(
+                        "properties differ at {path}: missing property {key}"
+                    ));
                 }
             }
             a.iter()
@@ -811,7 +863,9 @@ fn json_difference(path: &str, mine: &Value, theirs: &Value) -> Option<String> {
                 .find_map(|(i, (x, y))| json_difference(&format!("{path}[{i}]"), x, y))
         }
         (a, b) if a == b => None,
-        (a, b) => Some(format!("values differ at {path}: Expected {a} but found {b}")),
+        (a, b) => Some(format!(
+            "values differ at {path}: Expected {a} but found {b}"
+        )),
     }
 }
 
@@ -956,7 +1010,7 @@ fn es6_number(f: f64) -> String {
             out.push_str(&digits[1..]);
         }
         out.push('e');
-        out.push(if n - 1 >= 0 { '+' } else { '-' });
+        out.push(if n > 0 { '+' } else { '-' });
         out.push_str(&(n - 1).abs().to_string());
     }
     out
@@ -992,7 +1046,10 @@ fn verify(alg: &str, key: &PublicKey, message: &[u8], signature: &[u8]) -> Resul
                     ));
                 }
             };
-            let components = sig::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() };
+            let components = sig::RsaPublicKeyComponents {
+                n: n.as_slice(),
+                e: e.as_slice(),
+            };
             Ok(components.verify(params, message, signature).is_ok())
         }
         PublicKey::Ec { curve, point } => {
@@ -1005,7 +1062,9 @@ fn verify(alg: &str, key: &PublicKey, message: &[u8], signature: &[u8]) -> Resul
                     ));
                 }
             };
-            Ok(sig::UnparsedPublicKey::new(algorithm, point).verify(message, signature).is_ok())
+            Ok(sig::UnparsedPublicKey::new(algorithm, point)
+                .verify(message, signature)
+                .is_ok())
         }
     }
 }
@@ -1027,8 +1086,14 @@ struct Certificate<'a> {
     not_after: Option<f64>,
 }
 
+/// A DER TLV split: (tag, content, whole element, rest of the input).
+type Tlv<'a> = (u8, &'a [u8], &'a [u8], &'a [u8]);
+
+/// A child element: (tag, content, whole element).
+type DerChild<'a> = (u8, &'a [u8], &'a [u8]);
+
 /// One DER TLV: (tag, content, whole element).
-fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
+fn tlv(input: &[u8]) -> Option<Tlv<'_>> {
     let tag = *input.first()?;
     let first = *input.get(1)?;
     let (len, header) = if first & 0x80 == 0 {
@@ -1049,7 +1114,7 @@ fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
     Some((tag, content, &input[..end], &input[end..]))
 }
 
-fn children(mut content: &[u8]) -> Option<Vec<(u8, &[u8], &[u8])>> {
+fn children(mut content: &[u8]) -> Option<Vec<DerChild<'_>>> {
     let mut out = Vec::new();
     while !content.is_empty() {
         let (tag, inner, whole, rest) = tlv(content)?;
@@ -1145,18 +1210,22 @@ impl<'a> Certificate<'a> {
                     b"1.2.840.113549.1.1.5" => &sig::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
                     _ => return false,
                 };
-                sig::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() }
-                    .verify(params, self.tbs, self.signature)
-                    .is_ok()
+                sig::RsaPublicKeyComponents {
+                    n: n.as_slice(),
+                    e: e.as_slice(),
+                }
+                .verify(params, self.tbs, self.signature)
+                .is_ok()
             }
             PublicKey::Ec { curve, point } => {
-                let algorithm: &dyn sig::VerificationAlgorithm = match (self.sig_alg.as_slice(), curve) {
-                    (b"1.2.840.10045.4.3.2", Curve::P256) => &sig::ECDSA_P256_SHA256_ASN1,
-                    (b"1.2.840.10045.4.3.3", Curve::P384) => &sig::ECDSA_P384_SHA384_ASN1,
-                    (b"1.2.840.10045.4.3.3", Curve::P256) => &sig::ECDSA_P256_SHA384_ASN1,
-                    (b"1.2.840.10045.4.3.2", Curve::P384) => &sig::ECDSA_P384_SHA256_ASN1,
-                    _ => return false,
-                };
+                let algorithm: &dyn sig::VerificationAlgorithm =
+                    match (self.sig_alg.as_slice(), curve) {
+                        (b"1.2.840.10045.4.3.2", Curve::P256) => &sig::ECDSA_P256_SHA256_ASN1,
+                        (b"1.2.840.10045.4.3.3", Curve::P384) => &sig::ECDSA_P384_SHA384_ASN1,
+                        (b"1.2.840.10045.4.3.3", Curve::P256) => &sig::ECDSA_P256_SHA384_ASN1,
+                        (b"1.2.840.10045.4.3.2", Curve::P384) => &sig::ECDSA_P384_SHA256_ASN1,
+                        _ => return false,
+                    };
                 sig::UnparsedPublicKey::new(algorithm, point)
                     .verify(self.tbs, self.signature)
                     .is_ok()
@@ -1345,7 +1414,8 @@ fn parse_instant(s: &str) -> Option<f64> {
         }
         _ => return None,
     };
-    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    let secs =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset;
     Some(secs as f64 + fraction)
 }
 
@@ -1375,8 +1445,9 @@ fn format_epoch(secs: i64) -> String {
 
 fn is_base64(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') || b.is_ascii_whitespace())
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') || b.is_ascii_whitespace()
+        })
 }
 
 /// Decode base64 the way commons-codec does: whitespace ignored, either
@@ -1400,7 +1471,10 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 fn strip_zeros(bytes: &[u8]) -> Vec<u8> {
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len().saturating_sub(1));
+    let start = bytes
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(bytes.len().saturating_sub(1));
     bytes[start..].to_vec()
 }
 
@@ -1460,8 +1534,14 @@ mod tests {
     #[test]
     fn instants() {
         assert_eq!(parse_instant("1970-01-01T00:00:00Z"), Some(0.0));
-        assert_eq!(parse_instant("2020-10-23T04:54:56.048+00:00"), Some(1_603_428_896.048));
-        assert_eq!(parse_instant("2026-03-26T14:02:12.000+02:00"), parse_instant("2026-03-26T12:02:12Z"));
+        assert_eq!(
+            parse_instant("2020-10-23T04:54:56.048+00:00"),
+            Some(1_603_428_896.048)
+        );
+        assert_eq!(
+            parse_instant("2026-03-26T14:02:12.000+02:00"),
+            parse_instant("2026-03-26T12:02:12Z")
+        );
         assert_eq!(format_epoch(1_774_526_532), "2026-03-26T12:02:12Z");
     }
 

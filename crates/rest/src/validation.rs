@@ -315,8 +315,11 @@ impl ValidationService {
             _ => TerminologyFailMode::Open,
         };
         let signatures = (config.signatures != "off").then(|| {
-            let paths: Vec<std::path::PathBuf> =
-                config.signature_certs.iter().map(std::path::PathBuf::from).collect();
+            let paths: Vec<std::path::PathBuf> = config
+                .signature_certs
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect();
             let (keys, problems) = helios_fhir_validator::SignatureOptions::load_keys(&paths);
             for problem in problems {
                 warn!("HFS_VALIDATION_SIGNATURE_CERTS: {problem}");

@@ -16,7 +16,8 @@ use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::packs::core_registry;
 use helios_fhir_validator::signature::{SignatureOptions, SignatureTrust, parse_key_file};
 use helios_fhir_validator::{
-    EffectHandlers, ErrorKind, SchemaResolver, Severity, ValidationError, ValidationOptions, Validator,
+    EffectHandlers, ErrorKind, SchemaResolver, Severity, ValidationError, ValidationOptions,
+    Validator,
 };
 use serde_json::{Value, json};
 
@@ -28,7 +29,11 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-async fn validate(resource: &Value, sig: Option<&SignatureOptions>, empty_fails: bool) -> Vec<ValidationError> {
+async fn validate(
+    resource: &Value,
+    sig: Option<&SignatureOptions>,
+    empty_fails: bool,
+) -> Vec<ValidationError> {
     let validator = Validator::new(core_registry(FhirVersion::R4));
     let evaluator = FhirPathConstraintEvaluator::new().with_empty_fails(empty_fails);
     let suppress = vec!["dom-6".to_string()];
@@ -74,7 +79,10 @@ async fn detached_jws_over_canonical_json_verifies() {
     let bundle = fixture("bundle-signed-good.json");
     let issues = validate(&bundle, Some(&SignatureOptions::default()), false).await;
     assert!(signature_errors(&issues).is_empty(), "{issues:#?}");
-    assert!(has_message(&issues, "The signature verified OK"), "{issues:#?}");
+    assert!(
+        has_message(&issues, "The signature verified OK"),
+        "{issues:#?}"
+    );
     assert!(has_message(
         &issues,
         "The content was signed by OU=IG Publisher,L=Ann Arbor,CN=hl7.org,O=HL7,ST=Missouri,C=us (and this has been verified by the signature)"
@@ -135,7 +143,8 @@ async fn cdex_search_bundle_example_does_not_verify() {
         "{issues:#?}"
     );
     // On the Bundle, also when the Bundle is nested in Parameters.
-    let params = json!({"resourceType": "Parameters", "parameter": [{"name": "b", "resource": bundle}]});
+    let params =
+        json!({"resourceType": "Parameters", "parameter": [{"name": "b", "resource": bundle}]});
     let issues = validate(&params, Some(&SignatureOptions::default()), false).await;
     assert!(
         issues.iter().any(|e| e.kind == ErrorKind::Signature
@@ -168,7 +177,12 @@ async fn listed_trust_and_kid_lookup() {
     let header_b64 = {
         use base64::Engine as _;
         let data = bundle["signature"]["data"].as_str().unwrap();
-        let jws = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(data).unwrap()).unwrap();
+        let jws = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+        )
+        .unwrap();
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(jws.split('.').next().unwrap())
             .unwrap();
@@ -255,33 +269,48 @@ async fn rendering_xhtml_on_a_primitive_sidecar_runs_html_checks() {
         ]}
     });
     let mut overlay = SchemaRegistry::new();
-    assert!(overlay.insert(helios_fhir_validator::converter::convert(&sd).unwrap().schema));
-    let resolver: std::sync::Arc<dyn SchemaResolver> = std::sync::Arc::new(CompositeResolver::new(vec![
-        std::sync::Arc::new(overlay),
-        core_registry(FhirVersion::R4),
-    ]));
+    assert!(
+        overlay.insert(
+            helios_fhir_validator::converter::convert(&sd)
+                .unwrap()
+                .schema
+        )
+    );
+    let resolver: std::sync::Arc<dyn SchemaResolver> =
+        std::sync::Arc::new(CompositeResolver::new(vec![
+            std::sync::Arc::new(overlay),
+            core_registry(FhirVersion::R4),
+        ]));
     let validator = Validator::new(resolver);
     let evaluator = FhirPathConstraintEvaluator::new();
     let handlers = EffectHandlers {
         constraints: Some(&evaluator),
         ..Default::default()
     };
-    let q = |xhtml: &str| json!({
-        "resourceType": "Questionnaire", "status": "draft",
-        "item": [{"linkId": "1", "type": "choice", "answerOption": [{"valueCoding": {
-            "system": "http://example.org", "code": "sad", "display": "Sad",
-            "_display": {"extension": [{
-                "url": "http://hl7.org/fhir/StructureDefinition/rendering-xhtml",
-                "valueString": xhtml
-            }]}
-        }}]}]
-    });
+    let q = |xhtml: &str| {
+        json!({
+            "resourceType": "Questionnaire", "status": "draft",
+            "item": [{"linkId": "1", "type": "choice", "answerOption": [{"valueCoding": {
+                "system": "http://example.org", "code": "sad", "display": "Sad",
+                "_display": {"extension": [{
+                    "url": "http://hl7.org/fhir/StructureDefinition/rendering-xhtml",
+                    "valueString": xhtml
+                }]}
+            }}]}]
+        })
+    };
     let opts = ValidationOptions::default();
     let bad = validator
-        .validate(&q("<img src='data:image/png;base64,AAAA'/>"), FhirVersion::R4, &opts, &handlers)
+        .validate(
+            &q("<img src='data:image/png;base64,AAAA'/>"),
+            FhirVersion::R4,
+            &opts,
+            &handlers,
+        )
         .await;
     assert!(
-        bad.iter().any(|e| e.severity == Severity::Error && e.message.contains("xhtml-ext-1")),
+        bad.iter()
+            .any(|e| e.severity == Severity::Error && e.message.contains("xhtml-ext-1")),
         "{bad:#?}"
     );
     let good = validator
@@ -292,7 +321,10 @@ async fn rendering_xhtml_on_a_primitive_sidecar_runs_html_checks() {
             &handlers,
         )
         .await;
-    assert!(!good.iter().any(|e| e.message.contains("xhtml-ext-1")), "{good:#?}");
+    assert!(
+        !good.iter().any(|e| e.message.contains("xhtml-ext-1")),
+        "{good:#?}"
+    );
 }
 
 /// `encounter-period` (Java: per-1 failed): mixed-precision start/end make
@@ -306,14 +338,17 @@ async fn empty_invariant_results_fail_only_when_asked() {
         "period": {"start": "2021-01-01T10:00:00Z", "end": "2021-01-01"}
     });
     let pass = validate(&enc, None, false).await;
-    assert!(!pass.iter().any(|e| e.message.contains("per-1")), "{pass:#?}");
+    assert!(
+        !pass.iter().any(|e| e.message.contains("per-1")),
+        "{pass:#?}"
+    );
     let fail = validate(&enc, None, true).await;
     assert!(
-        fail.iter().any(|e| e.severity == Severity::Error && e.message.contains("per-1")),
+        fail.iter()
+            .any(|e| e.severity == Severity::Error && e.message.contains("per-1")),
         "{fail:#?}"
     );
 }
-
 
 /// mCODE / genomics bundles (Java: Reference_REF_CantMatchChoice at every
 /// reference to an entry that fails its profile on an invariant): the entry's
@@ -337,12 +372,19 @@ async fn references_to_entries_failing_their_profile_on_invariants_are_reported(
     });
     let mut overlay = SchemaRegistry::new();
     for sd in [&pat, &obs] {
-        assert!(overlay.insert(helios_fhir_validator::converter::convert(sd).unwrap().schema));
+        assert!(
+            overlay.insert(
+                helios_fhir_validator::converter::convert(sd)
+                    .unwrap()
+                    .schema
+            )
+        );
     }
-    let resolver: std::sync::Arc<dyn SchemaResolver> = std::sync::Arc::new(CompositeResolver::new(vec![
-        std::sync::Arc::new(overlay),
-        core_registry(FhirVersion::R4),
-    ]));
+    let resolver: std::sync::Arc<dyn SchemaResolver> =
+        std::sync::Arc::new(CompositeResolver::new(vec![
+            std::sync::Arc::new(overlay),
+            core_registry(FhirVersion::R4),
+        ]));
     let validator = Validator::new(resolver);
     let evaluator = FhirPathConstraintEvaluator::new();
     let handlers = EffectHandlers {
@@ -364,22 +406,41 @@ async fn references_to_entries_failing_their_profile_on_invariants_are_reported(
         ]})
     };
     let opts = ValidationOptions::default();
-    let bad = validator.validate(&bundle(Value::Null), FhirVersion::R4, &opts, &handlers).await;
-    assert!(bad.iter().any(|e| e.message.contains("pat-p-1")), "{bad:#?}");
+    let bad = validator
+        .validate(&bundle(Value::Null), FhirVersion::R4, &opts, &handlers)
+        .await;
+    assert!(
+        bad.iter().any(|e| e.message.contains("pat-p-1")),
+        "{bad:#?}"
+    );
     assert!(
         bad.iter().any(|e| e.path == "Bundle.entry.0.resource.subject"
             && e.message == "Unable to find a profile match for Patient/1 among choices: http://example.org/StructureDefinition/pat-p"),
         "{bad:#?}"
     );
-    let good = validator.validate(&bundle(json!([{"family": "X"}])), FhirVersion::R4, &opts, &handlers).await;
-    assert!(!good.iter().any(|e| e.message.contains("Unable to find a profile match")), "{good:#?}");
+    let good = validator
+        .validate(
+            &bundle(json!([{"family": "X"}])),
+            FhirVersion::R4,
+            &opts,
+            &handlers,
+        )
+        .await;
+    assert!(
+        !good
+            .iter()
+            .any(|e| e.message.contains("Unable to find a profile match")),
+        "{good:#?}"
+    );
 }
 
 /// The invariants decided natively (ele-1, ext-1, dom-2/4/5, bdl-1..5/7/8)
 /// give the same verdicts as their FHIRPath.
 #[tokio::test]
 async fn natively_decided_invariants_agree_with_fhirpath() {
-    use helios_fhir_validator::{ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint};
+    use helios_fhir_validator::{
+        ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
+    };
     let cases = [
         json!({"resourceType": "Bundle", "type": "collection", "total": 3, "entry": [
             {"fullUrl": "http://x/Patient/1", "resource": {"resourceType": "Patient", "id": "1",
@@ -413,24 +474,44 @@ async fn natively_decided_invariants_agree_with_fhirpath() {
     let evaluator = FhirPathConstraintEvaluator::new();
     for resource in &cases {
         let outcome = validator.validate_sync(resource, &ValidationOptions::default());
-        let native_ids = ["ele-1", "ext-1", "dom-2", "dom-4", "dom-5", "bdl-1", "bdl-2", "bdl-3", "bdl-4", "bdl-5", "bdl-7", "bdl-8", "ref-1", "txt-1", "txt-2"];
+        let native_ids = [
+            "ele-1", "ext-1", "dom-2", "dom-4", "dom-5", "bdl-1", "bdl-2", "bdl-3", "bdl-4",
+            "bdl-5", "bdl-7", "bdl-8", "ref-1", "txt-1", "txt-2",
+        ];
         let constraints: Vec<DeferredConstraint<'_>> = outcome
             .deferred
             .iter()
             .filter_map(|d| match d {
-                Deferred::Constraint { path, id, expression, own_resource, .. }
-                    if native_ids.contains(&id.as_str()) =>
-                {
-                    Some(DeferredConstraint { path, id, expression, own_resource: *own_resource })
-                }
+                Deferred::Constraint {
+                    path,
+                    id,
+                    expression,
+                    own_resource,
+                    ..
+                } if native_ids.contains(&id.as_str()) => Some(DeferredConstraint {
+                    path,
+                    id,
+                    expression,
+                    own_resource: *own_resource,
+                }),
                 _ => None,
             })
             .collect();
         assert!(constraints.len() > 10);
         let by_fhirpath = evaluator.evaluate_all(resource, FhirVersion::R4, &constraints);
         // The effects pass (native) reports a failure exactly where FHIRPath fails.
-        let handlers = EffectHandlers { constraints: Some(&evaluator), ..Default::default() };
-        let issues = validator.validate(resource, FhirVersion::R4, &ValidationOptions::default(), &handlers).await;
+        let handlers = EffectHandlers {
+            constraints: Some(&evaluator),
+            ..Default::default()
+        };
+        let issues = validator
+            .validate(
+                resource,
+                FhirVersion::R4,
+                &ValidationOptions::default(),
+                &handlers,
+            )
+            .await;
         for (c, outcome) in constraints.iter().zip(&by_fhirpath) {
             let reported = issues.iter().any(|e| {
                 e.path == c.path && e.extra.get("constraint").and_then(Value::as_str) == Some(c.id)
@@ -456,37 +537,70 @@ async fn natively_decided_invariants_agree_with_fhirpath() {
 #[tokio::test]
 async fn must_have_value_and_value_alternatives() {
     use helios_fhir_validator::{CompositeResolver, SchemaRegistry};
-    let sd = |url: &str, ext: Value| json!({
-        "resourceType": "StructureDefinition", "url": url, "name": "P", "status": "active",
-        "kind": "resource", "abstract": false, "type": "Patient", "derivation": "constraint",
-        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
-        "differential": {"element": [{"id": "Patient.active", "path": "Patient.active", "min": 1, "extension": [ext]}]}
-    });
-    let present = sd("http://example.org/vp", json!({"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.mustHaveValue", "valueBoolean": true}));
-    let alternative = sd("http://example.org/va", json!({"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.valueAlternatives", "valueCanonical": "http://hl7.org/fhir/StructureDefinition/data-absent-reason"}));
+    let sd = |url: &str, ext: Value| {
+        json!({
+            "resourceType": "StructureDefinition", "url": url, "name": "P", "status": "active",
+            "kind": "resource", "abstract": false, "type": "Patient", "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "differential": {"element": [{"id": "Patient.active", "path": "Patient.active", "min": 1, "extension": [ext]}]}
+        })
+    };
+    let present = sd(
+        "http://example.org/vp",
+        json!({"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.mustHaveValue", "valueBoolean": true}),
+    );
+    let alternative = sd(
+        "http://example.org/va",
+        json!({"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.valueAlternatives", "valueCanonical": "http://hl7.org/fhir/StructureDefinition/data-absent-reason"}),
+    );
     let mut overlay = SchemaRegistry::new();
     for s in [&present, &alternative] {
         assert!(overlay.insert(helios_fhir_validator::converter::convert(s).unwrap().schema));
     }
-    let resolver: std::sync::Arc<dyn SchemaResolver> = std::sync::Arc::new(CompositeResolver::new(vec![
-        std::sync::Arc::new(overlay),
-        core_registry(FhirVersion::R4),
-    ]));
+    let resolver: std::sync::Arc<dyn SchemaResolver> =
+        std::sync::Arc::new(CompositeResolver::new(vec![
+            std::sync::Arc::new(overlay),
+            core_registry(FhirVersion::R4),
+        ]));
     let validator = Validator::new(resolver);
     let run = |ext_url: &str, profile: &str| {
         let patient = json!({"resourceType": "Patient", "_active": {"extension": [{"url": ext_url, "valueCode": "unknown"}]}});
-        let opts = ValidationOptions { profiles: vec![profile.to_string()], ..Default::default() };
+        let opts = ValidationOptions {
+            profiles: vec![profile.to_string()],
+            ..Default::default()
+        };
         validator.validate_sync(&patient, &opts).errors
     };
     let dar = "http://hl7.org/fhir/StructureDefinition/data-absent-reason";
     let nf = "http://hl7.org/fhir/StructureDefinition/iso21090-nullFlavor";
-    let has = |errs: &[ValidationError], text: &str| errs.iter().any(|e| e.path == "Patient.active" && e.message.contains(text));
-    assert!(has(&run(dar, "http://example.org/vp"), "requires that a value be present"));
-    assert!(!has(&run(dar, "http://example.org/va"), "if a value is not present"));
-    assert!(has(&run(nf, "http://example.org/va"), "if a value is not present"));
+    let has = |errs: &[ValidationError], text: &str| {
+        errs.iter()
+            .any(|e| e.path == "Patient.active" && e.message.contains(text))
+    };
+    assert!(has(
+        &run(dar, "http://example.org/vp"),
+        "requires that a value be present"
+    ));
+    assert!(!has(
+        &run(dar, "http://example.org/va"),
+        "if a value is not present"
+    ));
+    assert!(has(
+        &run(nf, "http://example.org/va"),
+        "if a value is not present"
+    ));
     let valued = json!({"resourceType": "Patient", "active": true});
-    let opts = ValidationOptions { profiles: vec!["http://example.org/vp".into()], ..Default::default() };
-    assert!(validator.validate_sync(&valued, &opts).errors.iter().all(|e| !e.message.contains("requires that")));
+    let opts = ValidationOptions {
+        profiles: vec!["http://example.org/vp".into()],
+        ..Default::default()
+    };
+    assert!(
+        validator
+            .validate_sync(&valued, &opts)
+            .errors
+            .iter()
+            .all(|e| !e.message.contains("requires that"))
+    );
 }
 
 /// subscriptions-backport `Bundle-r4b-notification-*` (Java: one "does not
@@ -500,8 +614,13 @@ fn unknown_nested_resource_types_are_reported_once() {
             "topic": "http://example.org/t"},
         "request": {"method": "GET", "url": "x"}, "response": {"status": "200"}}]});
     let validator = Validator::new(core_registry(FhirVersion::R4));
-    let errors = validator.validate_sync(&bundle, &ValidationOptions::default()).errors;
-    let under: Vec<_> = errors.iter().filter(|e| e.path.starts_with("Bundle.entry.0.resource")).collect();
+    let errors = validator
+        .validate_sync(&bundle, &ValidationOptions::default())
+        .errors;
+    let under: Vec<_> = errors
+        .iter()
+        .filter(|e| e.path.starts_with("Bundle.entry.0.resource"))
+        .collect();
     assert_eq!(under.len(), 1, "{errors:#?}");
     assert_eq!(
         under[0].message,

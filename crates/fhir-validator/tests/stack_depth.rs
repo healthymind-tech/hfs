@@ -62,7 +62,9 @@ fn validating_a_large_bundle_fits_a_small_stack() {
     let issues = std::thread::Builder::new()
         .stack_size(kib * 1024)
         .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
             runtime.block_on(async {
                 let validator = Validator::new(core_registry(FhirVersion::R4));
                 let evaluator = FhirPathConstraintEvaluator::new();
@@ -85,7 +87,12 @@ fn validating_a_large_bundle_fits_a_small_stack() {
                         .errors;
                 }
                 validator
-                    .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &handlers)
+                    .validate(
+                        &resource,
+                        FhirVersion::R4,
+                        &ValidationOptions::default(),
+                        &handlers,
+                    )
                     .await
             })
         })
@@ -93,7 +100,9 @@ fn validating_a_large_bundle_fits_a_small_stack() {
         .join()
         .unwrap();
     assert!(
-        issues.iter().all(|e| e.severity != helios_fhir_validator::Severity::Error),
+        issues
+            .iter()
+            .all(|e| e.severity != helios_fhir_validator::Severity::Error),
         "{issues:#?}"
     );
 }
