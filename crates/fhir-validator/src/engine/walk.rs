@@ -110,6 +110,9 @@ pub(super) struct WalkCtx<'a> {
     pub(super) cascades: Vec<Cascade>,
     /// See [`PendingTarget`].
     pub(super) pending_targets: Vec<PendingTarget<'a>>,
+    /// Paths of nested resources whose resourceType is unknown (reported
+    /// once there).
+    pub(super) unknown_resource_paths: HashSet<String>,
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
     pub(super) path: PathTracker,
@@ -289,6 +292,7 @@ impl<'a> WalkCtx<'a> {
             resolver: self.resolver,
             cascades: Vec::new(),
             pending_targets: Vec::new(),
+            unknown_resource_paths: HashSet::new(),
             errors: Vec::new(),
             deferred: Vec::new(),
             path: PathTracker::new(
@@ -461,6 +465,7 @@ pub(super) fn validate<'a>(
         resolver,
         cascades: Vec::new(),
         pending_targets: Vec::new(),
+        unknown_resource_paths: HashSet::new(),
         errors: Vec::new(),
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
@@ -777,6 +782,9 @@ pub(super) fn add_schemas_to_set(
     {
         match ctx.resolver.resolve(&type_ref) {
             Some(type_schema) => add_schemas_to_set(ctx, set, type_schema, &type_ref),
+            // An unknown nested resource type is reported once, where the
+            // node's resourceType is read (see `validate_node`).
+            None if ctx.unknown_resource_paths.contains(&ctx.path.render_dotted()) => {}
             None => ctx.error(
                 ErrorKind::UnknownSchema,
                 errors::msg_unknown_schema(&type_ref),
@@ -915,15 +923,18 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
                     // SubscriptionStatus in an R4 Bundle): the HL7 validator
                     // reports it once and does not look inside, so neither
                     // is every member reported as unknown.
-                    ctx.error_full(
-                        ErrorKind::UnknownSchema,
-                        errors::msg_unknown_schema(rt),
-                        Severity::Error,
-                        None,
-                        Some(format!(
-                            "Contained resource does not appear to be a FHIR resource (unknown name '{rt}')"
-                        )),
+                    let message = format!(
+                        "Contained resource does not appear to be a FHIR resource (unknown name '{rt}')"
                     );
+                    let here = ctx.path.render_dotted();
+                    // A type profile of the element may have tried the type
+                    // already ("could not resolve schema"): one report.
+                    let unresolved = errors::msg_unknown_schema(rt);
+                    ctx.errors.retain(|e| {
+                        !(e.kind == ErrorKind::UnknownSchema && e.path == here && e.message == unresolved)
+                    });
+                    ctx.error(ErrorKind::ResourceRule, message);
+                    ctx.unknown_resource_paths.insert(here);
                     return;
                 }
             }

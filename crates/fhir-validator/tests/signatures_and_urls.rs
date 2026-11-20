@@ -502,7 +502,7 @@ fn unknown_nested_resource_types_are_reported_once() {
     let under: Vec<_> = errors.iter().filter(|e| e.path.starts_with("Bundle.entry.0.resource")).collect();
     assert_eq!(under.len(), 1, "{errors:#?}");
     assert_eq!(
-        under[0].hl7_message.as_deref(),
-        Some("Contained resource does not appear to be a FHIR resource (unknown name 'SubscriptionStatus')")
+        under[0].message,
+        "Contained resource does not appear to be a FHIR resource (unknown name 'SubscriptionStatus')"
     );
 }
