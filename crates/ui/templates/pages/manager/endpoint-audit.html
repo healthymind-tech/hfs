@@ -1,0 +1,42 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# AuditEvents of this endpoint (its tenant's /AuditEvent), newest first. #}
+{% block title %}{{ i18n.t("mgr-nav-audit") }} — {{ head.display_name }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+{% call ui::ep_head(head, i18n.t("mgr-nav-audit"), false, false, false) %}{% endcall %}
+<section class="card table-card">
+  <div class="card-head">
+    <h2>{{ i18n.t_arg("mgr-audit-latest", "count", count.clone()) }}</h2>
+    <a class="btn btn--small" href="/ui/e/{{ head.name }}/data/resources?type=AuditEvent">{% call ui::icon("search") %}{% endcall %}{{ i18n.t("mgr-audit-search") }}</a>
+  </div>
+  {% if !error.is_empty() %}
+  {% call ui::empty_state("alert", i18n.t("mgr-audit-unavailable"), error.clone()) %}{% endcall %}
+  {% else if rows.is_empty() %}
+  {% call ui::empty_state("history", i18n.t("mgr-audit-empty"), i18n.t("mgr-audit-empty-text")) %}{% endcall %}
+  {% else %}
+  <div class="table-wrap" tabindex="0" aria-label="{{ i18n.t("mgr-nav-audit") }}">
+    <table class="data-table data-table--stack">
+      <thead><tr>
+        <th scope="col">{{ i18n.t("mgr-audit-col-time") }}</th>
+        <th scope="col">{{ i18n.t("mgr-audit-col-event") }}</th>
+        <th scope="col">{{ i18n.t("mgr-audit-col-entity") }}</th>
+        <th scope="col">{{ i18n.t("mgr-audit-col-agent") }}</th>
+        <th scope="col">{{ i18n.t("mgr-audit-col-outcome") }}</th>
+      </tr></thead>
+      <tbody>
+        {% for a in rows %}
+        <tr>
+          <td data-label="{{ i18n.t("mgr-audit-col-time") }}"><time class="mono">{{ a.at }}</time></td>
+          <td data-label="{{ i18n.t("mgr-audit-col-event") }}">{{ a.kind }}{% if !a.action.is_empty() %} <span class="tag tag--muted">{{ a.action }}</span>{% endif %}</td>
+          <td data-label="{{ i18n.t("mgr-audit-col-entity") }}" class="mono">{{ a.what }}</td>
+          <td data-label="{{ i18n.t("mgr-audit-col-agent") }}">{{ a.agent }}</td>
+          <td data-label="{{ i18n.t("mgr-audit-col-outcome") }}">{% if a.outcome_ok %}{% call ui::pill_raw("ok", "check-circle", i18n.t("mgr-outcome-ok")) %}{% endcall %}{% else %}{% call ui::pill_raw("danger", "alert", i18n.t("mgr-outcome-failed")) %}{% endcall %} <span class="mono">{{ a.outcome }}</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if has_more %}<div class="card__body"><a class="btn" href="{{ more_href }}">{{ i18n.t("mgr-load-more") }}</a></div>{% endif %}
+  {% endif %}
+</section>
+{% endblock %}

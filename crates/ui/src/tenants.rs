@@ -1822,6 +1822,7 @@ mod inventory_hook_tests {
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             login: None,
             admin_gate: helios_admin_auth::AdminGate::Open,
+            manager: None,
         }
     }
 

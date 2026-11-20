@@ -1,0 +1,4 @@
+{# Live name/path availability for the new-endpoint form. #}
+<p class="availability availability--{% if ok %}ok{% else %}bad{% endif %}" role="status">
+  <span>{{ message }}</span>{% if ok %} <code>{{ url }}</code>{% endif %}
+</p>

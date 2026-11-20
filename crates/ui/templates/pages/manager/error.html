@@ -1,0 +1,15 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# Manager error page: unknown endpoint (404), role too low (403), backend down (503). #}
+{% block title %}{{ i18n.t(title_key) }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+<div class="error-page">
+  <p class="error-page__code" aria-hidden="true">{{ code }}</p>
+  <h1 class="page-head__title">{{ i18n.t(title_key) }}</h1>
+  <p class="error-page__text">{{ i18n.t(text_key) }}</p>
+  {% if !detail.is_empty() %}<details class="disclosure"><summary>{{ i18n.t("mgr-error-details") }}</summary><pre class="error-page__detail">{{ detail }}</pre></details>{% endif %}
+  <div class="error-page__actions">
+    <a class="btn btn--primary" href="{{ back_href }}">{% call ui::icon("grid") %}{% endcall %}{{ i18n.t(back_key) }}</a>
+  </div>
+</div>
+{% endblock %}
