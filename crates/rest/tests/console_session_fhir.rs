@@ -181,10 +181,8 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
     };
     // Console JS (csrf.js) sends the session's synchronizer token on writes.
     let post = |p: &'static str, who: &'static str, origin: Option<&'static str>| {
-        post_raw(p, who, origin).add_header(
-            "x-csrf-token",
-            HeaderValue::from_str(&tokens[who]).unwrap(),
-        )
+        post_raw(p, who, origin)
+            .add_header("x-csrf-token", HeaderValue::from_str(&tokens[who]).unwrap())
     };
     const SITE: Option<&str> = Some("http://hfs.test");
 
@@ -216,7 +214,9 @@ async fn real_console_sessions_act_on_the_fhir_api_by_role() {
     }
     // Same-site but without the session's CSRF token: refused.
     assert_eq!(
-        post_raw("/alpha/Patient", "editor", SITE).await.status_code(),
+        post_raw("/alpha/Patient", "editor", SITE)
+            .await
+            .status_code(),
         StatusCode::FORBIDDEN,
         "no CSRF token"
     );
