@@ -50,6 +50,9 @@ Fork migrations in this build:
 | `hm-0005-package-jobs` | `hfs_package_jobs` | fork (hm/p3-cluster) |
 | `hm-0006-search-index-statistics` | dependency-only extended statistics on `search_index`, token statistics target 1000, ANALYZE ([index-strategy.md §4](index-strategy.md#4-planning-cost-and-extended-statistics-hm-0006)) | fork (hm/p3-pgops2) |
 | `hm-0007-bulk-manifest-index-pending` | `bulk_manifests.index_pending` (deferred bulk-submit indexing) | fork (hm/p3-interop2; was startup DDL, registered here at merge). Upstream v52 adds the same column (`BOOLEAN NOT NULL DEFAULT FALSE`) plus `index_pending_types` and `idx_bulk_manifests_index_pending`, all `IF NOT EXISTS`: on a database that already ran hm-0007, v52 only adds the latter two. |
+| `hm-0008-endpoints` | `hfs_endpoints`, `hfs_endpoint_revisions`, `hfs_config_epochs` + `hfs_bump_config_epoch()` (statement triggers, `NOTIFY hfs_config`) | fork (FHIR server manager, [design](../design/fhir-server-manager.md) §4.1; inert until `HFS_MANAGER=on`) |
+| `hm-0009-console-auth` | `hfs_console_settings`, `hfs_console_users`, `hfs_console_role_bindings` | fork (design §4.2) |
+| `hm-0010-endpoint-sync` | `hfs_sync_jobs`, `hfs_sync_runs`, `hfs_sync_log`, `hfs_sync_conflicts`, `hfs_sync_item_state` | fork (design §4.3) |
 
 hm/p3-cluster first numbered 0002–0005 as ladder v48–v51; they were moved onto
 this track when it was merged with hm/p3-pgops (upstream has its own v48+). No

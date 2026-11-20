@@ -42,6 +42,7 @@ __pycache__/
 /docs/*
 # fork operator docs stay at docs/ (healthymind fork)
 !/docs/ops/
+!/docs/design/
 !/docs/hts-terminology-admin.md
 !/docs/search-modifier-spec-compliance-plan.md
 # README brand assets and screenshots (healthymind fork)

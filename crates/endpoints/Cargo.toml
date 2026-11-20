@@ -1,0 +1,42 @@
+[package]
+name = "helios-endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/endpoints"
+description = "FHIR server manager foundation: the FHIR endpoint model, registry, stores, console-auth and sync contracts, sealed secrets and the outbound URL policy"
+keywords = ["helios-software", "fhir", "multi-endpoint"]
+
+# Package 0 of docs/design/fhir-server-manager.md. Deliberately light: no
+# axum, no helios-fhir (its generated models are heavy), no persistence. The
+# REST layer, the UI, the console-auth and the sync packages all depend on
+# this crate; it depends on none of them. Every dependency below is already in
+# the workspace lock.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+arc-swap = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2.5"
+tracing = "0.1"
+# Sealed secrets (AES-256-GCM, random 96-bit nonces from the OS CSPRNG).
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+# PostgreSQL EndpointStore + LISTEN task (feature `postgres`, package P1),
+# over the server's shared pool. Same versions/features as helios-persistence.
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"], optional = true }
+
+[features]
+default = []
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }

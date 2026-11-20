@@ -69,6 +69,9 @@ pub struct TenantExtractor {
     source: TenantSource,
     url_routed: bool,
     resolved: ResolvedTenant,
+    /// The named endpoint's path segment when the request came through one
+    /// (FHIR server manager); public URLs are built under it.
+    endpoint_segment: Option<String>,
 }
 
 impl TenantExtractor {
@@ -84,6 +87,7 @@ impl TenantExtractor {
                 source,
                 all_sources: vec![(source, tenant_id_obj)],
             },
+            endpoint_segment: None,
         }
     }
 
@@ -101,6 +105,7 @@ impl TenantExtractor {
             source: resolved.source,
             url_routed,
             resolved,
+            endpoint_segment: None,
         }
     }
 
@@ -141,6 +146,22 @@ impl TenantExtractor {
         self.url_routed
     }
 
+    /// The URL segment public URLs of this request are built under: the
+    /// named endpoint's path (FHIR server manager), else the tenant id when
+    /// the request was routed by a tenant URL prefix, else none.
+    pub fn url_segment(&self) -> Option<&str> {
+        match &self.endpoint_segment {
+            Some(segment) => Some(segment),
+            None if self.url_routed => Some(self.tenant_id()),
+            None => None,
+        }
+    }
+
+    /// The named endpoint's path segment, when the request came through one.
+    pub fn endpoint_segment(&self) -> Option<&str> {
+        self.endpoint_segment.as_deref()
+    }
+
     /// Returns true if the tenant is the default fallback.
     pub fn is_default(&self) -> bool {
         self.source.is_default()
@@ -177,7 +198,10 @@ where
         state: &AppState<S>,
     ) -> Result<Self, Self::Rejection> {
         let extractor = Self::resolve(parts, state).await?;
-        enforce_provisioned(state, &extractor).await?;
+        // A named endpoint's tenant is provisioned by the endpoint itself.
+        if extractor.endpoint_segment.is_none() {
+            enforce_provisioned(state, &extractor).await?;
+        }
         // The audit trail of this request belongs to the tenant it addressed.
         helios_audit::context::set_tenant(extractor.tenant_id(), extractor.is_url_based());
         // Tell the audit middleware which tenant this request acted on, so its
@@ -224,11 +248,82 @@ fn reject_reserved_tenant(id: &str, source: TenantSource) -> Result<(), RestErro
 }
 
 impl TenantExtractor {
+    /// Resolves the tenant of a request.
+    ///
+    /// Without the FHIR server manager (no `ResolvedEndpoint` extension) this
+    /// is [`Self::resolve_unmanaged`], unchanged. With it:
+    ///
+    /// * a **named endpoint**'s tenant is authoritative ([`Self::resolve_named`]);
+    /// * the **default endpoint** resolves as before and then enforces the
+    ///   one-door rule (D-7, [`enforce_default_door`]).
+    async fn resolve<S>(parts: &mut Parts, state: &AppState<S>) -> Result<Self, RestError>
+    where
+        S: helios_persistence::core::ResourceStorage + Send + Sync,
+    {
+        let endpoint = parts
+            .extensions
+            .get::<helios_endpoints::ResolvedEndpoint>()
+            .cloned();
+        match endpoint {
+            Some(ep) if !ep.is_default() => Self::resolve_named(parts, &ep),
+            Some(ep) => {
+                let extractor = Self::resolve_unmanaged(parts, state).await?;
+                enforce_default_door(parts, state, &ep, &extractor)?;
+                Ok(extractor)
+            }
+            None => Self::resolve_unmanaged(parts, state).await,
+        }
+    }
+
+    /// A named endpoint: its tenant is the only tenant it serves.
+    ///
+    /// * A token's tenant claim must be absent or equal to the endpoint's
+    ///   tenant (`403` otherwise) — the administrator credential carries none.
+    /// * `X-Tenant-ID` never selects anything here: absent, empty or equal to
+    ///   the endpoint's tenant is accepted, anything else is `400`.
+    fn resolve_named(
+        parts: &Parts,
+        endpoint: &helios_endpoints::ResolvedEndpoint,
+    ) -> Result<Self, RestError> {
+        let tenant = endpoint.endpoint.tenant_id();
+        let name = endpoint.endpoint.name();
+        if let Some(claim) = parts
+            .extensions
+            .get::<helios_auth::Principal>()
+            .filter(|p| p.issuer != crate::middleware::auth::ADMIN_ISSUER)
+            .and_then(|p| p.tenant_id())
+            .filter(|t| !t.is_empty())
+            && claim != tenant
+        {
+            return Err(RestError::Forbidden {
+                message: format!(
+                    "Authenticated token's tenant claim '{claim}' does not match endpoint \
+                     '{name}' (tenant '{tenant}')"
+                ),
+            });
+        }
+        if let Some(header) = parts.headers.get(X_TENANT_ID) {
+            let value = header.to_str().unwrap_or("\u{fffd}").trim();
+            if !value.is_empty() && value != tenant {
+                return Err(RestError::BadRequest {
+                    message: format!(
+                        "X-Tenant-ID names tenant '{value}' but endpoint '{name}' serves \
+                         tenant '{tenant}'; a named endpoint never selects a tenant by header"
+                    ),
+                });
+            }
+        }
+        reject_reserved_tenant(tenant, TenantSource::UrlPath)?;
+        let mut extractor = TenantExtractor::new(tenant, TenantSource::UrlPath);
+        extractor.endpoint_segment = Some(endpoint.endpoint.spec.path.as_str().to_string());
+        Ok(extractor)
+    }
+
     /// Resolves the tenant for a request from JWT claim / header / URL / default,
     /// applying strict-validation consistency checks. Provisioned-tenant
     /// enforcement is applied separately by the extractor
     /// ([`enforce_provisioned`]).
-    async fn resolve<S>(parts: &mut Parts, state: &AppState<S>) -> Result<Self, RestError>
+    async fn resolve_unmanaged<S>(parts: &mut Parts, state: &AppState<S>) -> Result<Self, RestError>
     where
         S: helios_persistence::core::ResourceStorage + Send + Sync,
     {
@@ -374,6 +469,55 @@ impl TenantExtractor {
 
         Ok(TenantExtractor::from_resolved(resolved))
     }
+}
+
+/// The tenant-selection header.
+const X_TENANT_ID: &str = "x-tenant-id";
+
+/// The one-door rule on the default endpoint (design D-7).
+///
+/// When the request selected a tenant other than the default endpoint's own
+/// (by `X-Tenant-ID`, a token claim, or a URL prefix in URL-tenant mode):
+///
+/// * a tenant bound to a **named endpoint** is refused (`403`, naming the URL
+///   it is served at), whatever selected it — otherwise the root door would
+///   bypass that endpoint's own authentication;
+/// * a tenant selected by `X-Tenant-ID` is refused (`403`) when the default
+///   endpoint's `legacyTenantHeader` is off.
+fn enforce_default_door<S>(
+    parts: &Parts,
+    state: &AppState<S>,
+    endpoint: &helios_endpoints::ResolvedEndpoint,
+    extractor: &TenantExtractor,
+) -> Result<(), RestError>
+where
+    S: helios_persistence::core::ResourceStorage + Send + Sync,
+{
+    let tenant = extractor.tenant_id();
+    if tenant == endpoint.endpoint.tenant_id() {
+        return Ok(());
+    }
+    let bound = parts
+        .extensions
+        .get::<crate::endpoint::RequestSnapshot>()
+        .and_then(|s| s.0.tenant_bound_to_named(tenant).cloned());
+    if let Some(bound) = bound {
+        return Err(RestError::Forbidden {
+            message: format!(
+                "tenant '{tenant}' is served by endpoint '{}' at {}/{}; it cannot be \
+                 selected on the default endpoint",
+                bound.name(),
+                state.base_url(),
+                bound.spec.path.as_str()
+            ),
+        });
+    }
+    if extractor.source() == TenantSource::Header && !endpoint.endpoint.spec.legacy_tenant_header {
+        return Err(RestError::Forbidden {
+            message: "X-Tenant-ID tenant selection is disabled on this endpoint".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Rejects a resolved tenant that is not provisioned, when

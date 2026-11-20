@@ -3373,6 +3373,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-endpoints"
+version = "0.2.9"
+dependencies = [
+ "aes-gcm",
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "deadpool-postgres",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "helios-fhir"
 version = "0.2.9"
 dependencies = [
@@ -3492,6 +3513,7 @@ dependencies = [
  "helios-admin-auth",
  "helios-audit",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-observability",
  "helios-persistence",
@@ -3704,6 +3726,7 @@ dependencies = [
  "helios-admin-auth",
  "helios-audit",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
  "helios-observability",
@@ -3718,6 +3741,7 @@ dependencies = [
  "jsonpath-rust",
  "jsonwebtoken",
  "libc",
+ "metrics",
  "mime",
  "p256 0.14.0",
  "p384",
