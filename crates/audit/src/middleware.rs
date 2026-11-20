@@ -863,3 +863,7 @@ mod tests {
         assert_eq!(sanitize_request_id(&"a".repeat(500)).len(), 128);
     }
 }
+
+#[cfg(test)]
+#[path = "middleware_hm_tests.rs"]
+mod hm_tests;

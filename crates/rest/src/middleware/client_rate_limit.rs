@@ -303,3 +303,7 @@ mod tests {
         assert!(!RateLimitConfig::default().enabled());
     }
 }
+
+#[cfg(test)]
+#[path = "client_rate_limit_hm_tests.rs"]
+mod hm_tests;
