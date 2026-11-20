@@ -122,20 +122,84 @@ fn render(
             ("local", "console-mode-local"),
         ],
         oidc_fields: vec![
-            (field::OIDC_ISSUER, "console-settings-oidc-issuer", "HFS_CONSOLE_OIDC_ISSUER", get(|o| o.issuer.clone())),
-            (field::OIDC_CLIENT_ID, "console-settings-oidc-client-id", "HFS_CONSOLE_OIDC_CLIENT_ID", get(|o| o.client_id.clone())),
-            (field::OIDC_SCOPES, "console-settings-oidc-scopes", "HFS_CONSOLE_OIDC_SCOPES", o.as_ref().map(|o| o.scopes.clone()).unwrap_or_else(|| "openid profile email".into())),
-            (field::OIDC_ROLE_CLAIM, "console-settings-oidc-role-claim", "HFS_CONSOLE_OIDC_ROLE_CLAIM", o.as_ref().map(|o| o.role_claim.clone()).unwrap_or_else(|| "roles".into())),
-            (field::OIDC_ADMIN_VALUES, "console-settings-oidc-admin-values", "HFS_CONSOLE_OIDC_ADMIN_VALUES", get(|o| o.role_mapping.admin.join(", "))),
-            (field::OIDC_EDITOR_VALUES, "console-settings-oidc-editor-values", "HFS_CONSOLE_OIDC_EDITOR_VALUES", get(|o| o.role_mapping.editor.join(", "))),
-            (field::OIDC_VIEWER_VALUES, "console-settings-oidc-viewer-values", "HFS_CONSOLE_OIDC_VIEWER_VALUES", get(|o| o.role_mapping.viewer.join(", "))),
+            (
+                field::OIDC_ISSUER,
+                "console-settings-oidc-issuer",
+                "HFS_CONSOLE_OIDC_ISSUER",
+                get(|o| o.issuer.clone()),
+            ),
+            (
+                field::OIDC_CLIENT_ID,
+                "console-settings-oidc-client-id",
+                "HFS_CONSOLE_OIDC_CLIENT_ID",
+                get(|o| o.client_id.clone()),
+            ),
+            (
+                field::OIDC_SCOPES,
+                "console-settings-oidc-scopes",
+                "HFS_CONSOLE_OIDC_SCOPES",
+                o.as_ref()
+                    .map(|o| o.scopes.clone())
+                    .unwrap_or_else(|| "openid profile email".into()),
+            ),
+            (
+                field::OIDC_ROLE_CLAIM,
+                "console-settings-oidc-role-claim",
+                "HFS_CONSOLE_OIDC_ROLE_CLAIM",
+                o.as_ref()
+                    .map(|o| o.role_claim.clone())
+                    .unwrap_or_else(|| "roles".into()),
+            ),
+            (
+                field::OIDC_ADMIN_VALUES,
+                "console-settings-oidc-admin-values",
+                "HFS_CONSOLE_OIDC_ADMIN_VALUES",
+                get(|o| o.role_mapping.admin.join(", ")),
+            ),
+            (
+                field::OIDC_EDITOR_VALUES,
+                "console-settings-oidc-editor-values",
+                "HFS_CONSOLE_OIDC_EDITOR_VALUES",
+                get(|o| o.role_mapping.editor.join(", ")),
+            ),
+            (
+                field::OIDC_VIEWER_VALUES,
+                "console-settings-oidc-viewer-values",
+                "HFS_CONSOLE_OIDC_VIEWER_VALUES",
+                get(|o| o.role_mapping.viewer.join(", ")),
+            ),
         ],
         number_fields: vec![
-            (field::MIN_PASSWORD_LENGTH, "console-settings-min-length", "HFS_CONSOLE_PASSWORD_MIN_LENGTH", s.local.min_password_length.to_string()),
-            (field::LOCKOUT_FAILURES, "console-settings-lockout-failures", "HFS_CONSOLE_LOCKOUT_FAILURES", s.local.lockout_failures.to_string()),
-            (field::LOCKOUT_MINUTES, "console-settings-lockout-minutes", "HFS_CONSOLE_LOCKOUT_MINUTES", s.local.lockout_minutes.to_string()),
-            (field::SESSION_IDLE, "console-settings-session-idle", "HFS_CONSOLE_SESSION_IDLE_MINUTES", s.session_idle_minutes.to_string()),
-            (field::SESSION_ABSOLUTE, "console-settings-session-absolute", "HFS_CONSOLE_SESSION_ABSOLUTE_HOURS", s.session_absolute_hours.to_string()),
+            (
+                field::MIN_PASSWORD_LENGTH,
+                "console-settings-min-length",
+                "HFS_CONSOLE_PASSWORD_MIN_LENGTH",
+                s.local.min_password_length.to_string(),
+            ),
+            (
+                field::LOCKOUT_FAILURES,
+                "console-settings-lockout-failures",
+                "HFS_CONSOLE_LOCKOUT_FAILURES",
+                s.local.lockout_failures.to_string(),
+            ),
+            (
+                field::LOCKOUT_MINUTES,
+                "console-settings-lockout-minutes",
+                "HFS_CONSOLE_LOCKOUT_MINUTES",
+                s.local.lockout_minutes.to_string(),
+            ),
+            (
+                field::SESSION_IDLE,
+                "console-settings-session-idle",
+                "HFS_CONSOLE_SESSION_IDLE_MINUTES",
+                s.session_idle_minutes.to_string(),
+            ),
+            (
+                field::SESSION_ABSOLUTE,
+                "console-settings-session-absolute",
+                "HFS_CONSOLE_SESSION_ABSOLUTE_HOURS",
+                s.session_absolute_hours.to_string(),
+            ),
         ],
         pinned_fields: console.env().pinned.iter().copied().collect(),
         revision,
@@ -258,7 +322,9 @@ pub(crate) fn settings_from_form(
         s.break_glass = form.get(field::BREAK_GLASS).is_some_and(|v| v == "true");
     }
     let issuer = form.get(field::OIDC_ISSUER).map(|v| v.trim().to_string());
-    let client = form.get(field::OIDC_CLIENT_ID).map(|v| v.trim().to_string());
+    let client = form
+        .get(field::OIDC_CLIENT_ID)
+        .map(|v| v.trim().to_string());
     let has_oidc_input = issuer.as_deref().is_some_and(|v| !v.is_empty())
         || client.as_deref().is_some_and(|v| !v.is_empty())
         || current.oidc.is_some();
@@ -325,8 +391,10 @@ pub(crate) fn settings_from_form(
         s.allowed_origins = list(v);
     }
     let secret = match (
-        form.get(field::OIDC_CLIENT_SECRET).filter(|v| !v.is_empty()),
-        form.get("oidc.clientSecret.clear").is_some_and(|v| v == "true"),
+        form.get(field::OIDC_CLIENT_SECRET)
+            .filter(|v| !v.is_empty()),
+        form.get("oidc.clientSecret.clear")
+            .is_some_and(|v| v == "true"),
     ) {
         (Some(v), _) => SecretInput::Set(v.clone()),
         (None, true) => SecretInput::Clear,
@@ -400,11 +468,7 @@ pub(crate) async fn save(
     {
         Ok(_) => Redirect::to("/ui/settings/auth?saved=1").into_response(),
         Err(ConsoleError::Invalid(errors)) => {
-            field_errors.extend(
-                errors
-                    .into_iter()
-                    .map(|e| (e.field.to_string(), e.message)),
-            );
+            field_errors.extend(errors.into_iter().map(|e| (e.field.to_string(), e.message)));
             fail(None, field_errors, proposed)
         }
         Err(e) => fail(Some(error_text(&i18n, &e)), Vec::new(), proposed),
@@ -431,7 +495,8 @@ pub(crate) async fn test_sign_in(
     {
         Ok((cookie, url)) => {
             let mut r = Redirect::to(&url).into_response();
-            r.headers_mut().append(axum::http::header::SET_COOKIE, cookie);
+            r.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
             r
         }
         Err(e) => {
@@ -488,12 +553,18 @@ mod tests {
         assert_eq!(secret, SecretInput::Set("s3".into()));
 
         // Pinned fields are disabled and so absent: the current value stays.
-        let (s2, secret, _) = settings_from_form(&form(&[("revision", "1"), ("breakGlass", "true")]), &s_with(&current));
+        let (s2, secret, _) = settings_from_form(
+            &form(&[("revision", "1"), ("breakGlass", "true")]),
+            &s_with(&current),
+        );
         assert_eq!(s2.mode, ConsoleAuthMode::Local);
         assert!(s2.break_glass);
         assert_eq!(secret, SecretInput::Keep);
         let (_, secret, errors) = settings_from_form(
-            &form(&[("oidc.clientSecret.clear", "true"), ("sessionIdleMinutes", "x")]),
+            &form(&[
+                ("oidc.clientSecret.clear", "true"),
+                ("sessionIdleMinutes", "x"),
+            ]),
             &current,
         );
         assert_eq!(secret, SecretInput::Clear);

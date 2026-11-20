@@ -171,7 +171,10 @@ impl ConsoleStore for PgConsoleStore {
             }
         }
         let current = client
-            .query_opt("SELECT revision FROM hfs_console_settings WHERE id = 1", &[])
+            .query_opt(
+                "SELECT revision FROM hfs_console_settings WHERE id = 1",
+                &[],
+            )
             .await
             .map_err(unavailable)?
             .map(|r| r.get::<_, i64>(0) as u64)
@@ -183,9 +186,7 @@ impl ConsoleStore for PgConsoleStore {
         let client = self.client().await?;
         let rows = client
             .query(
-                &format!(
-                    "SELECT {USER_COLUMNS} FROM hfs_console_users ORDER BY lower(username)"
-                ),
+                &format!("SELECT {USER_COLUMNS} FROM hfs_console_users ORDER BY lower(username)"),
                 &[],
             )
             .await

@@ -24,7 +24,9 @@ fn pool() -> Option<deadpool_postgres::Pool> {
     };
     let mut cfg = deadpool_postgres::Config::new();
     cfg.host = Some(host);
-    cfg.port = std::env::var("HFS_TEST_PG_PORT").ok().and_then(|p| p.parse().ok());
+    cfg.port = std::env::var("HFS_TEST_PG_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok());
     cfg.user = Some("postgres".into());
     cfg.password = Some("postgres".into());
     cfg.dbname = Some("postgres".into());
@@ -51,17 +53,39 @@ async fn postgres_integration_console_session_store() {
     let key = format!("k{}", now()) + &uuid_like();
     let subject = format!("local:{key}");
     let doc = serde_json::json!({"subject": subject, "role": "viewer"});
-    store.put(&key, KIND_SESSION, &doc, now() + 60).await.unwrap();
-    assert_eq!(store.get(&key, KIND_SESSION).await.unwrap(), Some(doc.clone()));
-    assert!(store.get(&key, KIND_PENDING).await.unwrap().is_none(), "kind scoped");
+    store
+        .put(&key, KIND_SESSION, &doc, now() + 60)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&key, KIND_SESSION).await.unwrap(),
+        Some(doc.clone())
+    );
+    assert!(
+        store.get(&key, KIND_PENDING).await.unwrap().is_none(),
+        "kind scoped"
+    );
     // Replace (touch) keeps one row.
     let doc2 = serde_json::json!({"subject": subject, "role": "admin"});
-    store.put(&key, KIND_SESSION, &doc2, now() + 60).await.unwrap();
+    store
+        .put(&key, KIND_SESSION, &doc2, now() + 60)
+        .await
+        .unwrap();
     assert_eq!(store.get(&key, KIND_SESSION).await.unwrap(), Some(doc2));
-    assert!(store.list(KIND_SESSION).await.unwrap().iter().any(|(k, _)| *k == key));
+    assert!(
+        store
+            .list(KIND_SESSION)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(k, _)| *k == key)
+    );
     // Expired rows are invisible.
     let old = format!("{key}-old");
-    store.put(&old, KIND_SESSION, &doc, now() - 5).await.unwrap();
+    store
+        .put(&old, KIND_SESSION, &doc, now() - 5)
+        .await
+        .unwrap();
     assert!(store.get(&old, KIND_SESSION).await.unwrap().is_none());
     // Subject revocation and exactly-once delete.
     assert_eq!(store.delete_subject(&subject).await.unwrap(), 2);
@@ -82,21 +106,36 @@ async fn postgres_integration_console_session_store() {
 fn uuid_like() -> String {
     use rand::Rng;
     let mut r = rand::thread_rng();
-    (0..12).map(|_| char::from(b'a' + r.gen_range(0..26))).collect()
+    (0..12)
+        .map(|_| char::from(b'a' + r.gen_range(0..26)))
+        .collect()
 }
 
-async fn instance(pool: &deadpool_postgres::Pool, store: Arc<MemoryConsoleStore>) -> Arc<ConsoleAuth> {
+async fn instance(
+    pool: &deadpool_postgres::Pool,
+    store: Arc<MemoryConsoleStore>,
+) -> Arc<ConsoleAuth> {
     let gate = AdminGate::configure(
         "HFS",
         AdminSettings::default().with_password("break-glass-password-1"),
         true,
-        CookieSpec { name: "hfs_admin", path: "/" },
+        CookieSpec {
+            name: "hfs_admin",
+            path: "/",
+        },
     );
     ConsoleAuth::new(
-        env(&[("HFS_CONSOLE_AUTH_MODE", "local"), ("HFS_CONSOLE_LOCKOUT_FAILURES", "3")]),
+        env(&[
+            ("HFS_CONSOLE_AUTH_MODE", "local"),
+            ("HFS_CONSOLE_LOCKOUT_FAILURES", "3"),
+        ]),
         store,
         Arc::new(PgConsoleSessionStore::connect(pool.clone()).await.unwrap()),
-        Arc::new(PgAdminSessionStore::connect(pool.clone(), LOCKOUT_SCOPE).await.unwrap()),
+        Arc::new(
+            PgAdminSessionStore::connect(pool.clone(), LOCKOUT_SCOPE)
+                .await
+                .unwrap(),
+        ),
         gate,
         ConsoleOptions {
             public_base_url: "http://hfs.test".into(),
@@ -146,8 +185,9 @@ async fn postgres_integration_console_sessions_are_cluster_wide() {
     helios_endpoints::console::ConsoleStore::update_user(accounts.as_ref(), u2, u.revision)
         .await
         .unwrap();
-    let LoginResult::Success { cookies, .. } =
-        a.login_password(&site(), peer, &name, "tidy-Lantern-41-orbit").await
+    let LoginResult::Success { cookies, .. } = a
+        .login_password(&site(), peer, &name, "tidy-Lantern-41-orbit")
+        .await
     else {
         panic!("sign-in")
     };
@@ -157,21 +197,31 @@ async fn postgres_integration_console_sessions_are_cluster_wide() {
         .filter_map(|c| c.split(';').next())
         .collect();
     let mut h = site();
-    h.insert(header::COOKIE, HeaderValue::from_str(&cookie.join("; ")).unwrap());
-    assert_eq!(b.resolve(&h).await.unwrap().principal.role, ConsoleRole::Editor);
+    h.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&cookie.join("; ")).unwrap(),
+    );
+    assert_eq!(
+        b.resolve(&h).await.unwrap().principal.role,
+        ConsoleRole::Editor
+    );
     let _ = b.logout(&h).await;
     assert!(a.resolve(&h).await.is_none(), "signed out everywhere");
 
     // Lockout shared: 2 failures on A + 1 on B lock the account on both.
     for rt in [&a, &a] {
-        assert!(matches!(rt.login_password(&site(), peer, &name, "x").await, LoginResult::Invalid));
+        assert!(matches!(
+            rt.login_password(&site(), peer, &name, "x").await,
+            LoginResult::Invalid
+        ));
     }
     assert!(matches!(
         b.login_password(&site(), peer, &name, "x").await,
         LoginResult::RateLimited(_)
     ));
     assert!(matches!(
-        a.login_password(&site(), peer, &name, "tidy-Lantern-41-orbit").await,
+        a.login_password(&site(), peer, &name, "tidy-Lantern-41-orbit")
+            .await,
         LoginResult::RateLimited(_)
     ));
 }

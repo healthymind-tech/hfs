@@ -161,8 +161,10 @@ pub(crate) async fn login_page(
     // With console sign-in (P3) the break-glass administrator signs in on
     // the console's own page.
     if console.is_some() {
-        return Redirect::to(&helios_admin_auth::console::guard::sign_in_target(&next, true))
-            .into_response();
+        return Redirect::to(&helios_admin_auth::console::guard::sign_in_target(
+            &next, true,
+        ))
+        .into_response();
     }
     let gate = &state.admin_gate;
     match gate {

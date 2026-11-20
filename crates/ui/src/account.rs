@@ -55,7 +55,9 @@ pub(crate) fn error_text(i18n: &I18n, e: &ConsoleError) -> String {
             _ => i18n.t(p.message_id()),
         },
         ConsoleError::Conflict(_) => i18n.t("console-error-conflict"),
-        ConsoleError::Unavailable(d) => i18n.t_arg("console-error-unavailable", "detail", d.clone()),
+        ConsoleError::Unavailable(d) => {
+            i18n.t_arg("console-error-unavailable", "detail", d.clone())
+        }
         other => other.to_string(),
     }
 }

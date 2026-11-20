@@ -115,7 +115,11 @@ impl EnvBootstrap {
 
     /// Through `get` (the environment, or a map in tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        let var = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let var = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
         let mut env = Self::default();
         let mut warnings = Vec::new();
 
@@ -181,7 +185,9 @@ impl EnvBootstrap {
                     env.client_secret = Some(Secret::new(s.trim_end_matches(['\r', '\n'])));
                     env.pinned.insert(field::OIDC_CLIENT_SECRET);
                 }
-                Ok(_) => warnings.push(format!("HFS_CONSOLE_OIDC_CLIENT_SECRET_FILE ({path}) is empty")),
+                Ok(_) => warnings.push(format!(
+                    "HFS_CONSOLE_OIDC_CLIENT_SECRET_FILE ({path}) is empty"
+                )),
                 Err(e) => warnings.push(format!(
                     "cannot read HFS_CONSOLE_OIDC_CLIENT_SECRET_FILE ({path}): {}",
                     e.kind()
@@ -202,9 +208,21 @@ impl EnvBootstrap {
             env.pinned.insert(field::OIDC_ROLE_CLAIM);
         }
         for (name, slot, path) in [
-            ("HFS_CONSOLE_OIDC_ADMIN_VALUES", &mut env.admin_values, field::OIDC_ADMIN_VALUES),
-            ("HFS_CONSOLE_OIDC_EDITOR_VALUES", &mut env.editor_values, field::OIDC_EDITOR_VALUES),
-            ("HFS_CONSOLE_OIDC_VIEWER_VALUES", &mut env.viewer_values, field::OIDC_VIEWER_VALUES),
+            (
+                "HFS_CONSOLE_OIDC_ADMIN_VALUES",
+                &mut env.admin_values,
+                field::OIDC_ADMIN_VALUES,
+            ),
+            (
+                "HFS_CONSOLE_OIDC_EDITOR_VALUES",
+                &mut env.editor_values,
+                field::OIDC_EDITOR_VALUES,
+            ),
+            (
+                "HFS_CONSOLE_OIDC_VIEWER_VALUES",
+                &mut env.viewer_values,
+                field::OIDC_VIEWER_VALUES,
+            ),
         ] {
             if let Some(v) = var(name) {
                 *slot = Some(list(&v));
@@ -230,22 +248,52 @@ impl EnvBootstrap {
                             $slot = Some(n);
                             env.pinned.insert($path);
                         }
-                        Err(_) => warnings.push(format!("{}={v:?} is not a number; ignored", $name)),
+                        Err(_) => {
+                            warnings.push(format!("{}={v:?} is not a number; ignored", $name))
+                        }
                     }
                 }
             };
         }
-        num!("HFS_CONSOLE_SESSION_IDLE_MINUTES", env.session_idle, field::SESSION_IDLE);
-        num!("HFS_CONSOLE_SESSION_ABSOLUTE_HOURS", env.session_absolute, field::SESSION_ABSOLUTE);
-        num!("HFS_CONSOLE_PASSWORD_MIN_LENGTH", env.min_password_length, field::MIN_PASSWORD_LENGTH);
-        num!("HFS_CONSOLE_LOCKOUT_FAILURES", env.lockout_failures, field::LOCKOUT_FAILURES);
-        num!("HFS_CONSOLE_LOCKOUT_MINUTES", env.lockout_minutes, field::LOCKOUT_MINUTES);
+        num!(
+            "HFS_CONSOLE_SESSION_IDLE_MINUTES",
+            env.session_idle,
+            field::SESSION_IDLE
+        );
+        num!(
+            "HFS_CONSOLE_SESSION_ABSOLUTE_HOURS",
+            env.session_absolute,
+            field::SESSION_ABSOLUTE
+        );
+        num!(
+            "HFS_CONSOLE_PASSWORD_MIN_LENGTH",
+            env.min_password_length,
+            field::MIN_PASSWORD_LENGTH
+        );
+        num!(
+            "HFS_CONSOLE_LOCKOUT_FAILURES",
+            env.lockout_failures,
+            field::LOCKOUT_FAILURES
+        );
+        num!(
+            "HFS_CONSOLE_LOCKOUT_MINUTES",
+            env.lockout_minutes,
+            field::LOCKOUT_MINUTES
+        );
         if let Some(v) = var("HFS_CONSOLE_BREAK_GLASS") {
-            env.break_glass = Some(matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+            env.break_glass = Some(matches!(
+                v.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            ));
             env.pinned.insert(field::BREAK_GLASS);
         }
         if let Some(v) = var("HFS_CONSOLE_ALLOWED_ORIGINS") {
-            env.allowed_origins = Some(list(&v).iter().filter_map(|o| normalize_origin(o)).collect());
+            env.allowed_origins = Some(
+                list(&v)
+                    .iter()
+                    .filter_map(|o| normalize_origin(o))
+                    .collect(),
+            );
             env.pinned.insert(field::ALLOWED_ORIGINS);
         }
         env.allow_anonymous_admin = var("HFS_CONSOLE_ALLOW_ANONYMOUS_ADMIN")
@@ -352,7 +400,10 @@ impl EnvBootstrap {
         let o = |s: &ConsoleAuthSettings| s.oidc.clone();
         let checks: [(&'static str, bool); 17] = [
             (field::MODE, proposed.mode != effective.mode),
-            (field::ANONYMOUS_ROLE, proposed.anonymous_role != effective.anonymous_role),
+            (
+                field::ANONYMOUS_ROLE,
+                proposed.anonymous_role != effective.anonymous_role,
+            ),
             (
                 field::OIDC_ISSUER,
                 o(proposed).map(|x| x.issuer) != o(&effective).map(|x| x.issuer),
@@ -388,12 +439,18 @@ impl EnvBootstrap {
                 field::OIDC_DEFAULT_ROLE,
                 o(proposed).map(|x| x.default_role) != o(&effective).map(|x| x.default_role),
             ),
-            (field::SESSION_IDLE, proposed.session_idle_minutes != effective.session_idle_minutes),
+            (
+                field::SESSION_IDLE,
+                proposed.session_idle_minutes != effective.session_idle_minutes,
+            ),
             (
                 field::SESSION_ABSOLUTE,
                 proposed.session_absolute_hours != effective.session_absolute_hours,
             ),
-            (field::BREAK_GLASS, proposed.break_glass != effective.break_glass),
+            (
+                field::BREAK_GLASS,
+                proposed.break_glass != effective.break_glass,
+            ),
             (
                 field::MIN_PASSWORD_LENGTH,
                 proposed.local.min_password_length != effective.local.min_password_length,
@@ -406,7 +463,10 @@ impl EnvBootstrap {
                 field::LOCKOUT_MINUTES,
                 proposed.local.lockout_minutes != effective.local.lockout_minutes,
             ),
-            (field::ALLOWED_ORIGINS, proposed.allowed_origins != effective.allowed_origins),
+            (
+                field::ALLOWED_ORIGINS,
+                proposed.allowed_origins != effective.allowed_origins,
+            ),
         ];
         for (f, differs) in checks {
             if differs && self.is_pinned(f) {
@@ -444,7 +504,10 @@ pub fn validate(s: &ConsoleAuthSettings, allow_anonymous_admin: bool) -> Vec<Set
     }
     if s.mode == ConsoleAuthMode::Oidc {
         match &s.oidc {
-            None => err(field::OIDC_ISSUER, "OIDC mode needs an issuer and a client id"),
+            None => err(
+                field::OIDC_ISSUER,
+                "OIDC mode needs an issuer and a client id",
+            ),
             Some(o) => {
                 if url::Url::parse(&o.issuer)
                     .ok()
@@ -482,7 +545,10 @@ pub fn validate(s: &ConsoleAuthSettings, allow_anonymous_admin: bool) -> Vec<Set
     if !(1..=1_440).contains(&s.local.lockout_minutes) {
         err(field::LOCKOUT_MINUTES, "between 1 minute and 24 hours");
     }
-    if s.allowed_origins.iter().any(|o| normalize_origin(o).as_deref() != Some(o.as_str())) {
+    if s.allowed_origins
+        .iter()
+        .any(|o| normalize_origin(o).as_deref() != Some(o.as_str()))
+    {
         err(field::ALLOWED_ORIGINS, "origins are scheme://host[:port]");
     }
     errors

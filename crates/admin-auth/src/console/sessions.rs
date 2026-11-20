@@ -223,9 +223,8 @@ pub mod postgres {
             tx.execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK])
                 .await
                 .map_err(err)?;
-            tx
-                .batch_execute(
-                    "CREATE TABLE IF NOT EXISTS login_sessions (
+            tx.batch_execute(
+                "CREATE TABLE IF NOT EXISTS login_sessions (
                         id         TEXT PRIMARY KEY,
                         kind       TEXT NOT NULL,
                         data       JSONB NOT NULL,
@@ -235,9 +234,9 @@ pub mod postgres {
                     );
                     CREATE INDEX IF NOT EXISTS idx_login_sessions_expires
                         ON login_sessions (expires_at);",
-                )
-                .await
-                .map_err(err)?;
+            )
+            .await
+            .map_err(err)?;
             tx.commit().await.map_err(err)?;
             Ok(Self { pool })
         }
@@ -354,7 +353,10 @@ mod tests {
         s.put("k3", KIND_PENDING, &doc, now + 60).await.unwrap();
         assert!(s.get("k1", KIND_SESSION).await.unwrap().is_some());
         assert!(s.get("k1", KIND_PENDING).await.unwrap().is_none());
-        assert!(s.get("k2", KIND_SESSION).await.unwrap().is_none(), "expired");
+        assert!(
+            s.get("k2", KIND_SESSION).await.unwrap().is_none(),
+            "expired"
+        );
         assert_eq!(s.list(KIND_SESSION).await.unwrap().len(), 1);
         assert_eq!(s.delete_subject("local:bob").await.unwrap(), 2);
         assert!(s.get("k3", KIND_PENDING).await.unwrap().is_some());

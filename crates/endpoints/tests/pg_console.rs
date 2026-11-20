@@ -8,8 +8,7 @@
 
 use chrono::Utc;
 use helios_endpoints::console::{
-    ConsoleAuthMode, ConsoleAuthSettings, ConsoleRole, ConsoleStore, ConsoleStoreError,
-    ConsoleUser,
+    ConsoleAuthMode, ConsoleAuthSettings, ConsoleRole, ConsoleStore, ConsoleStoreError, ConsoleUser,
 };
 use helios_endpoints::pg_console::PgConsoleStore;
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
@@ -198,7 +197,9 @@ async fn postgres_integration_console_store_role_bindings() {
         .await
         .unwrap();
     assert_eq!(
-        store.set_role_binding("local:bob", "nope", ConsoleRole::Editor, "admin").await,
+        store
+            .set_role_binding("local:bob", "nope", ConsoleRole::Editor, "admin")
+            .await,
         Err(ConsoleStoreError::NotFound)
     );
     let roles = store.endpoint_roles("local:bob").await.unwrap();

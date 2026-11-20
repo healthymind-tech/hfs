@@ -348,7 +348,12 @@ mod tests {
     #[test]
     fn require_login_protects_everything_but_the_sign_in() {
         let get = Method::GET;
-        for path in ["/hts", "/hts/code-systems", "/hts/value-sets/x", "/hts/capability-statement"] {
+        for path in [
+            "/hts",
+            "/hts/code-systems",
+            "/hts/value-sets/x",
+            "/hts/capability-statement",
+        ] {
             assert!(protects_with(true, &get, path), "{path}");
             assert!(!protects_with(false, &get, path), "{path}");
         }
@@ -363,7 +368,10 @@ mod tests {
         assert!(!require_login_from(None, Some("none")));
         assert!(!require_login_from(None, None));
         assert!(effective_gate_with(AdminGate::Open, true).is_locked());
-        assert!(matches!(effective_gate_with(AdminGate::Open, false), AdminGate::Open));
+        assert!(matches!(
+            effective_gate_with(AdminGate::Open, false),
+            AdminGate::Open
+        ));
     }
 
     #[test]

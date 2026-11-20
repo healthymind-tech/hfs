@@ -30,9 +30,9 @@ impl CsrfField {
     /// session. The token is base64url, so it needs no escaping.
     pub fn html(&self) -> String {
         match &self.0 {
-            Some(t) if t
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+            Some(t)
+                if t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
             {
                 format!(r#"<input type="hidden" name="_csrf" value="{t}">"#)
             }

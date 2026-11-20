@@ -25,7 +25,7 @@ use std::time::Duration;
 use helios_admin_auth::console::{
     ConsoleAuth, ConsoleOptions, EnvBootstrap, MemorySessionStore, memory::MemoryConsoleStore,
 };
-use helios_admin_auth::{AdminGate, AdminSettings, AdminSessionStore};
+use helios_admin_auth::{AdminGate, AdminSessionStore, AdminSettings};
 use tracing::{info, warn};
 
 /// The shared PostgreSQL pool, recorded by the PG backend's startup.
@@ -42,7 +42,12 @@ static CONSOLE: OnceLock<Option<Arc<ConsoleAuth>>> = OnceLock::new();
 
 fn env_on(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -88,7 +93,11 @@ pub async fn build(
     console
 }
 
-async fn build_runtime(env: EnvBootstrap, base_url: &str, break_glass: AdminGate) -> Arc<ConsoleAuth> {
+async fn build_runtime(
+    env: EnvBootstrap,
+    base_url: &str,
+    break_glass: AdminGate,
+) -> Arc<ConsoleAuth> {
     let admin = AdminSettings::from_env("HFS").allow_origin_of(base_url);
     let origin = public_origin(base_url);
     let key_ring = match helios_endpoints::SecretKeyRing::from_env() {
@@ -197,7 +206,13 @@ mod tests {
         if std::env::var("HFS_CONSOLE_PUBLIC_URL").is_ok() {
             return;
         }
-        assert_eq!(public_origin("https://hfs.gugulu.tw/fhir"), "https://hfs.gugulu.tw");
-        assert_eq!(public_origin("http://localhost:8080"), "http://localhost:8080");
+        assert_eq!(
+            public_origin("https://hfs.gugulu.tw/fhir"),
+            "https://hfs.gugulu.tw"
+        );
+        assert_eq!(
+            public_origin("http://localhost:8080"),
+            "http://localhost:8080"
+        );
     }
 }

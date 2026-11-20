@@ -554,7 +554,12 @@ impl ConsoleAuth {
                 "Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
                 secure,
             ),
-            Self::cookie_header(CSRF_COOKIE, "", "Path=/; SameSite=Strict; Max-Age=0", secure),
+            Self::cookie_header(
+                CSRF_COOKIE,
+                "",
+                "Path=/; SameSite=Strict; Max-Age=0",
+                secure,
+            ),
         ]
     }
 
@@ -621,7 +626,8 @@ impl ConsoleAuth {
     /// Forgets every cached session of `subject` on this instance, so the
     /// next request re-reads the account (role change, disable).
     pub fn invalidate_subject(&self, subject: &str) {
-        self.cache_lock().retain(|_, c| c.session.subject != subject);
+        self.cache_lock()
+            .retain(|_, c| c.session.subject != subject);
     }
 
     /// Ends every session of `subject` everywhere.
@@ -632,7 +638,10 @@ impl ConsoleAuth {
         }
     }
 
-    fn principal_of(session: &ConsoleSession, roles: &BTreeMap<String, ConsoleRole>) -> ConsolePrincipal {
+    fn principal_of(
+        session: &ConsoleSession,
+        roles: &BTreeMap<String, ConsoleRole>,
+    ) -> ConsolePrincipal {
         ConsolePrincipal {
             subject: session.subject.clone(),
             display_name: session.display_name.clone(),
@@ -814,8 +823,7 @@ impl ConsoleAuth {
                         session.oidc = Some(sessions::OidcSessionTokens {
                             id_token: t.id_token.or(tokens.id_token),
                             refresh_token: t.refresh_token.or(Some(refresh)),
-                            access_expires_unix: unix_now()
-                                + t.expires_in.unwrap_or(300) as i64,
+                            access_expires_unix: unix_now() + t.expires_in.unwrap_or(300) as i64,
                         });
                         let _ = self.put_session(key, session).await;
                         true
@@ -936,8 +944,7 @@ impl ConsoleAuth {
         let matches = tokio::task::spawn_blocking(move || password::verify_password(&pw, &hash))
             .await
             .unwrap_or(false);
-        let ok_user = user
-            .filter(|u| matches && !u.disabled && u.password_hash.is_some());
+        let ok_user = user.filter(|u| matches && !u.disabled && u.password_hash.is_some());
         let Some(user) = ok_user else {
             let window = i64::from(policy.lockout_minutes) * 60;
             let max = u32::from(policy.lockout_failures);
@@ -949,9 +956,9 @@ impl ConsoleAuth {
             }
             tracing::warn!(client = %ip_key, locked_out = locked.is_some(), "console sign-in failed");
             return match locked {
-                Some(until) => {
-                    LoginResult::RateLimited(Duration::from_secs((until - unix_now()).max(1) as u64))
-                }
+                Some(until) => LoginResult::RateLimited(Duration::from_secs(
+                    (until - unix_now()).max(1) as u64,
+                )),
                 None => LoginResult::Invalid,
             };
         };
@@ -1064,7 +1071,8 @@ impl ConsoleAuth {
         );
         let secure = self.options.public_base_url.starts_with("https://")
             || matches!(self.options.cookie_secure, CookieSecure::Always);
-        let runtime = Arc::new(oidc::build(&o, secret, env_secret, &redirect, secure, policy).await?);
+        let runtime =
+            Arc::new(oidc::build(&o, secret, env_secret, &redirect, secure, policy).await?);
         *slot = Some(runtime.clone());
         Ok(runtime)
     }
@@ -1345,7 +1353,11 @@ impl ConsoleAuth {
         patch: UserPatch,
         expected_revision: u64,
     ) -> Result<ConsoleUser, ConsoleError> {
-        let mut user = self.store.user_by_id(id).await?.ok_or(ConsoleError::NotFound)?;
+        let mut user = self
+            .store
+            .user_by_id(id)
+            .await?
+            .ok_or(ConsoleError::NotFound)?;
         if let Some(v) = patch.display_name {
             user.display_name = clean(v);
         }
@@ -1373,13 +1385,18 @@ impl ConsoleAuth {
     /// Sets a new one-time password (shown once to the admin), forces a
     /// change at next sign-in and ends the account's sessions.
     pub async fn reset_password(&self, actor: &str, id: &str) -> Result<String, ConsoleError> {
-        let mut user = self.store.user_by_id(id).await?.ok_or(ConsoleError::NotFound)?;
+        let mut user = self
+            .store
+            .user_by_id(id)
+            .await?
+            .ok_or(ConsoleError::NotFound)?;
         let generated = password::generate_password();
         let revision = user.revision;
         user.password_hash = Some(hash_blocking(generated.clone()).await);
         user.must_change_password = true;
         let updated = self.store.update_user(user, revision).await?;
-        self.end_sessions_of(&local_subject(&updated.username)).await;
+        self.end_sessions_of(&local_subject(&updated.username))
+            .await;
         tracing::info!(actor, user = %updated.username, "console user password reset");
         Ok(generated)
     }
@@ -1391,12 +1408,14 @@ impl ConsoleAuth {
         current: &str,
         new: &str,
     ) -> Result<(), ConsoleError> {
-        let id = resolved
-            .session
-            .user_id
-            .clone()
-            .ok_or_else(|| ConsoleError::Forbidden("only local accounts have a password here".into()))?;
-        let mut user = self.store.user_by_id(&id).await?.ok_or(ConsoleError::NotFound)?;
+        let id = resolved.session.user_id.clone().ok_or_else(|| {
+            ConsoleError::Forbidden("only local accounts have a password here".into())
+        })?;
+        let mut user = self
+            .store
+            .user_by_id(&id)
+            .await?
+            .ok_or(ConsoleError::NotFound)?;
         let hash = user.password_hash.clone().unwrap_or_default();
         let cur = current.to_string();
         if !tokio::task::spawn_blocking(move || password::verify_password(&cur, &hash))
@@ -1408,8 +1427,12 @@ impl ConsoleAuth {
         if current == new {
             return Err(invalid("newPassword", "choose a different password"));
         }
-        password::check_policy(new, &user.username, self.settings().local.min_password_length)
-            .map_err(ConsoleError::Policy)?;
+        password::check_policy(
+            new,
+            &user.username,
+            self.settings().local.min_password_length,
+        )
+        .map_err(ConsoleError::Policy)?;
         let revision = user.revision;
         user.password_hash = Some(hash_blocking(new.to_string()).await);
         user.must_change_password = false;
@@ -1436,7 +1459,11 @@ impl ConsoleAuth {
 
     /// Deletes an account (last-admin rule) and ends its sessions.
     pub async fn delete_user(&self, actor: &str, id: &str) -> Result<(), ConsoleError> {
-        let user = self.store.user_by_id(id).await?.ok_or(ConsoleError::NotFound)?;
+        let user = self
+            .store
+            .user_by_id(id)
+            .await?
+            .ok_or(ConsoleError::NotFound)?;
         self.store.delete_user(id).await?;
         self.end_sessions_of(&local_subject(&user.username)).await;
         tracing::info!(actor, user = %user.username, "console user deleted");
@@ -1553,7 +1580,10 @@ impl ConsoleAuth {
                 }
                 ConsoleAuthMode::Oidc => {
                     let o = effective.oidc.clone().ok_or_else(|| {
-                        invalid(settings::field::OIDC_ISSUER, "configure the OIDC client first")
+                        invalid(
+                            settings::field::OIDC_ISSUER,
+                            "configure the OIDC client first",
+                        )
                     })?;
                     let fp = oidc::fingerprint(&o, self.env.client_secret.is_some());
                     match check {
@@ -1605,7 +1635,9 @@ impl ConsoleAuth {
         }
         let rewrapped = ring
             .rewrap(&sealed, settings::CLIENT_SECRET_AAD)
-            .map_err(|e| ConsoleError::Unavailable(format!("cannot re-seal the OIDC client secret: {e}")))?;
+            .map_err(|e| {
+                ConsoleError::Unavailable(format!("cannot re-seal the OIDC client secret: {e}"))
+            })?;
         if let Some(o) = stored.oidc.as_mut() {
             o.client_secret = Some(rewrapped);
         }
@@ -1689,7 +1721,9 @@ impl ConsoleSessionResolver for ConsoleAuth {
             axum::http::header::COOKIE,
             HeaderValue::from_str(cookie_header).ok()?,
         );
-        ConsoleAuth::resolve(self, &headers).await.map(|r| r.principal)
+        ConsoleAuth::resolve(self, &headers)
+            .await
+            .map(|r| r.principal)
     }
 }
 
@@ -1769,7 +1803,10 @@ pub mod testing {
             oidc_test_passed: None,
         };
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::HOST, HeaderValue::from_static("hfs.test"));
+        h.insert(
+            axum::http::header::HOST,
+            HeaderValue::from_static("hfs.test"),
+        );
         let (_, cookies) = rt
             .create_session(&h, None, session)
             .await

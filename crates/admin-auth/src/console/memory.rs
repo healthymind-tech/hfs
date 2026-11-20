@@ -52,7 +52,10 @@ fn would_leave_no_admin(users: &[ConsoleUser], id: &str, still_admin: bool) -> b
     }
     let enabled_admin = |u: &ConsoleUser| u.role == ConsoleRole::Admin && !u.disabled;
     let was = users.iter().any(|u| u.id == id && enabled_admin(u));
-    let others = users.iter().filter(|u| u.id != id && enabled_admin(u)).count();
+    let others = users
+        .iter()
+        .filter(|u| u.id != id && enabled_admin(u))
+        .count();
     was && others == 0
 }
 
@@ -102,7 +105,11 @@ impl ConsoleStore for MemoryConsoleStore {
     async fn create_user(&self, mut user: ConsoleUser) -> Result<ConsoleUser, ConsoleStoreError> {
         let mut inner = self.lock();
         let lower = user.username.to_lowercase();
-        if inner.users.iter().any(|u| u.username.to_lowercase() == lower) {
+        if inner
+            .users
+            .iter()
+            .any(|u| u.username.to_lowercase() == lower)
+        {
             return Err(ConsoleStoreError::DuplicateUsername(user.username));
         }
         if user.id.is_empty() {
@@ -276,11 +283,15 @@ mod tests {
             .unwrap();
         assert_eq!(r, 1);
         assert_eq!(
-            s.save_settings(&ConsoleAuthSettings::default(), 0, "a").await,
+            s.save_settings(&ConsoleAuthSettings::default(), 0, "a")
+                .await,
             Err(ConsoleStoreError::Conflict { current: 1 })
         );
 
-        let alice = s.create_user(user("Alice", ConsoleRole::Admin)).await.unwrap();
+        let alice = s
+            .create_user(user("Alice", ConsoleRole::Admin))
+            .await
+            .unwrap();
         assert_eq!(
             s.create_user(user("ALICE", ConsoleRole::Viewer)).await,
             Err(ConsoleStoreError::DuplicateUsername("ALICE".into()))
@@ -296,7 +307,10 @@ mod tests {
             s.delete_user(&alice.id).await,
             Err(ConsoleStoreError::Forbidden(_))
         ));
-        let bob = s.create_user(user("bob", ConsoleRole::Admin)).await.unwrap();
+        let bob = s
+            .create_user(user("bob", ConsoleRole::Admin))
+            .await
+            .unwrap();
         let u = s.update_user(demote.clone(), 1).await.unwrap();
         assert_eq!((u.role, u.revision), (ConsoleRole::Editor, 2));
         assert_eq!(u.password_hash.as_deref(), Some("h"), "None keeps the hash");
@@ -315,7 +329,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            s.set_role_binding("local:alice", "x", ConsoleRole::Admin, "a").await,
+            s.set_role_binding("local:alice", "x", ConsoleRole::Admin, "a")
+                .await,
             Err(ConsoleStoreError::NotFound)
         );
         assert_eq!(s.list_role_bindings().await.unwrap().len(), 1);
@@ -330,7 +345,14 @@ mod tests {
             Err(ConsoleStoreError::NotFound)
         );
         s.record_login(&bob.id, Utc::now()).await.unwrap();
-        assert!(s.user_by_id(&bob.id).await.unwrap().unwrap().last_login_at.is_some());
+        assert!(
+            s.user_by_id(&bob.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_login_at
+                .is_some()
+        );
         assert!(s.user_by_name("BOB").await.unwrap().is_some());
     }
 }

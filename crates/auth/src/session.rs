@@ -1622,7 +1622,9 @@ mod oidc_client_tests {
             "iss": "https://idp.example/realms/r", "aud": ["x", "hfs-web"],
             "exp": 2000, "nonce": "n1", "sub": "u"
         });
-        let check = |c: &Value| check_id_claims(c, "https://idp.example/realms/r/", "hfs-web", "n1", 1000, 0);
+        let check = |c: &Value| {
+            check_id_claims(c, "https://idp.example/realms/r/", "hfs-web", "n1", 1000, 0)
+        };
         assert!(check(&ok).is_ok());
         for (k, v) in [
             ("iss", serde_json::json!("https://evil")),
@@ -1642,13 +1644,18 @@ mod oidc_client_tests {
         let t = OidcTokens::from_response(TokenResponse {
             access_token: jwt(serde_json::json!({"sub": "a", "realm_access": {"roles": ["r"]}})),
             refresh_token: Some("rt".into()),
-            id_token: Some(jwt(serde_json::json!({"sub": "u1", "iss": "i", "name": "N"}))),
+            id_token: Some(jwt(
+                serde_json::json!({"sub": "u1", "iss": "i", "name": "N"}),
+            )),
             expires_in: Some(60),
         });
         assert_eq!(t.principal().unwrap().subject, "u1");
         assert_eq!(t.access_claims["realm_access"]["roles"][0], "r");
         let shown = format!("{t:?}");
-        assert!(!shown.contains("rt\"") && shown.contains("[redacted]"), "{shown}");
+        assert!(
+            !shown.contains("rt\"") && shown.contains("[redacted]"),
+            "{shown}"
+        );
     }
 }
 
