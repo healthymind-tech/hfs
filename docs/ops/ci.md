@@ -17,7 +17,7 @@ dispatch. One run per ref (a new push cancels the running one).
 | `rustfmt` | `cargo fmt --all -- --check` |
 | `clippy (production features)` | `cargo clippy --locked --all-targets -p helios-hfs -p helios-hts --features $PROD_FEATURES -- $CLIPPY_ARGS` |
 | `clippy (all features)` | `cargo clippy --locked --all-targets --all-features -- $CLIPPY_ARGS` (what upstream's ci.yml lint runs) |
-| `test (<shard>)` ×10 | `cargo llvm-cov --no-report --locked <packages> [--features …] <targets>` per crate group, then `cargo llvm-cov report --lcov` |
+| `test (<shard>)` ×10 | `cargo test --locked <packages> [--features …] <targets>` per crate group with the cargo-llvm-cov instrumentation (`source <(cargo llvm-cov show-env --export-prefix)`), then `cargo llvm-cov report --lcov` |
 | `coverage summary` | merges the shards' lcov files, writes a per-crate line-coverage table to the job summary, uploads `coverage-report` (merged `lcov.info` + `coverage.md`) |
 
 `PROD_FEATURES` is the production image's feature list (kept in sync by hand

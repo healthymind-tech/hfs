@@ -192,8 +192,12 @@ jobs:
           for a in "${sel[@]}"; do [ "$a" = "--" ] && break; build+=("$a"); done
           feat=()
           [ -n "${{ matrix.features }}" ] && feat=(--features "${{ matrix.features }}")
+          # Instrumented plain `cargo test` (as upstream's coverage job does):
+          # show-env exports the RUSTFLAGS / LLVM_PROFILE_FILE cargo-llvm-cov uses.
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
           start=$(date +%s)
-          cargo llvm-cov --no-report --locked ${{ matrix.packages }} "${feat[@]}" "${build[@]}" --no-run
+          cargo test --locked ${{ matrix.packages }} "${feat[@]}" "${build[@]}" --no-run
           echo "build: $(( ($(date +%s) - start) / 60 )) min"
       - name: Run tests
         run: |
@@ -201,8 +205,9 @@ jobs:
           mapfile -t sel < "$RUNNER_TEMP/sel.txt"
           feat=()
           [ -n "${{ matrix.features }}" ] && feat=(--features "${{ matrix.features }}")
+          source <(cargo llvm-cov show-env --export-prefix)
           start=$(date +%s)
-          cargo llvm-cov --no-report --locked ${{ matrix.packages }} "${feat[@]}" "${sel[@]}"
+          cargo test --locked ${{ matrix.packages }} "${feat[@]}" "${sel[@]}"
           echo "tests: $(( ($(date +%s) - start) / 60 )) min"
       - name: Coverage report (lcov)
         if: success()
@@ -210,6 +215,7 @@ jobs:
           set -euo pipefail
           safe=$(echo "${{ matrix.name }}" | tr -c 'a-zA-Z0-9-\n' '_')
           echo "SAFE_NAME=$safe" >> "$GITHUB_ENV"
+          source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov report --lcov --output-path "lcov-$safe.info"
       - uses: actions/upload-artifact@v7
         if: success()
