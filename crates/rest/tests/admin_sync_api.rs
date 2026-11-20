@@ -407,3 +407,36 @@ async fn not_installed_answers_503() {
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(oo["resourceType"], "OperationOutcome");
 }
+
+#[tokio::test]
+async fn admin_token_scope_is_required() {
+    use helios_rest::handlers::admin_sync::SyncApi;
+    use helios_rest::middleware::auth::AdminTokenScope;
+    let (svc, _) = service().await;
+    let principal = |scopes: &str| helios_auth::Principal {
+        subject: "svc".into(),
+        issuer: "https://idp.example.org".into(),
+        tenant_id: None,
+        scopes: helios_auth::ScopeSet::parse(scopes),
+        jti: None,
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        custom_claims: Default::default(),
+        launch_context: None,
+    };
+    for (scopes, expected) in [("system/*.rs", StatusCode::FORBIDDEN), ("system/*.cruds", StatusCode::OK)] {
+        let p = principal(scopes);
+        let app = helios_rest::routing::admin_sync::routes_with_scope(
+            SyncApi::Fixed(svc.clone()),
+            AdminTokenScope("system/*.cruds".into()),
+        )
+        .layer(axum::middleware::from_fn(move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+            let p = p.clone();
+            async move {
+                req.extensions_mut().insert(p);
+                next.run(req).await
+            }
+        }));
+        let (s, _, _) = call(&app, "GET", "/admin/sync/jobs", None, &[]).await;
+        assert_eq!(s, expected, "{scopes}");
+    }
+}

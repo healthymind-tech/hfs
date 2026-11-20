@@ -229,7 +229,7 @@ impl Hapi {
                 v.push((x.at, entry));
             }
         }
-        v.sort_by(|a, b| b.0.cmp(&a.0)); // newest first, like HAPI
+        v.sort_by_key(|x| std::cmp::Reverse(x.0)); // newest first, like HAPI
         v.into_iter().map(|x| x.1).collect()
     }
 

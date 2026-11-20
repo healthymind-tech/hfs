@@ -703,6 +703,9 @@ where
         })
         .unwrap_or((None, "Device/hfs".to_string()));
 
+    // The per-endpoint auth layer (below) keeps the environment's config.
+    let auth_config_for_hook = auth_config.clone();
+
     // Build the outbound auth provider before moving auth_config into the
     // app state — the subscription engine (constructed below) consumes it.
     #[cfg(feature = "subscriptions")]
@@ -1168,25 +1171,36 @@ where
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
-    // Per-client rate limiting (`HFS_RATE_LIMIT_*`). Inside authentication,
-    // so a request is billed to its OAuth client when it has one, and outside
-    // authorization and the handlers.
-    let rate_limit = middleware::client_rate_limit::RateLimitConfig::from_env();
-    let rate_limiter = rate_limit
-        .enabled()
-        .then(|| middleware::client_rate_limit::ClientRateLimiter::new(rate_limit));
-
-    // Authentication, authorization and rate limiting of the FHIR stack
-    // (package P2 makes this per endpoint; see `endpoint::auth`). Just inside
-    // authentication, the authenticated principal is reported to the audit
-    // context (the audit layer itself sits outside auth, see below).
-    let router = endpoint::auth::auth_layer(
-        router,
-        endpoint::auth::AuthHook {
-            auth_state: auth_state.clone(),
-            rate_limiter,
-        },
+    // Authentication, per-client rate limiting and authorization, per FHIR
+    // endpoint (FHIR server manager P2, `endpoint::auth`). Always installed:
+    // without the manager (no `ResolvedEndpoint` on the request) or for an
+    // endpoint that inherits the environment, it runs today's
+    // `auth_middleware` / rate limit (`HFS_RATE_LIMIT_*`) / audit principal
+    // capture / `authz_middleware` chain with the environment's state, and is
+    // a pass-through when `HFS_AUTH_MODE=off`. Rate limiting sits inside
+    // authentication, so a request is billed to its OAuth client when it has
+    // one, and outside authorization and the handlers.
+    let auth_base = match (&auth_state, &audit_state) {
+        (Some(auth), _) => endpoint::AuthBase::from_state(auth),
+        (None, Some(audit)) => endpoint::AuthBase::new(
+            Arc::clone(&audit.sink),
+            audit.config.source_observer.clone(),
+        ),
+        (None, None) => {
+            endpoint::AuthBase::new(Arc::new(helios_audit::sinks::NullSink), "Device/hfs")
+        }
+    };
+    let auth_hook = Arc::new(
+        endpoint::AuthHook::new(auth_config_for_hook, auth_state.clone(), auth_base)
+            .with_allowed_origin(&config.base_url),
     );
+    if let Some(runtime) = &endpoints {
+        // Compile every endpoint's auth now (JWKS fetched before the first
+        // request) and prune fetchers, rate-limit buckets and discovery
+        // entries of endpoints that go away.
+        auth_hook.watch(Arc::clone(&runtime.registry));
+    }
+    let router = endpoint::auth_layer(router, auth_hook);
 
     // FHIR server manager: the dispatcher resolves the endpoint, strips a
     // named endpoint's `/{path}` and hands the request to the stack above.

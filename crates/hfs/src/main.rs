@@ -2531,6 +2531,9 @@ async fn run() -> anyhow::Result<()> {
         admin_gate(&config),
     )
     .await?;
+    // FHIR endpoints with their own auth accept the administrator credential
+    // (when they allow it) even where the environment's auth is off.
+    helios_rest::endpoint::auth::install_admin_gate(admin_gate(&config));
 
     let audit_config = AuditConfig::from_env();
 

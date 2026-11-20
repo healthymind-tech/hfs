@@ -1173,3 +1173,67 @@ Later packages: rebase on these.
 - **Not in P1** (owned elsewhere): per-endpoint rate limits (P2; the effective
   section is exposed as `EffectiveConfig::rate_limit`), SMART discovery (P2),
   admin API reload-before-reply (P4 calls `EndpointRuntime::reload_if_stale`).
+
+### P2 — per-endpoint FHIR auth (`hm/m-p2`)
+
+- **Auth hook.** P1's `AuthHook { auth_state, rate_limiter }` struct is
+  replaced by `rest::endpoint::AuthHook::new(env_config, env_state, AuthBase)`
+  (builder: `with_rate_limit`, `with_outbound`, `with_allowed_origin`,
+  `with_console_resolver`) and `auth_layer(router, Arc<AuthHook>)`. `build_app`
+  calls `hook.watch(registry)` when the endpoint runtime is present (compiles
+  every endpoint's auth up front, prunes on snapshot change). The layer group
+  is always installed; without a `ResolvedEndpoint` or with `auth: null` it
+  runs the old chain with the environment's state (pass-through when
+  `HFS_AUTH_MODE=off`).
+- **Request extensions.** `Arc<EffectiveAuth>` (`EffectiveAuth::of(&ext)`:
+  mode, state, config, scope policy, console access, rate budget, guard;
+  `smart_configuration()`, `capability_security(cors)`),
+  `middleware::client_rate_limit::RateBudget`, and for endpoint-configured
+  auth `middleware::auth::EndpointScopePolicy`.
+- **Verifier key.** `helios_auth::VerifierKey = (issuer, jwks_url,
+  jwks_max_age, guarded)` shares the JWKS fetcher; algorithms, clock skew and
+  audience are per-endpoint provider checks over the shared keys (D-8 listed
+  algorithms/skew in the key; they do not change what is fetched).
+- **Outbound policy.** Endpoints with `managedBy=ui` fetch issuer discovery
+  and JWKS through `helios_auth::OutboundGuard::Policy` (URL check + a DNS
+  resolver that drops internal addresses, redirects off); `managedBy=env`
+  endpoints are trusted like `HFS_AUTH_JWKS_URL`. A refused JWKS URL makes the
+  endpoint answer tokens `503`. Production's in-network Keycloak therefore
+  needs `HFS_OUTBOUND_ALLOW=keycloak` for console-created endpoints.
+- **P3 (console principal).** P2 consumes `ConsoleSessionResolver` with the
+  raw `Cookie` header. Install it process-wide with
+  `rest::endpoint::auth::install_console_resolver(Arc<dyn …>)` from
+  `manager/console_auth.rs` (or `AuthHook::set_console_resolver`). Console
+  principals: issuer `CONSOLE_ISSUER`, subject = console subject, scopes =
+  `role_for(endpoint).data_scopes(consoleAccess)`; skipped when a request
+  carries `Authorization` or `Sec-Fetch-Site: cross-site`; unsafe methods
+  need `Origin`/`Referer` = request `Host` or `HFS_BASE_URL`'s origin. The
+  break-glass admin gate for endpoints when the environment's auth is off:
+  `install_admin_gate(gate)` (wired in `main.rs`).
+- **P4 (`$test-auth`, warnings, admin scope).**
+  `helios_auth::EndpointAuthProbe::new(OutboundGuard)` (or
+  `AuthHook::probe(managed_by)`) `.test(&EndpointAuth).await -> ProbeReport`
+  (serde camelCase: `ok, mode, issuer{ok,url,detail,elapsedMs},
+  jwks{…,keyCount}, warnings[], checks[{name,ok,detail}]` — `checks` has the
+  shape of P4's `ProbeCheck`: `issuer-discovery`, `jwks`, `algorithms`, and
+  `token` from `.test_with_token(&auth, jwt)`, which validates a supplied token
+  exactly as the endpoint would). P4 implements its `EndpointAuthProbe` trait
+  over it (or re-exports `helios_auth::{ProbeReport, ProbeCheck}`) and wires it
+  with `OutboundGuard::Policy(OutboundPolicy::from_env())`. Warnings: `helios_auth::discovery::
+  auth_warnings(&EndpointAuth)` and `shared_audience_warnings(iter of (name,
+  &EndpointAuth))`. New admin routes layer
+  `middleware::auth::admin_token_scope_middleware` with
+  `Arc<AdminTokenScope::from_env()>` (`HFS_ADMIN_TOKEN_SCOPE`, default
+  `system/*.cruds`) inside the environment's `auth_middleware`.
+- **SMART discovery.** Endpoint documents add `end_session_endpoint`
+  (environment document unchanged). CapabilityStatement: P1's builder keeps the
+  configured `oauth-uris`; for endpoint-configured auth the handler replaces
+  `rest.security` with the discovery-filled one (keeping P1's `cors` flag).
+- **One middleware.** `auth_layer` installs a single `from_fn` running
+  resolve → authenticate → rate limit → audit attribution → authorize
+  (`middleware::auth::{authenticate_request, authorize_request}` and
+  `client_rate_limit::check` return results instead of calling `next`). With
+  one layer per step, debug builds overflowed a worker's 2 MiB stack on
+  `$validate` under `HFS_MANAGER=on` + audit + auth.
+- **Patient shared types** follow the endpoint's policy, in batch/transaction
+  entries too (task-local set by the authorization layer).

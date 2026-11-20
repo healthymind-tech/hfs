@@ -74,6 +74,30 @@ pub struct PatientCompartment(Option<String>, Vec<String>);
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PatientSharedTypes(pub Vec<String>);
 
+tokio::task_local! {
+    /// The [`PatientSharedTypes`] of the request being served, for code that
+    /// has no access to the request extensions (the batch/transaction
+    /// handler's per-entry confinement). Set by the authorization layer.
+    static REQUEST_SHARED_TYPES: Vec<String>;
+}
+
+/// Runs `fut` with `types` as the request's shared reference types (see
+/// [`request_shared_types`]).
+pub(crate) async fn with_request_shared_types<F: std::future::Future>(
+    types: Vec<String>,
+    fut: F,
+) -> F::Output {
+    REQUEST_SHARED_TYPES.scope(types, fut).await
+}
+
+/// The shared reference types of the request being served (the endpoint's
+/// policy), else `fallback` (the environment's).
+pub(crate) fn request_shared_types(fallback: &[String]) -> Vec<String> {
+    REQUEST_SHARED_TYPES
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| fallback.to_vec())
+}
+
 impl PatientCompartment {
     /// A request that is not confined to a compartment.
     pub fn unconfined() -> Self {
