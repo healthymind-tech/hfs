@@ -23,6 +23,8 @@
        (cycling, sync, animation) is theme.js, deferred like the rest. -->
   {{ status.theme_boot()?|safe }}
   <script src="/ui/assets/theme.js" defer></script>
+  <!-- Console sign-in CSRF token on htmx, fetch and form posts (P3, crates/ui/src/csrf.rs). -->
+  <script src="/ui/assets/csrf.js" defer></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
   <!-- The shared busy states (#679); ahead of every page script by defer's

@@ -126,7 +126,9 @@ helios-ui-chrome = { path = "../ui-chrome", version = "0.2.9" }
 
 # Administrator sign-in for the console's admin pages (`/ui/admin/login`, the
 # guard on IG Packages, Tenants, Bulk and SQL export), shared with HTS.
-helios-admin-auth = { path = "../admin-auth", version = "0.2.9" }
+helios-admin-auth = { path = "../admin-auth", version = "0.2.9", features = ["console"] }
+# Console sign-in contracts (roles, principal) — package P3.
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
 
 # Typed htmx header handling: the infallible `HxRequest` extractor for the
 # fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching

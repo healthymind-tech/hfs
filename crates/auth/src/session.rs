@@ -799,36 +799,7 @@ impl SessionStore {
     }
 
     async fn post_token(&self, form: &[(&str, String)]) -> Result<TokenResponse, AuthError> {
-        let response = self
-            .http
-            .post(&self.config.token_endpoint)
-            .form(form)
-            .send()
-            .await
-            // `without_url`: the error would otherwise print the configured
-            // endpoint, userinfo and query included (#2149).
-            .map_err(|e| {
-                AuthError::InternalError(format!("token endpoint unreachable: {}", e.without_url()))
-            })?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.get("error_description")
-                        .or_else(|| v.get("error"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| body.chars().take(200).collect());
-            return Err(AuthError::ValidationError(format!(
-                "token endpoint answered {status}: {detail}"
-            )));
-        }
-        serde_json::from_str(&body).map_err(|e| {
-            AuthError::ValidationError(format!("token endpoint sent an unreadable response: {e}"))
-        })
+        post_token_with(&self.http, &self.config.token_endpoint, form).await
     }
 
     /// Marks the session used. The in-process copy is updated on every call;
@@ -1291,6 +1262,401 @@ fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// ---------------------------------------------------------------------------
+// Authorization Code + PKCE primitives for a relying party that keeps its own
+// sessions — the web console sign-in of the FHIR server manager (P3, design
+// §7). Same wire protocol as [`SessionStore`] (one `build_authorize_url`, one
+// token-endpoint call, the same unverified-claims rule for tokens received
+// over our own back channel), plus an OpenID Connect `nonce` and the raw
+// claims the console maps to roles.
+// ---------------------------------------------------------------------------
+
+/// Tokens from a code exchange or a refresh, with their decoded claims.
+///
+/// `Debug` prints every token as `[redacted]`.
+#[derive(Clone)]
+pub struct OidcTokens {
+    /// Access token.
+    pub access_token: String,
+    /// Refresh token, when issued.
+    pub refresh_token: Option<String>,
+    /// ID token, when issued.
+    pub id_token: Option<String>,
+    /// `expires_in` seconds.
+    pub expires_in: Option<u64>,
+    /// Claims of the ID token (`Null` without one). Not signature-checked:
+    /// received directly from the token endpoint (OIDC Core §3.1.3.7).
+    pub id_claims: Value,
+    /// Claims of the access token when it is a JWT (`Null` otherwise).
+    pub access_claims: Value,
+}
+
+impl std::fmt::Debug for OidcTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcTokens")
+            .field("access_token", &REDACTED)
+            .field("refresh_token", &redacted_opt(&self.refresh_token))
+            .field("id_token", &redacted_opt(&self.id_token))
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OidcTokens {
+    fn from_response(tokens: TokenResponse) -> Self {
+        let id_claims = tokens
+            .id_token
+            .as_deref()
+            .and_then(unverified_claims)
+            .unwrap_or(Value::Null);
+        let access_claims = unverified_claims(&tokens.access_token).unwrap_or(Value::Null);
+        Self {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            id_token: tokens.id_token,
+            expires_in: tokens.expires_in,
+            id_claims,
+            access_claims,
+        }
+    }
+
+    /// The identity: ID token claims, else the access token's.
+    pub fn principal(&self) -> Result<SessionPrincipal, AuthError> {
+        if self.id_claims.is_null() {
+            principal_from_claims(&self.access_claims)
+        } else {
+            principal_from_claims(&self.id_claims)
+        }
+    }
+}
+
+/// The endpoints of an OpenID Connect provider, from its discovery document
+/// (explicit overrides win).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcEndpoints {
+    /// `issuer` as the document states it (falls back to the configured one).
+    pub issuer: String,
+    /// Authorization endpoint.
+    pub authorization_endpoint: String,
+    /// Token endpoint.
+    pub token_endpoint: String,
+    /// RP-initiated logout endpoint, when the provider has one.
+    pub end_session_endpoint: Option<String>,
+}
+
+/// Reads `{issuer}/.well-known/openid-configuration` with `http` (a client
+/// the caller may have pinned to SSRF-checked addresses) and applies the
+/// explicit overrides.
+pub async fn discover_with(
+    http: &reqwest::Client,
+    issuer: &str,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    end_session_endpoint: Option<String>,
+) -> Result<OidcEndpoints, AuthError> {
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    let shown = redact_url(&url);
+    let failed = |e: reqwest::Error| {
+        AuthError::InternalError(format!(
+            "OIDC discovery at {shown} failed: {}",
+            e.without_url()
+        ))
+    };
+    let doc: Value = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(failed)?
+        .error_for_status()
+        .map_err(failed)?
+        .json()
+        .await
+        .map_err(failed)?;
+    let pick = |explicit: Option<String>, key: &str| -> Option<String> {
+        explicit.or_else(|| doc.get(key).and_then(Value::as_str).map(str::to_string))
+    };
+    let authorization_endpoint = pick(authorization_endpoint, "authorization_endpoint")
+        .ok_or_else(|| {
+            AuthError::InternalError(format!("{shown} has no authorization_endpoint"))
+        })?;
+    let token_endpoint = pick(token_endpoint, "token_endpoint")
+        .ok_or_else(|| AuthError::InternalError(format!("{shown} has no token_endpoint")))?;
+    Ok(OidcEndpoints {
+        issuer: doc
+            .get("issuer")
+            .and_then(Value::as_str)
+            .unwrap_or(issuer)
+            .to_string(),
+        authorization_endpoint,
+        token_endpoint,
+        end_session_endpoint: pick(end_session_endpoint, "end_session_endpoint"),
+    })
+}
+
+/// A stateless Authorization Code + PKCE (S256) client.
+#[derive(Clone)]
+pub struct OidcCodeClient {
+    config: LoginConfig,
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for OidcCodeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcCodeClient")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OidcCodeClient {
+    /// A client over `http` (pinned or not, the caller decides).
+    pub fn new(config: LoginConfig, http: reqwest::Client) -> Self {
+        Self { config, http }
+    }
+
+    /// The configuration.
+    pub fn config(&self) -> &LoginConfig {
+        &self.config
+    }
+
+    /// The authorize URL for one login: `state`, the S256 `challenge` of the
+    /// verifier, and the OpenID Connect `nonce` the ID token must echo.
+    pub fn authorize_url(&self, state: &str, challenge: &str, nonce: &str) -> String {
+        let base = build_authorize_url(
+            &self.config.authorization_endpoint,
+            &self.config.client_id,
+            &self.config.redirect_uri,
+            &self.config.scopes,
+            state,
+            challenge,
+        );
+        let mut extra = form_urlencoded::Serializer::new(String::new());
+        extra.append_pair("nonce", nonce);
+        format!("{base}&{}", extra.finish())
+    }
+
+    /// Exchanges an authorization code (with the PKCE verifier).
+    pub async fn exchange_code(&self, code: &str, verifier: &str) -> Result<OidcTokens, AuthError> {
+        let mut form = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("redirect_uri", self.config.redirect_uri.clone()),
+            ("client_id", self.config.client_id.clone()),
+            ("code_verifier", verifier.to_string()),
+        ];
+        if let Some(secret) = &self.config.client_secret {
+            form.push(("client_secret", secret.clone()));
+        }
+        post_token_with(&self.http, &self.config.token_endpoint, &form)
+            .await
+            .map(OidcTokens::from_response)
+    }
+
+    /// Uses a refresh token.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<OidcTokens, AuthError> {
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.to_string()),
+            ("client_id", self.config.client_id.clone()),
+        ];
+        if let Some(secret) = &self.config.client_secret {
+            form.push(("client_secret", secret.clone()));
+        }
+        post_token_with(&self.http, &self.config.token_endpoint, &form)
+            .await
+            .map(OidcTokens::from_response)
+    }
+
+    /// The RP-initiated logout URL, when the provider has an end-session
+    /// endpoint.
+    pub fn end_session_url(
+        &self,
+        post_logout_redirect_uri: &str,
+        id_token_hint: Option<&str>,
+    ) -> Option<String> {
+        let endpoint = self.config.end_session_endpoint.as_deref()?;
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.append_pair("post_logout_redirect_uri", post_logout_redirect_uri);
+        query.append_pair("client_id", &self.config.client_id);
+        if let Some(hint) = id_token_hint {
+            query.append_pair("id_token_hint", hint);
+        }
+        let separator = if endpoint.contains('?') { '&' } else { '?' };
+        Some(format!("{endpoint}{separator}{}", query.finish()))
+    }
+}
+
+/// Checks the ID token claims a relying party must check even when the token
+/// came over its own back channel (OIDC Core §3.1.3.7): `iss` equals the
+/// issuer, `aud` contains the client id, `exp` is in the future (with
+/// `skew_secs`), and `nonce` equals the one sent.
+pub fn check_id_claims(
+    claims: &Value,
+    issuer: &str,
+    client_id: &str,
+    nonce: &str,
+    now_unix: i64,
+    skew_secs: i64,
+) -> Result<(), AuthError> {
+    let bad = |m: &str| Err(AuthError::ValidationError(format!("ID token {m}")));
+    if claims.is_null() {
+        return bad("missing (request the openid scope)");
+    }
+    let iss = claims.get("iss").and_then(Value::as_str).unwrap_or("");
+    if iss.trim_end_matches('/') != issuer.trim_end_matches('/') {
+        return bad("issuer mismatch");
+    }
+    let aud_ok = match claims.get("aud") {
+        Some(Value::String(a)) => a == client_id,
+        Some(Value::Array(a)) => a.iter().any(|v| v.as_str() == Some(client_id)),
+        _ => false,
+    };
+    if !aud_ok {
+        return bad("audience does not name this client");
+    }
+    match claims.get("exp").and_then(Value::as_i64) {
+        Some(exp) if exp + skew_secs > now_unix => {}
+        _ => return bad("expired"),
+    }
+    let sent = claims.get("nonce").and_then(Value::as_str).unwrap_or("");
+    if !constant_time_eq(sent.as_bytes(), nonce.as_bytes()) {
+        return bad("nonce mismatch");
+    }
+    Ok(())
+}
+
+async fn post_token_with(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    form: &[(&str, String)],
+) -> Result<TokenResponse, AuthError> {
+    let response = http
+        .post(token_endpoint)
+        .form(form)
+        .send()
+        .await
+        .map_err(|e| {
+            AuthError::InternalError(format!("token endpoint unreachable: {}", e.without_url()))
+        })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error_description")
+                    .or_else(|| v.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| body.chars().take(200).collect());
+        return Err(AuthError::ValidationError(format!(
+            "token endpoint answered {status}: {detail}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(|e| {
+        AuthError::ValidationError(format!("token endpoint sent an unreadable response: {e}"))
+    })
+}
+
+#[cfg(test)]
+mod oidc_client_tests {
+    use super::*;
+
+    fn jwt(claims: Value) -> String {
+        format!(
+            "e30.{}.sig",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+
+    fn client(end_session: Option<&str>) -> OidcCodeClient {
+        OidcCodeClient::new(
+            LoginConfig {
+                client_id: "hfs-web".into(),
+                client_secret: None,
+                redirect_uri: "https://h.example/ui/callback".into(),
+                scopes: "openid profile".into(),
+                authorization_endpoint: "https://idp.example/auth?kc=1".into(),
+                token_endpoint: "https://idp.example/token".into(),
+                end_session_endpoint: end_session.map(str::to_string),
+                cookie_secure: true,
+            },
+            reqwest::Client::new(),
+        )
+    }
+
+    #[test]
+    fn authorize_url_carries_pkce_state_and_nonce() {
+        let url = client(None).authorize_url("st", "ch", "no nce");
+        assert!(url.starts_with("https://idp.example/auth?kc=1&"), "{url}");
+        for part in [
+            "state=st",
+            "code_challenge=ch",
+            "code_challenge_method=S256",
+            "nonce=no+nce",
+            "response_type=code",
+            "client_id=hfs-web",
+        ] {
+            assert!(url.contains(part), "{part} in {url}");
+        }
+    }
+
+    #[test]
+    fn end_session_url_only_with_an_endpoint() {
+        assert!(client(None).end_session_url("https://h/ui", None).is_none());
+        let url = client(Some("https://idp.example/logout"))
+            .end_session_url("https://h/ui", Some("idt"))
+            .unwrap();
+        assert!(url.contains("id_token_hint=idt") && url.contains("client_id=hfs-web"));
+    }
+
+    #[test]
+    fn id_claim_checks() {
+        let ok = serde_json::json!({
+            "iss": "https://idp.example/realms/r", "aud": ["x", "hfs-web"],
+            "exp": 2000, "nonce": "n1", "sub": "u"
+        });
+        let check = |c: &Value| {
+            check_id_claims(c, "https://idp.example/realms/r/", "hfs-web", "n1", 1000, 0)
+        };
+        assert!(check(&ok).is_ok());
+        for (k, v) in [
+            ("iss", serde_json::json!("https://evil")),
+            ("aud", serde_json::json!("other")),
+            ("exp", serde_json::json!(999)),
+            ("nonce", serde_json::json!("n2")),
+        ] {
+            let mut c = ok.clone();
+            c[k] = v;
+            assert!(check(&c).is_err(), "{k}");
+        }
+        assert!(check(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn tokens_decode_claims_and_principal() {
+        let t = OidcTokens::from_response(TokenResponse {
+            access_token: jwt(serde_json::json!({"sub": "a", "realm_access": {"roles": ["r"]}})),
+            refresh_token: Some("rt".into()),
+            id_token: Some(jwt(
+                serde_json::json!({"sub": "u1", "iss": "i", "name": "N"}),
+            )),
+            expires_in: Some(60),
+        });
+        assert_eq!(t.principal().unwrap().subject, "u1");
+        assert_eq!(t.access_claims["realm_access"]["roles"][0], "r");
+        let shown = format!("{t:?}");
+        assert!(
+            !shown.contains("rt\"") && shown.contains("[redacted]"),
+            "{shown}"
+        );
+    }
 }
 
 #[cfg(test)]

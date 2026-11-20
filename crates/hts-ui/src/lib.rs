@@ -194,6 +194,8 @@ pub fn router_with_admin(
     admin: Option<Router>,
     gate: helios_admin_auth::AdminGate,
 ) -> Router {
+    // HTS_CONSOLE_REQUIRE_LOGIN (P3): never open when sign-in is required.
+    let gate = login::effective_gate(gate);
     let base = match admin {
         Some(admin) => Router::new().nest_service("/hts/api/admin", admin),
         None => Router::new(),
