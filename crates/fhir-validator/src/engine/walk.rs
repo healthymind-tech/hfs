@@ -897,7 +897,22 @@ pub(super) fn validate_node<'a>(ctx: &mut WalkCtx<'a>, set: &SchemaSet, data: &'
         if let Some(rt) = data.get("resourceType").and_then(Value::as_str) {
             match ctx.resolver.resolve(rt) {
                 Some(schema) => add_schemas_to_set(ctx, &mut extended, schema, rt),
-                None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(rt)),
+                None => {
+                    // Not a resource of this FHIR version (an R4B
+                    // SubscriptionStatus in an R4 Bundle): the HL7 validator
+                    // reports it once and does not look inside, so neither
+                    // is every member reported as unknown.
+                    ctx.error_full(
+                        ErrorKind::UnknownSchema,
+                        errors::msg_unknown_schema(rt),
+                        Severity::Error,
+                        None,
+                        Some(format!(
+                            "Contained resource does not appear to be a FHIR resource (unknown name '{rt}')"
+                        )),
+                    );
+                    return;
+                }
             }
             // A nested resource (Bundle entry, contained, Parameters part)
             // is held to the profiles it claims, as the root resource is: a

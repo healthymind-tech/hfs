@@ -214,7 +214,9 @@ async fn hl7_namespace_uris_that_name_nothing_are_errors() {
         {"name": "topic", "valueUri": "http://hl7.org/fhir/us/davinci-hrex/SubscriptionTopic/Task"},
         {"name": "sid", "valueUri": "http://hl7.org/fhir/sid/us-npi"},
         {"name": "sp", "valueUri": "http://hl7.org/fhir/SearchParameter/Patient-name"},
-        {"name": "mapping", "valueUri": "http://hl7.org/fhir/w5"}
+        {"name": "mapping", "valueUri": "http://hl7.org/fhir/w5"},
+        {"name": "cs", "valueUri": "http://hl7.org/fhir/concept-properties#itemWeight"},
+        {"name": "ig", "valueUri": "http://hl7.org/fhir/us/core"}
     ]});
     let issues = validate(&params, None, false).await;
     let urls = of_kind(&issues, ErrorKind::UrlUnresolved);
@@ -476,4 +478,24 @@ async fn must_have_value_and_value_alternatives() {
     let valued = json!({"resourceType": "Patient", "active": true});
     let opts = ValidationOptions { profiles: vec!["http://example.org/vp".into()], ..Default::default() };
     assert!(validator.validate_sync(&valued, &opts).errors.iter().all(|e| !e.message.contains("requires that")));
+}
+
+/// subscriptions-backport `Bundle-r4b-notification-*` (Java: one "does not
+/// appear to be a FHIR resource" error): an entry of a resource type this
+/// FHIR version does not have is reported once, its members are not walked.
+#[test]
+fn unknown_nested_resource_types_are_reported_once() {
+    let bundle = json!({"resourceType": "Bundle", "type": "history", "entry": [{
+        "fullUrl": "urn:uuid:1",
+        "resource": {"resourceType": "SubscriptionStatus", "status": "active", "type": "heartbeat",
+            "topic": "http://example.org/t"},
+        "request": {"method": "GET", "url": "x"}, "response": {"status": "200"}}]});
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let errors = validator.validate_sync(&bundle, &ValidationOptions::default()).errors;
+    let under: Vec<_> = errors.iter().filter(|e| e.path.starts_with("Bundle.entry.0.resource")).collect();
+    assert_eq!(under.len(), 1, "{errors:#?}");
+    assert_eq!(
+        under[0].hl7_message.as_deref(),
+        Some("Contained resource does not appear to be a FHIR resource (unknown name 'SubscriptionStatus')")
+    );
 }

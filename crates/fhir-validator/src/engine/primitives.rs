@@ -185,7 +185,17 @@ fn hl7_url_names_nothing(ctx: &WalkCtx<'_>, url: &str) -> bool {
                 .is_some_and(|s| crate::editor::is_resource(&s)))
         .then_some(i)
     }) else {
-        return true;
+        // No base. Canonical resources of the core spec and of packages
+        // live one or two segments below `…/fhir` (`…/fhir/concept-properties`,
+        // a CodeSystem; a package canonical `…/fhir/us/core`), and the HL7
+        // validator resolves those through its loaded packages, which this
+        // walk cannot see — so only a deeper url is judged: no package
+        // defines anything there.
+        let bare = url.split(['#', '?']).next().unwrap_or(url);
+        let depth = bare
+            .strip_prefix("http://hl7.org/fhir")
+            .map(|rest| rest.split('/').filter(|s| !s.is_empty()).count());
+        return depth.is_some_and(|d| d > 2);
     };
     // With a base, the HL7 validator looks a package up by it and fails
     // when no package has that canonical. A package canonical is
