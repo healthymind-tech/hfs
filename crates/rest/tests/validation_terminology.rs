@@ -208,6 +208,11 @@ fn hfs(ts_url: &str, terminology: &str, fail: &str) -> TestServer {
             extensible_bindings: "off".to_string(),
             ..Default::default()
         },
+        // The outage cases point at a closed port. Linux refuses at once;
+        // Windows retries the SYN for about two seconds per connection, and
+        // one validation makes several terminology calls, which ran past
+        // for_testing()'s 5 s request timeout (408) on windows-latest.
+        request_timeout: 60,
         ..ServerConfig::for_testing()
     };
     TestServer::new(create_app_with_config(backend, config)).expect("server")
