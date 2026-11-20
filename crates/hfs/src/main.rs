@@ -19,6 +19,10 @@
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 mod cluster;
+/// Console sign-in wiring (FHIR server manager P3); moves under P1's
+/// `manager/mod.rs` (`install_console_auth`) when that lands.
+#[path = "manager/console_auth.rs"]
+mod console_auth;
 
 use std::sync::Arc;
 
@@ -1622,6 +1626,13 @@ async fn serve(
     }
     #[cfg(feature = "ui")]
     helios_ui::set_admin_gate(admin_gate.clone());
+    // Console sign-in (P3): `HFS_MANAGER=on` or `HFS_CONSOLE_AUTH_MODE`.
+    let console = console_auth::build(
+        &config.base_url,
+        effective_ui_enabled(config.ui_enabled),
+        admin_gate.clone(),
+    )
+    .await;
 
     let app = attach_ui(
         app,
@@ -1631,6 +1642,8 @@ async fn serve(
         ui_bulk_provider,
         write_observer,
     );
+    // The console admin API, inside the admin guard below.
+    let app = console_auth::routes(app, console.as_ref());
     // Outermost of the application layers, so it sees `/admin/...` whether
     // the UI router or the FHIR router answers it.
     // Just inside the admin gate: the signed-in administrator becomes the
@@ -1644,6 +1657,8 @@ async fn serve(
         },
         admin_guard_unless_jwt,
     ));
+    // Outermost: every layer above sees the console runtime.
+    let app = console_auth::layer(app, console.as_ref());
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -1817,6 +1832,7 @@ static ADMIN_SESSION_STORE: std::sync::OnceLock<Arc<dyn helios_admin_auth::Admin
 async fn open_admin_session_store(
     backend: &helios_persistence::backends::postgres::PostgresBackend,
 ) {
+    console_auth::record_pool(backend.shared_pool());
     match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
         backend.shared_pool(),
         "HFS",
