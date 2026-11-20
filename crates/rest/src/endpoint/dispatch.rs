@@ -101,7 +101,7 @@ where
 
     fn call(&mut self, mut request: Request) -> Self::Future {
         match prepare(&self.registry, &mut request) {
-            Ok((resolved, name)) => {
+            Prepared::Serve(resolved, name) => {
                 let inner = self.inner.call(request);
                 let started = Instant::now();
                 Box::pin(super::scope(resolved, async move {
@@ -110,17 +110,21 @@ where
                     Ok(response)
                 }))
             }
-            Err(response) => Box::pin(std::future::ready(Ok(response))),
+            Prepared::Respond(response) => Box::pin(std::future::ready(Ok(response))),
         }
     }
 }
 
-/// Resolves the request on the current snapshot. `Ok` = serve (the request
-/// is rewritten and carries its extensions), `Err` = answer this instead.
-fn prepare(
-    registry: &EndpointRegistry,
-    request: &mut Request,
-) -> Result<(ResolvedEndpoint, String), Response> {
+/// What [`prepare`] decided.
+enum Prepared {
+    /// Serve: the request is rewritten and carries its extensions.
+    Serve(ResolvedEndpoint, String),
+    /// Answer this instead (503 / 404).
+    Respond(Response),
+}
+
+/// Resolves the request on the current snapshot.
+fn prepare(registry: &EndpointRegistry, request: &mut Request) -> Prepared {
     let snapshot = registry.snapshot();
     let path = request.uri().path().to_string();
     match snapshot.resolve(&path) {
@@ -140,15 +144,15 @@ fn prepare(
             request
                 .extensions_mut()
                 .insert(RequestSnapshot(Arc::clone(&snapshot)));
-            Ok((resolved, name))
+            Prepared::Serve(resolved, name)
         }
         Resolution::Unavailable(resolved) => {
             helios_audit::context::set_endpoint(resolved.endpoint.name(), &resolved.prefix);
             let response = unavailable(&resolved);
             record(resolved.endpoint.name(), response.status(), Instant::now());
-            Err(response)
+            Prepared::Respond(response)
         }
-        Resolution::NotFound => Err(not_found(&path)),
+        Resolution::NotFound => Prepared::Respond(not_found(&path)),
     }
 }
 
