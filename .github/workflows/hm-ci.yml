@@ -127,6 +127,8 @@ jobs:
             packages: -p helios-persistence
             features: helios-persistence/postgres
             select: printf '%s\n' --lib --test postgres_tests --test postgres_write_concurrency --test sof_pg_runner --test sof_columnar_profile --test hm_postgres_coordination
+            # helios-endpoints' PostgreSQL stores (manager branches).
+            optional: endpoints:helios-endpoints:postgres:pg_console
           - name: rest+hfs
             packages: -p helios-rest -p helios-hfs
             features: ""
@@ -188,13 +190,30 @@ jobs:
       - name: Select test targets
         run: |
           set -euo pipefail
+          # `optional` entries are dir:package[:feature[:test]] — crates that
+          # exist only on some branches (the FHIR servers manager's
+          # helios-endpoints). Each part is added only when present: the
+          # crate dir, a `<feature> =` line in its Cargo.toml, tests/<test>.rs.
           pkgs="${{ matrix.packages }}"
+          feats="${{ matrix.features }}"
+          extra=()
           for o in ${{ matrix.optional }}; do
-            if [ -f "crates/${o%%:*}/Cargo.toml" ]; then pkgs="$pkgs -p ${o#*:}"; fi
+            IFS=: read -r dir pkg feat test <<< "$o"
+            [ -f "crates/$dir/Cargo.toml" ] || continue
+            pkgs="$pkgs -p $pkg"
+            if [ -n "${feat:-}" ] && grep -qE "^${feat}[[:space:]]*=" "crates/$dir/Cargo.toml"; then
+              feats="${feats:+$feats,}$pkg/$feat"
+            fi
+            if [ -n "${test:-}" ] && [ -f "crates/$dir/tests/$test.rs" ]; then
+              extra+=(--test "$test")
+            fi
           done
           echo "PKGS=$pkgs" >> "$GITHUB_ENV"
-          echo "packages: $pkgs"
-          ${{ matrix.select }} > "$RUNNER_TEMP/sel.txt"
+          echo "FEATS=$feats" >> "$GITHUB_ENV"
+          echo "packages: $pkgs; features: $feats"
+          ${{ matrix.select }} > "$RUNNER_TEMP/sel.raw"
+          # Extra test targets go before any `--` (harness arguments).
+          awk -v extra="${extra[*]:-}" 'BEGIN{done=0} $0=="--" && !done {n=split(extra,a," "); for(i=1;i<=n;i++) print a[i]; done=1} {print} END{if(!done){n=split(extra,a," "); for(i=1;i<=n;i++) print a[i]}}' "$RUNNER_TEMP/sel.raw" > "$RUNNER_TEMP/sel.txt"
           tr '\n' ' ' < "$RUNNER_TEMP/sel.txt"; echo
       - name: Build tests (instrumented)
         run: |
@@ -203,7 +222,7 @@ jobs:
           build=()
           for a in "${sel[@]}"; do [ "$a" = "--" ] && break; build+=("$a"); done
           feat=()
-          [ -n "${{ matrix.features }}" ] && feat=(--features "${{ matrix.features }}")
+          if [ -n "$FEATS" ]; then feat=(--features "$FEATS"); fi
           # Instrumented plain `cargo test` (as upstream's coverage job does):
           # show-env exports the RUSTFLAGS / LLVM_PROFILE_FILE cargo-llvm-cov uses.
           source <(cargo llvm-cov show-env --export-prefix)
@@ -216,7 +235,7 @@ jobs:
           set -euo pipefail
           mapfile -t sel < "$RUNNER_TEMP/sel.txt"
           feat=()
-          [ -n "${{ matrix.features }}" ] && feat=(--features "${{ matrix.features }}")
+          if [ -n "$FEATS" ]; then feat=(--features "$FEATS"); fi
           source <(cargo llvm-cov show-env --export-prefix)
           start=$(date +%s)
           cargo test --locked $PKGS "${feat[@]}" "${sel[@]}"

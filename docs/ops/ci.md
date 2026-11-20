@@ -32,12 +32,12 @@ backends are compiled by the all-features clippy):
 | core | helios-fhir, -fhir-macro, -fhirpath-support, -serde, -serde-support, -cds-hooks, -observability | |
 | fhirpath+sof | helios-fhirpath, helios-sof | |
 | persistence-sqlite | helios-persistence | targets that start no container (`hm-test-args.py --docker-free`) |
-| persistence-postgres | helios-persistence `postgres` | `--lib` + the PostgreSQL integration targets against the `postgres:16` service (`HFS_TEST_PG_HOST`) |
+| persistence-postgres | helios-persistence `postgres` | `--lib` + the PostgreSQL integration targets against the `postgres:16` service (`HFS_TEST_PG_HOST`); on branches with `crates/endpoints` also `helios-endpoints` with `postgres` and its `pg_console` test |
 | rest+hfs | helios-rest, helios-hfs | targets that start no container |
 | rest-postgres | helios-rest `postgres` | the Docker-backed targets except MongoDB / Elasticsearch / MinIO / S3; testcontainers on the runner's Docker |
 | hts-sqlite / hts-postgres | helios-hts (`postgres`) | the PostgreSQL run uses `HTS_TEST_PG_URL` (service container) |
 | fhir-validator | helios-fhir-validator `fhirpath,xml` | |
-| services+ui | helios-auth, -admin-auth, -audit, -subscriptions, -ui, -ui-chrome, -hts-ui | admin-auth / subscriptions with `postgres`; the email suite starts mailpit with testcontainers; also `helios-endpoints` on branches that have `crates/endpoints` (matrix `optional`) |
+| services+ui | helios-auth, -admin-auth, -audit, -subscriptions, -ui, -ui-chrome, -hts-ui | admin-auth / subscriptions with `postgres`; the email suite starts mailpit with testcontainers; also `helios-endpoints` on branches that have `crates/endpoints` (matrix `optional`: `dir:package[:feature[:test]]`, each part used only when present) |
 
 Not run here: MongoDB, Elasticsearch, MinIO/S3 container suites (production
 uses none of them), the Playwright browser suites, release builds, Inferno and
