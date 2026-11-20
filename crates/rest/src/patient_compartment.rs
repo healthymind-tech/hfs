@@ -74,7 +74,6 @@ pub struct PatientCompartment(Option<String>, Vec<String>);
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PatientSharedTypes(pub Vec<String>);
 
-
 impl PatientCompartment {
     /// A request that is not confined to a compartment.
     pub fn unconfined() -> Self {
@@ -229,7 +228,7 @@ impl PatientCompartment {
             });
             return Ok(());
         }
-        if self.1.iter().any(|t| *t == query.resource_type) {
+        if self.1.contains(&query.resource_type) {
             // A shared reference type: searched unfiltered (its includes are
             // still confined by `retain_members`).
             return Ok(());
@@ -295,7 +294,10 @@ where
             .get::<PatientSharedTypes>()
             .map(|s| s.0.clone())
             .unwrap_or_default();
-        Ok(Self::from_access_scope(parts.extensions.get::<AccessScope>()).with_shared_types(shared))
+        Ok(
+            Self::from_access_scope(parts.extensions.get::<AccessScope>())
+                .with_shared_types(shared),
+        )
     }
 }
 

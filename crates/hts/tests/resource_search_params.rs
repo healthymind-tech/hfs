@@ -121,13 +121,19 @@ async fn code_system_search_parameters_filter() {
             "/CodeSystem?supplements=http://hts.test/p2o/cs/base%7C1.0",
             &["p2o-sup-versioned"],
         ),
-        ("/CodeSystem?supplements=http://hts.test/p2o/cs/nothing", &[]),
+        (
+            "/CodeSystem?supplements=http://hts.test/p2o/cs/nothing",
+            &[],
+        ),
         (
             "/CodeSystem?supplements=http://hts.test/p2o/cs/base&status=active",
             &["p2o-sup-bare"],
         ),
         // system == url
-        ("/CodeSystem?system=http://hts.test/p2o/cs/base", &["p2o-base"]),
+        (
+            "/CodeSystem?system=http://hts.test/p2o/cs/base",
+            &["p2o-base"],
+        ),
         (
             "/CodeSystem?system=http://hts.test/p2o/cs/base&url=http://hts.test/p2o/cs/fragment",
             &[],
@@ -153,7 +159,10 @@ async fn code_system_search_parameters_filter() {
         ("/ValueSet?_lastUpdated=ge2000-01&name=VsTwo", &["p2o-vs2"]),
         ("/ConceptMap?publisher=other", &["p2o-cm"]),
         ("/ConceptMap?publisher=acme", &[]),
-        ("/ConceptMap?_lastUpdated=gt2000-01-01T00:00:00%2B08:00", &["p2o-cm"]),
+        (
+            "/ConceptMap?_lastUpdated=gt2000-01-01T00:00:00%2B08:00",
+            &["p2o-cm"],
+        ),
     ];
     for (path, expected) in cases {
         let got = search(&app, path).await;
@@ -168,15 +177,18 @@ async fn code_system_search_parameters_filter() {
     assert_eq!(body["total"], 2, "{body}");
 
     // Paging applies after the filter.
-    let (_, page) = app.get_fhir("/CodeSystem?content-mode=supplement&_count=2").await;
+    let (_, page) = app
+        .get_fhir("/CodeSystem?content-mode=supplement&_count=2")
+        .await;
     assert_eq!(page["total"], 3, "{page}");
     assert_eq!(page["entry"].as_array().unwrap().len(), 2, "{page}");
 
     // The stored resource is returned, not a synthetic summary.
-    let (_, full) = app.get_fhir("/CodeSystem?supplements=http://hts.test/p2o/cs/other").await;
+    let (_, full) = app
+        .get_fhir("/CodeSystem?supplements=http://hts.test/p2o/cs/other")
+        .await;
     assert_eq!(
-        full["entry"][0]["resource"]["supplements"],
-        "http://hts.test/p2o/cs/other",
+        full["entry"][0]["resource"]["supplements"], "http://hts.test/p2o/cs/other",
         "{full}"
     );
 }
@@ -205,7 +217,15 @@ fn supplements_query(canonical: &str) -> ResourceSearchQuery {
 fn search_ids(found: &[Value]) -> Vec<String> {
     let mut out: Vec<String> = found
         .iter()
-        .map(|r| r["id"].as_str().unwrap().split('|').next().unwrap().to_owned())
+        .map(|r| {
+            r["id"]
+                .as_str()
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
         .collect();
     out.sort();
     out

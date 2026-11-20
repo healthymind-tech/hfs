@@ -367,10 +367,10 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
 fn is_resource_slot(ed: &Ed) -> bool {
     let last = ed.path.rsplit('.').next().unwrap_or_default();
     matches!(last, "resource" | "contained")
-        && ed
-            .types
-            .iter()
-            .all(|t| t.effective_code().starts_with(|c: char| c.is_ascii_uppercase()))
+        && ed.types.iter().all(|t| {
+            t.effective_code()
+                .starts_with(|c: char| c.is_ascii_uppercase())
+        })
 }
 
 /// Binding, constraints, fixed/pattern — the keywords that apply to a value

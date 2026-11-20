@@ -49,10 +49,7 @@ impl ClusterChangeFeed for PgClusterChangeFeed {
     async fn start(&self) -> StorageResult<ChangeCursor> {
         let client = self.client().await?;
         let row = client
-            .query_one(
-                "SELECT pg_snapshot_xmin(pg_current_snapshot())::text",
-                &[],
-            )
+            .query_one("SELECT pg_snapshot_xmin(pg_current_snapshot())::text", &[])
             .await
             .map_err(|e| internal(format!("read snapshot xmin: {e}")))?;
         let xmin = parse_xid(&row.get::<_, String>(0))?;

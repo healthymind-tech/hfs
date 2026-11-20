@@ -95,26 +95,24 @@ async fn handle_ws_connection(
 
     // Validate and consume the binding token (single-use; redeemable on any
     // instance when clustered, upstream B2), then hold it to the request tenant.
-    let (tenant_id, subscription_id) = match check_binding_tenant(
-        engine.redeem_ws_token(&token).await,
-        &request_tenant_id,
-    ) {
-        Ok(binding) => binding,
-        Err(BindingTokenRejection::InvalidOrExpired) => {
-            warn!("Invalid or expired WebSocket binding token");
-            close_with_policy_violation(&mut socket, "invalid-or-expired-token").await;
-            return;
-        }
-        Err(BindingTokenRejection::TenantMismatch { token_tenant_id }) => {
-            warn!(
-                request_tenant_id = %request_tenant_id,
-                token_tenant_id = %token_tenant_id,
-                "WebSocket binding token tenant does not match request tenant"
-            );
-            close_with_policy_violation(&mut socket, "tenant-mismatch").await;
-            return;
-        }
-    };
+    let (tenant_id, subscription_id) =
+        match check_binding_tenant(engine.redeem_ws_token(&token).await, &request_tenant_id) {
+            Ok(binding) => binding,
+            Err(BindingTokenRejection::InvalidOrExpired) => {
+                warn!("Invalid or expired WebSocket binding token");
+                close_with_policy_violation(&mut socket, "invalid-or-expired-token").await;
+                return;
+            }
+            Err(BindingTokenRejection::TenantMismatch { token_tenant_id }) => {
+                warn!(
+                    request_tenant_id = %request_tenant_id,
+                    token_tenant_id = %token_tenant_id,
+                    "WebSocket binding token tenant does not match request tenant"
+                );
+                close_with_policy_violation(&mut socket, "tenant-mismatch").await;
+                return;
+            }
+        };
 
     // Verify subscription still exists.
     let sub = match engine

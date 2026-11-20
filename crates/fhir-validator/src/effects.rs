@@ -537,6 +537,7 @@ async fn execute_constraints(
 
     // Select, filter, and dedup — preserving deferred order.
     let mut seen: HashSet<(String, String)> = HashSet::new();
+    #[allow(clippy::type_complexity)]
     let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity, bool)> = Vec::new();
     for d in deferred {
         let Deferred::Constraint {
@@ -1081,8 +1082,8 @@ async fn execute_terminology(
                         // and unbound Codings. On meta.tag / meta.security
                         // (local tag systems are normal there) it is
                         // information.
-                        let on_meta_label = path.contains(".meta.tag.")
-                            || path.contains(".meta.security.");
+                        let on_meta_label =
+                            path.contains(".meta.tag.") || path.contains(".meta.security.");
                         errors.push(
                             ValidationError::new(
                                 ErrorKind::UnknownCodeSystem,
@@ -1433,8 +1434,14 @@ mod tests {
         assert!(coded_value(&expression, Some("Expression")).is_none());
         assert!(coded_value(&expression, None).is_none());
         let coding = serde_json::json!({"system": "http://x", "code": "a"});
-        assert!(matches!(coded_value(&coding, None), Some(CodedValue::Coding(_))));
-        assert!(matches!(coded_value(&serde_json::json!("Patient"), Some("code")), Some(CodedValue::Code(_))));
+        assert!(matches!(
+            coded_value(&coding, None),
+            Some(CodedValue::Coding(_))
+        ));
+        assert!(matches!(
+            coded_value(&serde_json::json!("Patient"), Some("code")),
+            Some(CodedValue::Code(_))
+        ));
         assert!(matches!(
             coded_value(&serde_json::json!({"text": "t"}), None),
             Some(CodedValue::CodeableConcept(_))

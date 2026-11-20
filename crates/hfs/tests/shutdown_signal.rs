@@ -57,8 +57,7 @@ fn answers(port: u16) -> bool {
         return false;
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-    if s
-        .write_all(b"GET /metadata HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    if s.write_all(b"GET /metadata HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .is_err()
     {
         return false;

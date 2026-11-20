@@ -84,6 +84,7 @@ pub(crate) struct PgMeta {
     pub(super) cs_version: RwLock<HashMap<String, Option<String>>>,
     pub(super) cs_content: RwLock<HashMap<String, Option<String>>>,
     pub(super) case_insensitive: RwLock<HashMap<String, bool>>,
+    #[allow(clippy::type_complexity)]
     pub(super) prop_codes: RwLock<HashMap<(String, String), Arc<Vec<String>>>>,
     /// `(0 = inactive | 1 = abstract, system url, code)` → flag.
     pub(super) concept_flags: RwLock<HashMap<(u8, String, String), bool>>,
@@ -758,6 +759,7 @@ pub(crate) trait CachedQuery {
     ) -> impl std::future::Future<Output = Result<tokio_postgres::Row, tokio_postgres::Error>> + Send + 'a;
 }
 
+#[allow(clippy::manual_async_fn)]
 impl CachedQuery for PgClient {
     fn cq<'a>(
         &'a self,
@@ -1254,14 +1256,8 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             stats.errors.extend(parsed.parse_errors.iter().cloned());
             let res: Result<(), HtsError> = async {
                 for cs in &parsed.code_systems {
-                    write_code_system(
-                        &tx,
-                        cs,
-                        &mut stats,
-                        parsed.fresh_load,
-                        !parsed.chunked,
-                    )
-                    .await?;
+                    write_code_system(&tx, cs, &mut stats, parsed.fresh_load, !parsed.chunked)
+                        .await?;
                 }
                 for vs in &parsed.value_sets {
                     write_value_set(&tx, vs, &mut stats).await?;
@@ -2448,7 +2444,10 @@ mod pool_tuning_tests {
         let pool = cfg.pool.unwrap();
         assert_eq!(pool.max_size, 1, "a zero size is clamped to one");
         assert_eq!(pool.timeouts.wait, Some(std::time::Duration::from_secs(30)));
-        assert_eq!(pool.timeouts.create, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            pool.timeouts.create,
+            Some(std::time::Duration::from_secs(5))
+        );
         assert_eq!(cfg.options.as_deref(), Some("-c statement_timeout=60000"));
     }
 

@@ -232,7 +232,6 @@ mod sync_failure_ledger_suite;
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
-
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -3523,13 +3522,20 @@ mod postgres_integration {
         let first = PostgresBackend::new(config_with(server, true))
             .await
             .expect("Failed to create PostgresBackend");
-        assert!((1..=half).contains(&size(&first)), "{} of {server}", size(&first));
+        assert!(
+            (1..=half).contains(&size(&first)),
+            "{} of {server}",
+            size(&first)
+        );
         let second = PostgresBackend::new(config_with(server, true))
             .await
             .expect("Failed to create PostgresBackend");
         let (a, b) = (size(&first), size(&second));
         assert!(a >= 1 && b >= 1, "{a} + {b}");
-        assert!(a + b <= half || a + b == 2, "{a} + {b} exceed half of {server}");
+        assert!(
+            a + b <= half || a + b == 2,
+            "{a} + {b} exceed half of {server}"
+        );
 
         // An explicit size is kept, even above what the budget leaves (it only
         // warns once the pools add up to more than the server accepts).
@@ -7203,7 +7209,8 @@ mod postgres_integration {
         // same 40 codes plus 1,200 absent ones answer the same.
         let mut long = values.clone();
         long.extend(
-            (5000..6200).map(|c| SearchValue::new(SearchPrefix::Eq, format!("http://snomed.info/sct|{c}"))),
+            (5000..6200)
+                .map(|c| SearchValue::new(SearchPrefix::Eq, format!("http://snomed.info/sct|{c}"))),
         );
         let long_param = |modifier, values: Vec<SearchValue>| SearchParameter {
             name: "code".into(),
@@ -7314,7 +7321,11 @@ mod postgres_integration {
         // category=vital-signs & date=ge2025-01-01 (day >= 3653, or the 2030 row)
         let ge_2025 = 3653;
         let q = SearchQuery::new("Observation")
-            .with_parameter(param("category", SearchParamType::Token, SearchValue::eq("vital-signs")))
+            .with_parameter(param(
+                "category",
+                SearchParamType::Token,
+                SearchValue::eq("vital-signs"),
+            ))
             .with_parameter(param(
                 "date",
                 SearchParamType::Date,
@@ -7329,7 +7340,11 @@ mod postgres_integration {
 
         // status=final & date=ge2025-01-01
         let q = SearchQuery::new("Observation")
-            .with_parameter(param("status", SearchParamType::Token, SearchValue::eq("final")))
+            .with_parameter(param(
+                "status",
+                SearchParamType::Token,
+                SearchValue::eq("final"),
+            ))
             .with_parameter(param(
                 "date",
                 SearchParamType::Date,
@@ -7343,7 +7358,11 @@ mod postgres_integration {
         // occurrence may match a different row (the 2030 row satisfies `ge`)
         let (ge_2018, lt_2018h) = (1096, 1277);
         let q = SearchQuery::new("Observation")
-            .with_parameter(param("category", SearchParamType::Token, SearchValue::eq("vital-signs")))
+            .with_parameter(param(
+                "category",
+                SearchParamType::Token,
+                SearchValue::eq("vital-signs"),
+            ))
             .with_parameter(param(
                 "date",
                 SearchParamType::Date,
@@ -14722,7 +14741,11 @@ mod postgres_integration {
             .expect("transaction PUT to a deleted id");
         assert_eq!(result.entries[0].status, 201, "{:?}", result.entries[0]);
 
-        let stored = backend.read(&tenant, "Patient", "lazarus").await.unwrap().unwrap();
+        let stored = backend
+            .read(&tenant, "Patient", "lazarus")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.version_id(), "3", "create 1, delete 2, resurrect 3");
         assert_eq!(stored.content()["name"][0]["family"], "Back");
         let history = backend
@@ -23954,7 +23977,7 @@ mod postgres_integration {
                 .unwrap();
             // Newest first, with a three-way tie in the middle.
             let at = match i {
-                2 | 3 | 4 => "2026-01-10T00:00:00Z".to_string(),
+                2..=4 => "2026-01-10T00:00:00Z".to_string(),
                 _ => format!("2026-01-{:02}T00:00:00Z", 20 - i),
             };
             pin_last_updated(&backend, id, instant(&at)).await;
@@ -40342,7 +40365,9 @@ mod postgres_integration {
             let b = create_backend().await;
             let tenant = create_tenant("feed");
             let tid = tenant.tenant_id().as_str().to_string();
-            let feed = b.cluster_change_feed().expect("postgres backs a change feed");
+            let feed = b
+                .cluster_change_feed()
+                .expect("postgres backs a change feed");
             let mut cursor = feed.start().await.unwrap();
 
             let sd = json!({
@@ -40358,9 +40383,14 @@ mod postgres_integration {
                 .await
                 .unwrap();
             // A non-watched type never enters the feed.
-            a.create(&tenant, "Patient", json!({"resourceType": "Patient", "id": "p"}), FhirVersion::default())
-                .await
-                .unwrap();
+            a.create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 changes_for(&feed, &mut cursor, &tid).await,
                 vec!["StructureDefinition/feed-sd".to_string()]
@@ -40370,7 +40400,9 @@ mod postgres_integration {
                 "a delivered change is not delivered twice"
             );
 
-            a.delete(&tenant, "StructureDefinition", "feed-sd").await.unwrap();
+            a.delete(&tenant, "StructureDefinition", "feed-sd")
+                .await
+                .unwrap();
             assert_eq!(
                 changes_for(&feed, &mut cursor, &tid).await,
                 vec!["StructureDefinition/feed-sd".to_string()],
@@ -40385,7 +40417,9 @@ mod postgres_integration {
             let b = create_backend().await;
             let tenant = create_tenant("feed-slow");
             let tid = tenant.tenant_id().as_str().to_string();
-            let feed = b.cluster_change_feed().expect("postgres backs a change feed");
+            let feed = b
+                .cluster_change_feed()
+                .expect("postgres backs a change feed");
             let mut cursor = feed.start().await.unwrap();
 
             let insert = "INSERT INTO resources
@@ -40410,7 +40444,11 @@ mod postgres_integration {
             );
             assert!(changes_for(&feed, &mut cursor, &tid).await.is_empty());
 
-            assert!(feed.prune(std::time::Duration::from_secs(3600)).await.is_ok());
+            assert!(
+                feed.prune(std::time::Duration::from_secs(3600))
+                    .await
+                    .is_ok()
+            );
         }
     }
 
@@ -40476,7 +40514,9 @@ mod postgres_integration {
         /// contiguous 1..=31.
         #[tokio::test]
         async fn postgres_integration_cluster_unconditional_put_storm_keeps_every_version() {
-            use helios_persistence::core::{HistoryParams, InstanceHistoryProvider, ResourceStorage};
+            use helios_persistence::core::{
+                HistoryParams, InstanceHistoryProvider, ResourceStorage,
+            };
             let handles = [
                 Arc::new(create_backend().await),
                 Arc::new(create_backend().await),
@@ -40484,7 +40524,12 @@ mod postgres_integration {
             ];
             let tenant = create_tenant("put-storm");
             let created = handles[0]
-                .create(&tenant, "Patient", json!({"resourceType": "Patient"}), FhirVersion::default())
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                    FhirVersion::default(),
+                )
                 .await
                 .unwrap();
             let id = created.id().to_string();
@@ -40505,7 +40550,9 @@ mod postgres_integration {
                 }));
             }
             for t in tasks {
-                t.await.unwrap().expect("unconditional PUT must not lose its race");
+                t.await
+                    .unwrap()
+                    .expect("unconditional PUT must not lose its race");
             }
             let history = handles[1]
                 .history_instance(&tenant, "Patient", &id, &HistoryParams::new().count(100))

@@ -238,14 +238,22 @@ mod tests {
             ..safe_cluster_view()
         };
         let errors = validate_cluster_config(&memory_fanout).unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("HFS_SUBSCRIPTIONS_FANOUT")), "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("HFS_SUBSCRIPTIONS_FANOUT")),
+            "{errors:?}"
+        );
         let non_postgres = ClusterConfigView {
             subscriptions_enabled: true,
             primary_backend: BackendKind::MongoDB,
             ..safe_cluster_view()
         };
         let errors = validate_cluster_config(&non_postgres).unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("requires a postgres")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("requires a postgres")),
+            "{errors:?}"
+        );
     }
 
     /// The refusal table: one unsafe dimension at a time, each error naming
@@ -351,5 +359,4 @@ mod tests {
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));
     }
-
 }

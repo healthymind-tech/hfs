@@ -32,7 +32,8 @@ pub mod version;
 
 pub use jobs::{Job, JobKind, JobStatus, JobView};
 pub use manager::{
-    CoreTerminologyReport, InstallOptions, InstallRequest, ManagerDeps, ManagerError, PackageManager, TerminologyTarget,
+    CoreTerminologyReport, InstallOptions, InstallRequest, ManagerDeps, ManagerError,
+    PackageManager, TerminologyTarget,
 };
 pub use resolver::{InstallMode, NodeAction, Plan};
 pub use version::DependencyPolicy;

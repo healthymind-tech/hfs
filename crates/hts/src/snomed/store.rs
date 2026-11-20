@@ -8,7 +8,10 @@ use super::{ConceptInfo, ConceptRow, ModelImport};
 use crate::error::HtsError;
 
 fn split_terms(s: &str) -> Vec<String> {
-    s.split('\n').filter(|t| !t.is_empty()).map(str::to_string).collect()
+    s.split('\n')
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────────
@@ -46,9 +49,17 @@ mod sqlite {
                 version.unwrap_or("")
             )));
         };
-        for t in ["snomed_concepts", "snomed_relationships", "snomed_mrcm", "snomed_model_stamps"] {
-            tx.execute(&format!("DELETE FROM {t} WHERE system_id = ?1"), [&system_id])
-                .map_err(err)?;
+        for t in [
+            "snomed_concepts",
+            "snomed_relationships",
+            "snomed_mrcm",
+            "snomed_model_stamps",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {t} WHERE system_id = ?1"),
+                [&system_id],
+            )
+            .map_err(err)?;
         }
         let mut n = 0u64;
         {
@@ -117,7 +128,9 @@ mod sqlite {
 
     /// The model of `system_id`, built on first use.
     pub fn load(conn: &Connection, system_id: &str) -> Result<Option<Arc<SnomedModel>>, HtsError> {
-        let Some(stamp) = stamp(conn, system_id)? else { return Ok(None) };
+        let Some(stamp) = stamp(conn, system_id)? else {
+            return Ok(None);
+        };
         if let Some(m) = model::cached(&stamp) {
             return Ok(Some(m));
         }
@@ -133,7 +146,13 @@ mod sqlite {
             .map_err(err)?;
         rows.concepts = st
             .query_map([system_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty())))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+                ))
             })
             .map_err(err)?
             .collect::<rusqlite::Result<_>>()
@@ -145,7 +164,9 @@ mod sqlite {
             )
             .map_err(err)?;
         rows.relationships = st
-            .query_map([system_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .query_map([system_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
             .map_err(err)?
             .collect::<rusqlite::Result<_>>()
             .map_err(err)?;
@@ -164,7 +185,14 @@ mod sqlite {
             .map_err(err)?;
         rows.mrcm = st
             .query_map([system_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .map_err(err)?
             .collect::<rusqlite::Result<_>>()
@@ -172,7 +200,11 @@ mod sqlite {
         let mut m = SnomedModel::build(rows);
         m.system_id = system_id.to_string();
         m.version = conn
-            .query_row("SELECT version FROM code_systems WHERE id = ?1", [system_id], |r| r.get(0))
+            .query_row(
+                "SELECT version FROM code_systems WHERE id = ?1",
+                [system_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(err)?
             .flatten();
@@ -221,7 +253,11 @@ mod sqlite {
     }
 
     /// The codes among `codes` the system does not hold.
-    pub fn missing(conn: &Connection, system_id: &str, codes: &[String]) -> Result<Vec<String>, HtsError> {
+    pub fn missing(
+        conn: &Connection,
+        system_id: &str,
+        codes: &[String],
+    ) -> Result<Vec<String>, HtsError> {
         let mut st = conn
             .prepare_cached("SELECT 1 FROM concepts WHERE system_id = ?1 AND code = ?2")
             .map_err(err)?;
@@ -236,7 +272,11 @@ mod sqlite {
 
     /// The stored system id of `url|version` (the latest version when
     /// unpinned).
-    pub fn system_id(conn: &Connection, url: &str, version: Option<&str>) -> Result<Option<String>, HtsError> {
+    pub fn system_id(
+        conn: &Connection,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<String>, HtsError> {
         conn.query_row(
             "SELECT id FROM code_systems c WHERE url = ?1 AND (?2 IS NULL OR version = ?2)
              ORDER BY EXISTS (SELECT 1 FROM snomed_model_stamps s WHERE s.system_id = c.id) DESC,
@@ -288,17 +328,26 @@ mod pg {
                 version.unwrap_or("")
             )));
         };
-        for t in ["snomed_concepts", "snomed_relationships", "snomed_mrcm", "snomed_model_stamps"] {
-            tx.execute(&format!("DELETE FROM {t} WHERE system_id = $1"), &[&system_id])
-                .await
-                .map_err(err)?;
+        for t in [
+            "snomed_concepts",
+            "snomed_relationships",
+            "snomed_mrcm",
+            "snomed_model_stamps",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {t} WHERE system_id = $1"),
+                &[&system_id],
+            )
+            .await
+            .map_err(err)?;
         }
         let mut n = 0u64;
         for chunk in data.concepts.chunks(20_000) {
             let code: Vec<&str> = chunk.iter().map(|c| c.code.as_str()).collect();
             let active: Vec<bool> = chunk.iter().map(|c| c.active).collect();
             let primitive: Vec<bool> = chunk.iter().map(|c| c.primitive).collect();
-            let eff: Vec<Option<&str>> = chunk.iter().map(|c| c.effective_time.as_deref()).collect();
+            let eff: Vec<Option<&str>> =
+                chunk.iter().map(|c| c.effective_time.as_deref()).collect();
             let module: Vec<Option<&str>> = chunk.iter().map(|c| c.module.as_deref()).collect();
             let terms: Vec<String> = chunk.iter().map(|c| c.terms.join("\n")).collect();
             let inactive: Vec<String> = chunk.iter().map(|c| c.inactive_terms.join("\n")).collect();
@@ -350,14 +399,22 @@ mod pg {
 
     pub async fn stamp(client: &Client, system_id: &str) -> Result<Option<String>, HtsError> {
         Ok(client
-            .query_opt("SELECT stamp FROM snomed_model_stamps WHERE system_id = $1", &[&system_id])
+            .query_opt(
+                "SELECT stamp FROM snomed_model_stamps WHERE system_id = $1",
+                &[&system_id],
+            )
             .await
             .map_err(err)?
             .map(|r| r.get(0)))
     }
 
-    pub async fn load(client: &Client, system_id: &str) -> Result<Option<Arc<SnomedModel>>, HtsError> {
-        let Some(stamp) = stamp(client, system_id).await? else { return Ok(None) };
+    pub async fn load(
+        client: &Client,
+        system_id: &str,
+    ) -> Result<Option<Arc<SnomedModel>>, HtsError> {
+        let Some(stamp) = stamp(client, system_id).await? else {
+            return Ok(None);
+        };
         if let Some(m) = model::cached(&stamp) {
             return Ok(Some(m));
         }
@@ -409,7 +466,10 @@ mod pg {
         let mut m = SnomedModel::build(rows);
         m.system_id = system_id.to_string();
         m.version = client
-            .query_opt("SELECT version FROM code_systems WHERE id = $1", &[&system_id])
+            .query_opt(
+                "SELECT version FROM code_systems WHERE id = $1",
+                &[&system_id],
+            )
             .await
             .map_err(err)?
             .and_then(|r| r.get(0));
@@ -453,7 +513,11 @@ mod pg {
             .collect())
     }
 
-    pub async fn missing(client: &Client, system_id: &str, codes: &[String]) -> Result<Vec<String>, HtsError> {
+    pub async fn missing(
+        client: &Client,
+        system_id: &str,
+        codes: &[String],
+    ) -> Result<Vec<String>, HtsError> {
         let found: std::collections::HashSet<String> = client
             .query(
                 "SELECT code FROM concepts WHERE system_id = $1 AND code = ANY($2)",
@@ -464,10 +528,18 @@ mod pg {
             .into_iter()
             .map(|r| r.get(0))
             .collect();
-        Ok(codes.iter().filter(|c| !found.contains(*c)).cloned().collect())
+        Ok(codes
+            .iter()
+            .filter(|c| !found.contains(*c))
+            .cloned()
+            .collect())
     }
 
-    pub async fn system_id(client: &Client, url: &str, version: Option<&str>) -> Result<Option<String>, HtsError> {
+    pub async fn system_id(
+        client: &Client,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<Option<String>, HtsError> {
         Ok(client
             .query_opt(
                 "SELECT id FROM code_systems c WHERE url = $1 AND ($2::text IS NULL OR version = $2)

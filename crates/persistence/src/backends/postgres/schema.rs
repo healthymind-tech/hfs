@@ -385,7 +385,10 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
     ensure_fork_migrations_table(&*client).await?;
     for name in FORK_MIGRATIONS {
         let applied = client
-            .query_opt("SELECT 1 FROM hm_schema_migrations WHERE name = $1", &[name])
+            .query_opt(
+                "SELECT 1 FROM hm_schema_migrations WHERE name = $1",
+                &[name],
+            )
             .await
             .map_err(|e| pg_error(format!("Failed to read hm_schema_migrations: {e}")))?
             .is_some();
@@ -417,11 +420,12 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
 /// The applied fork migrations, oldest first. Operators query
 /// `hm_schema_migrations` directly (docs/ops/database-migrations.md).
 #[cfg(test)]
-async fn applied_fork_migrations(
-    client: &deadpool_postgres::Client,
-) -> StorageResult<Vec<String>> {
+async fn applied_fork_migrations(client: &deadpool_postgres::Client) -> StorageResult<Vec<String>> {
     let exists: bool = client
-        .query_one("SELECT to_regclass('hm_schema_migrations') IS NOT NULL", &[])
+        .query_one(
+            "SELECT to_regclass('hm_schema_migrations') IS NOT NULL",
+            &[],
+        )
         .await
         .map_err(|e| pg_error(format!("Failed to inspect hm_schema_migrations: {e}")))?
         .get(0);
@@ -5106,7 +5110,11 @@ async fn fork_search_parameter_epochs(client: &deadpool_postgres::Client) -> Sto
                  EXECUTE FUNCTION hfs_bump_search_parameter_epoch();",
         )
         .await
-        .map_err(|e| pg_error(format!("Fork migration {FORK_SEARCH_PARAMETER_EPOCHS} failed: {e}")))?;
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration {FORK_SEARCH_PARAMETER_EPOCHS} failed: {e}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -5181,9 +5189,7 @@ async fn fork_search_index_statistics(client: &mut deadpool_postgres::Client) ->
 /// rebuild finishes. A boolean with a constant default is a catalog-only
 /// change. (hm/p3-interop2 added it as idempotent startup DDL; registered on
 /// the fork track at merge so every fork schema change is recorded by name.)
-async fn fork_bulk_manifest_index_pending(
-    client: &deadpool_postgres::Client,
-) -> StorageResult<()> {
+async fn fork_bulk_manifest_index_pending(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .batch_execute(
             "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE",
@@ -5195,7 +5201,6 @@ async fn fork_bulk_manifest_index_pending(
             ))
         })
 }
-
 
 /// v46 -> v47: `idx_resources_reindex_id`, the id-range `$reindex` walk's
 /// index (#1767).
@@ -6578,7 +6583,11 @@ async fn fork_resource_change_feed(client: &deadpool_postgres::Client) -> Storag
                  EXECUTE FUNCTION hfs_record_resource_change();",
         )
         .await
-        .map_err(|e| pg_error(format!("Fork migration hm-0004-resource-change-feed failed: {e}")))?;
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration hm-0004-resource-change-feed failed: {e}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -6595,7 +6604,9 @@ async fn fork_resource_change_feed(client: &deadpool_postgres::Client) -> Storag
 ///   the cluster-jobs lease + fencing discipline plus a retry schedule (B5).
 /// - `subscription_ws_tokens` — single-use WebSocket binding tokens,
 ///   redeemed with `DELETE … RETURNING` (B2).
-async fn fork_subscription_cluster_delivery(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn fork_subscription_cluster_delivery(
+    client: &deadpool_postgres::Client,
+) -> StorageResult<()> {
     client
         .execute(
             "CREATE TABLE IF NOT EXISTS subscription_state (
@@ -7069,7 +7080,10 @@ mod postgres_integration_migrations {
 
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         // The ladder number is upstream's (v0.2.8); fork changes go by name.
-        assert_eq!(SCHEMA_VERSION, 55, "the fork must not take upstream numbers");
+        assert_eq!(
+            SCHEMA_VERSION, 55,
+            "the fork must not take upstream numbers"
+        );
         assert_eq!(
             applied_fork_migrations(&client).await.unwrap(),
             FORK_MIGRATIONS
@@ -7115,7 +7129,9 @@ mod postgres_integration_migrations {
             .await
             .unwrap();
         // The resources insert above bumps no epoch (not a SearchParameter).
-        initialize_schema(&mut client).await.expect("upgrade fork v47");
+        initialize_schema(&mut client)
+            .await
+            .expect("upgrade fork v47");
 
         // Re-stamped to v46, then upstream v47..SCHEMA_VERSION ran.
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
@@ -7137,7 +7153,10 @@ mod postgres_integration_migrations {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(epoch, 41, "the re-stamp must not re-run or reset the epochs");
+        assert_eq!(
+            epoch, 41,
+            "the re-stamp must not re-run or reset the epochs"
+        );
         let kept: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM resources WHERE tenant_id = 't1' AND id = 'keep-me'",
@@ -7339,7 +7358,9 @@ mod postgres_integration_migrations {
             .collect();
         assert_eq!(applied_before.len(), FORK_MIGRATIONS.len());
 
-        initialize_schema(&mut client).await.expect("migrate v46 to current");
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v46 to current");
 
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         for object in [
@@ -7431,7 +7452,9 @@ mod postgres_integration_migrations {
         let backend = fresh_backend("newer_schema").await;
         let mut client = backend.get_client().await.unwrap();
         initialize_schema(&mut client).await.expect("initialize");
-        set_schema_version(&client, SCHEMA_VERSION + 10).await.unwrap();
+        set_schema_version(&client, SCHEMA_VERSION + 10)
+            .await
+            .unwrap();
 
         let err = run_migrations_with(&mut client, false)
             .await

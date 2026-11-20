@@ -315,7 +315,10 @@ impl AuthConfig {
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
         // `HFS_AUTH_MODE` wins; without it `HFS_AUTH_ENABLED=true` means full.
-        let mode = match env::var("HFS_AUTH_MODE").ok().filter(|v| !v.trim().is_empty()) {
+        let mode = match env::var("HFS_AUTH_MODE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
             Some(raw) => AuthMode::parse(&raw).unwrap_or_else(|| {
                 tracing::error!(
                     value = %raw,
@@ -418,7 +421,11 @@ impl AuthConfig {
     /// The mode in force: [`AuthMode::Off`] when disabled, else
     /// [`mode`](Self::mode).
     pub fn effective_mode(&self) -> AuthMode {
-        if self.enabled { self.mode } else { AuthMode::Off }
+        if self.enabled {
+            self.mode
+        } else {
+            AuthMode::Off
+        }
     }
 
     /// Build an outbound auth provider from this config.
@@ -689,7 +696,10 @@ mod tests {
         assert_eq!(config.clock_skew_secs, 15);
         assert_eq!(
             config.smart_capabilities,
-            Some(vec!["launch-standalone".to_string(), "permission-v2".to_string()])
+            Some(vec![
+                "launch-standalone".to_string(),
+                "permission-v2".to_string()
+            ])
         );
         clear_auth_env();
     }
@@ -699,21 +709,38 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_auth_env();
         let config = AuthConfig::from_env();
-        assert!(config.patient_shared_read_types().iter().any(|t| t == "Medication"));
-        assert!(!config.patient_shared_read_types().iter().any(|t| t == "Binary"));
+        assert!(
+            config
+                .patient_shared_read_types()
+                .iter()
+                .any(|t| t == "Medication")
+        );
+        assert!(
+            !config
+                .patient_shared_read_types()
+                .iter()
+                .any(|t| t == "Binary")
+        );
         unsafe { env::set_var("HFS_AUTH_PATIENT_SHARED_TYPES", "Medication, Location") };
         assert_eq!(
             AuthConfig::from_env().patient_shared_read_types(),
             ["Medication".to_string(), "Location".to_string()]
         );
         unsafe { env::set_var("HFS_AUTH_PATIENT_NON_COMPARTMENT", "deny") };
-        assert!(AuthConfig::from_env().patient_shared_read_types().is_empty());
+        assert!(
+            AuthConfig::from_env()
+                .patient_shared_read_types()
+                .is_empty()
+        );
         clear_auth_env();
     }
 
     #[test]
     fn auth_mode_parses_spellings() {
-        assert_eq!(AuthMode::parse("WRITE_PROTECT"), Some(AuthMode::WriteProtect));
+        assert_eq!(
+            AuthMode::parse("WRITE_PROTECT"),
+            Some(AuthMode::WriteProtect)
+        );
         assert_eq!(AuthMode::parse("full"), Some(AuthMode::Full));
         assert_eq!(AuthMode::parse("off"), Some(AuthMode::Off));
         assert_eq!(AuthMode::parse("maybe"), None);

@@ -17,8 +17,8 @@ use chrono::Utc;
 use helios_fhir::FhirVersion;
 
 use crate::core::{
-    DistinctMetaValue, IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
-    SearchResult, TextSearchProvider,
+    DistinctMetaValue, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
 };
 use crate::error::{QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -796,9 +796,9 @@ impl PostgresBackend {
             let plan: serde_json::Value = row.get(0);
             let rows = plan[0]["Plan"]["Plan Rows"].as_f64().unwrap_or(0.0);
             let factor = match range_value_column(param.param_type) {
-                Some(column) => range_estimate_correction(
-                    self.value_null_fraction(client, column).await,
-                ),
+                Some(column) => {
+                    range_estimate_correction(self.value_null_fraction(client, column).await)
+                }
                 None => 1.0,
             };
             estimates.push(rows * factor);
@@ -1687,7 +1687,7 @@ impl SearchProvider for PostgresBackend {
                     .filter(|_| COUNT_FROM_INDEX_ALONE);
                 let single = match single {
                     Some(pred) if super::null_timestamp_facts::enabled() => {
-                        match super::null_timestamp_facts::param_name_of(&pred) {
+                        match super::null_timestamp_facts::param_name_of(pred) {
                             Some(param)
                                 if super::null_timestamp_facts::param_has_no_null_rows(
                                     &client,
@@ -2829,14 +2829,21 @@ mod range_estimate_tests {
         assert_eq!(choose_walk_driver(&[9_000.0, 50_000.0], &[O, R]), 1);
         assert_eq!(choose_walk_driver(&[9_000.0, 50_000.0], &[O, O]), 0);
         // token + ge date + lt date (a window): the smaller of token and lt
-        assert_eq!(choose_walk_driver(&[139_000.0, 437_000.0, 191_000.0], &[T, O, R]), 0);
-        assert_eq!(choose_walk_driver(&[139_000.0, 437_000.0, 20_000.0], &[T, O, R]), 2);
+        assert_eq!(
+            choose_walk_driver(&[139_000.0, 437_000.0, 191_000.0], &[T, O, R]),
+            0
+        );
+        assert_eq!(
+            choose_walk_driver(&[139_000.0, 437_000.0, 20_000.0], &[T, O, R]),
+            2
+        );
     }
 
     #[test]
     fn open_dates_are_recognised_from_the_predicate() {
         let ge = "param_name = 'date' AND (value_date_end > $3 OR (value_date >= $4 AND value_date < $5 AND value_date_end <= $5))";
-        let le = "param_name = 'date' AND (value_date < $3 OR (value_date >= $3 AND value_date < $4))";
+        let le =
+            "param_name = 'date' AND (value_date < $3 OR (value_date >= $3 AND value_date < $4))";
         assert_eq!(walk_role(SearchParamType::Date, ge), WalkRole::OpenRange);
         assert_eq!(walk_role(SearchParamType::Date, le), WalkRole::Range);
         assert_eq!(
@@ -2848,8 +2855,14 @@ mod range_estimate_tests {
 
     #[test]
     fn only_range_typed_memberships_are_corrected() {
-        assert_eq!(range_value_column(SearchParamType::Date), Some("value_date"));
-        assert_eq!(range_value_column(SearchParamType::Number), Some("value_number"));
+        assert_eq!(
+            range_value_column(SearchParamType::Date),
+            Some("value_date")
+        );
+        assert_eq!(
+            range_value_column(SearchParamType::Number),
+            Some("value_number")
+        );
         assert_eq!(
             range_value_column(SearchParamType::Quantity),
             Some("value_quantity_value")

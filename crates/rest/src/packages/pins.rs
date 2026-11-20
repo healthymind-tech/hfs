@@ -41,7 +41,10 @@ pub fn profile_key(url: &str, version: Option<&str>) -> String {
 
 /// Compute the pins of every installed package of `tenant`.
 pub async fn compute(store: &dyn PackageStore, tenant: &str) -> Result<ProfilePins, String> {
-    let packages = store.list_packages(tenant).await.map_err(|e| e.to_string())?;
+    let packages = store
+        .list_packages(tenant)
+        .await
+        .map_err(|e| e.to_string())?;
     let rows = store
         .package_resources(tenant, None)
         .await
@@ -64,7 +67,10 @@ pub async fn compute(store: &dyn PackageStore, tenant: &str) -> Result<ProfilePi
                 // next to it, and the HL7 validator layers the 0.3.2
                 // definition (its snapshot was generated from it).
                 if let Some(v) = &r.version {
-                    value_sets.entry(key.clone()).or_default().push((url.clone(), v.clone()));
+                    value_sets
+                        .entry(key.clone())
+                        .or_default()
+                        .push((url.clone(), v.clone()));
                 }
                 profiles.entry(key).or_default().push((url, r.version));
             }
@@ -101,7 +107,9 @@ pub fn assemble(
                             // elsewhere (older installers satisfied DTR's
                             // SDC 3.0.0 with 4.0.0) or not at all (mCODE's
                             // genomics-reporting 2.0.0, installed later).
-                            if let Some(want) = declared.and_then(|d| d.get(name)).and_then(Value::as_str) {
+                            if let Some(want) =
+                                declared.and_then(|d| d.get(name)).and_then(Value::as_str)
+                            {
                                 let key = format!("{name}#{want}");
                                 if installed.contains(&key) {
                                     return Some(key);
@@ -127,8 +135,10 @@ pub fn assemble(
             }
             // Within one package, the highest version of a url (a package
             // rarely ships two).
-            let mut own: Vec<&(String, String)> =
-                value_sets.get(&p).map(|v| v.iter().collect()).unwrap_or_default();
+            let mut own: Vec<&(String, String)> = value_sets
+                .get(&p)
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
             own.sort_by(|a, b| crate::packages::version::compare(&b.1, &a.1));
             for (url, version) in own {
                 pins.entry(url.clone()).or_insert_with(|| version.clone());
@@ -166,7 +176,11 @@ mod tests {
     #[test]
     fn profiles_pin_their_own_then_their_dependencies_value_sets() {
         let packages = vec![
-            package("hl7.fhir.uv.ips", "1.1.0", json!({"hl7.fhir.r4.core": "embedded"})),
+            package(
+                "hl7.fhir.uv.ips",
+                "1.1.0",
+                json!({"hl7.fhir.r4.core": "embedded"}),
+            ),
             package(
                 "tw.gov.mohw.twcore",
                 "1.0.0",
@@ -186,19 +200,32 @@ mod tests {
         let mut profiles = HashMap::new();
         profiles.insert(
             "hl7.fhir.uv.ips#1.1.0".to_string(),
-            vec![("http://ips/Observation-tobacco".to_string(), Some("1.1.0".to_string()))],
+            vec![(
+                "http://ips/Observation-tobacco".to_string(),
+                Some("1.1.0".to_string()),
+            )],
         );
         profiles.insert(
             "tw.gov.mohw.twcore#1.0.0".to_string(),
-            vec![("https://twcore/Patient".to_string(), Some("1.0.0".to_string()))],
+            vec![(
+                "https://twcore/Patient".to_string(),
+                Some("1.0.0".to_string()),
+            )],
         );
         let pins = assemble(&packages, &value_sets, &profiles);
         let ips = &pins["http://ips/Observation-tobacco|1.1.0"];
         assert_eq!(ips.get(smoking).map(String::as_str), Some("1.1.0"));
         assert!(!ips.contains_key("https://twcore/ValueSet/a"));
         let tw = &pins["https://twcore/Patient|1.0.0"];
-        assert_eq!(tw.get(smoking).map(String::as_str), Some("1.1.0"), "via the dependency");
-        assert_eq!(tw.get("https://twcore/ValueSet/a").map(String::as_str), Some("1.0.0"));
+        assert_eq!(
+            tw.get(smoking).map(String::as_str),
+            Some("1.1.0"),
+            "via the dependency"
+        );
+        assert_eq!(
+            tw.get("https://twcore/ValueSet/a").map(String::as_str),
+            Some("1.0.0")
+        );
     }
 
     #[test]
@@ -225,11 +252,16 @@ mod tests {
         let mut profiles = HashMap::new();
         profiles.insert(
             "hl7.fhir.us.mcode#3.0.0".to_string(),
-            vec![("http://mcode/genomic-variant".to_string(), Some("3.0.0".to_string()))],
+            vec![(
+                "http://mcode/genomic-variant".to_string(),
+                Some("3.0.0".to_string()),
+            )],
         );
         let pins = assemble(&packages, &canonicals, &profiles);
         assert_eq!(
-            pins["http://mcode/genomic-variant|3.0.0"].get(variant).map(String::as_str),
+            pins["http://mcode/genomic-variant|3.0.0"]
+                .get(variant)
+                .map(String::as_str),
             Some("2.0.0"),
             "the declared 2.0.0 is installed, so mCODE means it"
         );

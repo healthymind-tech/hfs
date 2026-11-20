@@ -610,7 +610,9 @@ impl SqliteTerminologyBackend {
                 HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
             })?;
             schema::migrate_p25_data(&conn).map_err(|e| {
-                HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
+                HtsError::StorageError(format!(
+                    "Failed to apply the CDCREC/UCUM repair migration: {e}"
+                ))
             })?;
             schema::migrate_p25_data2(&conn)?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
@@ -834,7 +836,9 @@ impl SqliteTerminologyBackend {
                 HtsError::StorageError(format!("Failed to apply property-hierarchy migration: {e}"))
             })?;
             schema::migrate_p25_data(&conn).map_err(|e| {
-                HtsError::StorageError(format!("Failed to apply the CDCREC/UCUM repair migration: {e}"))
+                HtsError::StorageError(format!(
+                    "Failed to apply the CDCREC/UCUM repair migration: {e}"
+                ))
             })?;
             schema::migrate_p25_data2(&conn)?;
             schema::migrate_concept_closure(&conn).map_err(|e| {
@@ -1513,7 +1517,11 @@ mod tests {
         )
         .unwrap();
         let vs_id: String = conn
-            .query_row("SELECT id FROM value_sets WHERE url = 'http://t/vs/dr'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM value_sets WHERE url = 'http://t/vs/dr'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO value_set_expansions (value_set_id, system_url, code) \
@@ -1524,7 +1532,11 @@ mod tests {
         // A value set built from other value sets (US Core 7 detailed-race)
         // holds only the null-flavor part of a stale expansion.
         let vs7: String = conn
-            .query_row("SELECT id FROM value_sets WHERE url = 'http://t/vs/dr7'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM value_sets WHERE url = 'http://t/vs/dr7'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO value_set_expansions (value_set_id, system_url, code) \
@@ -1535,9 +1547,14 @@ mod tests {
         schema::migrate_p25_data(&conn).unwrap();
         assert_eq!(edges(&conn), 2);
         let cached: i64 = conn
-            .query_row("SELECT COUNT(*) FROM value_set_expansions", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM value_set_expansions", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(cached, 0, "stale expansions over CDCREC and of value-set-built sets dropped");
+        assert_eq!(
+            cached, 0,
+            "stale expansions over CDCREC and of value-set-built sets dropped"
+        );
         // Runs once.
         conn.execute_batch("DELETE FROM concept_hierarchy").unwrap();
         schema::migrate_p25_data(&conn).unwrap();

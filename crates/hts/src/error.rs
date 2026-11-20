@@ -253,6 +253,10 @@ mod outcome_tests {
             json!(["codeA"])
         );
         // The text is in details.text only (no duplicate `diagnostics`).
-        assert!(coded.to_operation_outcome()["issue"][0].get("diagnostics").is_none());
+        assert!(
+            coded.to_operation_outcome()["issue"][0]
+                .get("diagnostics")
+                .is_none()
+        );
     }
 }

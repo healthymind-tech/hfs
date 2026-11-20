@@ -440,8 +440,7 @@ const CODING_JSON: &str = "CodingJson";
 /// `true` when a stored Coding property value is the whole Coding as a JSON
 /// object (the upstream import form for a `valueCoding` without a `code`).
 fn stored_coding_json(value: &str) -> bool {
-    value.starts_with('{')
-        && serde_json::from_str::<Value>(value).is_ok_and(|v| v.is_object())
+    value.starts_with('{') && serde_json::from_str::<Value>(value).is_ok_and(|v| v.is_object())
 }
 
 /// Index the `valueCoding` properties of a stored CodeSystem's concepts by

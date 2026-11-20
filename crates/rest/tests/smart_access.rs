@@ -133,7 +133,10 @@ async fn put(server: &TestServer, resource: Value) {
     let r = server
         .put(&path)
         .add_header(header::AUTHORIZATION, bearer(SYSTEM_JWT))
-        .add_header(header::CONTENT_TYPE, HeaderValue::from_static("application/fhir+json"))
+        .add_header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
         .json(&resource)
         .await;
     assert!(r.status_code().is_success(), "seed {path}: {}", r.text());
@@ -201,7 +204,12 @@ async fn patient_search_is_confined_to_the_launch_patient() {
     let server = seeded(AuthMode::Full).await;
     let r = get(&server, "/Observation", PATIENT_P1).await;
     r.assert_status_ok();
-    assert_eq!(ids(&r), vec!["Observation/o1", "Observation/o3"], "{}", r.text());
+    assert_eq!(
+        ids(&r),
+        vec!["Observation/o1", "Observation/o3"],
+        "{}",
+        r.text()
+    );
 
     let r = get(&server, "/Patient", PATIENT_P1).await;
     r.assert_status_ok();
@@ -228,8 +236,12 @@ async fn patient_post_search_is_confined_too() {
 #[tokio::test]
 async fn patient_reads_outside_the_compartment_are_refused() {
     let server = seeded(AuthMode::Full).await;
-    get(&server, "/Observation/o1", PATIENT_P1).await.assert_status_ok();
-    get(&server, "/Patient/p1", PATIENT_P1).await.assert_status_ok();
+    get(&server, "/Observation/o1", PATIENT_P1)
+        .await
+        .assert_status_ok();
+    get(&server, "/Patient/p1", PATIENT_P1)
+        .await
+        .assert_status_ok();
     get(&server, "/Observation/o2", PATIENT_P1)
         .await
         .assert_status(StatusCode::FORBIDDEN);
@@ -253,7 +265,9 @@ async fn patient_reads_outside_the_compartment_are_refused() {
 #[tokio::test]
 async fn non_compartment_types_are_readable_but_includes_are_filtered() {
     let server = seeded(AuthMode::Full).await;
-    get(&server, "/Medication/m1", PATIENT_P1).await.assert_status_ok();
+    get(&server, "/Medication/m1", PATIENT_P1)
+        .await
+        .assert_status_ok();
     let r = get(
         &server,
         "/Practitioner?_revinclude=Observation:performer",
@@ -278,19 +292,31 @@ async fn everything_is_limited_to_the_launch_patient() {
     let r = get(&server, "/Patient/$everything", PATIENT_P1).await;
     r.assert_status_ok();
     let found = ids(&r);
-    assert!(!found.iter().any(|id| id == "Observation/o2" || id == "Patient/p2"), "{found:?}");
+    assert!(
+        !found
+            .iter()
+            .any(|id| id == "Observation/o2" || id == "Patient/p2"),
+        "{found:?}"
+    );
     let r = get(&server, "/Patient/p1/$everything", PATIENT_P1).await;
     r.assert_status_ok();
     let found = ids(&r);
     assert!(found.contains(&"Observation/o1".to_string()), "{found:?}");
-    assert!(!found.iter().any(|id| id == "Observation/o2" || id == "Patient/p2"), "{found:?}");
+    assert!(
+        !found
+            .iter()
+            .any(|id| id == "Observation/o2" || id == "Patient/p2"),
+        "{found:?}"
+    );
 }
 
 #[tokio::test]
 async fn history_and_conditional_writes_are_refused_and_batches_confined_for_patient_tokens() {
     let server = seeded(AuthMode::Full).await;
     let token = "scopes=patient/*.cruds;patient=p1";
-    get(&server, "/_history", token).await.assert_status(StatusCode::FORBIDDEN);
+    get(&server, "/_history", token)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
     get(&server, "/Observation/_history", token)
         .await
         .assert_status(StatusCode::FORBIDDEN);
@@ -300,12 +326,14 @@ async fn history_and_conditional_writes_are_refused_and_batches_confined_for_pat
     let r = server
         .post("/")
         .add_header(header::AUTHORIZATION, bearer(token))
-        .json(&json!({"resourceType": "Bundle", "type": "batch", "entry": [
-            {"request": {"method": "GET", "url": "Observation/o1"}},
-            {"request": {"method": "GET", "url": "Observation/o2"}},
-            {"request": {"method": "GET", "url": "Observation?category=laboratory"}},
-            {"request": {"method": "DELETE", "url": "Observation/o3"}}
-        ]}))
+        .json(
+            &json!({"resourceType": "Bundle", "type": "batch", "entry": [
+                {"request": {"method": "GET", "url": "Observation/o1"}},
+                {"request": {"method": "GET", "url": "Observation/o2"}},
+                {"request": {"method": "GET", "url": "Observation?category=laboratory"}},
+                {"request": {"method": "DELETE", "url": "Observation/o3"}}
+            ]}),
+        )
         .await;
     r.assert_status_ok();
     let body: Value = serde_json::from_str(&r.text()).unwrap();
@@ -324,7 +352,11 @@ async fn history_and_conditional_writes_are_refused_and_batches_confined_for_pat
         .iter()
         .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(searched, vec!["o1"], "a batch search leaked another patient");
+    assert_eq!(
+        searched,
+        vec!["o1"],
+        "a batch search leaked another patient"
+    );
     assert!(statuses[3].starts_with("403"), "{statuses:?}");
     get(&server, "/Observation/o3", "scopes=system/*.rs")
         .await
@@ -344,7 +376,10 @@ async fn patient_writes_must_stay_inside_the_compartment() {
         server
             .post("/Observation")
             .add_header(header::AUTHORIZATION, bearer(token))
-            .add_header(header::CONTENT_TYPE, HeaderValue::from_static("application/fhir+json"))
+            .add_header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
             .json(&body)
     };
     let mut other = observation("x", "p2", "laboratory");
@@ -358,7 +393,10 @@ async fn patient_writes_must_stay_inside_the_compartment() {
     server
         .put("/Observation/o2")
         .add_header(header::AUTHORIZATION, bearer(token))
-        .add_header(header::CONTENT_TYPE, HeaderValue::from_static("application/fhir+json"))
+        .add_header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
         .json(&observation("o2", "p1", "laboratory"))
         .await
         .assert_status(StatusCode::FORBIDDEN);
@@ -366,7 +404,10 @@ async fn patient_writes_must_stay_inside_the_compartment() {
     server
         .put("/Observation/o1")
         .add_header(header::AUTHORIZATION, bearer(token))
-        .add_header(header::CONTENT_TYPE, HeaderValue::from_static("application/fhir+json"))
+        .add_header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
         .json(&observation("o1", "p2", "laboratory"))
         .await
         .assert_status(StatusCode::FORBIDDEN);
@@ -400,7 +441,9 @@ async fn granular_scopes_restrict_search_and_read() {
     let r = get(&server, "/Observation", &token).await;
     r.assert_status_ok();
     assert_eq!(ids(&r), vec!["Observation/o1"]);
-    get(&server, "/Observation/o1", &token).await.assert_status_ok();
+    get(&server, "/Observation/o1", &token)
+        .await
+        .assert_status_ok();
     get(&server, "/Observation/o3", &token)
         .await
         .assert_status(StatusCode::FORBIDDEN);
@@ -434,7 +477,9 @@ async fn system_wide_reads_need_a_wildcard_read() {
     get(&server, "/_history", "scopes=system/Patient.rs")
         .await
         .assert_status(StatusCode::FORBIDDEN);
-    get(&server, "/_history", "scopes=system/*.rs").await.assert_status_ok();
+    get(&server, "/_history", "scopes=system/*.rs")
+        .await
+        .assert_status_ok();
 }
 
 #[tokio::test]
@@ -470,7 +515,10 @@ async fn challenges_follow_rfc_6750() {
     r.assert_status(StatusCode::FORBIDDEN);
     let challenge = r.header(header::WWW_AUTHENTICATE);
     assert!(
-        challenge.to_str().unwrap().contains("error=\"insufficient_scope\""),
+        challenge
+            .to_str()
+            .unwrap()
+            .contains("error=\"insufficient_scope\""),
         "{challenge:?}"
     );
 }
@@ -508,7 +556,9 @@ async fn write_protect_mode_reads_anonymously_and_writes_with_a_token() {
     get(&server, "/Patient", "garbage")
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
-    get(&server, "/Observation", PATIENT_P1).await.assert_status_ok();
+    get(&server, "/Observation", PATIENT_P1)
+        .await
+        .assert_status_ok();
     assert_eq!(
         ids(&get(&server, "/Observation", PATIENT_P1).await).len(),
         2
@@ -562,7 +612,9 @@ async fn shared_reference_types_follow_the_policy() {
     // Allow (default): Medication/Practitioner readable with patient/*.rs,
     // never writable; Binary (not a shared type) unreachable.
     let server = seeded(AuthMode::Full).await;
-    get(&server, "/Medication/m1", PATIENT_P1).await.assert_status_ok();
+    get(&server, "/Medication/m1", PATIENT_P1)
+        .await
+        .assert_status_ok();
     let r = get(&server, "/Practitioner", PATIENT_P1).await;
     r.assert_status_ok();
     assert_eq!(ids(&r), vec!["Practitioner/pr1"]);
@@ -571,14 +623,21 @@ async fn shared_reference_types_follow_the_policy() {
         .assert_status(StatusCode::FORBIDDEN);
     server
         .put("/Practitioner/pr1")
-        .add_header(header::AUTHORIZATION, bearer("scopes=patient/*.cruds;patient=p1"))
+        .add_header(
+            header::AUTHORIZATION,
+            bearer("scopes=patient/*.cruds;patient=p1"),
+        )
         .json(&json!({"resourceType": "Practitioner", "id": "pr1", "active": false}))
         .await
         .assert_status(StatusCode::FORBIDDEN);
     // A patient/ scope that does not name the type still reaches nothing.
-    get(&server, "/Medication/m1", "scopes=patient/Observation.rs;patient=p1")
-        .await
-        .assert_status(StatusCode::FORBIDDEN);
+    get(
+        &server,
+        "/Medication/m1",
+        "scopes=patient/Observation.rs;patient=p1",
+    )
+    .await
+    .assert_status(StatusCode::FORBIDDEN);
 
     // Deny: nothing outside the compartment.
     let server = server_with(
@@ -593,9 +652,18 @@ async fn shared_reference_types_follow_the_policy() {
     get(&server, "/Medication/m1", PATIENT_P1)
         .await
         .assert_status(StatusCode::FORBIDDEN);
-    let r = get(&server, "/Observation?_id=o1&_include=Observation:performer", PATIENT_P1).await;
+    let r = get(
+        &server,
+        "/Observation?_id=o1&_include=Observation:performer",
+        PATIENT_P1,
+    )
+    .await;
     r.assert_status_ok();
-    assert_eq!(ids(&r), vec!["Observation/o1"], "Practitioner included under deny");
+    assert_eq!(
+        ids(&r),
+        vec!["Observation/o1"],
+        "Practitioner included under deny"
+    );
 }
 
 #[tokio::test]
@@ -603,10 +671,17 @@ async fn includes_keep_shared_types_only_when_the_token_names_them() {
     let server = seeded(AuthMode::Full).await;
     let path = "/Observation?_id=o1&_include=Observation:performer&_include=Observation:subject";
     let r = get(&server, path, PATIENT_P1).await;
-    assert_eq!(ids(&r), vec!["Observation/o1", "Patient/p1", "Practitioner/pr1"]);
+    assert_eq!(
+        ids(&r),
+        vec!["Observation/o1", "Patient/p1", "Practitioner/pr1"]
+    );
     let r = get(&server, path, "scopes=patient/Observation.rs;patient=p1").await;
     r.assert_status_ok();
-    assert_eq!(ids(&r), vec!["Observation/o1"], "types the token cannot read leaked");
+    assert_eq!(
+        ids(&r),
+        vec!["Observation/o1"],
+        "types the token cannot read leaked"
+    );
 }
 
 #[tokio::test]
@@ -647,9 +722,11 @@ async fn granular_scopes_refuse_what_they_cannot_check() {
     server
         .post("/")
         .add_header(header::AUTHORIZATION, bearer(&token))
-        .json(&json!({"resourceType": "Bundle", "type": "batch", "entry": [
-            {"request": {"method": "GET", "url": "Observation/o3"}}
-        ]}))
+        .json(
+            &json!({"resourceType": "Bundle", "type": "batch", "entry": [
+                {"request": {"method": "GET", "url": "Observation/o3"}}
+            ]}),
+        )
         .await
         .assert_status(StatusCode::FORBIDDEN);
     server
@@ -694,12 +771,17 @@ async fn granular_and_patient_scopes_combine_without_widening() {
     let r = server
         .post("/")
         .add_header(header::AUTHORIZATION, bearer(PATIENT_P1))
-        .json(&json!({"resourceType": "Bundle", "type": "batch", "entry": [
-            {"request": {"method": "GET", "url": "Observation?_count=50"}}
-        ]}))
+        .json(
+            &json!({"resourceType": "Bundle", "type": "batch", "entry": [
+                {"request": {"method": "GET", "url": "Observation?_count=50"}}
+            ]}),
+        )
         .await;
     r.assert_status_ok();
     let body: Value = serde_json::from_str(&r.text()).unwrap();
-    let n = body["entry"][0]["resource"]["entry"].as_array().map(|a| a.len()).unwrap_or(0);
+    let n = body["entry"][0]["resource"]["entry"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
     assert_eq!(n, 2, "{body}");
 }

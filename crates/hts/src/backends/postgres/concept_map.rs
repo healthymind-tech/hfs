@@ -354,6 +354,7 @@ struct TranslateRow {
 ///
 /// `other_side_sys` restricts the result-side system (target side in forward
 /// mode, source side in reverse mode).
+#[allow(clippy::too_many_arguments)]
 async fn query_translate_elements(
     client: &super::PgClient,
     code: &str,

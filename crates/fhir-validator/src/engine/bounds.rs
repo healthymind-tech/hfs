@@ -223,7 +223,7 @@ fn compare_quantity(data: &Value, bound: &Value) -> Option<Ordering> {
         (Some(x), Some(y)) if x == y => a.partial_cmp(&b),
         (Some(x), Some(y)) => {
             let ((ux, fx), (uy, fy)) = (base_unit(&x)?, base_unit(&y)?);
-            if ux.eq_ignore_ascii_case(uy) && (ux == uy || ux.to_ascii_uppercase() == "L") {
+            if ux.eq_ignore_ascii_case(uy) && (ux == uy || ux.eq_ignore_ascii_case("L")) {
                 (a * fx).partial_cmp(&(b * fy))
             } else {
                 None

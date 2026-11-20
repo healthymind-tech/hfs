@@ -1606,7 +1606,10 @@ async fn set_index_pending(backend: &Arc<SqliteBackend>, poll_path: &str, pendin
                 lease_duration: Duration::from_secs(60),
                 fencing_token: 0,
             };
-            backend.mark_manifest_index_pending(&lease, &[]).await.unwrap();
+            backend
+                .mark_manifest_index_pending(&lease, &[])
+                .await
+                .unwrap();
         } else {
             backend
                 .clear_manifest_index_pending(&target.tenant, &manifest.manifest_id)

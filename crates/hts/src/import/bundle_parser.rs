@@ -406,7 +406,9 @@ pub fn truncated_copy_warning(
     incoming_missing_from_stored: i64,
 ) -> Option<String> {
     let incoming = cs.concepts.len() as i64;
-    if stored_content != "complete" || incoming >= stored_concepts || incoming_missing_from_stored > 0
+    if stored_content != "complete"
+        || incoming >= stored_concepts
+        || incoming_missing_from_stored > 0
     {
         return None;
     }
@@ -498,7 +500,8 @@ pub const P25_DATA_MIGRATION_MARKER: &str = "#migration:cdcrec-hierarchy-ucum-en
 /// One-time repair marker of the p25-data2 fixes: stored composes lose the
 /// advisory versions of [`ADVISORY_VERSION_SYSTEMS`], and cached expansions
 /// get their `value_set_dependencies` rows.
-pub const P25_DATA2_MIGRATION_MARKER: &str = "#migration:advisory-versions-vs-dependencies-p25data2";
+pub const P25_DATA2_MIGRATION_MARKER: &str =
+    "#migration:advisory-versions-vs-dependencies-p25data2";
 
 /// URLs whose cached expansions the p25-data migration clears.
 pub const P25_DATA_SYSTEMS: [&str; 2] = [CDCREC_URL, "http://unitsofmeasure.org"];
@@ -966,9 +969,15 @@ mod tests {
         let parsed = parse_value_set(&vs).unwrap();
         let compose: Value = serde_json::from_str(parsed.compose_json.as_deref().unwrap()).unwrap();
         assert!(compose["include"][0].get("version").is_none());
-        assert_eq!(compose["include"][1]["version"], "2.77", "other systems keep their pin");
+        assert_eq!(
+            compose["include"][1]["version"], "2.77",
+            "other systems keep their pin"
+        );
         assert!(compose["exclude"][0].get("version").is_none());
-        assert_eq!(parsed.resource_json["compose"]["include"][0]["version"], "23.1");
+        assert_eq!(
+            parsed.resource_json["compose"]["include"][0]["version"],
+            "23.1"
+        );
     }
 
     #[test]
@@ -1140,7 +1149,10 @@ mod tests {
         // the expansion's code system versions are not pinned: the stored
         // expansion already names its members, whatever editions are loaded
         assert!(includes.iter().all(|i| i.get("version").is_none()));
-        assert_eq!(icd["concept"][0]["display"], "Type 2 diabetes mellitus without complications");
+        assert_eq!(
+            icd["concept"][0]["display"],
+            "Type 2 diabetes mellitus without complications"
+        );
         // the stored resource itself is untouched
         assert!(parsed.resource_json.get("compose").is_none());
     }
@@ -1156,7 +1168,12 @@ mod tests {
         let parsed = parse_value_set_value(&vs).unwrap();
         assert!(parsed.compose_json.unwrap().contains("\"A\""));
         let empty = serde_json::json!({"resourceType": "ValueSet", "url": "http://example.org/e"});
-        assert!(parse_value_set_value(&empty).unwrap().compose_json.is_none());
+        assert!(
+            parse_value_set_value(&empty)
+                .unwrap()
+                .compose_json
+                .is_none()
+        );
     }
 
     #[test]

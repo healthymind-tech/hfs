@@ -401,7 +401,9 @@ pub async fn authz_middleware(
         let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
             .action(AuditAction::Execute)
             .outcome("8")
-            .outcome_desc(format!("Forbidden: {what} needs a scope that reads every type"))
+            .outcome_desc(format!(
+                "Forbidden: {what} needs a scope that reads every type"
+            ))
             .agent(principal.subject(), None, true)
             .build();
         auth_state.audit_sink.record(event).await;
@@ -420,11 +422,9 @@ pub async fn authz_middleware(
             match SmartScopePolicy::check(&principal, &resource_type, operation) {
                 Ok(scope) => {
                     if scope.is_patient_compartment() {
-                        request
-                            .extensions_mut()
-                            .insert(crate::patient_compartment::PatientSharedTypes(
-                                shared.to_vec(),
-                            ));
+                        request.extensions_mut().insert(
+                            crate::patient_compartment::PatientSharedTypes(shared.to_vec()),
+                        );
                     }
                     if let AccessScope::PatientCompartment { patient_id } = &scope
                         && let Err(reason) =
@@ -921,7 +921,10 @@ fn service_unavailable_response(message: &str) -> Response {
     });
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, axum::http::HeaderValue::from_static("5"))],
+        [(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("5"),
+        )],
         Json(body),
     )
         .into_response()

@@ -1963,7 +1963,9 @@ mod provisioning_row_tests {
         );
 
         let view = inventory_view_for_tests();
-        let registered = load_registry(&I18n::new(RequestLocale::default()), &storage).await.expect("registry");
+        let registered = load_registry(&I18n::new(RequestLocale::default()), &storage)
+            .await
+            .expect("registry");
         let rows = merge_rows(&registered, &jobs, &view);
         let acme: Vec<_> = rows.iter().filter(|r| r.id == "acme").collect();
         assert_eq!(acme.len(), 1, "one row per tenant, not one per source");

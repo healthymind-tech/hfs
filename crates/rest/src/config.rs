@@ -2695,7 +2695,10 @@ impl fmt::Debug for ServerConfig {
             .field("subscriptions_enabled", subscriptions_enabled)
             .field("subscriptions_fanout", subscriptions_fanout)
             .field("reindex_concurrency", reindex_concurrency)
-            .field("terminology_public_url", &terminology_public_url.as_deref().map(redact_url))
+            .field(
+                "terminology_public_url",
+                &terminology_public_url.as_deref().map(redact_url),
+            )
             .field("packages", packages)
             .field("search_terminology", search_terminology)
             .finish()

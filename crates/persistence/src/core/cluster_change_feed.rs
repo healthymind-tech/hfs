@@ -100,10 +100,19 @@ mod tests {
             ..Default::default()
         };
         assert!(cursor.mark(1, 105), "first delivery");
-        assert!(!cursor.mark(1, 105), "redelivery of a running transaction's row");
-        assert!(!cursor.mark(2, 99), "a row below the mark was consumed already");
+        assert!(
+            !cursor.mark(1, 105),
+            "redelivery of a running transaction's row"
+        );
+        assert!(
+            !cursor.mark(2, 99),
+            "a row below the mark was consumed already"
+        );
         cursor.advance(106);
-        assert!(cursor.delivered.is_empty(), "rows below the new mark are forgotten");
+        assert!(
+            cursor.delivered.is_empty(),
+            "rows below the new mark are forgotten"
+        );
         cursor.advance(50);
         assert_eq!(cursor.low_xid, 106, "the mark never moves back");
     }

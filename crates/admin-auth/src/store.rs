@@ -64,11 +64,14 @@ pub mod testing {
 
     use super::*;
 
+    /// A client's failure count, window start and lockout end (unix seconds).
+    type FailureRecord = (u32, i64, Option<i64>);
+
     /// See the module docs.
     #[derive(Default)]
     pub struct MemoryStore {
         sessions: Mutex<HashMap<String, StoredSession>>,
-        failures: Mutex<HashMap<String, (u32, i64, Option<i64>)>>,
+        failures: Mutex<HashMap<String, FailureRecord>>,
     }
 
     fn now() -> i64 {

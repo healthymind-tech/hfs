@@ -28,7 +28,10 @@ async fn app() -> TestApp {
 }
 
 fn param<'a>(out: &'a Value, name: &str) -> Option<&'a Value> {
-    out["parameter"].as_array()?.iter().find(|p| p["name"] == name)
+    out["parameter"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
 }
 
 fn result(out: &Value) -> Option<bool> {
@@ -42,7 +45,11 @@ fn enc(s: &str) -> String {
 #[tokio::test]
 async fn code_system_validate_code_accepts_loaded_edition_uris() {
     let app = app().await;
-    for version in [INT.to_string(), format!("{INT}/version/20250601"), "20250601".into()] {
+    for version in [
+        INT.to_string(),
+        format!("{INT}/version/20250601"),
+        "20250601".into(),
+    ] {
         let (_, out) = app
             .get_fhir(&format!(
                 "/CodeSystem/$validate-code?url={}&code=763875007&version={}",
@@ -97,7 +104,10 @@ async fn value_set_validate_code_maps_coding_versions() {
         .to_string()
     };
     let (_, out) = app
-        .post_fhir("/ValueSet/$validate-code", call(&format!("{INT}/version/20250601")))
+        .post_fhir(
+            "/ValueSet/$validate-code",
+            call(&format!("{INT}/version/20250601")),
+        )
         .await;
     assert_eq!(result(&out), Some(true), "{out}");
     let (_, out) = app.post_fhir("/ValueSet/$validate-code", call(INT)).await;

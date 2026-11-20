@@ -224,15 +224,25 @@ mod tests {
         let ext = |url: &str| {
             let mut m = HashMap::new();
             m.insert("url".to_string(), EvaluationResult::string(url.to_string()));
-            EvaluationResult::Object { map: m, type_info: None }
+            EvaluationResult::Object {
+                map: m,
+                type_info: None,
+            }
         };
         let element = |exts: Vec<EvaluationResult>| {
             let mut m = HashMap::new();
             m.insert(
                 "extension".to_string(),
-                EvaluationResult::Collection { items: exts, has_undefined_order: false, type_info: None },
+                EvaluationResult::Collection {
+                    items: exts,
+                    has_undefined_order: false,
+                    type_info: None,
+                },
             );
-            EvaluationResult::Object { map: m, type_info: None }
+            EvaluationResult::Object {
+                map: m,
+                type_info: None,
+            }
         };
         let base = EvaluationResult::Collection {
             items: vec![
@@ -254,10 +264,14 @@ mod tests {
             type_info: None,
         };
         assert_eq!(
-            extension_function(&one, &[EvaluationResult::string("http://x/b".to_string())]).unwrap(),
+            extension_function(&one, &[EvaluationResult::string("http://x/b".to_string())])
+                .unwrap(),
             ext("http://x/b")
         );
-        assert_eq!(extension_function(&one, &url).unwrap(), EvaluationResult::Empty);
+        assert_eq!(
+            extension_function(&one, &url).unwrap(),
+            EvaluationResult::Empty
+        );
     }
 
     #[test]

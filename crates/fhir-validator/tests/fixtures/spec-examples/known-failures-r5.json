@@ -3226,6 +3226,14 @@
       "reason": "Genuine defect in the published example (HL7 Java validator BUNDLE_ENTRY_URL_MATCHES_TYPE_ID / BUNDLE_BUNDLE_ENTRY_NOTFOUND_CANNOT): fullUrl .../Patient/pat12 carries id pat2, and relative references from urn:uuid entries cannot resolve."
     },
     {
+      "file": "observation-example-f202-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: a body-temperature vital sign with no effective[x], which the mandatory vital-signs profile requires (1..1); the example's entered-in-error status does not exempt it."
+    },
+    {
       "file": "researchsubject-example-crossover-placebo-to-drug.json",
       "issues": 2,
       "kinds": [

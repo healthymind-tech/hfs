@@ -924,7 +924,9 @@ pub fn migrate_p25_data2(conn: &rusqlite::Connection) -> Result<(), crate::error
             )
             .map_err(db)?;
         let rows = stmt
-            .query_map([system], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .query_map([system], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
             .map_err(db)?;
         for row in rows {
             let (id, compose) = row.map_err(db)?;
@@ -945,8 +947,11 @@ pub fn migrate_p25_data2(conn: &rusqlite::Connection) -> Result<(), crate::error
                 rusqlite::params![id, compose.to_string()],
             )
             .map_err(db)?;
-            conn.execute("DELETE FROM value_set_expansions WHERE value_set_id = ?1", [&id])
-                .map_err(db)?;
+            conn.execute(
+                "DELETE FROM value_set_expansions WHERE value_set_id = ?1",
+                [&id],
+            )
+            .map_err(db)?;
         }
     }
     let cached: Vec<String> = {

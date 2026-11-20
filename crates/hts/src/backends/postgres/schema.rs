@@ -788,7 +788,10 @@ pub async fn migrate_p25_data2_pg(
                 .await
                 .map_err(db)?;
             client
-                .execute("DELETE FROM value_set_expansions WHERE value_set_id = $1", &[&id])
+                .execute(
+                    "DELETE FROM value_set_expansions WHERE value_set_id = $1",
+                    &[&id],
+                )
                 .await
                 .map_err(db)?;
             stripped += 1;

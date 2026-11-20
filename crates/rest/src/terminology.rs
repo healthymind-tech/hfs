@@ -40,8 +40,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use helios_persistence::error::TerminologyFailureKind;
 use helios_persistence::core::bulk_submit_input::redact_urls_in;
+use helios_persistence::error::TerminologyFailureKind;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -1046,7 +1046,10 @@ mod tests {
             ExpansionLimits::default(),
             Duration::from_secs(5),
         );
-        let codes = long.expand_value_set("http://vs").await.expect("within timeout");
+        let codes = long
+            .expand_value_set("http://vs")
+            .await
+            .expect("within timeout");
         assert_eq!(codes.len(), 1);
     }
 

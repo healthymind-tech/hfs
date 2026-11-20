@@ -297,10 +297,11 @@ where
 
 /// The search's `Prefer: handling` (FHIR search error handling).
 ///
-/// Without the header the server still ignores, and reports, a search
-/// parameter it does not know; it refuses a result parameter whose value it
-/// cannot honour (`_sort`, `_total`). `lenient` ignores and reports both,
-/// `strict` refuses both.
+/// Without the header handling is lenient, as FHIR search error handling
+/// has it: the server ignores, and reports in an OperationOutcome entry, a
+/// search parameter it does not know and a result parameter whose value it
+/// cannot honour (`_sort`, `_total`). `lenient` states the same explicitly;
+/// `strict` refuses both with a `400`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Handling {
     /// No `handling` preference.
@@ -375,7 +376,6 @@ where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     let strict = handling == Handling::Strict;
-    let lenient = handling == Handling::Lenient;
     // A search resolves in the version the client named with the `fhirVersion`
     // MIME parameter on `Accept`, else in the server default (#2254). Naming
     // one also restricts the matches to resources stored under it (set on the
@@ -563,11 +563,11 @@ where
         search_params = SearchParams::from_pairs(retained);
     }
 
-    // A result parameter whose value the server cannot honour is a `400`, as
-    // FHIR search error handling has it, unless the client asked for lenient
-    // handling: then it is ignored and reported. `_sort=nope` and
-    // `_total=bogus` both used to answer `200`, the sort silently replaced by
-    // an id sort and the `_total` by none.
+    // A result parameter whose value the server cannot honour is a `400`
+    // under `Prefer: handling=strict`. Otherwise (no preference, or lenient)
+    // it is ignored and reported, like an unknown search parameter: the
+    // `_sort` falls back to an id sort and the `_total` is dropped, each with
+    // a warning on the searchset's OperationOutcome entry.
     let mut sort_warnings = sort_warnings;
     let mut total_ignored = false;
     if let Some(value) =
@@ -575,7 +575,7 @@ where
     {
         let message =
             format!("_total value '{value}' is not one of 'none', 'estimate' or 'accurate'");
-        if !lenient {
+        if strict {
             return Err(RestError::InvalidParameter {
                 param: "_total".to_string(),
                 message,
@@ -590,7 +590,7 @@ where
             .collect();
         search_params = SearchParams::from_pairs(retained);
     }
-    if !lenient {
+    if strict {
         let unsortable = {
             let reg = state.storage().search_param_registry(tenant.context());
             let registry = reg.read();

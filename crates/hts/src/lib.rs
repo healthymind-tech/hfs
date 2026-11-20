@@ -81,6 +81,6 @@ pub mod tx_overlay;
 pub mod types;
 pub(crate) mod ucum;
 pub(crate) mod ucum_validate;
+pub mod vcl;
 pub mod version_order;
 pub mod write_guard;
-pub mod vcl;

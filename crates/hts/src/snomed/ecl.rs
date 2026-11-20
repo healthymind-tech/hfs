@@ -57,7 +57,11 @@ pub enum Filter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ecl {
-    Sub { op: Option<Op>, focus: Focus, filters: Vec<Filter> },
+    Sub {
+        op: Option<Op>,
+        focus: Focus,
+        filters: Vec<Filter>,
+    },
     Refined(Box<Ecl>, Refinement),
     Dotted(Box<Ecl>, Vec<Ecl>),
     And(Vec<Ecl>),
@@ -124,7 +128,11 @@ impl std::fmt::Display for EclError {
 // ── Parser ──────────────────────────────────────────────────────────────────
 
 pub fn parse(text: &str) -> Result<Ecl, EclError> {
-    let mut p = P { s: text.as_bytes(), text, pos: 0 };
+    let mut p = P {
+        s: text.as_bytes(),
+        text,
+        pos: 0,
+    };
     let e = p.expression_constraint()?;
     p.ws();
     if p.pos < p.s.len() {
@@ -314,7 +322,11 @@ impl P<'_> {
         self.ws();
         let mut focus = self.focus()?;
         if member_of {
-            focus = Focus::MemberOf(Box::new(Ecl::Sub { op: None, focus, filters: vec![] }));
+            focus = Focus::MemberOf(Box::new(Ecl::Sub {
+                op: None,
+                focus,
+                filters: vec![],
+            }));
         }
         let mut filters = Vec::new();
         loop {
@@ -564,7 +576,13 @@ impl P<'_> {
     fn attribute(&mut self, card: Option<Cardinality>) -> Result<AttributeConstraint, EclError> {
         self.ws();
         let reverse = self.peek() == Some(b'R')
-            && self.s.get(self.pos + 1).is_some_and(|c| c.is_ascii_whitespace() || c.is_ascii_digit() || *c == b'<' || *c == b'(' || *c == b'*');
+            && self.s.get(self.pos + 1).is_some_and(|c| {
+                c.is_ascii_whitespace()
+                    || c.is_ascii_digit()
+                    || *c == b'<'
+                    || *c == b'('
+                    || *c == b'*'
+            });
         if reverse {
             self.pos += 1;
             self.ws();
@@ -591,21 +609,35 @@ impl P<'_> {
             if !self.eat("#") {
                 return Err(self.err("expected a number"));
             }
-            Comparison::Number { op, value: self.number()? }
+            Comparison::Number {
+                op,
+                value: self.number()?,
+            }
         };
         if reverse && !matches!(comparison, Comparison::Expression { .. }) {
             return Err(self.err("a reverse attribute needs a concept value"));
         }
-        Ok(AttributeConstraint { cardinality: card, reverse, name: Box::new(name), comparison })
+        Ok(AttributeConstraint {
+            cardinality: card,
+            reverse,
+            name: Box::new(name),
+            comparison,
+        })
     }
 
     fn value_after(&mut self, negated: bool, op: NumOp) -> Result<Comparison, EclError> {
         self.ws();
         if self.eat("#") {
-            return Ok(Comparison::Number { op, value: self.number()? });
+            return Ok(Comparison::Number {
+                op,
+                value: self.number()?,
+            });
         }
         if self.peek() == Some(b'"') {
-            return Ok(Comparison::String { negated, value: self.quoted()? });
+            return Ok(Comparison::String {
+                negated,
+                value: self.quoted()?,
+            });
         }
         for (k, v) in [("true", true), ("false", false)] {
             if self.keyword(k) || (self.starts(k) && self.s.get(self.pos + k.len()).is_none()) {
@@ -616,7 +648,10 @@ impl P<'_> {
             }
         }
         let value = self.sub_expression_constraint()?;
-        Ok(Comparison::Expression { negated, value: Box::new(value) })
+        Ok(Comparison::Expression {
+            negated,
+            value: Box::new(value),
+        })
     }
 
     fn number(&mut self) -> Result<f64, EclError> {
@@ -663,7 +698,14 @@ impl Ecl {
                 // A reference set named directly need not be a concept of
                 // the edition (an extension's refset); it just has members.
                 Focus::MemberOf(x) => {
-                    if !matches!(x.as_ref(), Ecl::Sub { op: None, focus: Focus::Concept(_), .. }) {
+                    if !matches!(
+                        x.as_ref(),
+                        Ecl::Sub {
+                            op: None,
+                            focus: Focus::Concept(_),
+                            ..
+                        }
+                    ) {
                         sub(x, out)
                     }
                 }
@@ -710,16 +752,32 @@ impl Ecl {
                     Some(_) => return None,
                 };
                 match focus {
-                    Focus::Concept(c) => Some(E::Focus { op, concept: F::Id(c.clone()) }),
-                    Focus::Wildcard => Some(E::Focus { op, concept: F::Wildcard }),
+                    Focus::Concept(c) => Some(E::Focus {
+                        op,
+                        concept: F::Id(c.clone()),
+                    }),
+                    Focus::Wildcard => Some(E::Focus {
+                        op,
+                        concept: F::Wildcard,
+                    }),
                     Focus::Nested(inner) if op.is_none() => inner.to_simple(),
                     Focus::MemberOf(inner) if op.is_none() => match inner.as_ref() {
-                        Ecl::Sub { op: None, focus: Focus::Concept(c), filters } if filters.is_empty() => {
-                            Some(E::MemberOf(Box::new(E::Focus { op: None, concept: F::Id(c.clone()) })))
-                        }
-                        Ecl::Sub { op: None, focus: Focus::Wildcard, filters } if filters.is_empty() => {
-                            Some(E::MemberOf(Box::new(E::Focus { op: None, concept: F::Wildcard })))
-                        }
+                        Ecl::Sub {
+                            op: None,
+                            focus: Focus::Concept(c),
+                            filters,
+                        } if filters.is_empty() => Some(E::MemberOf(Box::new(E::Focus {
+                            op: None,
+                            concept: F::Id(c.clone()),
+                        }))),
+                        Ecl::Sub {
+                            op: None,
+                            focus: Focus::Wildcard,
+                            filters,
+                        } if filters.is_empty() => Some(E::MemberOf(Box::new(E::Focus {
+                            op: None,
+                            concept: F::Wildcard,
+                        }))),
                         _ => None,
                     },
                     _ => None,
@@ -766,7 +824,9 @@ impl Virtual {
             let t = idx(&a.name.id)?;
             let val = match &a.value {
                 AttributeValue::Concept(c) => VValue::Concept(idx(&c.id)?),
-                AttributeValue::Expression(x) => VValue::Expression(Box::new(Virtual::from_sub(m, x)?)),
+                AttributeValue::Expression(x) => {
+                    VValue::Expression(Box::new(Virtual::from_sub(m, x)?))
+                }
                 AttributeValue::Concrete(c) => VValue::Concrete(c.clone()),
             };
             Ok((t, val))
@@ -775,7 +835,8 @@ impl Virtual {
             v.groups.push(vec![value(a)?]);
         }
         for g in &e.groups {
-            v.groups.push(g.iter().map(value).collect::<Result<_, _>>()?);
+            v.groups
+                .push(g.iter().map(value).collect::<Result<_, _>>()?);
         }
         Ok(v)
     }
@@ -821,7 +882,11 @@ pub struct UnknownConcept(pub String);
 
 impl<'m> Evaluator<'m> {
     pub fn new(m: &'m SnomedModel) -> Self {
-        Evaluator { m, memo: HashMap::new(), reverse: None }
+        Evaluator {
+            m,
+            memo: HashMap::new(),
+            reverse: None,
+        }
     }
 
     /// The concepts `e` selects.
@@ -860,7 +925,11 @@ impl<'m> Evaluator<'m> {
                     Focus::Nested(x) => (*self.eval_rc(x)?).clone(),
                     Focus::MemberOf(x) => {
                         let refsets = match x.as_ref() {
-                            Ecl::Sub { op: None, focus: Focus::Concept(c), filters } if filters.is_empty() => {
+                            Ecl::Sub {
+                                op: None,
+                                focus: Focus::Concept(c),
+                                filters,
+                            } if filters.is_empty() => {
                                 std::rc::Rc::new(m.idx(c).into_iter().collect())
                             }
                             _ => self.eval_rc(x)?,
@@ -1008,17 +1077,22 @@ impl<'m> Evaluator<'m> {
         match f {
             Filter::Active(a) => m.active[c as usize] == *a,
             Filter::Primitive(p) => m.primitive[c as usize] == *p,
-            Filter::Term(words) => [m.display[c as usize].as_deref(), m.first_term[c as usize].as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|t| {
-                    let tw: Vec<String> = t
-                        .split(|ch: char| !ch.is_alphanumeric())
-                        .filter(|w| !w.is_empty())
-                        .map(str::to_lowercase)
-                        .collect();
-                    words.iter().all(|w| tw.iter().any(|x| x.starts_with(w.as_str())))
-                }),
+            Filter::Term(words) => [
+                m.display[c as usize].as_deref(),
+                m.first_term[c as usize].as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|t| {
+                let tw: Vec<String> = t
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_lowercase)
+                    .collect();
+                words
+                    .iter()
+                    .all(|w| tw.iter().any(|x| x.starts_with(w.as_str())))
+            }),
         }
     }
 
@@ -1052,7 +1126,8 @@ impl<'m> Evaluator<'m> {
                             })?,
                         };
                         v.foci.iter().any(|&f| {
-                            targets.contains(&f) || self.m.ancestors(f).iter().any(|a| targets.contains(a))
+                            targets.contains(&f)
+                                || self.m.ancestors(f).iter().any(|a| targets.contains(a))
                         })
                     }
                     _ => false,
@@ -1142,7 +1217,9 @@ impl<'m> Evaluator<'m> {
         let card = a.cardinality.unwrap_or(Cardinality { min: 1, max: None });
         let names = self.eval_rc(&a.name)?;
         if a.reverse {
-            let Subject::Concept(c) = s else { return Ok(card.allows(0)) };
+            let Subject::Concept(c) = s else {
+                return Ok(card.allows(0));
+            };
             let Comparison::Expression { negated, value } = &a.comparison else {
                 return Ok(false);
             };
@@ -1152,7 +1229,9 @@ impl<'m> Evaluator<'m> {
                 .get(c)
                 .map(|v| {
                     v.iter()
-                        .filter(|(src, ty)| names.contains(ty) && (sources.contains(src) != *negated))
+                        .filter(|(src, ty)| {
+                            names.contains(ty) && (sources.contains(src) != *negated)
+                        })
                         .count()
                 })
                 .unwrap_or(0);
@@ -1241,15 +1320,31 @@ mod tests {
 
     #[test]
     fn rejects_mixed_operators_and_bad_syntax() {
-        for t in ["<< 128045006 OR << 10200004 AND << 64572001", "<<", "<< 10200004 <<", "<< abc", "<< 1234567 MINUS << 2345678 MINUS << 3456789"] {
+        for t in [
+            "<< 128045006 OR << 10200004 AND << 64572001",
+            "<<",
+            "<< 10200004 <<",
+            "<< abc",
+            "<< 1234567 MINUS << 2345678 MINUS << 3456789",
+        ] {
             assert!(parse(t).is_err(), "{t}");
         }
     }
 
     #[test]
     fn simple_constraints_go_to_sql() {
-        assert!(parse("<< 1234567 OR < 2345678").unwrap().to_simple().is_some());
+        assert!(
+            parse("<< 1234567 OR < 2345678")
+                .unwrap()
+                .to_simple()
+                .is_some()
+        );
         assert!(parse("<! 1234567").unwrap().to_simple().is_none());
-        assert!(parse("< 1234567 : 2345678 = *").unwrap().to_simple().is_none());
+        assert!(
+            parse("< 1234567 : 2345678 = *")
+                .unwrap()
+                .to_simple()
+                .is_none()
+        );
     }
 }

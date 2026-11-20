@@ -33,7 +33,7 @@ use helios_observability::redact::redact_url;
 use helios_persistence::core::database_url::redact_database_url;
 #[cfg(feature = "postgres")]
 use helios_persistence::core::database_url::redact_postgres_location;
-use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
+use helios_persistence::{BackendKind, ResourceStorage};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::{info, warn};
 
@@ -2084,7 +2084,9 @@ async fn init_auth_with_audit(
         .await
         {
             Ok((authorize, token, end_session)) => {
-                auth_config.smart_authorize_endpoint.get_or_insert(authorize);
+                auth_config
+                    .smart_authorize_endpoint
+                    .get_or_insert(authorize);
                 auth_config.smart_token_endpoint.get_or_insert(token);
                 if auth_config.smart_end_session_endpoint.is_none() {
                     auth_config.smart_end_session_endpoint = end_session;
@@ -7229,7 +7231,9 @@ mod tests {
             CompositeConfig, CompositeStorage, DynStorage, SyncMode,
         };
         use helios_persistence::core::{SubmissionChange, SubmissionId};
-        use helios_persistence::{StorageResult, StoredResource, TenantId, TenantPermissions};
+        use helios_persistence::{
+            StorageResult, StoredResource, TenantContext, TenantId, TenantPermissions,
+        };
         use parking_lot::Mutex;
         use serde_json::Value;
 

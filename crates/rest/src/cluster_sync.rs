@@ -60,7 +60,7 @@ pub async fn run_profile_sync<S>(
     loop {
         ticker.tick().await;
         polls = polls.wrapping_add(1);
-        if polls % PRUNE_EVERY == 0
+        if polls.is_multiple_of(PRUNE_EVERY)
             && let Err(e) = feed.prune(FEED_RETENTION).await
         {
             debug!(error = %e, "pruning the cluster change feed failed");
@@ -75,8 +75,11 @@ pub async fn run_profile_sync<S>(
         // One application per resource per tick, whatever the number of
         // feed rows (an IG install writes a definition several times).
         changes.sort_by(|a, b| {
-            (&a.tenant_id, &a.resource_type, &a.resource_id)
-                .cmp(&(&b.tenant_id, &b.resource_type, &b.resource_id))
+            (&a.tenant_id, &a.resource_type, &a.resource_id).cmp(&(
+                &b.tenant_id,
+                &b.resource_type,
+                &b.resource_id,
+            ))
         });
         changes.dedup();
         for change in changes {

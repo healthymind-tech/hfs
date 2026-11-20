@@ -228,7 +228,9 @@ impl ProfileCache {
             std::fs::create_dir_all(dir)?;
             remove_stale_temporaries(dir);
         }
-        let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
         let result = (|| {
             let file = std::fs::File::create(&tmp)?;
             let mut gz = flate2::write::GzEncoder::new(

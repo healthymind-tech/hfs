@@ -30,7 +30,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
-use helios_persistence::core::{DistinctMetaValue, ResourceStorage, SearchProvider, VersionedStorage};
+use helios_persistence::core::{
+    DistinctMetaValue, ResourceStorage, SearchProvider, VersionedStorage,
+};
 use helios_persistence::types::{MetaOperation, StoredResource, apply_meta_operation};
 use serde_json::{Map, Value, json};
 use tracing::debug;
@@ -487,6 +489,10 @@ fn respond_summary(meta: Value, req_headers: &HeaderMap) -> RestResult<Response>
         "resourceType": "Parameters",
         "parameter": [{ "name": "return", "valueMeta": meta }]
     });
-    format_resource_response(StatusCode::OK, HeaderMap::new(), &parameters, negotiated.format)
+    format_resource_response(
+        StatusCode::OK,
+        HeaderMap::new(),
+        &parameters,
+        negotiated.format,
+    )
 }
-

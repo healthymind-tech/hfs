@@ -333,15 +333,18 @@ fn constraint_params(sets: &[Vec<(String, String)>]) -> Result<Vec<(String, Stri
     }
     let single: Vec<&(String, String)> = sets
         .iter()
-        .filter_map(|c| (c.len() == 1).then(|| &c[0]))
+        .filter(|&c| c.len() == 1)
+        .map(|c| &c[0])
         .collect();
     if single.len() == sets.len() && single.iter().all(|(p, _)| *p == single[0].0) {
         let values: Vec<&str> = single.iter().map(|(_, v)| v.as_str()).collect();
         return Ok(vec![(single[0].0.clone(), values.join(","))]);
     }
-    Err("the token's granular scopes for this type constrain different search parameters and \
+    Err(
+        "the token's granular scopes for this type constrain different search parameters and \
          cannot be combined into one search"
-        .to_string())
+            .to_string(),
+    )
 }
 
 fn forbidden(message: &str) -> Response {
@@ -497,13 +500,15 @@ where
             "type-level history is not available for a type the token reaches only through \
              granular scopes",
         ),
-        Route::PatientExport => forbidden(
-            "Patient/$export is not available to tokens with granular scopes",
-        ),
-        Route::ConditionalWrite { .. } | Route::Patch { .. } | Route::Operation { .. } => forbidden(
-            "conditional writes, PATCH and operations are not available for a type the token \
+        Route::PatientExport => {
+            forbidden("Patient/$export is not available to tokens with granular scopes")
+        }
+        Route::ConditionalWrite { .. } | Route::Patch { .. } | Route::Operation { .. } => {
+            forbidden(
+                "conditional writes, PATCH and operations are not available for a type the token \
              reaches only through granular scopes",
-        ),
+            )
+        }
         Route::Search { ty, post } => {
             let sets = granular(&ty, SmartPermissions::SEARCH).unwrap_or_default();
             let extra = match constraint_params(&sets) {
@@ -573,7 +578,8 @@ where
             if !body_allowed(&bytes, &ty, &ctx, &reach) {
                 return forbidden("the resource does not match the token's granular scope");
             }
-            next.run(Request::from_parts(parts, Body::from(bytes))).await
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
         }
         Route::Update { ty, id } => {
             let reach = reach(&principal.scopes, &ty, SmartPermissions::UPDATE);
@@ -583,7 +589,9 @@ where
                 Err(_) => return forbidden("request body too large"),
             };
             if !body_allowed(&bytes, &ty, &ctx, &reach) {
-                return forbidden("the updated resource would not match the token's granular scope");
+                return forbidden(
+                    "the updated resource would not match the token's granular scope",
+                );
             }
             match stored(&state, &mut parts, &ty, &id).await {
                 Ok(Some(existing)) if !ctx.resource_allowed(&existing, &reach) => {
@@ -594,7 +602,8 @@ where
                 Ok(_) => {}
                 Err(response) => return response,
             }
-            next.run(Request::from_parts(parts, Body::from(bytes))).await
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
         }
         Route::Delete { ty, id } => {
             let reach = reach(&principal.scopes, &ty, SmartPermissions::DELETE);
@@ -614,6 +623,7 @@ where
 }
 
 /// The stored current version of `ty/id`, as JSON.
+#[allow(clippy::result_large_err)]
 async fn stored<S>(
     state: &AppState<S>,
     parts: &mut axum::http::request::Parts,
@@ -682,7 +692,12 @@ async fn check_single_response(
 }
 
 /// Filters a Bundle response; other responses pass unchanged.
-async fn filter_response(response: Response, ctx: &Ctx, drop_bare: bool, max_body: usize) -> Response {
+async fn filter_response(
+    response: Response,
+    ctx: &Ctx,
+    drop_bare: bool,
+    max_body: usize,
+) -> Response {
     if !response.status().is_success() {
         return response;
     }
@@ -707,7 +722,10 @@ async fn filter_response(response: Response, ctx: &Ctx, drop_bare: bool, max_bod
     if dropped == 0 {
         return Response::from_parts(parts, Body::from(bytes));
     }
-    debug!(dropped, "SMART access: entries outside the token's scopes removed");
+    debug!(
+        dropped,
+        "SMART access: entries outside the token's scopes removed"
+    );
     rebuild(parts, &value)
 }
 
@@ -779,7 +797,10 @@ mod tests {
             classify(&Method::POST, "/Patient/$everything"),
             Route::Everything { id: None }
         );
-        assert_eq!(classify(&Method::POST, "/Patient/$validate"), Route::Validate);
+        assert_eq!(
+            classify(&Method::POST, "/Patient/$validate"),
+            Route::Validate
+        );
         assert_eq!(
             classify(&Method::PUT, "/Observation"),
             Route::ConditionalWrite {
@@ -819,23 +840,48 @@ mod tests {
     fn reach_follows_the_widest_context_like_the_policy() {
         let s = |x: &str| ScopeSet::parse(x);
         let lab = "?category=laboratory";
-        assert_eq!(reach(&s("system/*.rs"), "Observation", SmartPermissions::READ), Reach::Free);
-        assert_eq!(reach(&s("patient/*.rs"), "Observation", SmartPermissions::READ), Reach::Free);
-        assert_eq!(reach(&s("patient/Patient.rs"), "Observation", SmartPermissions::READ), Reach::Denied);
         assert_eq!(
-            reach(&s(&format!("user/Observation.rs{lab}")), "Observation", SmartPermissions::SEARCH),
+            reach(&s("system/*.rs"), "Observation", SmartPermissions::READ),
+            Reach::Free
+        );
+        assert_eq!(
+            reach(&s("patient/*.rs"), "Observation", SmartPermissions::READ),
+            Reach::Free
+        );
+        assert_eq!(
+            reach(
+                &s("patient/Patient.rs"),
+                "Observation",
+                SmartPermissions::READ
+            ),
+            Reach::Denied
+        );
+        assert_eq!(
+            reach(
+                &s(&format!("user/Observation.rs{lab}")),
+                "Observation",
+                SmartPermissions::SEARCH
+            ),
             Reach::Constrained(vec![vec![("category".into(), "laboratory".into())]])
         );
         // A wider (user/) grant decides, as SmartScopePolicy picks it over the
         // patient/ one: its constraint applies even though the patient/ scope
         // is unconstrained (never wider than either grant).
         assert!(matches!(
-            reach(&s(&format!("patient/Observation.rs user/Observation.rs{lab}")), "Observation", SmartPermissions::READ),
+            reach(
+                &s(&format!("patient/Observation.rs user/Observation.rs{lab}")),
+                "Observation",
+                SmartPermissions::READ
+            ),
             Reach::Constrained(_)
         ));
         // Patient-only granular scopes constrain within the compartment.
         assert!(matches!(
-            reach(&s(&format!("patient/Observation.rs{lab}")), "Observation", SmartPermissions::READ),
+            reach(
+                &s(&format!("patient/Observation.rs{lab}")),
+                "Observation",
+                SmartPermissions::READ
+            ),
             Reach::Constrained(_)
         ));
     }

@@ -56,6 +56,7 @@ pub struct RangeRule {
 #[derive(Debug, Default, Clone)]
 pub struct ModelRows {
     /// `(code, active, primitive, display, first term)`.
+    #[allow(clippy::type_complexity)]
     pub concepts: Vec<(String, bool, bool, Option<String>, Option<String>)>,
     /// `(source, group, type, value, concrete)`; is-a included.
     pub relationships: Vec<(String, i32, String, String, bool)>,
@@ -102,7 +103,9 @@ pub fn parse_concrete(v: &str) -> Option<Concrete> {
         return n.parse().ok().map(Concrete::Integer);
     }
     if let Some(s) = v.strip_prefix('"') {
-        return Some(Concrete::String(s.strip_suffix('"').unwrap_or(s).to_string()));
+        return Some(Concrete::String(
+            s.strip_suffix('"').unwrap_or(s).to_string(),
+        ));
     }
     match v {
         "true" => Some(Concrete::Boolean(true)),
@@ -115,7 +118,9 @@ impl SnomedModel {
     pub fn build(rows: ModelRows) -> Self {
         let mut m = SnomedModel::default();
         for (code, active, primitive, display, first) in rows.concepts {
-            let Ok(id) = code.parse::<u64>() else { continue };
+            let Ok(id) = code.parse::<u64>() else {
+                continue;
+            };
             let i = m.codes.len() as u32;
             m.codes.push(id);
             m.index.insert(id, i);
@@ -138,7 +143,9 @@ impl SnomedModel {
                 }
                 continue;
             }
-            let (Some(s), Some(t)) = (m.idx(&src), m.idx(&ty)) else { continue };
+            let (Some(s), Some(t)) = (m.idx(&src), m.idx(&ty)) else {
+                continue;
+            };
             if concrete {
                 if let Some(c) = parse_concrete(&value) {
                     m.rels[s as usize].push(Rel {
@@ -174,7 +181,11 @@ impl SnomedModel {
                         });
                     }
                 }
-                "range" => m.ranges.entry(a).or_default().push(RangeRule { constraint: c1 }),
+                "range" => m
+                    .ranges
+                    .entry(a)
+                    .or_default()
+                    .push(RangeRule { constraint: c1 }),
                 _ => {}
             }
         }
@@ -191,7 +202,9 @@ impl SnomedModel {
 
     /// The index of concept `code`.
     pub fn idx(&self, code: &str) -> Option<u32> {
-        code.parse::<u64>().ok().and_then(|c| self.index.get(&c).copied())
+        code.parse::<u64>()
+            .ok()
+            .and_then(|c| self.index.get(&c).copied())
     }
 
     pub fn code(&self, i: u32) -> String {

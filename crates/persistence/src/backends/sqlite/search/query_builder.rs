@@ -1234,7 +1234,10 @@ impl QueryBuilder {
                 .collect::<Vec<_>>()
                 .join(" UNION ALL ");
             let params = arms.into_iter().flat_map(|a| a.params).collect();
-            return Some(Self::membership(param, SqlFragment::with_params(sql, params)));
+            return Some(Self::membership(
+                param,
+                SqlFragment::with_params(sql, params),
+            ));
         }
 
         let combined = if is_plain_multi_reference {

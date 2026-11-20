@@ -381,7 +381,9 @@ pub async fn import_loinc_csv(
         if with_properties {
             for name in &paths.part_links {
                 let bytes = read_entry(&path_owned, name)?;
-                for (loinc, property, part) in parse_part_links(bytes.as_slice(), name, &mut parse_errors)? {
+                for (loinc, property, part) in
+                    parse_part_links(bytes.as_slice(), name, &mut parse_errors)?
+                {
                     if let Some(concept) = all_concepts.get_mut(&loinc) {
                         let property = interner.get(&property);
                         if !concept
@@ -534,11 +536,16 @@ pub async fn import_loinc_csv(
                         value_key: "valueCode",
                         value: ll.as_str(),
                     })
-                    .chain(entry.properties.iter().map(|(code, key, value)| BuilderProperty {
-                        code,
-                        value_key: key,
-                        value: value.as_str(),
-                    }))
+                    .chain(
+                        entry
+                            .properties
+                            .iter()
+                            .map(|(code, key, value)| BuilderProperty {
+                                code,
+                                value_key: key,
+                                value: value.as_str(),
+                            }),
+                    )
                     .collect()
             })
             .collect();
@@ -768,7 +775,10 @@ pub async fn backfill_loinc_properties(
         props_written += p;
         desig_written += d;
         crate::import::progress::report_batch(i + 1, num_batches);
-        eprintln!("[{FORMAT}] batch {}/{num_batches} — {props_written} properties", i + 1);
+        eprintln!(
+            "[{FORMAT}] batch {}/{num_batches} — {props_written} properties",
+            i + 1
+        );
     }
     debug_assert!(rows.peek().is_none());
     eprintln!(
@@ -1927,11 +1937,11 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let concepts = parse_loinc_table(csv.as_bytes(), &mut errors).unwrap();
         let calcium = &concepts["17861-6"];
         assert_eq!(calcium.display, "Calcium [Mass/volume] in Serum or Plasma");
-        assert_eq!(
-            calcium.alternates,
-            vec!["Calcium SerPl-mCnc".to_string()]
+        assert_eq!(calcium.alternates, vec!["Calcium SerPl-mCnc".to_string()]);
+        assert!(
+            concepts["1-8"].alternates.is_empty(),
+            "a short name equal to the display is dropped"
         );
-        assert!(concepts["1-8"].alternates.is_empty(), "a short name equal to the display is dropped");
         let designations = english_designations(&calcium.alternates);
         assert!(designations.iter().all(|d| d.language == "en-US"));
     }
@@ -2639,12 +2649,20 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false, &LanguageFilter::default())
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
         {
             let conn = backend.pool().get().unwrap();
-            conn.execute("DELETE FROM concept_designations", []).unwrap();
+            conn.execute("DELETE FROM concept_designations", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO concept_designations (concept_id, language, value)
                  SELECT id, 'fr-FR', 'HGB BLD-MCNC' FROM concepts WHERE code = '718-7'",
@@ -2654,8 +2672,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         }
         let rows = || {
             vec![
-                ("718-7".to_string(), "en-US".to_string(), "Hgb Bld-mCnc".to_string()),
-                ("718-7".to_string(), "en-US".to_string(), "hgb bld-mcnc".to_string()),
+                (
+                    "718-7".to_string(),
+                    "en-US".to_string(),
+                    "Hgb Bld-mCnc".to_string(),
+                ),
+                (
+                    "718-7".to_string(),
+                    "en-US".to_string(),
+                    "hgb bld-mcnc".to_string(),
+                ),
                 // Equal to the display, ignoring case: not a designation.
                 (
                     "718-7".to_string(),

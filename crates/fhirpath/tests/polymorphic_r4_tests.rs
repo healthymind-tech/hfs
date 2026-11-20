@@ -197,7 +197,10 @@ fn implementation_guide_is_not_an_implementation_variant() {
         ("CapabilityStatement.implementation.exists()", false),
         ("implementation.exists()", false),
         ("%resource.implementation.exists()", false),
-        ("CapabilityStatement.all((kind != 'requirements') or (implementation.exists().not() and software.exists().not()))", true),
+        (
+            "CapabilityStatement.all((kind != 'requirements') or (implementation.exists().not() and software.exists().not()))",
+            true,
+        ),
         ("CapabilityStatement.implementationGuide.exists()", true),
     ] {
         assert_eq!(

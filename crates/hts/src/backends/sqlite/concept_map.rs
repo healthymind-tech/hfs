@@ -385,6 +385,7 @@ struct TranslateRow {
 /// filters `target_system` (so callers can say "translate from source-CS
 /// into target-CS"); in reverse mode it filters `source_system` (so
 /// callers can say "what code in source-CS maps to this target-CS code?").
+#[allow(clippy::too_many_arguments)]
 fn query_translate_elements(
     conn: &Connection,
     code: &str,

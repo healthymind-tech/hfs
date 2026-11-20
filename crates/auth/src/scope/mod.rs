@@ -19,7 +19,10 @@ impl Grant {
     /// Whether every resource this grant admits is also admitted by `self`.
     fn subsumes(&self, other: &Grant) -> bool {
         (!self.patient_compartment || other.patient_compartment)
-            && self.constraints.iter().all(|c| other.constraints.contains(c))
+            && self
+                .constraints
+                .iter()
+                .all(|c| other.constraints.contains(c))
     }
 }
 
@@ -100,7 +103,11 @@ impl ScopeSet {
     /// this one says what a permitted request may actually see.
     pub fn access(&self, resource_type: &str, permission: SmartPermissions) -> Access {
         let mut grants: Vec<Grant> = Vec::new();
-        for scope in self.scopes.iter().filter(|s| s.covers(resource_type, permission)) {
+        for scope in self
+            .scopes
+            .iter()
+            .filter(|s| s.covers(resource_type, permission))
+        {
             let grant = Grant {
                 patient_compartment: scope.context == ScopeContext::Patient,
                 constraints: scope.constraints.clone(),
@@ -123,7 +130,9 @@ impl ScopeSet {
 
     /// Whether any scope is a `patient/` scope.
     pub fn has_patient_scopes(&self) -> bool {
-        self.scopes.iter().any(|s| s.context == ScopeContext::Patient)
+        self.scopes
+            .iter()
+            .any(|s| s.context == ScopeContext::Patient)
     }
 
     /// Whether any scope is a SMART v2 granular scope.
@@ -369,7 +378,8 @@ mod tests {
             Access::Full
         );
         assert_eq!(
-            ScopeSet::parse("user/Observation.read").access("Observation", SmartPermissions::SEARCH),
+            ScopeSet::parse("user/Observation.read")
+                .access("Observation", SmartPermissions::SEARCH),
             Access::Full
         );
     }
@@ -377,8 +387,14 @@ mod tests {
     #[test]
     fn access_is_denied_without_a_covering_scope() {
         let set = ScopeSet::parse("patient/Patient.rs");
-        assert_eq!(set.access("Observation", SmartPermissions::READ), Access::Denied);
-        assert_eq!(set.access("Patient", SmartPermissions::CREATE), Access::Denied);
+        assert_eq!(
+            set.access("Observation", SmartPermissions::READ),
+            Access::Denied
+        );
+        assert_eq!(
+            set.access("Patient", SmartPermissions::CREATE),
+            Access::Denied
+        );
     }
 
     #[test]
@@ -397,8 +413,14 @@ mod tests {
     #[test]
     fn an_unrestricted_scope_wins_over_a_patient_scope() {
         let set = ScopeSet::parse("patient/*.rs user/Observation.rs");
-        assert_eq!(set.access("Observation", SmartPermissions::READ), Access::Full);
-        assert!(set.access("Condition", SmartPermissions::READ).needs_patient());
+        assert_eq!(
+            set.access("Observation", SmartPermissions::READ),
+            Access::Full
+        );
+        assert!(
+            set.access("Condition", SmartPermissions::READ)
+                .needs_patient()
+        );
     }
 
     #[test]
@@ -411,7 +433,8 @@ mod tests {
             other => panic!("expected restricted, got {other:?}"),
         }
         // A plain patient scope subsumes the granular ones.
-        let set = ScopeSet::parse("patient/Observation.rs?category=laboratory patient/Observation.rs");
+        let set =
+            ScopeSet::parse("patient/Observation.rs?category=laboratory patient/Observation.rs");
         assert_eq!(
             set.access("Observation", SmartPermissions::SEARCH),
             Access::Restricted(vec![Grant {

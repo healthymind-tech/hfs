@@ -183,6 +183,7 @@ pub struct ActiveSubscription {
 #[derive(Debug, Clone)]
 pub(crate) struct SubscriptionSnapshot {
     pub subscription: ActiveSubscription,
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub generation: GenerationToken,
 }
 
@@ -196,6 +197,7 @@ enum GenerationState {
 #[derive(Debug)]
 struct Generation {
     state: watch::Sender<GenerationState>,
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     status_writes: Arc<Mutex<()>>,
 }
 
@@ -206,6 +208,7 @@ pub(crate) struct GenerationToken {
     inner: Arc<Generation>,
 }
 
+#[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
 impl GenerationToken {
     fn new(status: SubscriptionStatusCode) -> Self {
         let state = if status.is_terminal() {
@@ -298,6 +301,7 @@ impl StatusSourceFence {
         }
     }
 
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn matches(&self, version_id: &str, content: &serde_json::Value) -> bool {
         self.version_id
             .as_deref()
@@ -389,6 +393,7 @@ impl std::error::Error for RangeError {}
 struct RegisteredSubscription {
     subscription: ActiveSubscription,
     generation: GenerationToken,
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     source_fence: StatusSourceFence,
     /// Most recent events, oldest first. Numbered and trimmed under the same
     /// map guard as `subscription.events_since_start`, so the two never drift.
@@ -403,6 +408,7 @@ impl RegisteredSubscription {
         }
     }
 
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     fn is_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
         self.generation.same_generation(&snapshot.generation)
     }
@@ -804,6 +810,7 @@ impl SubscriptionManager {
             .collect()
     }
 
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn is_current(&self, snapshot: &SubscriptionSnapshot) -> bool {
         let sub = &snapshot.subscription;
         let key = (sub.tenant_id.clone(), sub.id.clone());
@@ -812,6 +819,7 @@ impl SubscriptionManager {
             .is_some_and(|entry| entry.is_current(snapshot))
     }
 
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn is_current_status(
         &self,
         snapshot: &SubscriptionSnapshot,
@@ -826,6 +834,7 @@ impl SubscriptionManager {
 
     /// Assign numbers only while the evaluated generation is still Active, and
     /// remember the event in the bounded history under the same guard.
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn record_event_if_current(
         &self,
         snapshot: &SubscriptionSnapshot,
@@ -945,6 +954,7 @@ impl SubscriptionManager {
     /// guard as the failure streak, so replacement cannot split acceptance.
     /// It must be cheap, perform no I/O, and never re-enter this manager.
     /// The returned failure count may drive async transitions after this returns.
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn accept_delivery_outcome(
         &self,
         snapshot: &SubscriptionSnapshot,
@@ -986,6 +996,7 @@ impl SubscriptionManager {
             .is_some()
     }
 
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn update_status_if_current(
         &self,
         snapshot: &SubscriptionSnapshot,
@@ -1002,6 +1013,7 @@ impl SubscriptionManager {
 
     /// This fence can be used after an async storage read without retaining a
     /// map guard. Generation/status must be rechecked before issuing the write.
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn source_fence(
         &self,
         snapshot: &SubscriptionSnapshot,
@@ -1017,6 +1029,7 @@ impl SubscriptionManager {
     /// Record successful server write-back only for the same registration and
     /// prior source. A late completion cannot advance a client's replacement
     /// fence. Callers serialize own writes with the generation's write lock.
+    #[allow(dead_code)] // unused after the v0.2.9 merge; kept until the duplicate is removed
     pub(crate) fn acknowledge_status_write(
         &self,
         snapshot: &SubscriptionSnapshot,

@@ -959,7 +959,6 @@ async fn stored_expansion_first_and_cached_shape() {
 /// supplement), and the base CodeSystem's inline concept entries.
 #[tokio::test(flavor = "multi_thread")]
 async fn supplements_reach_lookup_helpers_after_import() {
-    use helios_hts::traits::CodeSystemOperations;
     let _g = SERIAL.lock().await;
     let bs = backends().await;
     let base = json!({
@@ -1089,25 +1088,64 @@ async fn enumerated_ucum_units_survive_a_stored_atom_table() {
         ]}]}
     });
     for (_, b, _) in &bs {
-        import(b, &bundle(vec![ucum_atoms.clone(), property_cs(), vitals.clone(), other.clone()]))
-            .await;
+        import(
+            b,
+            &bundle(vec![
+                ucum_atoms.clone(),
+                property_cs(),
+                vitals.clone(),
+                other.clone(),
+            ]),
+        )
+        .await;
     }
     let exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/vitals")).await);
     assert_eq!(
         exp,
         Ok((
-            ["%", "cm", "kg", "/min", "mm[Hg]", "g"].map(String::from).to_vec(),
+            ["%", "cm", "kg", "/min", "mm[Hg]", "g"]
+                .map(String::from)
+                .to_vec(),
             Some(6)
         )),
         "compose order, malformed unit dropped"
     );
     let v = same_on_all!(bs, |b| (
-        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "mm[Hg]").await,
-        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "kg").await,
-        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "g").await,
-        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "mg").await,
-        validates(b, "http://u.test/vs/vitals", Some("http://unitsofmeasure.org"), "not a unit")
-            .await,
+        validates(
+            b,
+            "http://u.test/vs/vitals",
+            Some("http://unitsofmeasure.org"),
+            "mm[Hg]"
+        )
+        .await,
+        validates(
+            b,
+            "http://u.test/vs/vitals",
+            Some("http://unitsofmeasure.org"),
+            "kg"
+        )
+        .await,
+        validates(
+            b,
+            "http://u.test/vs/vitals",
+            Some("http://unitsofmeasure.org"),
+            "g"
+        )
+        .await,
+        validates(
+            b,
+            "http://u.test/vs/vitals",
+            Some("http://unitsofmeasure.org"),
+            "mg"
+        )
+        .await,
+        validates(
+            b,
+            "http://u.test/vs/vitals",
+            Some("http://unitsofmeasure.org"),
+            "not a unit"
+        )
+        .await,
     ));
     assert_eq!(v, (true, true, true, false, false));
     let other_exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/other")).await);
@@ -1159,7 +1197,11 @@ async fn flat_cdcrec_expands_descendants() {
         }
     });
     for (_, b, _) in &bs {
-        import(b, &bundle(vec![cdcrec.clone(), detailed.clone(), ethnicity.clone()])).await;
+        import(
+            b,
+            &bundle(vec![cdcrec.clone(), detailed.clone(), ethnicity.clone()]),
+        )
+        .await;
     }
     let exp = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-race"))
         .await
@@ -1172,11 +1214,24 @@ async fn flat_cdcrec_expands_descendants() {
         Ok((vec!["1004-1".to_string(), "2039-6".to_string()], Some(2)))
     );
     let v = same_on_all!(bs, |b| (
-        validates(b, "http://u.test/vs/detailed-race", Some("urn:oid:2.16.840.1.113883.6.238"), "2039-6").await,
-        validates(b, "http://u.test/vs/detailed-race", Some("urn:oid:2.16.840.1.113883.6.238"), "2135-2").await,
+        validates(
+            b,
+            "http://u.test/vs/detailed-race",
+            Some("urn:oid:2.16.840.1.113883.6.238"),
+            "2039-6"
+        )
+        .await,
+        validates(
+            b,
+            "http://u.test/vs/detailed-race",
+            Some("urn:oid:2.16.840.1.113883.6.238"),
+            "2135-2"
+        )
+        .await,
     ));
     assert_eq!(v, (true, false));
-    let eth = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-eth")).await);
+    let eth = same_on_all!(bs, |b| expand(b, url_req("http://u.test/vs/detailed-eth"))
+        .await);
     assert_eq!(eth, Ok((vec!["2148-5".to_string()], Some(1))));
 }
 
@@ -1254,7 +1309,11 @@ async fn truncated_copy_does_not_replace_complete_code_system() {
     ));
     assert_eq!(steps.0, (1, 0), "full copy written");
     assert_eq!(steps.1, (0, 1), "sample skipped with a warning");
-    assert_eq!(steps.2, ("complete".to_string(), None), "full copy's metadata kept");
+    assert_eq!(
+        steps.2,
+        ("complete".to_string(), None),
+        "full copy's metadata kept"
+    );
     assert_eq!(steps.3, (0, 1), "not-present stub skipped");
     assert_eq!(steps.4, ("complete".to_string(), None));
     assert_eq!(steps.5, (1, 0), "a copy with new codes is written");
@@ -1288,14 +1347,21 @@ async fn bundle_reimport_drops_cached_expansions_over_the_system() {
     for (_, b, _) in &bs {
         import(b, &bundle(vec![cs(&["A", "B"]), vs.clone()])).await;
     }
-    let before = same_on_all!(bs, |b| expand(b, url_req("http://tw.test/ValueSet/pcs")).await);
+    let before = same_on_all!(bs, |b| expand(b, url_req("http://tw.test/ValueSet/pcs"))
+        .await);
     assert_eq!(before.unwrap().1, Some(2));
     for (_, b, _) in &bs {
         import(b, &bundle(vec![cs(&["A", "B", "C"])])).await;
     }
     let after = same_on_all!(bs, |b| (
         expand(b, url_req("http://tw.test/ValueSet/pcs")).await,
-        validates(b, "http://tw.test/ValueSet/pcs", Some("http://tw.test/CodeSystem/pcs"), "C").await,
+        validates(
+            b,
+            "http://tw.test/ValueSet/pcs",
+            Some("http://tw.test/CodeSystem/pcs"),
+            "C"
+        )
+        .await,
     ));
     assert_eq!(after.0.unwrap().1, Some(3));
     assert!(after.1);
@@ -1329,7 +1395,11 @@ async fn cached_expansions_follow_their_dependencies() {
         "compose": {"include": [{"valueSet": ["http://dep.test/vs/inner"]}]}
     });
     for (_, b, _) in &bs {
-        import(b, &bundle(vec![cs(&[("a", "0")]), inner.clone(), outer.clone()])).await;
+        import(
+            b,
+            &bundle(vec![cs(&[("a", "0")]), inner.clone(), outer.clone()]),
+        )
+        .await;
     }
     let before = same_on_all!(bs, |b| (
         expand(b, url_req("http://dep.test/vs/inner")).await,

@@ -2330,11 +2330,12 @@ mod unsupported_params {
     }
 
     /// A `_sort` field or `_total` value the server cannot honour is a `400`
-    /// without a `Prefer` header and under `handling=strict`; under
-    /// `handling=lenient` it is ignored and reported. Both used to answer
-    /// `200` with nothing to say the request was not honoured.
+    /// under `Prefer: handling=strict`. Without a `Prefer` header, and under
+    /// `handling=lenient`, it is ignored and reported in the searchset's
+    /// OperationOutcome entry — FHIR search error handling's lenient default,
+    /// the same as an unknown search parameter.
     #[tokio::test]
-    async fn test_unhonourable_sort_and_total_are_rejected_unless_lenient() {
+    async fn test_unhonourable_sort_and_total_are_rejected_only_when_strict() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
@@ -2344,56 +2345,75 @@ mod unsupported_params {
             "/Patient?_total=bogus",
             "/Patient?_summary=count&_total=bogus",
         ] {
-            for prefer in [None, Some("handling=strict")] {
+            let response = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(PREFER, HeaderValue::from_static("handling=strict"))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{url} with Prefer: handling=strict"
+            );
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
+        }
+
+        for prefer in [None, Some("handling=lenient")] {
+            let request = |url: &'static str| {
                 let mut request = server
                     .get(url)
                     .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"));
                 if let Some(prefer) = prefer {
                     request = request.add_header(PREFER, HeaderValue::from_static(prefer));
                 }
-                let response = request.await;
+                request
+            };
+
+            for (url, field) in [
+                ("/Patient?_sort=nope", "nope"),
+                ("/Patient?_sort=family,-nope", "nope"),
+            ] {
+                let response = request(url).await;
                 assert_eq!(
                     response.status_code(),
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::OK,
                     "{url} with Prefer {prefer:?}"
                 );
                 let body: Value = response.json();
-                assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
+                assert!(
+                    get_bundle_entries(&body)
+                        .iter()
+                        .any(|e| e["resource"]["resourceType"] == "Patient"),
+                    "{url} with Prefer {prefer:?}: {body}"
+                );
+                assert!(
+                    outcome_diagnostics(&body)
+                        .iter()
+                        .any(|d| d.contains(&format!("_sort parameter '{field}'"))),
+                    "{url} with Prefer {prefer:?}: {body}"
+                );
             }
+
+            let response = request("/Patient?_total=bogus").await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::OK,
+                "_total=bogus with Prefer {prefer:?}"
+            );
+            let body: Value = response.json();
+            assert!(
+                outcome_diagnostics(&body)
+                    .iter()
+                    .any(|d| d.contains("_total value 'bogus'")),
+                "{body}"
+            );
+            assert!(
+                !self_link(&body).contains("_total"),
+                "the ignored _total is not claimed by the self link: {}",
+                self_link(&body)
+            );
         }
-
-        let lenient = |url: &'static str| {
-            server
-                .get(url)
-                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-                .add_header(PREFER, HeaderValue::from_static("handling=lenient"))
-        };
-
-        let response = lenient("/Patient?_sort=nope").await;
-        response.assert_status_ok();
-        let body: Value = response.json();
-        assert!(!get_bundle_entries(&body).is_empty());
-        assert!(
-            outcome_diagnostics(&body)
-                .iter()
-                .any(|d| d.contains("_sort parameter 'nope'")),
-            "{body}"
-        );
-
-        let response = lenient("/Patient?_total=bogus").await;
-        response.assert_status_ok();
-        let body: Value = response.json();
-        assert!(
-            outcome_diagnostics(&body)
-                .iter()
-                .any(|d| d.contains("_total value 'bogus'")),
-            "{body}"
-        );
-        assert!(
-            !self_link(&body).contains("_total"),
-            "the ignored _total is not claimed by the self link: {}",
-            self_link(&body)
-        );
     }
 
     /// The values the server honours keep answering `200`.

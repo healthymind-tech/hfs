@@ -332,7 +332,8 @@ impl PackageManager {
         coordinator: Arc<dyn helios_persistence::core::package_jobs::PackageJobCoordinator>,
         instance_id: String,
     ) -> Self {
-        self.jobs.attach_mirror(Arc::clone(&coordinator), instance_id);
+        self.jobs
+            .attach_mirror(Arc::clone(&coordinator), instance_id);
         self.coordinator = Some(coordinator);
         self
     }
@@ -1317,6 +1318,7 @@ impl PackageManager {
         Ok(search_parameters)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_terminology(
         &self,
         job: &Job,
@@ -1386,7 +1388,11 @@ impl PackageManager {
                     );
                 }
                 for w in &outcome.warnings {
-                    job.warn(key, format!("{resource_type} (terminology server)"), w.clone());
+                    job.warn(
+                        key,
+                        format!("{resource_type} (terminology server)"),
+                        w.clone(),
+                    );
                 }
                 let ok = chunk.len() as u64 - failed;
                 job.count(key, &resource_type, |c| {
@@ -1750,11 +1756,7 @@ impl PackageManager {
             .event_type("http://dicom.nema.org/resources/ontology/DCM", "110100")
             .detail("package", package.to_string())
             .detail("tenant", tenant.to_string());
-        builder = builder.agent(
-            who.unwrap_or("hfs-package-manager"),
-            None,
-            who.is_some(),
-        );
+        builder = builder.agent(who.unwrap_or("hfs-package-manager"), None, who.is_some());
         let event = builder.build();
         match &self.deps.audit {
             Some(sink) => sink.record(event).await,
@@ -2191,7 +2193,10 @@ fn surface_plan_warnings(job: &Job, plan: &super::resolver::Plan) {
     for w in &plan.warnings {
         // Missing nodes already have their own warning (the plan repeats
         // the lookup error as `key: error`).
-        if missing.iter().any(|k| w.starts_with(&format!("{k}:")) || w.starts_with(&format!("{k} ("))) {
+        if missing
+            .iter()
+            .any(|k| w.starts_with(&format!("{k}:")) || w.starts_with(&format!("{k} (")))
+        {
             continue;
         }
         job.warn(&plan.root, "plan", w.clone());
@@ -2394,19 +2399,31 @@ mod tests {
             ],
         };
         let table = JobTable::default();
-        let job = table.create(JobKind::Install, "hl7.fhir.us.core#7.0.0", "default", json!({}), None);
+        let job = table.create(
+            JobKind::Install,
+            "hl7.fhir.us.core#7.0.0",
+            "default",
+            json!({}),
+            None,
+        );
         surface_plan_warnings(&job, &plan);
         let view = job.view();
         assert_eq!(view.warnings.len(), 2, "{:?}", view.warnings);
         assert_eq!(view.warnings[0].resource, "us.nlm.vsac#0.18.0");
         assert!(
-            view.warnings[0].message.contains("required by hl7.fhir.us.core#7.0.0"),
+            view.warnings[0]
+                .message
+                .contains("required by hl7.fhir.us.core#7.0.0"),
             "{}",
             view.warnings[0].message
         );
         assert_eq!(view.warnings[1].resource, "plan");
         assert!(view.errors.is_empty(), "warnings do not fail the job");
-        assert!(view.log.iter().any(|l| l.contains("warning: ") && l.contains("us.nlm.vsac")));
+        assert!(
+            view.log
+                .iter()
+                .any(|l| l.contains("warning: ") && l.contains("us.nlm.vsac"))
+        );
     }
 
     #[test]

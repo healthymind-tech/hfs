@@ -105,7 +105,9 @@ impl SmartScope {
         // SMART v1 (`read`, `write`, `*`) or SMART v2 (`cruds` letters).
         let permissions = match perm_str {
             "read" => SmartPermissions::READ | SmartPermissions::SEARCH,
-            "write" => SmartPermissions::CREATE | SmartPermissions::UPDATE | SmartPermissions::DELETE,
+            "write" => {
+                SmartPermissions::CREATE | SmartPermissions::UPDATE | SmartPermissions::DELETE
+            }
             "*" => SmartPermissions::all(),
             other => SmartPermissions::from_permission_str(other)?,
         };

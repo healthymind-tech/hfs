@@ -13,7 +13,10 @@ use super::model::SnomedModel;
 
 /// The virtual form of a single concept.
 pub fn of_concept(m: &SnomedModel, c: u32) -> Virtual {
-    Virtual { foci: vec![c], groups: concept_groups(m, c) }
+    Virtual {
+        foci: vec![c],
+        groups: concept_groups(m, c),
+    }
 }
 
 /// The normal form of `v`.
@@ -40,9 +43,10 @@ pub fn normal_form(m: &SnomedModel, v: &Virtual) -> Virtual {
         .collect();
     let mut keep: Vec<Vec<(u32, VValue)>> = Vec::new();
     for (i, g) in groups.iter().enumerate() {
-        let redundant = groups.iter().enumerate().any(|(j, h)| {
-            j != i && group_subsumes(m, g, h) && (!group_subsumes(m, h, g) || j < i)
-        });
+        let redundant = groups
+            .iter()
+            .enumerate()
+            .any(|(j, h)| j != i && group_subsumes(m, g, h) && (!group_subsumes(m, h, g) || j < i));
         if !redundant {
             keep.push(g.clone());
         }
@@ -77,7 +81,9 @@ fn group_subsumes(m: &SnomedModel, a: &[(u32, VValue)], b: &[(u32, VValue)]) -> 
 
 /// Whether normal form `a` subsumes normal form `b`.
 pub fn nf_subsumes(m: &SnomedModel, a: &Virtual, b: &Virtual) -> bool {
-    a.foci.iter().all(|&p| b.foci.iter().any(|&q| m.subsumes(p, q)))
+    a.foci
+        .iter()
+        .all(|&p| b.foci.iter().any(|&q| m.subsumes(p, q)))
         && a.groups
             .iter()
             .all(|ga| b.groups.iter().any(|gb| group_subsumes(m, ga, gb)))

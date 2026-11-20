@@ -158,6 +158,7 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
         .flatten()
         .map(|(system, _)| system.as_str())
         .collect();
+    #[allow(clippy::type_complexity)]
     let display_table: Vec<(&str, Vec<(&String, &Vec<String>)>)> = used
         .iter()
         .filter_map(|system| {
