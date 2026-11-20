@@ -423,19 +423,24 @@ async fn admin_token_scope_is_required() {
         custom_claims: Default::default(),
         launch_context: None,
     };
-    for (scopes, expected) in [("system/*.rs", StatusCode::FORBIDDEN), ("system/*.cruds", StatusCode::OK)] {
+    for (scopes, expected) in [
+        ("system/*.rs", StatusCode::FORBIDDEN),
+        ("system/*.cruds", StatusCode::OK),
+    ] {
         let p = principal(scopes);
         let app = helios_rest::routing::admin_sync::routes_with_scope(
             SyncApi::Fixed(svc.clone()),
             AdminTokenScope("system/*.cruds".into()),
         )
-        .layer(axum::middleware::from_fn(move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-            let p = p.clone();
-            async move {
-                req.extensions_mut().insert(p);
-                next.run(req).await
-            }
-        }));
+        .layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let p = p.clone();
+                async move {
+                    req.extensions_mut().insert(p);
+                    next.run(req).await
+                }
+            },
+        ));
         let (s, _, _) = call(&app, "GET", "/admin/sync/jobs", None, &[]).await;
         assert_eq!(s, expected, "{scopes}");
     }
