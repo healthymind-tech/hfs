@@ -53,6 +53,18 @@ const VALIDATION_STACK: usize = 16 * 1024 * 1024;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// See [`on_large_stack`].
+fn use_large_stack_pool() -> bool {
+    static USE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USE.get_or_init(|| {
+        match std::env::var("HFS_VALIDATION_STACK_THREAD").as_deref() {
+            Ok("always") => true,
+            Ok("never") => false,
+            _ => cfg!(debug_assertions),
+        }
+    })
+}
+
 /// A bounded pool of large-stack threads, grown on demand up to the number
 /// of CPUs (at least 2, at most 64). Threads stay alive, so their
 /// allocator caches stay warm and no thread is created per call.
@@ -137,8 +149,15 @@ impl LargeStackPool {
 /// happens on a pool thread whose stack does not depend on the caller's.
 /// Calls already on a pool thread run inline, so nested validation never
 /// waits for the pool. A panic in `f` is re-raised on the caller.
+///
+/// Only debug builds need this: a release build validates a Bundle in
+/// ~230 KiB of stack, and the hand-over to the pool costs ~0.2–0.6 ms per
+/// call on a loaded host — measurable on a 20-entry transaction, which
+/// validates every entry. So release builds recurse inline unless
+/// `HFS_VALIDATION_STACK_THREAD=always` (`never` disables the pool in debug
+/// builds too; the default is `debug`).
 pub(crate) fn on_large_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if ON_LARGE_STACK.with(std::cell::Cell::get) {
+    if ON_LARGE_STACK.with(std::cell::Cell::get) || !use_large_stack_pool() {
         return f();
     }
     let (done, wait) = std::sync::mpsc::sync_channel::<std::thread::Result<R>>(1);
