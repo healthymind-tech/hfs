@@ -1254,6 +1254,11 @@ where
     // Tenant-maintenance API (`/admin/tenants`) rides the same cross-tenant admin
     // tier as `console/metrics/tenants`: system-context scope + authentication.
     let admin_console = routing::console_metrics::admin_routes(console_admin_state)
+        .merge(routing::admin_endpoints::app_routes(
+            &admin_tenants_state,
+            &package_manager,
+            package_upload_limit,
+        ))
         .merge(routing::admin_tenants::routes(admin_tenants_state))
         .merge(routing::admin_packages::routes(
             package_manager,

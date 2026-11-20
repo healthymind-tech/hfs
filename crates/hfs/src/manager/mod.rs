@@ -104,6 +104,9 @@ pub struct ManagerContext {
     pub outbound: Arc<OutboundPolicy>,
     /// Routers merged into the app by [`attach`].
     pub routes: Vec<axum::Router>,
+    /// Where the app publishes the endpoint admin service (P4) it builds;
+    /// the console (P5) writes through the same state.
+    pub admin_api: helios_rest::endpoint::AdminApiSlot,
     /// Background tasks (aborted when the context is dropped at shutdown).
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -112,6 +115,7 @@ impl ManagerContext {
     /// The runtime the REST app builder installs the dispatcher from.
     pub fn runtime(&self) -> EndpointRuntime {
         EndpointRuntime::new(Arc::clone(&self.registry), Arc::clone(&self.store))
+            .with_admin_api_slot(Arc::clone(&self.admin_api))
     }
 }
 
@@ -205,6 +209,7 @@ pub async fn init_with(
         key_ring,
         outbound,
         routes: Vec::new(),
+        admin_api: Default::default(),
         tasks: Vec::new(),
     };
 

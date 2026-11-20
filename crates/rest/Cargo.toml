@@ -57,7 +57,7 @@ helios-serde = { path = "../serde", version = "0.2.9", optional = true, default-
 helios-sof = { path = "../sof", version = "0.2.9", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.9" }
 # `Secret` (redacted Debug) for HFS_TERMINOLOGY_SERVER_TOKEN.
-helios-admin-auth = { path = "../admin-auth", version = "0.2.9" }
+helios-admin-auth = { path = "../admin-auth", version = "0.2.9", features = ["console"] }
 helios-audit = { path = "../audit", version = "0.2.9", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.2.9", optional = true, default-features = false }
 helios-fhir-validator = { path = "../fhir-validator", version = "0.2.9", default-features = false, features = ["fhirpath"] }

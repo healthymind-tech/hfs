@@ -42,7 +42,16 @@ pub struct EndpointRuntime {
     /// Where endpoint configuration is persisted (PostgreSQL in production,
     /// the memory store for `HFS_ENDPOINTS_FILE` on other backends and tests).
     pub store: Arc<dyn EndpointStore>,
+    /// The endpoint admin service (package P4) the app builds for this
+    /// runtime, shared with the manager console so both write through one
+    /// state (audit sink, storage statistics, audit search). Filled by
+    /// `build_app`; clones of the runtime share the slot.
+    pub admin_api: AdminApiSlot,
 }
+
+/// Where `build_app` publishes the endpoint admin service it built.
+pub type AdminApiSlot =
+    Arc<std::sync::OnceLock<crate::handlers::admin_endpoints::AdminEndpointsState>>;
 
 impl std::fmt::Debug for EndpointRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,7 +64,23 @@ impl std::fmt::Debug for EndpointRuntime {
 impl EndpointRuntime {
     /// A runtime over `registry` and `store`.
     pub fn new(registry: Arc<EndpointRegistry>, store: Arc<dyn EndpointStore>) -> Self {
-        Self { registry, store }
+        Self {
+            registry,
+            store,
+            admin_api: AdminApiSlot::default(),
+        }
+    }
+
+    /// Shares `slot` (the process's manager context keeps one, so every
+    /// runtime it hands out publishes the admin service to the same place).
+    pub fn with_admin_api_slot(mut self, slot: AdminApiSlot) -> Self {
+        self.admin_api = slot;
+        self
+    }
+
+    /// The endpoint admin service built by the app, once it is built.
+    pub fn admin_api(&self) -> Option<&crate::handlers::admin_endpoints::AdminEndpointsState> {
+        self.admin_api.get()
     }
 
     /// Reloads the registry from the store if the store moved (the admin API
