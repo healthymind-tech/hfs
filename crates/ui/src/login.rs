@@ -481,9 +481,7 @@ fn stamp_session(request: &mut Request, resolved: &Resolved) {
         custom_claims: serde_json::Map::new(),
         ..Default::default()
     });
-    request
-        .extensions_mut()
-        .insert(session_principal.clone());
+    request.extensions_mut().insert(session_principal.clone());
     request.extensions_mut().insert(SignedIn(session_principal));
 }
 
@@ -695,10 +693,7 @@ fn login_view(console: &ConsoleAuth, i18n: I18n, v: LoginView) -> Option<Console
         break_glass_href: format!("/ui/login?local=1&{next_q}"),
         show_idp_link: mode == ConsoleAuthMode::Oidc && v.local,
         idp_page_href: format!("/ui/login?{next_q}"),
-        lang_suffix: format!(
-            "&{next_q}{}",
-            if v.local { "&local=1" } else { "" }
-        ),
+        lang_suffix: format!("&{next_q}{}", if v.local { "&local=1" } else { "" }),
         i18n,
     })
 }
@@ -839,7 +834,11 @@ async fn login_oidc(
     }
 }
 
-async fn console_callback(console: &ConsoleAuth, query: CallbackQuery, request: Request) -> Response {
+async fn console_callback(
+    console: &ConsoleAuth,
+    query: CallbackQuery,
+    request: Request,
+) -> Response {
     let locale = request
         .extensions()
         .get::<RequestLocale>()
@@ -1267,7 +1266,14 @@ mod console_tests {
         body: String,
     }
 
-    async fn call(app: &Router, method: Method, path: &str, cookie: &str, csrf: &str, form: Option<&str>) -> Reply {
+    async fn call(
+        app: &Router,
+        method: Method,
+        path: &str,
+        cookie: &str,
+        csrf: &str,
+        form: Option<&str>,
+    ) -> Reply {
         let mut b = Request::builder()
             .method(method.clone())
             .uri(path)
@@ -1372,7 +1378,13 @@ mod console_tests {
     fn route_inventory_is_complete_enough() {
         let routes = all_ui_routes();
         assert!(routes.len() > 60, "{}", routes.len());
-        for p in ["/ui", "/ui/resources", "/ui/packages", "/ui/settings/users", "/ui/login/local"] {
+        for p in [
+            "/ui",
+            "/ui/resources",
+            "/ui/packages",
+            "/ui/settings/users",
+            "/ui/login/local",
+        ] {
             assert!(routes.iter().any(|r| r == p), "{p}");
         }
     }
@@ -1431,13 +1443,18 @@ mod console_tests {
             let anonymous_role = rt.anonymous().map(|p| p.role);
             for path in &routes {
                 for method in [Method::GET, Method::POST] {
-                    let Some(req) = requirement(&method, path) else { continue };
+                    let Some(req) = requirement(&method, path) else {
+                        continue;
+                    };
                     // The refusal page itself always answers 403.
                     if req == Requirement::Public || path == "/ui/console/denied" {
                         continue;
                     }
                     // POST only where a write exists or the rule differs.
-                    if method == Method::POST && requirement(&Method::GET, path) == Some(req.clone()) && !path.contains("settings") {
+                    if method == Method::POST
+                        && requirement(&Method::GET, path) == Some(req.clone())
+                        && !path.contains("settings")
+                    {
                         continue;
                     }
                     for (who, role, cookie, csrf) in &principals {
@@ -1450,11 +1467,20 @@ mod console_tests {
                             }
                         };
                         let r = call(&app, method.clone(), path, cookie, csrf, None).await;
-                        let ctx = format!("mode={mode} who={who} {method} {path} -> {} {}", r.status, r.location);
+                        let ctx = format!(
+                            "mode={mode} who={who} {method} {path} -> {} {}",
+                            r.status, r.location
+                        );
                         if allowed {
-                            assert!(!signed_in_redirect(&r) && !console_forbidden(&r), "allowed but refused: {ctx}");
+                            assert!(
+                                !signed_in_redirect(&r) && !console_forbidden(&r),
+                                "allowed but refused: {ctx}"
+                            );
                         } else if role.is_none() {
-                            assert!(signed_in_redirect(&r), "anonymous not sent to sign-in: {ctx}");
+                            assert!(
+                                signed_in_redirect(&r),
+                                "anonymous not sent to sign-in: {ctx}"
+                            );
                         } else {
                             assert!(console_forbidden(&r), "role too low not refused: {ctx}");
                         }
@@ -1472,7 +1498,15 @@ mod console_tests {
         let r = call(&app, Method::GET, "/ui/resources", "", "", None).await;
         assert_eq!(r.status, StatusCode::SEE_OTHER);
         assert_eq!(r.location, "/ui/login?next=/ui/resources");
-        let r = call(&app, Method::GET, "/ui/login?next=/ui/resources", "", "", None).await;
+        let r = call(
+            &app,
+            Method::GET,
+            "/ui/login?next=/ui/resources",
+            "",
+            "",
+            None,
+        )
+        .await;
         assert_eq!(r.status, StatusCode::OK);
         assert!(r.body.contains(r#"id="signin-form""#), "{}", r.body);
         assert!(r.body.contains("HealthyMind FHIR Server Manager"));
@@ -1481,11 +1515,27 @@ mod console_tests {
         assert!(zh.body.contains("療心智能"), "zh-Hant title");
 
         // Wrong password: 401 and the page again.
-        let r = call(&app, Method::POST, "/ui/login/local", "", "", Some("username=admin&password=nope&next=/ui/resources")).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/login/local",
+            "",
+            "",
+            Some("username=admin&password=nope&next=/ui/resources"),
+        )
+        .await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED);
         assert!(r.body.contains(r#"role="alert""#));
         // Break-glass sign-in.
-        let r = call(&app, Method::POST, "/ui/login/local", "", "", Some(&format!("username=admin&password={BG}&next=/ui/resources"))).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/login/local",
+            "",
+            "",
+            Some(&format!("username=admin&password={BG}&next=/ui/resources")),
+        )
+        .await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
         assert_eq!(r.location, "/ui/resources");
         let (cookie, csrf) = cookie_of(&r);
@@ -1495,11 +1545,27 @@ mod console_tests {
         let r = call(&app, Method::GET, "/ui/settings/users", &cookie, "", None).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
         assert!(r.body.contains(r#"name="_csrf""#));
-        let r = call(&app, Method::POST, "/ui/settings/users", &cookie, "", Some(&format!("_csrf={csrf}&username=ed&role=editor"))).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/settings/users",
+            &cookie,
+            "",
+            Some(&format!("_csrf={csrf}&username=ed&role=editor")),
+        )
+        .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
         assert!(r.body.contains(r#"id="one-time-password""#));
         // Without the token: refused, rendered as the localized message.
-        let r = call(&app, Method::POST, "/ui/settings/users", &cookie, "", Some("username=ed2")).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/settings/users",
+            &cookie,
+            "",
+            Some("username=ed2"),
+        )
+        .await;
         assert!(console_forbidden(&r), "{} {}", r.status, r.body);
         assert!(rt.store().user_by_name("ed2").await.unwrap().is_none());
 
@@ -1530,21 +1596,54 @@ mod console_tests {
     async fn forced_password_change_through_the_pages() {
         let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
         let (_, otp) = rt
-            .create_user("t", NewUser { username: "newbie".into(), role: Some(ConsoleRole::Viewer), ..Default::default() })
+            .create_user(
+                "t",
+                NewUser {
+                    username: "newbie".into(),
+                    role: Some(ConsoleRole::Viewer),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let otp = otp.unwrap();
         let app = app(rt.clone());
-        let r = call(&app, Method::POST, "/ui/login/local", "", "", Some(&format!("username=newbie&password={otp}&next=/ui"))).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/login/local",
+            "",
+            "",
+            Some(&format!("username=newbie&password={otp}&next=/ui")),
+        )
+        .await;
         assert_eq!(r.location, "/ui/account/password");
         let (cookie, csrf) = cookie_of(&r);
         let r = call(&app, Method::GET, "/ui/resources", &cookie, "", None).await;
         assert_eq!(r.location, "/ui/account/password");
         let r = call(&app, Method::GET, "/ui/account/password", &cookie, "", None).await;
         assert!(r.body.contains(r#"id="must-change""#));
-        let r = call(&app, Method::POST, "/ui/account/password", &cookie, &csrf, Some(&format!("current={otp}&new=a&confirm=a"))).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/account/password",
+            &cookie,
+            &csrf,
+            Some(&format!("current={otp}&new=a&confirm=a")),
+        )
+        .await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
-        let r = call(&app, Method::POST, "/ui/account/password", &cookie, &csrf, Some(&format!("current={otp}&new=calm-River-77-stone&confirm=calm-River-77-stone"))).await;
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/account/password",
+            &cookie,
+            &csrf,
+            Some(&format!(
+                "current={otp}&new=calm-River-77-stone&confirm=calm-River-77-stone"
+            )),
+        )
+        .await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
         let r = call(&app, Method::GET, "/ui", &cookie, "", None).await;
         assert!(!signed_in_redirect(&r) && r.location != "/ui/account/password");
@@ -1563,7 +1662,15 @@ mod console_tests {
         )
         .await;
         let oidc_app = app(rt);
-        let r = call(&oidc_app, Method::GET, "/ui/login?next=/ui/resources", "", "", None).await;
+        let r = call(
+            &oidc_app,
+            Method::GET,
+            "/ui/login?next=/ui/resources",
+            "",
+            "",
+            None,
+        )
+        .await;
         assert!(r.body.contains(r#"id="signin-idp""#));
         assert!(r.body.contains("/ui/login/oidc?next=%2Fui%2Fresources"));
         assert!(r.body.contains(r#"id="signin-break-glass""#));
@@ -1571,7 +1678,15 @@ mod console_tests {
         let r = call(&oidc_app, Method::GET, "/ui/login?local=1", "", "", None).await;
         assert!(r.body.contains(r#"id="signin-form""#));
         // The IdP is down: the start fails with a message, not a crash.
-        let r = call(&oidc_app, Method::GET, "/ui/login/oidc?next=/ui", "", "", None).await;
+        let r = call(
+            &oidc_app,
+            Method::GET,
+            "/ui/login/oidc?next=/ui",
+            "",
+            "",
+            None,
+        )
+        .await;
         assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
 
         let (rt, _) = runtime(env(&[]), Some(BG), opts()).await;
@@ -1580,10 +1695,22 @@ mod console_tests {
         let r = call(&app, Method::GET, "/ui/resources", "", "", None).await;
         assert_ne!(r.status, StatusCode::SEE_OTHER, "mode none: open console");
         let r = call(&app, Method::GET, "/ui/packages", "", "", None).await;
-        assert!(r.location.starts_with("/ui/login?local=1"), "{}", r.location);
+        assert!(
+            r.location.starts_with("/ui/login?local=1"),
+            "{}",
+            r.location
+        );
         let r = call(&app, Method::GET, "/ui/login", "", "", None).await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "nothing to sign in to");
-        let r = call(&app, Method::GET, "/ui/admin/login?next=/ui/packages", "", "", None).await;
+        let r = call(
+            &app,
+            Method::GET,
+            "/ui/admin/login?next=/ui/packages",
+            "",
+            "",
+            None,
+        )
+        .await;
         assert_eq!(r.location, "/ui/login?local=1&next=/ui/packages");
     }
 
@@ -1606,7 +1733,11 @@ mod console_tests {
                 .collect()
         };
         let en = keys("en");
-        assert_eq!(en, keys("zh-Hant"), "zh-Hant/console-auth.ftl must match en");
+        assert_eq!(
+            en,
+            keys("zh-Hant"),
+            "zh-Hant/console-auth.ftl must match en"
+        );
         let main = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../locales/en/main.ftl"),
         )

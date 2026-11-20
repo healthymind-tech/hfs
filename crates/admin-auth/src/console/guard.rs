@@ -144,8 +144,8 @@ pub async fn gate(console: &ConsoleAuth, request: Request) -> GateOutcome {
 
     let sign_in = |anonymous_visitor: bool| {
         let next = original_path_and_query(&request);
-        let local = anonymous_visitor
-            || console.mode() == helios_endpoints::console::ConsoleAuthMode::None;
+        let local =
+            anonymous_visitor || console.mode() == helios_endpoints::console::ConsoleAuthMode::None;
         let target = sign_in_target(&next, local);
         GateOutcome::SignIn {
             target,
@@ -226,7 +226,11 @@ impl GateOutcome {
         };
         match self {
             GateOutcome::Pass(..) => StatusCode::OK.into_response(),
-            GateOutcome::SignIn { target, htmx, refuse } => no_store(redirect(&target, htmx, refuse)),
+            GateOutcome::SignIn {
+                target,
+                htmx,
+                refuse,
+            } => no_store(redirect(&target, htmx, refuse)),
             GateOutcome::ChangePassword { htmx } => {
                 no_store(redirect(CHANGE_PASSWORD_PATH, htmx, false))
             }

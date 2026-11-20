@@ -345,8 +345,14 @@ pub(crate) async fn bind(
 ) -> Response {
     let ctx = ctx!(state, locale, rv, rt, console, resolved, csrf);
     let f = form(&body);
-    let subject = f.get("subject").map(|s| s.trim().to_string()).unwrap_or_default();
-    let endpoint = f.get("endpoint").map(|s| s.trim().to_string()).unwrap_or_default();
+    let subject = f
+        .get("subject")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let endpoint = f
+        .get("endpoint")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let Some(role) = f.get("role").and_then(|r| ConsoleRole::parse(r)) else {
         return outcome(&ctx, Err(ConsoleError::NotFound), None).await;
     };

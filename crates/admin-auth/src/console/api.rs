@@ -151,7 +151,12 @@ fn if_match(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(header::IF_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().trim_start_matches("W/").trim_matches('"').to_string())
+        .map(|v| {
+            v.trim()
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .to_string()
+        })
         .and_then(|v| v.parse().ok())
 }
 
@@ -233,7 +238,14 @@ async fn put_settings(
     }
     let proposed: ConsoleAuthSettings = match serde_json::from_value(body) {
         Ok(s) => s,
-        Err(e) => return outcome(StatusCode::UNPROCESSABLE_ENTITY, "invalid", &e.to_string(), None),
+        Err(e) => {
+            return outcome(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid",
+                &e.to_string(),
+                None,
+            );
+        }
     };
     match c
         .save_settings(&actor.0, proposed, secret, expected, OidcSwitchCheck::Probe)
@@ -348,7 +360,9 @@ struct UpdateBody {
 
 mod double_option {
     use serde::{Deserialize, Deserializer};
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Option<String>>, D::Error> {
         Option::<String>::deserialize(d).map(Some)
     }
 }

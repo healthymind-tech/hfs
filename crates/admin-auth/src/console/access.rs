@@ -171,7 +171,13 @@ mod tests {
     fn classification() {
         assert_eq!(req(Method::GET, "/Patient"), None);
         assert_eq!(req(Method::GET, "/uix"), None);
-        for p in ["/ui/login", "/ui/login/local", "/ui/callback", "/ui/assets/app.css", "/ui/about"] {
+        for p in [
+            "/ui/login",
+            "/ui/login/local",
+            "/ui/callback",
+            "/ui/assets/app.css",
+            "/ui/about",
+        ] {
             assert_eq!(req(Method::GET, p), Some(Requirement::Public), "{p}");
         }
         assert_eq!(req(Method::POST, "/ui/logout"), Some(Requirement::Public));
@@ -192,10 +198,22 @@ mod tests {
             assert_eq!(req(Method::GET, p), Some(Requirement::Role(Admin)), "{p}");
         }
         assert_eq!(req(Method::GET, "/ui"), Some(Requirement::Role(Viewer)));
-        assert_eq!(req(Method::GET, "/ui/resources"), Some(Requirement::Role(Viewer)));
-        assert_eq!(req(Method::GET, "/ui/sync"), Some(Requirement::Role(Viewer)));
-        assert_eq!(req(Method::POST, "/ui/sync/jobs"), Some(Requirement::Role(Admin)));
-        assert_eq!(req(Method::POST, "/ui/version"), Some(Requirement::Role(Viewer)));
+        assert_eq!(
+            req(Method::GET, "/ui/resources"),
+            Some(Requirement::Role(Viewer))
+        );
+        assert_eq!(
+            req(Method::GET, "/ui/sync"),
+            Some(Requirement::Role(Viewer))
+        );
+        assert_eq!(
+            req(Method::POST, "/ui/sync/jobs"),
+            Some(Requirement::Role(Admin))
+        );
+        assert_eq!(
+            req(Method::POST, "/ui/version"),
+            Some(Requirement::Role(Viewer))
+        );
         assert_eq!(
             req(Method::POST, "/ui/editor/render"),
             Some(Requirement::Role(Viewer))
@@ -204,7 +222,10 @@ mod tests {
             req(Method::POST, "/ui/sql/view-definitions"),
             Some(Requirement::Role(Editor))
         );
-        assert_eq!(req(Method::DELETE, "/ui/anything"), Some(Requirement::Role(Editor)));
+        assert_eq!(
+            req(Method::DELETE, "/ui/anything"),
+            Some(Requirement::Role(Editor))
+        );
         assert_eq!(
             req(Method::GET, "/ui/e/lab/data/Patient"),
             Some(Requirement::EndpointRole("lab".into(), Viewer))
@@ -231,19 +252,43 @@ mod tests {
             via: ConsoleVia::Local,
         };
         assert!(admin_api_allows(&p, &Method::GET, "/admin/endpoints"));
-        assert!(admin_api_allows(&p, &Method::GET, "/admin/endpoints/lab/history"));
+        assert!(admin_api_allows(
+            &p,
+            &Method::GET,
+            "/admin/endpoints/lab/history"
+        ));
         assert!(!admin_api_allows(&p, &Method::PUT, "/admin/endpoints/lab"));
         assert!(!admin_api_allows(&p, &Method::GET, "/admin/console/users"));
         assert!(!admin_api_allows(&p, &Method::GET, "/admin/packages"));
         p.endpoint_roles.insert("lab".into(), Admin);
         assert!(admin_api_allows(&p, &Method::PUT, "/admin/endpoints/lab"));
-        assert!(admin_api_allows(&p, &Method::POST, "/admin/endpoints/lab/$disable"));
-        assert!(!admin_api_allows(&p, &Method::DELETE, "/admin/endpoints/lab"));
+        assert!(admin_api_allows(
+            &p,
+            &Method::POST,
+            "/admin/endpoints/lab/$disable"
+        ));
+        assert!(!admin_api_allows(
+            &p,
+            &Method::DELETE,
+            "/admin/endpoints/lab"
+        ));
         assert!(!admin_api_allows(&p, &Method::POST, "/admin/endpoints"));
-        assert!(!admin_api_allows(&p, &Method::POST, "/admin/secrets/$rewrap"));
-        assert!(!admin_api_allows(&p, &Method::PUT, "/admin/endpoints/other"));
+        assert!(!admin_api_allows(
+            &p,
+            &Method::POST,
+            "/admin/secrets/$rewrap"
+        ));
+        assert!(!admin_api_allows(
+            &p,
+            &Method::PUT,
+            "/admin/endpoints/other"
+        ));
         p.role = Admin;
-        assert!(admin_api_allows(&p, &Method::DELETE, "/admin/endpoints/lab"));
+        assert!(admin_api_allows(
+            &p,
+            &Method::DELETE,
+            "/admin/endpoints/lab"
+        ));
         assert!(admin_api_allows(&p, &Method::GET, "/admin/console/users"));
     }
 }

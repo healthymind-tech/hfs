@@ -152,9 +152,10 @@ pub fn role_values(tokens: &OidcTokens, role_claim: &str) -> Vec<String> {
 
 /// The role these tokens map to under `settings` (`None` = no access).
 pub fn map_role(tokens: &OidcTokens, settings: &OidcClientSettings) -> Option<ConsoleRole> {
-    settings
-        .role_mapping
-        .resolve(&role_values(tokens, &settings.role_claim), settings.default_role)
+    settings.role_mapping.resolve(
+        &role_values(tokens, &settings.role_claim),
+        settings.default_role,
+    )
 }
 
 #[cfg(test)]
@@ -204,7 +205,10 @@ mod tests {
             serde_json::json!({"realm_access": {"roles": ["hfs-admin"]}}),
             serde_json::json!({"realm_access": {"roles": ["hfs-editor"]}}),
         );
-        assert_eq!(role_values(&t, &s.role_claim), vec!["hfs-admin", "hfs-editor"]);
+        assert_eq!(
+            role_values(&t, &s.role_claim),
+            vec!["hfs-admin", "hfs-editor"]
+        );
         assert_eq!(map_role(&t, &s), Some(ConsoleRole::Admin));
         let none = tokens(serde_json::json!({}), serde_json::Value::Null);
         assert_eq!(map_role(&none, &s), None);
