@@ -54,6 +54,8 @@ ring = "0.17"
 tracing = "0.1"
 
 [dev-dependencies]
+# tests/bench_document.rs: BENCH_TRACE=<filter> prints the timing spans.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros"] }

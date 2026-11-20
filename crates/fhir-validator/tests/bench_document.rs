@@ -38,6 +38,12 @@ async fn document_validation_cost() {
     };
     let n: usize = std::env::var("BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
     let resource: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    if let Ok(filter) = std::env::var("BENCH_TRACE") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let core = core_registry(FhirVersion::R4);
     let resolver: Arc<dyn SchemaResolver> = match std::env::var_os("BENCH_SDS") {
         Some(dir) => {
@@ -49,6 +55,10 @@ async fn document_validation_cost() {
                     continue;
                 }
                 let sd: Value = serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+                // As the server: a stored definition never shadows a core one.
+                if sd.get("url").and_then(Value::as_str).is_some_and(|u| core.resolve(u).is_some()) {
+                    continue;
+                }
                 if let Ok(c) = convert(&sd) {
                     if overlay.insert(c.schema) {
                         count += 1;

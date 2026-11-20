@@ -386,6 +386,8 @@ async fn natively_decided_invariants_agree_with_fhirpath() {
                 "contained": [{"resourceType": "Organization", "id": "o", "meta": {"versionId": "2"},
                     "contained": [{"resourceType": "Organization", "id": "p"}]}],
                 "managingOrganization": {"reference": "#o"},
+                "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>ok</p></div>"},
+                "generalPractitioner": [{"reference": "#missing"}, {"identifier": {"value": "x"}}, {"reference": "Practitioner/1"}],
                 "name": [{"given": ["A", null], "_given": [null, {"extension": [{"url": "http://x/e", "valueString": "x"}]}]}],
                 "_birthDate": {"id": "only"},
                 "extension": [{"url": "http://x/e", "valueString": "x", "extension": [{"url": "a", "valueBoolean": true}]}]}},
@@ -397,14 +399,19 @@ async fn natively_decided_invariants_agree_with_fhirpath() {
         json!({"resourceType": "Bundle", "type": "transaction", "entry": [
             {"fullUrl": "urn:uuid:1", "resource": {"resourceType": "Patient", "active": true},
              "request": {"method": "POST", "url": "Patient"}},
-            {"fullUrl": "urn:uuid:2", "resource": {"resourceType": "Patient", "active": true}}
+            {"fullUrl": "urn:uuid:2", "resource": {"resourceType": "Patient", "active": true,
+                "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><script>x</script></div>"},
+                "contained": [{"resourceType": "Organization", "id": "o2", "partOf": {"reference": "#o3"}},
+                              {"resourceType": "Organization", "id": "o3",
+                               "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"> </div>"}}],
+                "managingOrganization": {"reference": "#o2"}}}
         ]}),
     ];
     let validator = Validator::new(core_registry(FhirVersion::R4));
     let evaluator = FhirPathConstraintEvaluator::new();
     for resource in &cases {
         let outcome = validator.validate_sync(resource, &ValidationOptions::default());
-        let native_ids = ["ele-1", "ext-1", "dom-2", "dom-4", "dom-5", "bdl-1", "bdl-2", "bdl-3", "bdl-4", "bdl-5", "bdl-7", "bdl-8"];
+        let native_ids = ["ele-1", "ext-1", "dom-2", "dom-4", "dom-5", "bdl-1", "bdl-2", "bdl-3", "bdl-4", "bdl-5", "bdl-7", "bdl-8", "ref-1", "txt-1", "txt-2"];
         let constraints: Vec<DeferredConstraint<'_>> = outcome
             .deferred
             .iter()

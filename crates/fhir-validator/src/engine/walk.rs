@@ -254,8 +254,21 @@ impl<'a> WalkCtx<'a> {
             return true;
         }
         self.conformance.borrow_mut().insert(key.clone(), true);
+        let started = std::time::Instant::now();
         let outcome = self.nested_outcome(value, profile);
         let conforms = outcome.errors.iter().all(|e| e.severity != Severity::Error);
+        if tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::TRACE) {
+            let at = self.path.render_dotted();
+            tracing::trace!(
+                target: "helios_fhir_validator::timing",
+                at = %at,
+                profile,
+                nesting = self.nesting,
+                conforms,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "nested conformance walk"
+            );
+        }
         self.conformance.borrow_mut().insert(key, conforms);
         conforms
     }

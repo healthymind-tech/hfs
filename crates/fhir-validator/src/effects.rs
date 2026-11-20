@@ -516,11 +516,18 @@ const EXT_1: &str = "extension.exists() != value.exists()";
 /// - ext-1 `extension.exists() != value.exists()`: exactly one of nested
 ///   extensions and a `value[x]` (a value carried only by its `_valueX`
 ///   sidecar exists too).
-fn native_outcome(resource: &Value, path: &str, id: &str, expression: &str) -> Option<ConstraintOutcome> {
+fn native_outcome(
+    resource: &Value,
+    version: FhirVersion,
+    path: &str,
+    id: &str,
+    expression: &str,
+) -> Option<ConstraintOutcome> {
     let ele1 = id == "ele-1" && expression == ELE_1;
     let ext1 = id == "ext-1" && expression == EXT_1;
     if !ele1 && !ext1 {
-        return native_resource_rule(resource, path, id, expression);
+        return native_resource_rule(resource, path, id, expression)
+            .or_else(|| native_type_rule(resource, version, path, id, expression));
     }
     // Navigate; remember the parent object and key for primitives.
     let mut segments = path.split('.');
@@ -725,11 +732,120 @@ fn native_resource_rule(
             None => return Some(ConstraintOutcome::Passed),
         }
     }
+    // bdl-8 on an entry without fullUrl evaluates to empty (`{}.not()`),
+    // which only the evaluator's empty-result policy can decide.
+    if id == "bdl-8" {
+        let entries: &[Value] = match node {
+            Value::Array(a) => a,
+            other => std::slice::from_ref(other),
+        };
+        if entries.iter().any(|e| e.get("fullUrl").is_none()) {
+            return None;
+        }
+    }
     let ok = match node {
         Value::Array(nodes) => nodes.iter().all(rule),
         Value::Object(_) => rule(node),
         _ => true,
     };
+    Some(if ok {
+        ConstraintOutcome::Passed
+    } else {
+        ConstraintOutcome::Failed
+    })
+}
+
+/// ref-1 and the narrative invariants txt-1 / txt-2 (R4 expressions)
+/// decided without FHIRPath. ref-1 needs `%rootResource` (the resource
+/// holding the Reference, or its container when that one is contained), as
+/// the evaluator binds it; a Reference without `reference` evaluates to empty
+/// and is left to the evaluator's empty-result policy.
+fn native_type_rule(
+    resource: &Value,
+    version: FhirVersion,
+    path: &str,
+    id: &str,
+    expression: &str,
+) -> Option<ConstraintOutcome> {
+    const REF_1: &str = "reference.startsWith('#').not() or (reference.substring(1).trace('url') in %rootResource.contained.id.trace('ids'))";
+    let txt = matches!((id, expression), ("txt-1" | "txt-2", "htmlChecks()"));
+    if !(txt || (id == "ref-1" && expression == REF_1)) {
+        return None;
+    }
+    #[cfg(not(feature = "fhirpath"))]
+    if txt {
+        return None;
+    }
+    #[cfg(feature = "R6")]
+    if txt && matches!(version, FhirVersion::R6) {
+        return None; // R6 folds the content rule into txt-1
+    }
+    let _ = version;
+    // Navigate, remembering the resources passed and how each was reached.
+    let mut node = resource;
+    let mut resources: Vec<(&Value, bool)> = vec![(resource, false)];
+    let mut last_key = "";
+    for segment in path.split('.').skip(1) {
+        let next = match segment.parse::<usize>() {
+            Ok(index) => node.as_array().and_then(|a| a.get(index)),
+            Err(_) => {
+                last_key = segment;
+                node.get(segment)
+            }
+        };
+        let Some(next) = next else {
+            return Some(ConstraintOutcome::Passed);
+        };
+        node = next;
+        if node.get("resourceType").and_then(Value::as_str).is_some() {
+            resources.push((node, last_key == "contained"));
+        }
+    }
+    let items: &[Value] = match node {
+        Value::Array(a) => a,
+        other => std::slice::from_ref(other),
+    };
+    if txt {
+        #[cfg(feature = "fhirpath")]
+        {
+            let check: fn(&str) -> bool = if id == "txt-1" {
+                helios_fhirpath::check_html_names
+            } else {
+                helios_fhirpath::check_html_content
+            };
+            // `htmlChecks()` on anything but one xhtml string is false.
+            let ok = items.iter().all(|v| v.as_str().is_some_and(check));
+            return Some(if ok {
+                ConstraintOutcome::Passed
+            } else {
+                ConstraintOutcome::Failed
+            });
+        }
+        #[cfg(not(feature = "fhirpath"))]
+        return None;
+    }
+    // ref-1
+    let at = resources.len() - 1;
+    let root = if resources[at].1 && at > 0 {
+        resources[at - 1].0
+    } else {
+        resources[at].0
+    };
+    let contained: Vec<&str> = root
+        .get("contained")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("id").and_then(Value::as_str))
+        .collect();
+    let mut ok = true;
+    for item in items {
+        match item.get("reference").and_then(Value::as_str) {
+            None => return None,
+            Some(r) if !r.starts_with('#') => {}
+            Some(r) => ok &= contained.contains(&&r[1..]),
+        }
+    }
     Some(if ok {
         ConstraintOutcome::Passed
     } else {
@@ -831,7 +947,7 @@ async fn execute_constraints(
     // are most of the invariants evaluated.
     let native: Vec<Option<ConstraintOutcome>> = selected
         .iter()
-        .map(|(path, id, expression, ..)| native_outcome(resource, path, id, expression))
+        .map(|(path, id, expression, ..)| native_outcome(resource, version, path, id, expression))
         .collect();
     let refs: Vec<DeferredConstraint<'_>> = selected
         .iter()
