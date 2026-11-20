@@ -8,6 +8,9 @@
 //! server's admin guard in front of the app; a small layer stands in for it
 //! by inserting `helios_admin_auth::AdminUser`.
 
+#[path = "admin_endpoints_suite/mod.rs"]
+mod suite;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +25,16 @@ use helios_rest::{OperationsBundle, ServerConfig};
 use serde_json::{Value, json};
 
 async fn server(manager: bool, admin: bool) -> TestServer {
+    server_with(manager, admin, None).await.0
+}
+
+/// Also returns the runtime (when the manager is on); `sink` = an audit
+/// pipeline for the app.
+async fn server_with(
+    manager: bool,
+    admin: bool,
+    sink: Option<Arc<suite::CaptureSink>>,
+) -> (TestServer, Option<EndpointRuntime>) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -56,17 +69,23 @@ async fn server(manager: bool, admin: bool) -> TestServer {
     } else {
         None
     };
+    let audit = sink.map(|s| {
+        Arc::new(helios_audit::AuditMiddlewareState::new(
+            s,
+            helios_audit::AuditConfig::default(),
+        ))
+    });
     let app = helios_rest::create_app_with_auth_bulk_settings_and_ops(
         backend,
         config,
         helios_auth::AuthConfig::default(),
         None,
-        None,
+        audit,
         None,
         None,
         None,
         OperationsBundle {
-            endpoints: runtime,
+            endpoints: runtime.clone(),
             ..Default::default()
         },
     );
@@ -81,7 +100,7 @@ async fn server(manager: bool, admin: bool) -> TestServer {
     } else {
         app
     };
-    TestServer::new(app).unwrap()
+    (TestServer::new(app).unwrap(), runtime)
 }
 
 #[tokio::test]
@@ -177,4 +196,87 @@ async fn not_mounted_with_the_manager_off() {
         s.get("/admin/packages/config").await.status_code(),
         StatusCode::NOT_FOUND
     );
+}
+
+/// The admin events (DICOM 110100) the app's audit sink received.
+fn admin_events(sink: &suite::CaptureSink) -> Vec<(Option<String>, Value)> {
+    sink.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| e.to_string().contains("\"110100\""))
+        .cloned()
+        .collect()
+}
+
+/// What must be equal between two admin events of the same kind.
+fn shape(e: &Value) -> Value {
+    json!({
+        "type": e["type"],
+        "action": e["action"],
+        "outcome": e["outcome"],
+        "source": e["source"],
+        "what": e["entity"][0]["what"],
+        "entityType": e["entity"][0]["type"],
+        "detailNames": e["entity"][0]["detail"].as_array().map(|d| d.iter().map(|x| x["type"].clone()).collect::<Vec<_>>()),
+        "agentWho": e["agent"][0]["who"],
+        "tags": e["meta"]["tag"],
+    })
+}
+
+#[tokio::test]
+async fn console_writes_share_the_api_service_and_its_audit_trail() {
+    let sink = Arc::new(suite::CaptureSink::default());
+    let (s, runtime) = server_with(true, true, Some(sink.clone())).await;
+    let runtime = runtime.unwrap();
+    // The app published its admin service on the runtime.
+    let admin = runtime.admin_api().expect("published by build_app").clone();
+
+    let r = s
+        .post("/admin/endpoints")
+        .json(&json!({"name": "lab"}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::CREATED, "{}", r.text());
+
+    // API path.
+    let r = s
+        .patch("/admin/endpoints/lab")
+        .add_header(header::IF_MATCH, HeaderValue::from_static("*"))
+        .json(&json!({"displayName": "Lab (API)"}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let api_event = admin_events(&sink).last().cloned().unwrap();
+
+    // Console path: the same service, a typed edit by the same actor.
+    let actor = helios_endpoints::Actor {
+        subject: "admin".into(),
+        display: Some("admin".into()),
+        via: "admin-password".into(),
+    };
+    let current = admin.get_endpoint("lab").await.unwrap();
+    let mut spec = current.spec.clone();
+    spec.display_name = "Lab (console)".into();
+    admin
+        .update_endpoint(
+            "lab",
+            current.revision,
+            spec,
+            Default::default(),
+            &actor,
+            "patched",
+        )
+        .await
+        .unwrap();
+    let console_event = admin_events(&sink).last().cloned().unwrap();
+
+    assert_eq!(api_event.0.as_deref(), Some("default"));
+    assert_eq!(console_event.0, api_event.0, "same tenant");
+    assert_eq!(shape(&console_event.1), shape(&api_event.1));
+    assert!(console_event.1.to_string().contains("Endpoint/lab"));
+    // And the console's write is visible through the API.
+    let got: Value = s.get("/admin/endpoints/lab").await.json();
+    assert_eq!(got["displayName"], "Lab (console)");
+    // Statistics and audit search come with the shared service.
+    assert!(admin.endpoint_stats("lab", 600).await.is_ok());
+    assert!(admin.endpoint_audit("lab", 10, None).await.is_ok());
 }

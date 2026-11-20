@@ -89,6 +89,10 @@ where
             )
             .server_base(state.base_url())
             .build();
+    // Publish it for the manager console (one state for both, so console
+    // writes reach the same audit sink, statistics and audit search); a
+    // second app on the same runtime reuses the first one's service.
+    let admin = runtime.admin_api.get_or_init(|| admin).clone();
     routes(admin)
 }
 
