@@ -2358,6 +2358,97 @@ fn element_types(resolver: &dyn SchemaResolver, set: &SchemaSet) -> Vec<String> 
 /// layer declares `foo` with a primitive type, it mirrors `foo`'s
 /// array-vs-singular shape, and its content (per item for arrays, with
 /// `null` gaps allowed) validates against the resolver's `Element` schema.
+/// `mustHaveValue` / `valueAlternatives` on a primitive present only
+/// through its sidecar (HL7 validator: the R5 value controls, also read from
+/// the 5.0 cross-version extensions in R4 profiles).
+fn value_controls(
+    ctx: &mut WalkCtx<'_>,
+    elset: &SchemaSet,
+    base_key: &str,
+    key: &str,
+    value: &Value,
+    base_value: Option<&Value>,
+) {
+    let must = elset
+        .iter()
+        .find(|(_, s)| s.must_have_value == Some(true))
+        .map(|(k, _)| k.to_string());
+    let alternatives: Option<(String, Vec<String>)> = elset
+        .iter()
+        .find_map(|(k, s)| s.value_alternatives.clone().map(|a| (k.to_string(), a)));
+    if must.is_none() && alternatives.is_none() {
+        return;
+    }
+    // (sidecar item, its index) for every item without a value.
+    let missing: Vec<(&Value, Option<usize>)> = match value {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| {
+                !item.is_null()
+                    && base_value
+                        .and_then(Value::as_array)
+                        .and_then(|b| b.get(*i))
+                        .is_none_or(Value::is_null)
+            })
+            .map(|(i, item)| (item, Some(i)))
+            .collect(),
+        Value::Null => Vec::new(),
+        side if base_value.is_none_or(Value::is_null) => vec![(side, None)],
+        _ => Vec::new(),
+    };
+    if missing.is_empty() {
+        return;
+    }
+    let profile_of = |k: &str| k.split('#').next().unwrap_or(k).to_string();
+    ctx.path.pop();
+    ctx.path.push_key(base_key);
+    let element: String = ctx
+        .path
+        .render_dotted()
+        .split('.')
+        .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(".");
+    for (side, index) in missing {
+        if let Some(i) = index {
+            ctx.path.push_index(i);
+        }
+        if let Some(profile) = &must {
+            ctx.error(
+                ErrorKind::Required,
+                format!(
+                    "The element definition ``{element}`` in the profile '{}' requires that a value be present in this element",
+                    profile_of(profile)
+                ),
+            );
+        } else if let Some((profile, allowed)) = &alternatives {
+            let present = side
+                .get("extension")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("url").and_then(Value::as_str))
+                .any(|u| allowed.iter().any(|a| a.split('|').next() == Some(u)));
+            if !present {
+                ctx.error(
+                    ErrorKind::Required,
+                    format!(
+                        "The element definition ``{element}`` in the profile '{}' requires that if a value is not present, one of the extensions {} must be present",
+                        profile_of(profile),
+                        allowed.join(", ")
+                    ),
+                );
+            }
+        }
+        if index.is_some() {
+            ctx.path.pop();
+        }
+    }
+    ctx.path.pop();
+    ctx.path.push_key(key);
+}
+
 fn handle_sidecar<'a>(
     ctx: &mut WalkCtx<'a>,
     set: &SchemaSet,
@@ -2427,6 +2518,7 @@ fn handle_sidecar<'a>(
             ctx.path.push_key(key);
         }
     }
+    value_controls(ctx, &base_elset, base_key, key, value, base_value);
     match (expect_array, value.is_array()) {
         (true, false) => ctx.error(ErrorKind::NotArray, errors::msg_not_array(key)),
         (false, true) => ctx.error(ErrorKind::NotSingular, errors::msg_not_singular(key)),
@@ -2741,6 +2833,8 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         max_length,
         min_length,
         max_size,
+        must_have_value,
+        value_alternatives,
         binding,
         constraints,
         refers,

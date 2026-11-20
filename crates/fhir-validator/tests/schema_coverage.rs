@@ -107,6 +107,8 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             max_length: Some(0),
             min_length: Some(0),
             max_size: Some(0),
+            must_have_value: Some(true),
+            value_alternatives: Some(Vec::new()),
             binding: Some(Binding {
                 value_set: String::new(),
                 strength: None,
@@ -186,6 +188,9 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
             "maxLength",
             "minLength",
             "maxSize",
+            // R5 value controls (line V2): only IG / test profiles use them.
+            "mustHaveValue",
+            "valueAlternatives",
         ],
         // Unexercised rather than unimplemented: the core spec bundles contain
         // no re-slicing, so an IG corpus would be needed to cover these.

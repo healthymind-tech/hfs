@@ -439,3 +439,41 @@ async fn natively_decided_invariants_agree_with_fhirpath() {
         }
     }
 }
+
+/// fhir-test-cases `patient-value-present-*` / `patient-value-alternative-*`
+/// (R5 value controls via the 5.0 cross-version extensions).
+#[tokio::test]
+async fn must_have_value_and_value_alternatives() {
+    use helios_fhir_validator::{CompositeResolver, SchemaRegistry};
+    let sd = |url: &str, ext: Value| json!({
+        "resourceType": "StructureDefinition", "url": url, "name": "P", "status": "active",
+        "kind": "resource", "abstract": false, "type": "Patient", "derivation": "constraint",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "differential": {"element": [{"id": "Patient.active", "path": "Patient.active", "min": 1, "extension": [ext]}]}
+    });
+    let present = sd("http://example.org/vp", json!({"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.mustHaveValue", "valueBoolean": true}));
+    let alternative = sd("http://example.org/va", json!({"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.valueAlternatives", "valueCanonical": "http://hl7.org/fhir/StructureDefinition/data-absent-reason"}));
+    let mut overlay = SchemaRegistry::new();
+    for s in [&present, &alternative] {
+        assert!(overlay.insert(helios_fhir_validator::converter::convert(s).unwrap().schema));
+    }
+    let resolver: std::sync::Arc<dyn SchemaResolver> = std::sync::Arc::new(CompositeResolver::new(vec![
+        std::sync::Arc::new(overlay),
+        core_registry(FhirVersion::R4),
+    ]));
+    let validator = Validator::new(resolver);
+    let run = |ext_url: &str, profile: &str| {
+        let patient = json!({"resourceType": "Patient", "_active": {"extension": [{"url": ext_url, "valueCode": "unknown"}]}});
+        let opts = ValidationOptions { profiles: vec![profile.to_string()], ..Default::default() };
+        validator.validate_sync(&patient, &opts).errors
+    };
+    let dar = "http://hl7.org/fhir/StructureDefinition/data-absent-reason";
+    let nf = "http://hl7.org/fhir/StructureDefinition/iso21090-nullFlavor";
+    let has = |errs: &[ValidationError], text: &str| errs.iter().any(|e| e.path == "Patient.active" && e.message.contains(text));
+    assert!(has(&run(dar, "http://example.org/vp"), "requires that a value be present"));
+    assert!(!has(&run(dar, "http://example.org/va"), "if a value is not present"));
+    assert!(has(&run(nf, "http://example.org/va"), "if a value is not present"));
+    let valued = json!({"resourceType": "Patient", "active": true});
+    let opts = ValidationOptions { profiles: vec!["http://example.org/vp".into()], ..Default::default() };
+    assert!(validator.validate_sync(&valued, &opts).errors.iter().all(|e| !e.message.contains("requires that")));
+}
