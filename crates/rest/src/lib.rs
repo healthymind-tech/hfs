@@ -1319,14 +1319,11 @@ where
     // decides per request (an endpoint's own `cors` section, or the global
     // `HFS_CORS_*` layer for inherited endpoints and the console surface).
     let router = match &endpoints {
-        Some(runtime) => router.layer(axum::middleware::from_fn_with_state(
-            endpoint::cors::EndpointCors::new(
-                Arc::clone(&runtime.registry),
-                config.enable_cors.then(|| build_cors_layer(&config)),
-                config.cors_methods.clone(),
-                config.cors_headers.clone(),
-            ),
-            endpoint::cors::endpoint_cors,
+        Some(runtime) => router.layer(endpoint::cors::EndpointCors::new(
+            Arc::clone(&runtime.registry),
+            config.enable_cors.then(|| build_cors_layer(&config)),
+            config.cors_methods.clone(),
+            config.cors_headers.clone(),
         )),
         None if config.enable_cors => {
             let cors = build_cors_layer(&config);

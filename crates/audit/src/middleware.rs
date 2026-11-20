@@ -431,12 +431,19 @@ fn site_of(base_url: &str) -> Option<String> {
 }
 
 /// The `hfs-endpoint` extension naming the endpoint an event belongs to.
+///
+/// Built directly rather than through serde: deserializing an `Extension`
+/// (its `value[x]` choice spans every data type) costs ~100 KiB of stack in
+/// a debug build, on every audited request.
 fn endpoint_extension(name: &str) -> Option<crate::fhir_model::Extension> {
-    serde_json::from_value(serde_json::json!({
-        "url": crate::context::ENDPOINT_EXTENSION_URL,
-        "valueString": name,
-    }))
-    .ok()
+    Some(crate::fhir_model::Extension {
+        id: None,
+        extension: None,
+        url: crate::context::ENDPOINT_EXTENSION_URL.to_string().into(),
+        value: Some(crate::fhir_model::ExtensionValue::String(
+            crate::helpers::fhir_string(name),
+        )),
+    })
 }
 
 /// The request path without its tenant prefix (or the FHIR endpoint prefix

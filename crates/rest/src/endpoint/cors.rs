@@ -17,20 +17,24 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use axum::{
-    extract::{Request, State},
+    extract::Request,
     http::{HeaderName, HeaderValue, Method},
-    middleware::Next,
     response::Response,
 };
 use helios_endpoints::{CorsSettings, EndpointRegistry, Resolution};
-use tower::{Layer, ServiceExt};
+use tower::{Layer, Service, ServiceExt};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, Any, CorsLayer};
 
 /// First path segments that are never FHIR endpoints' CORS business.
 const NON_FHIR_PREFIXES: &[&str] = &["ui", "admin", "console", "metrics"];
 
-/// State of [`endpoint_cors`].
+/// The endpoint-aware CORS layer (a tower [`Layer`]).
 #[derive(Clone)]
 pub struct EndpointCors {
     registry: Arc<EndpointRegistry>,
@@ -151,22 +155,47 @@ pub fn build_layer(
     Some(cors)
 }
 
-/// The CORS middleware (see the module docs).
-pub async fn endpoint_cors(
-    State(state): State<EndpointCors>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let chosen = match state.layer_for(request.uri().path()) {
-        Ok(layer) => layer,
-        Err(()) => state.global.clone(),
-    };
-    match chosen {
-        Some(layer) => match layer.layer(next).oneshot(request).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        },
-        None => next.run(request).await,
+impl<S> Layer<S> for EndpointCors {
+    type Service = EndpointCorsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        EndpointCorsService {
+            inner,
+            state: self.clone(),
+        }
+    }
+}
+
+/// The endpoint-aware CORS service (see the module docs). A hand-written
+/// service with one boxed future, to keep its stack frame small.
+#[derive(Clone)]
+pub struct EndpointCorsService<S> {
+    inner: S,
+    state: EndpointCors,
+}
+
+impl<S> Service<Request> for EndpointCorsService<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let chosen = match self.state.layer_for(request.uri().path()) {
+            Ok(layer) => layer,
+            Err(()) => self.state.global.clone(),
+        };
+        match chosen {
+            Some(layer) => Box::pin(layer.layer(self.inner.clone()).oneshot(request)),
+            None => Box::pin(self.inner.call(request)),
+        }
     }
 }
 
@@ -205,9 +234,7 @@ mod tests {
             "*",
             "*",
         );
-        Router::new()
-            .fallback(get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(state, endpoint_cors))
+        Router::new().fallback(get(|| async { "ok" })).layer(state)
     }
 
     async fn origin_header(app: &Router, path: &str, origin: &str) -> Option<String> {

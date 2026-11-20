@@ -20,21 +20,27 @@
 //!   `Retry-After` while the endpoint is `provisioning`.
 //! * `NotFound` — `404` OperationOutcome (no default endpoint).
 //!
+//! Implemented as a tower [`Layer`]/[`Service`] ([`DispatchLayer`]).
+//!
 //! The snapshot is taken once, so a request finishes on the configuration it
 //! started with even if a reload swaps the registry meanwhile.
 
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::{
     Router,
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::{HeaderValue, StatusCode, header},
-    middleware::Next,
     response::{IntoResponse, Response},
 };
 use helios_endpoints::{EndpointRegistry, EndpointStatus, Resolution, ResolvedEndpoint};
+use tower::{Layer, Service};
 
 use super::RequestSnapshot;
 use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath};
@@ -43,18 +49,78 @@ use crate::middleware::tenant_prefix::{ExtractedTenantFromUrl, OriginalPath};
 pub const PROVISIONING_RETRY_AFTER_SECS: u32 = 30;
 
 /// Wraps `fhir_stack` in the dispatcher reading `registry`.
+///
+/// The stack's only route is its fallback (the FHIR router behind the
+/// tenant-prefix rewrite, wrapped by the auth layers), so a layer on it wraps
+/// that fallback and its rewrite happens before the inner router matches — no
+/// extra `Router` level per request.
 pub fn install(fhir_stack: Router, registry: Arc<EndpointRegistry>) -> Router {
-    Router::new()
-        .fallback_service(fhir_stack)
-        .layer(axum::middleware::from_fn_with_state(registry, dispatch))
+    fhir_stack.layer(DispatchLayer { registry })
 }
 
-/// The dispatcher middleware (see the module docs).
-pub async fn dispatch(
-    State(registry): State<Arc<EndpointRegistry>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
+/// Tower layer of the dispatcher. A hand-written service rather than
+/// `middleware::from_fn`: the request is prepared synchronously in `call` and
+/// the inner future is boxed once, so the dispatcher adds a single small
+/// frame to the request's stack depth (debug builds run close to the 2 MiB
+/// worker stack on heavy paths).
+#[derive(Clone)]
+pub struct DispatchLayer {
+    registry: Arc<EndpointRegistry>,
+}
+
+impl<S> Layer<S> for DispatchLayer {
+    type Service = Dispatch<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Dispatch {
+            inner,
+            registry: Arc::clone(&self.registry),
+        }
+    }
+}
+
+/// The dispatcher service (see the module docs).
+#[derive(Clone)]
+pub struct Dispatch<S> {
+    inner: S,
+    registry: Arc<EndpointRegistry>,
+}
+
+impl<S> Service<Request> for Dispatch<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request) -> Self::Future {
+        match prepare(&self.registry, &mut request) {
+            Ok((resolved, name)) => {
+                let inner = self.inner.call(request);
+                let started = Instant::now();
+                Box::pin(super::scope(resolved, async move {
+                    let response = inner.await?;
+                    record(&name, response.status(), started);
+                    Ok(response)
+                }))
+            }
+            Err(response) => Box::pin(std::future::ready(Ok(response))),
+        }
+    }
+}
+
+/// Resolves the request on the current snapshot. `Ok` = serve (the request
+/// is rewritten and carries its extensions), `Err` = answer this instead.
+fn prepare(
+    registry: &EndpointRegistry,
+    request: &mut Request,
+) -> Result<(ResolvedEndpoint, String), Response> {
     let snapshot = registry.snapshot();
     let path = request.uri().path().to_string();
     match snapshot.resolve(&path) {
@@ -63,7 +129,7 @@ pub async fn dispatch(
             // prefix to strip before classifying the path).
             helios_audit::context::set_endpoint(resolved.endpoint.name(), &resolved.prefix);
             if !resolved.is_default() {
-                rewrite_path(&mut request, &resolved.remaining_path);
+                rewrite_path(request, &resolved.remaining_path);
                 request.extensions_mut().insert(OriginalPath(path));
                 request.extensions_mut().insert(ExtractedTenantFromUrl(
                     resolved.endpoint.tenant_id().to_string(),
@@ -74,18 +140,15 @@ pub async fn dispatch(
             request
                 .extensions_mut()
                 .insert(RequestSnapshot(Arc::clone(&snapshot)));
-            let started = Instant::now();
-            let response = super::scope(resolved, next.run(request)).await;
-            record(&name, response.status(), started);
-            response
+            Ok((resolved, name))
         }
         Resolution::Unavailable(resolved) => {
             helios_audit::context::set_endpoint(resolved.endpoint.name(), &resolved.prefix);
             let response = unavailable(&resolved);
             record(resolved.endpoint.name(), response.status(), Instant::now());
-            response
+            Err(response)
         }
-        Resolution::NotFound => not_found(&path),
+        Resolution::NotFound => Err(not_found(&path)),
     }
 }
 

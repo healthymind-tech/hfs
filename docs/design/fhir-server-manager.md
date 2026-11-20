@@ -314,7 +314,7 @@ endpoint-correct.
 | IG packages | `/admin/endpoints/{name}/packages[/…]` = existing package API with tenant = endpoint tenant and the endpoint's terminology server/token for HTS imports; old `/admin/packages` keeps meaning default endpoint (+ `X-Tenant-ID` for unbound tenants). | `routing/admin_packages.rs` |
 | SearchParameters | custom SPs are stored per tenant and the epoch is per tenant: an SP posted to endpoint A does not affect B. | unchanged |
 | FHIR version | `ServerConfig::default_fhir_version` reads become `effective_version(req)` = endpoint release; the resource-type gate uses it; `$versions` lists the endpoint's release (plus negotiable ones). | `extractors/fhir_version.rs`, `middleware/resource_type.rs` |
-| CORS | the global `CorsLayer` on the FHIR stack is replaced by `endpoint_cors` middleware (answers preflight and decorates responses from the endpoint's `cors` or env defaults). Non-FHIR routes keep the global layer. | `middleware/cors.rs` (new, P1) |
+| CORS | the global `CorsLayer` on the FHIR stack is replaced by the endpoint-aware CORS layer (`rest::endpoint::cors::EndpointCors`) (answers preflight and decorates responses from the endpoint's `cors` or env defaults). Non-FHIR routes keep the global layer. | `middleware/cors.rs` (new, P1) |
 | Rate limits | `ClientRateLimiter` keyed by `(endpoint id, client)`; budgets from the endpoint; buckets of a removed endpoint dropped on snapshot change. | `middleware/client_rate_limit.rs` (P2) |
 | `X-Tenant-ID` | default endpoint: honoured for unbound tenants iff `legacyTenantHeader`; refused `403` for a tenant bound to a named endpoint (message names its URL). Named endpoint: a header naming another tenant → `400` (strict) — never selects. JWT tenant claims: on named endpoints a claim must equal the endpoint's tenant or be absent. | `extractors/tenant.rs` |
 | Metrics | Prometheus label `endpoint` on request metrics (bounded: endpoints are few; cap 200 endpoints per deployment, enforced by the API). | `helios-observability` |
@@ -1170,6 +1170,15 @@ Later packages: rebase on these.
   CI group `rest-postgres`), not an endpoints PG group, so `helios-endpoints`
   needs no `helios-persistence` dev-dependency. They honour
   `HFS_TEST_PG_HOST`/`HFS_TEST_PG_PORT`.
+- **Stack depth.** The dispatcher (`DispatchLayer`) and the CORS layer
+  (`EndpointCors`) are hand-written tower services with one boxed future each,
+  not `middleware::from_fn`, and the audit extension is built without serde:
+  the manager adds ~23 KiB of stack per request in a debug build (it first
+  added up to 155 KiB). Baseline note for every package: `$validate` of a
+  Bundle needs ~1.86 MiB of stack in a debug build *without* the manager
+  (validator recursion), i.e. ~140 KiB below Tokio's 2 MiB worker stack;
+  `crates/rest/tests/endpoint_stack_depth.rs` runs that path with manager +
+  audit + auth on a 2 MiB thread so CI catches any layer that eats the margin.
 - **Not in P1** (owned elsewhere): per-endpoint rate limits (P2; the effective
   section is exposed as `EffectiveConfig::rate_limit`), SMART discovery (P2),
   admin API reload-before-reply (P4 calls `EndpointRuntime::reload_if_stale`).
