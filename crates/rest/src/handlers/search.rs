@@ -471,7 +471,8 @@ where
 
     // Pre-process :in / :not-in / :above / :below modifiers via the
     // terminology server.
-    let expanded = if let Some(terminology) = state.search_terminology() {
+    let request_terminology = state.search_terminology_for_request();
+    let expanded = if let Some(terminology) = request_terminology.as_deref() {
         expand_terminology_params(pairs, terminology, state.expansion_failure_policy()).await?
     } else {
         // No terminology server configured: token `:in` / `:above` / `:below`
@@ -741,8 +742,9 @@ where
         // not define (`400`), and only then has a valid one expanded — through
         // the same code as a direct parameter's — or, without a terminology
         // server, rejects it as the guard above does a direct one (`501`).
-        let expander = state
-            .search_terminology()
+        let request_terminology = state.search_terminology_for_request();
+        let expander = request_terminology
+            .as_deref()
             .map(|terminology| ChainTerminologyExpander {
                 terminology,
                 policy: state.expansion_failure_policy(),

@@ -105,6 +105,15 @@ pub struct ProfileRehydrationReport {
 /// whose cursor never advances must not spin forever).
 const MAX_REHYDRATION_PAGES: usize = 10_000;
 
+/// The service's mode for an endpoint's `validation.mode`.
+fn mode_of(mode: helios_endpoints::ValidationMode) -> ValidationMode {
+    match mode {
+        helios_endpoints::ValidationMode::Off => ValidationMode::Off,
+        helios_endpoints::ValidationMode::Log => ValidationMode::Log,
+        helios_endpoints::ValidationMode::Enforce => ValidationMode::Enforce,
+    }
+}
+
 /// Write-path behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ValidationMode {
@@ -164,6 +173,52 @@ pub struct ValidationService {
     /// ([`crate::packages::pins`]), applied when a profile is registered.
     binding_pins:
         RwLock<std::collections::HashMap<String, Arc<crate::packages::pins::ProfilePins>>>,
+    /// `HFS_TERMINOLOGY_SERVER`, kept for endpoints that override the
+    /// terminology mode but inherit the server (FHIR server manager).
+    env_terminology_server: Option<String>,
+    /// `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS`.
+    terminology_timeout: Duration,
+    /// Terminology providers of endpoints that override validation or bind
+    /// their own terminology server, by `mode|url|timeout|version`.
+    endpoint_terminology: DashMap<String, Option<Arc<dyn TerminologyProvider>>>,
+}
+
+/// What the request's endpoint changes about validation (FHIR server
+/// manager). Built only for an endpoint with its own `validation` or
+/// `terminology` section; inherited endpoints validate with the service as
+/// configured.
+struct EndpointValidation {
+    mode: ValidationMode,
+    terminology: Option<Arc<dyn TerminologyProvider>>,
+    required_profiles: Vec<helios_endpoints::model::ProfileRequirement>,
+    stored_profiles: bool,
+}
+
+/// Builds the terminology provider for a terminology mode and server, the
+/// way [`ValidationService::from_config`] does for the environment.
+fn build_terminology_provider(
+    mode: &str,
+    server: Option<&str>,
+    timeout: Duration,
+    version: helios_fhir::FhirVersion,
+) -> Option<Arc<dyn TerminologyProvider>> {
+    match (mode, server) {
+        ("remote", Some(base)) => Some(Arc::new(CompositeTerminologyProvider::new(
+            helios_fhir_validator::core_terminology(version),
+            Arc::new(RemoteTerminologyProvider::new(base.to_string(), timeout)),
+        ))),
+        ("remote-only", Some(base)) => Some(Arc::new(RemoteTerminologyProvider::new(
+            base.to_string(),
+            timeout,
+        ))),
+        // `remote` without a server degrades to the embedded value sets.
+        ("embedded", _) | ("remote", None) => {
+            let provider: Arc<dyn TerminologyProvider> =
+                helios_fhir_validator::core_terminology(version);
+            Some(provider)
+        }
+        _ => None,
+    }
 }
 
 impl Default for ValidationService {
@@ -189,6 +244,9 @@ impl Default for ValidationService {
             stored_index: Default::default(),
             cache_dirty: tokio::sync::Notify::new(),
             binding_pins: Default::default(),
+            env_terminology_server: None,
+            terminology_timeout: Duration::from_millis(3000),
+            endpoint_terminology: DashMap::new(),
         }
     }
 }
@@ -275,6 +333,9 @@ impl ValidationService {
             stored_index: Default::default(),
             cache_dirty: tokio::sync::Notify::new(),
             binding_pins: Default::default(),
+            env_terminology_server: terminology_server.map(str::to_string),
+            terminology_timeout: Duration::from_millis(config.terminology_timeout_ms),
+            endpoint_terminology: DashMap::new(),
         }
     }
 
@@ -312,6 +373,106 @@ impl ValidationService {
         self.mode
     }
 
+    /// The write-path mode of the request running on this task: its
+    /// endpoint's own mode when it overrides validation (FHIR server
+    /// manager), else [`Self::mode`].
+    pub fn effective_mode(&self) -> ValidationMode {
+        crate::endpoint::with_current(|r| r.endpoint.spec.validation.as_ref().map(|v| v.mode))
+            .flatten()
+            .map_or(self.mode, mode_of)
+    }
+
+    /// The current request's endpoint override, if its endpoint has its own
+    /// `validation` or `terminology` section.
+    fn endpoint_override(&self, version: FhirVersion) -> Option<EndpointValidation> {
+        let endpoint = crate::endpoint::with_current(|r| std::sync::Arc::clone(&r.endpoint))?;
+        let spec = &endpoint.spec;
+        if spec.validation.is_none() && spec.terminology.is_none() {
+            return None;
+        }
+        let server = match &spec.terminology {
+            Some(binding) => binding.server_url.clone(),
+            None => self.env_terminology_server.clone(),
+        };
+        let timeout = spec
+            .terminology
+            .as_ref()
+            .and_then(|b| b.timeout_secs)
+            .map_or(self.terminology_timeout, |s| {
+                Duration::from_secs(u64::from(s))
+            });
+        let (mode, terminology, required_profiles, stored_profiles) = match &spec.validation {
+            Some(v) => {
+                let tmode = crate::endpoint::effective::terminology_mode_str(v.terminology);
+                let key = format!(
+                    "{tmode}|{}|{}|{version:?}",
+                    server.as_deref().unwrap_or(""),
+                    timeout.as_millis()
+                );
+                let provider = self
+                    .endpoint_terminology
+                    .entry(key)
+                    .or_insert_with(|| {
+                        build_terminology_provider(tmode, server.as_deref(), timeout, version)
+                    })
+                    .clone();
+                (
+                    mode_of(v.mode),
+                    provider,
+                    v.required_profiles.clone(),
+                    v.stored_profiles && self.tenant_profiles.is_some(),
+                )
+            }
+            None => {
+                // Only the terminology server differs: keep the server's mode,
+                // pointed at the endpoint's server.
+                let provider = if spec
+                    .terminology
+                    .as_ref()
+                    .and_then(|b| b.server_url.as_deref())
+                    == self.env_terminology_server.as_deref()
+                {
+                    self.terminology.clone()
+                } else {
+                    let tmode = self.terminology_mode_name();
+                    let key = format!(
+                        "{tmode}|{}|{}|{version:?}",
+                        server.as_deref().unwrap_or(""),
+                        timeout.as_millis()
+                    );
+                    self.endpoint_terminology
+                        .entry(key)
+                        .or_insert_with(|| {
+                            build_terminology_provider(tmode, server.as_deref(), timeout, version)
+                        })
+                        .clone()
+                };
+                (
+                    self.mode,
+                    provider,
+                    Vec::new(),
+                    self.tenant_profiles.is_some(),
+                )
+            }
+        };
+        Some(EndpointValidation {
+            mode,
+            terminology,
+            required_profiles,
+            stored_profiles,
+        })
+    }
+
+    /// The environment terminology mode, reconstructed from the provider the
+    /// service was built with (used when an endpoint binds only a server).
+    fn terminology_mode_name(&self) -> &'static str {
+        match &self.terminology {
+            None => "off",
+            Some(_) if self.env_terminology_server.is_none() => "embedded",
+            Some(_) => "remote",
+        }
+    }
+
     /// Validate a resource against the core pack for `version` (overlaid
     /// with the tenant's stored profiles) plus any extra profile canonicals.
     /// Structural issues first, then constraint issues, then binding issues.
@@ -322,6 +483,18 @@ impl ValidationService {
         profiles: Vec<String>,
         tenant: Option<&str>,
     ) -> Vec<ValidationError> {
+        // FHIR server manager: the endpoint's terminology provider and
+        // stored-profile switch replace the server's.
+        let endpoint = self.endpoint_override(version);
+        let terminology = match &endpoint {
+            Some(e) => e.terminology.clone(),
+            None => self.terminology.clone(),
+        };
+        let tenant = match &endpoint {
+            Some(e) if !e.stored_profiles => None,
+            _ => tenant,
+        };
+        let terminology = terminology.as_deref();
         // While a cold rehydration is still filling the registries, validate
         // right away and only wait (then validate again) when the pass hit a
         // definition the registries could not resolve — a request whose
@@ -329,14 +502,21 @@ impl ValidationService {
         if self.is_rehydrating() {
             let misses = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let issues = self
-                .validate_with(version, resource, profiles.clone(), tenant, Some(&misses))
+                .validate_with(
+                    version,
+                    resource,
+                    profiles.clone(),
+                    tenant,
+                    Some(&misses),
+                    terminology,
+                )
                 .await;
             if !misses.load(std::sync::atomic::Ordering::Relaxed) {
                 return issues;
             }
             self.await_rehydration().await;
         }
-        self.validate_with(version, resource, profiles, tenant, None)
+        self.validate_with(version, resource, profiles, tenant, None, terminology)
             .await
     }
 
@@ -347,6 +527,7 @@ impl ValidationService {
         profiles: Vec<String>,
         tenant: Option<&str>,
         misses: Option<&Arc<std::sync::atomic::AtomicBool>>,
+        terminology: Option<&dyn TerminologyProvider>,
     ) -> Vec<ValidationError> {
         let core = helios_fhir_validator::packs::core_registry(version);
         let resolver: Arc<dyn SchemaResolver> = match self.tenant_overlay(tenant, version) {
@@ -376,7 +557,7 @@ impl ValidationService {
                 .constraint_evaluator
                 .as_ref()
                 .map(|e| e as &dyn helios_fhir_validator::ConstraintEvaluator),
-            terminology: self.terminology.as_deref(),
+            terminology,
             suppress_constraints: &self.suppress_constraints,
             terminology_fail: self.terminology_fail,
             display_issues: self.display_issues,
@@ -415,7 +596,7 @@ impl ValidationService {
         resource_type: &str,
         resource: &mut Value,
     ) -> Result<(), RestError> {
-        if self.mode == ValidationMode::Enforce {
+        if self.effective_mode() == ValidationMode::Enforce {
             self.check_write(tenant, version, resource_type, resource)
                 .await?;
             drop_empty_elements(resource);
@@ -441,16 +622,28 @@ impl ValidationService {
         resource_type: &str,
         resource: &Value,
     ) -> Result<(), RestError> {
-        if self.mode == ValidationMode::Off {
+        // FHIR server manager: the endpoint's mode and required profiles.
+        let endpoint = self.endpoint_override(version);
+        let mode = endpoint.as_ref().map_or(self.mode, |e| e.mode);
+        if mode == ValidationMode::Off {
             return Ok(());
         }
+        let required: Vec<String> = endpoint
+            .map(|e| {
+                e.required_profiles
+                    .into_iter()
+                    .filter(|r| r.resource_type == resource_type)
+                    .map(|r| r.profile)
+                    .collect()
+            })
+            .unwrap_or_default();
         let issues = self
-            .validate_resource(version, resource, Vec::new(), Some(tenant))
+            .validate_resource(version, resource, required, Some(tenant))
             .await;
         if issues.is_empty() {
             return Ok(());
         }
-        match self.mode {
+        match mode {
             ValidationMode::Off => Ok(()),
             ValidationMode::Log => {
                 for issue in issues

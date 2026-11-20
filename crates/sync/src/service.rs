@@ -105,6 +105,17 @@ pub struct PeerTest {
     pub error: Option<String>,
 }
 
+/// Outcome of a re-seal pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RewrapCounts {
+    /// Re-sealed under the active key.
+    pub rewrapped: usize,
+    /// Already under the active key.
+    pub current: usize,
+    /// `object: reason`.
+    pub failed: Vec<String>,
+}
+
 /// See the module docs.
 pub struct SyncService {
     runtime: Arc<SyncRuntime>,
@@ -515,18 +526,31 @@ impl SyncService {
         Ok(out)
     }
 
-    /// Re-seals every job secret under the active key.
+    /// Re-seals every job secret under the active key of the server's ring.
     pub async fn rewrap_secrets(&self) -> Result<usize, SyncError> {
         let ring = self.runtime.env.key_ring.clone().ok_or(SyncError::NoKeyRing)?;
-        let mut n = 0;
+        Ok(self.rewrap_with(&ring).await?.rewrapped)
+    }
+
+    /// Re-seals every job secret not under `ring`'s active key (the
+    /// `POST /admin/secrets/$rewrap` participant).
+    pub async fn rewrap_with(&self, ring: &helios_endpoints::secret::SecretKeyRing) -> Result<RewrapCounts, SyncError> {
+        let mut out = RewrapCounts::default();
         for mut j in self.store().jobs().await? {
-            let k = crate::secrets::rewrap(&mut j.spec, &j.id, &ring)?;
-            if k > 0 {
-                self.store().update_job(&j.id, j.revision, j.spec).await?;
-                n += k;
+            let total = crate::secrets::sealed_count(&j.spec);
+            match crate::secrets::rewrap(&mut j.spec, &j.id, ring) {
+                Ok(0) => out.current += total,
+                Ok(k) => match self.store().update_job(&j.id, j.revision, j.spec).await {
+                    Ok(_) => {
+                        out.rewrapped += k;
+                        out.current += total - k;
+                    }
+                    Err(e) => out.failed.push(format!("sync-job:{}: {e}", j.id)),
+                },
+                Err(e) => out.failed.push(format!("sync-job:{}: {e}", j.id)),
             }
         }
-        Ok(n)
+        Ok(out)
     }
 
     /// Checks the peers of a stored job can be built (credentials open,

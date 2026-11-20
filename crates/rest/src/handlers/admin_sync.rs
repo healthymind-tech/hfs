@@ -408,6 +408,73 @@ pub async fn rewrap(State(api): State<SyncApi>) -> Response {
     result(StatusCode::OK, s.rewrap_secrets().await.map(|n| json!({"rewrapped": n})))
 }
 
+// ------------------------------------------------- P4 endpoint API hooks
+
+use crate::handlers::admin_endpoints::error::{ApiError, Issue};
+use crate::handlers::admin_endpoints::hooks::{DuplicateService, DuplicateStarted};
+use crate::handlers::admin_endpoints::{RewrapParticipant, RewrapReport};
+
+fn api_error(e: SyncError) -> ApiError {
+    match e {
+        SyncError::Invalid(v) => ApiError::unprocessable(
+            v.0.into_iter()
+                .map(|f| Issue::field("invalid", f.field, f.message))
+                .collect(),
+        ),
+        SyncError::NotFound(m) => ApiError::new(StatusCode::NOT_FOUND, "not-found", format!("{m} not found")),
+        SyncError::Revision { current } => ApiError::conflict(current),
+        SyncError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, "conflict", m),
+        SyncError::NoKeyRing => ApiError::new(StatusCode::CONFLICT, "business-rule", SyncError::NoKeyRing.to_string()),
+        SyncError::Forbidden(m) => ApiError::new(StatusCode::FORBIDDEN, "forbidden", m),
+        SyncError::Unavailable(m) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "transient", m),
+    }
+}
+
+/// `POST /admin/endpoints/{name}/$duplicate` (P4) through the sync service.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncDuplicate;
+
+#[async_trait::async_trait]
+impl DuplicateService for SyncDuplicate {
+    async fn start(
+        &self,
+        source: &helios_endpoints::Endpoint,
+        request: DuplicateRequest,
+        actor: &Actor,
+    ) -> Result<DuplicateStarted, ApiError> {
+        let svc = helios_sync::global().ok_or_else(|| {
+            ApiError::not_implemented("duplicating endpoints needs the sync service (HFS_MANAGER=on)")
+        })?;
+        let out = svc.duplicate(source.name(), request, actor).await.map_err(api_error)?;
+        let name = out.endpoint.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        Ok(DuplicateStarted {
+            job_id: out.job_id.clone().unwrap_or_default(),
+            status_url: match &out.run_id {
+                Some(r) => format!("admin/sync/runs/{r}"),
+                None => format!("admin/endpoints/{name}"),
+            },
+            endpoint: Some(out.endpoint),
+        })
+    }
+}
+
+/// Sync job credentials in `POST /admin/secrets/$rewrap` (P4).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncRewrap;
+
+#[async_trait::async_trait]
+impl RewrapParticipant for SyncRewrap {
+    async fn rewrap(&self, ring: &helios_endpoints::SecretKeyRing, _actor: &Actor) -> RewrapReport {
+        let Some(svc) = helios_sync::global() else {
+            return RewrapReport { scope: "sync".into(), rewrapped: 0, current: 0, failed: vec![] };
+        };
+        match svc.rewrap_with(ring).await {
+            Ok(c) => RewrapReport { scope: "sync".into(), rewrapped: c.rewrapped, current: c.current, failed: c.failed },
+            Err(e) => RewrapReport { scope: "sync".into(), rewrapped: 0, current: 0, failed: vec![format!("sync: {e}")] },
+        }
+    }
+}
+
 /// Header carrying the notification shared secret.
 pub const NOTIFY_SECRET_HEADER: &str = "x-sync-notify-secret";
 

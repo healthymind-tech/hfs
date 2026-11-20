@@ -3743,6 +3743,7 @@ dependencies = [
  "jsonpath-rust",
  "jsonwebtoken",
  "libc",
+ "metrics",
  "mime",
  "p256 0.14.0",
  "p384",

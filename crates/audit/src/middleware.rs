@@ -268,7 +268,14 @@ pub async fn audit_middleware(
     );
 
     let tenant = captured.tenant.clone();
+    let endpoint_extension = captured.endpoint.as_deref().and_then(endpoint_extension);
     for mut event in events {
+        if let Some(ext) = &endpoint_extension {
+            event
+                .extension
+                .get_or_insert_with(Vec::new)
+                .push(ext.clone());
+        }
         // Upstream #1515: tag the event with the request's tenant (searchable
         // with `_tag`); reserved `__…` tenants are left untagged.
         if let Some(t) = tenant
@@ -423,8 +430,28 @@ fn site_of(base_url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// The request path without its tenant prefix.
+/// The `hfs-endpoint` extension naming the endpoint an event belongs to.
+fn endpoint_extension(name: &str) -> Option<crate::fhir_model::Extension> {
+    serde_json::from_value(serde_json::json!({
+        "url": crate::context::ENDPOINT_EXTENSION_URL,
+        "valueString": name,
+    }))
+    .ok()
+}
+
+/// The request path without its tenant prefix (or the FHIR endpoint prefix
+/// the endpoint dispatcher stripped).
 fn strip_tenant(path: &str, captured: &Captured, url_tenant_routing: bool) -> String {
+    if let Some(prefix) = captured.endpoint_prefix.as_deref()
+        && let Some(rest) = path.strip_prefix(prefix)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return if rest.is_empty() {
+            "/".to_string()
+        } else {
+            rest.to_string()
+        };
+    }
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let first_is_tenant = match (&captured.tenant, captured.tenant_from_url) {
         (Some(t), true) => segs.first() == Some(&t.as_str()),
@@ -776,6 +803,30 @@ mod tests {
         assert_eq!(strip_tenant("/acme/Patient", &none, true), "/Patient");
         assert_eq!(strip_tenant("/Patient/1", &none, true), "/Patient/1");
         assert_eq!(strip_tenant("/acme/Patient", &none, false), "/acme/Patient");
+    }
+
+    #[test]
+    fn endpoint_prefix_is_stripped() {
+        let c = Captured {
+            tenant: Some("lab".into()),
+            tenant_from_url: true,
+            endpoint: Some("lab".into()),
+            endpoint_prefix: Some("/laboratory".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            strip_tenant("/laboratory/Patient/1", &c, false),
+            "/Patient/1"
+        );
+        assert_eq!(strip_tenant("/laboratory", &c, false), "/");
+        assert_eq!(
+            strip_tenant("/laboratoryx/Patient", &c, false),
+            "/laboratoryx/Patient"
+        );
+        let ext = endpoint_extension("lab").expect("extension");
+        let v = serde_json::to_value(&ext).unwrap();
+        assert_eq!(v["url"], crate::context::ENDPOINT_EXTENSION_URL);
+        assert_eq!(v["valueString"], "lab");
     }
 
     #[test]

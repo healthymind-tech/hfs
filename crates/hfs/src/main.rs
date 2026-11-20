@@ -19,7 +19,6 @@
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 mod cluster;
-// FHIR server manager wiring (P1 owns `manager/mod.rs`; P6 adds `sync.rs`).
 mod manager;
 
 use std::sync::Arc;
@@ -1556,6 +1555,8 @@ async fn start_mongodb(
         observability.observers.clone(),
     )
     .await?;
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, None).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -1565,8 +1566,9 @@ async fn start_mongodb(
         export_bundle,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own).
     serve(
@@ -3163,8 +3165,10 @@ async fn start_sqlite(
         observability.observers.clone(),
     )
     .await?;
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, None).await?;
     manager::sync::install_sync(
-        &config,
+        manager.as_ref(),
         manager::sync::SyncInstall {
             local: backend.clone(),
             cluster: backend.cluster_job_store(),
@@ -3172,7 +3176,6 @@ async fn start_sqlite(
             copier: None,
             observer: Some(observability.observers.clone()),
             audit: audit_state.clone(),
-            endpoints: None,
         },
     )
     .await?;
@@ -3185,8 +3188,9 @@ async fn start_sqlite(
         export_bundle,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     let served = serve(
         app,
         &config,
@@ -3482,6 +3486,7 @@ where
             audit_state,
         )),
         observability: Some(observability),
+        endpoints: None,
     }
 }
 
@@ -3526,6 +3531,7 @@ fn composite_ops(
             audit_state,
         )),
         observability: Some(observability),
+        endpoints: None,
     }
 }
 
@@ -4283,6 +4289,8 @@ async fn start_sqlite_elasticsearch(
         observability.observers.clone(),
     )
     .await?;
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, None).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -4292,8 +4300,9 @@ async fn start_sqlite_elasticsearch(
         export_bundle,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
     let served = serve(
@@ -4425,8 +4434,10 @@ async fn start_postgres(
         observability.observers.clone(),
     )
     .await?;
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, Some(manager::PgHandle::from_backend(&backend))).await?;
     manager::sync::install_sync(
-        &config,
+        manager.as_ref(),
         manager::sync::SyncInstall {
             local: backend.clone(),
             cluster: backend.cluster_job_store(),
@@ -4436,7 +4447,6 @@ async fn start_postgres(
             copier: Some(backend.clone()),
             observer: Some(observability.observers.clone()),
             audit: audit_state.clone(),
-            endpoints: None,
         },
     )
     .await?;
@@ -4449,8 +4459,9 @@ async fn start_postgres(
         export_bundle,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own).
     serve(
@@ -4677,6 +4688,8 @@ async fn start_postgres_elasticsearch(
         observability.observers.clone(),
     )
     .await?;
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, Some(manager::PgHandle::from_backend(&pg))).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -4686,8 +4699,9 @@ async fn start_postgres_elasticsearch(
         export_bundle,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
     serve(
@@ -4929,6 +4943,8 @@ async fn start_mongodb_elasticsearch(
         observability.observers.clone(),
     )
     .await?;
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, None).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -4938,8 +4954,9 @@ async fn start_mongodb_elasticsearch(
         export_bundle,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
     serve(
@@ -5060,6 +5077,7 @@ async fn start_s3(
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: None,
         observability: Some(observability.clone()),
+        endpoints: None,
     };
 
     // Bulk submit *is* wired: S3 keeps the submission, manifest, lease, and
@@ -5092,6 +5110,8 @@ async fn start_s3(
         None
     };
 
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, None).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -5101,8 +5121,9 @@ async fn start_s3(
         None,
         submit_bundle,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     serve(
         app,
         &config,
@@ -5408,6 +5429,8 @@ async fn start_s3_elasticsearch(
         None
     };
 
+    // FHIR server manager (HFS_MANAGER): endpoint store, registry and hooks.
+    let manager = manager::init(&config, None).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -5417,8 +5440,9 @@ async fn start_s3_elasticsearch(
         bulk_export,
         bulk_submit,
         settings_store,
-        ops,
+        manager::with_endpoints(ops, manager.as_ref()),
     );
+    let app = manager::attach(manager, app);
     // The UI's tenant-maintenance path goes through the composite (not the bare
     // primary) so a purge also clears the offloaded search documents.
     serve(

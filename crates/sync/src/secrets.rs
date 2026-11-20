@@ -324,6 +324,22 @@ pub fn rewrap(spec: &mut SyncJobSpec, job_id: &str, ring: &SecretKeyRing) -> Res
     Ok(n)
 }
 
+/// Number of sealed secrets a spec holds.
+pub fn sealed_count(spec: &SyncJobSpec) -> usize {
+    let peer = |p: &SyncPeer| match p {
+        SyncPeer::External(x) => usize::from(!matches!(x.auth, ExternalAuth::None)),
+        SyncPeer::Endpoint { .. } => 0,
+    };
+    let notify = usize::from(matches!(
+        spec.trigger,
+        SyncTrigger::Subscription {
+            notify_secret: Some(_),
+            ..
+        }
+    ));
+    peer(&spec.source) + peer(&spec.target) + notify
+}
+
 /// Constant-time comparison of two secrets.
 pub fn secrets_equal(a: &[u8], b: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
@@ -463,6 +479,7 @@ mod tests {
         )
         .unwrap();
         let both = SecretKeyRing::parse(&format!("{k2},{old}")).unwrap();
+        assert_eq!(sealed_count(&s3), 1);
         assert_eq!(rewrap(&mut s3, "j3", &both).unwrap(), 1);
         let only_new = SecretKeyRing::parse(&k2).unwrap();
         let SyncPeer::External(x) = &s3.target else { panic!() };

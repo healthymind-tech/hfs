@@ -246,7 +246,7 @@ impl RunState<'_> {
             .into_iter()
             .map(|s| ((s.resource_type.clone(), s.resource_id.clone()), s))
             .collect();
-        let mut ops: Vec<(WriteOp, &Change, Option<[u8; 32]>)> = Vec::new();
+        let mut ops: Vec<PlannedWrite<'_>> = Vec::new();
         let mut new_states: Vec<SyncItemState> = Vec::new();
         let now = Utc::now();
         for c in changes {
@@ -373,6 +373,9 @@ impl RunState<'_> {
         Ok(())
     }
 }
+
+/// A write decided for one change, with the change and its content hash.
+type PlannedWrite<'a> = (WriteOp, &'a Change, Option<[u8; 32]>);
 
 /// Runs the initial load until done (or stopped).
 async fn initial_load(st: &mut RunState<'_>, peers: &Peers) -> Result<(), EngineError> {

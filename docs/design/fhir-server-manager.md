@@ -1096,3 +1096,80 @@ risk: `crates/rest/src/lib.rs` (P1 owns; P4/P6 add one line each),
 - HTS single sign-on with the console OIDC client.
 - Id remapping sync (`IdStrategy::Remap` with reference rewriting).
 - Per-endpoint `HFS_MAX_BODY_SIZE` / request timeout overrides.
+
+---
+
+## 17. Changelog
+
+Contract changes and clarifications made while implementing the packages.
+Later packages: rebase on these.
+
+### P1 — endpoint runtime (`hm/m-p1`)
+
+- **Runtime injection.** The registry and store reach the app through a new
+  field `helios_rest::OperationsBundle::endpoints: Option<rest::endpoint::EndpointRuntime>`
+  (`EndpointRuntime { registry, store }`, `reload_if_stale()`); `None` = manager
+  off, nothing installed. `AppState` accessors return `Option`s:
+  `state.endpoints() -> Option<&Arc<EndpointRegistry>>`,
+  `state.endpoint_store() -> Option<&Arc<dyn EndpointStore>>`,
+  `state.endpoint_runtime()`. The binary builds it in
+  `crates/hfs/src/manager/mod.rs` (`init` → `ManagerContext`, `with_endpoints`,
+  `attach`); P3/P6 add their `install_*` line in `init_with`.
+- **Task-local endpoint.** Besides the `Extension<ResolvedEndpoint>` (and a
+  `rest::endpoint::RequestSnapshot` extension), the dispatcher makes the
+  endpoint the task-local `rest::endpoint::current()` for the request, so code
+  without the request (validation service, search terminology,
+  CapabilityStatement builder) reads it. `EffectiveConfig::for_request(&parts)`
+  and `EffectiveConfig::current()` both exist.
+- **Auth hook (P2).** `rest::endpoint::auth::auth_layer(router, AuthHook { auth_state, rate_limiter })`
+  in `crates/rest/src/endpoint/auth.rs`; P1 ships the pass-through that
+  reproduces the old global layering. The dispatcher wraps this stack, so the
+  path P2 sees is endpoint-relative. P2: replace the file's body (on rebase take
+  your version) and keep or adjust the single call site in `build_app`.
+- **Metrics.** Instead of an `endpoint` label on `http_requests_total` (which
+  would change the label set of an existing series), the dispatcher records
+  `hfs_endpoint_requests_total{endpoint,status_class}` and
+  `hfs_endpoint_request_duration_seconds{endpoint}`. `helios-observability` is
+  unchanged.
+- **Audit.** `helios-audit` gained `context::set_endpoint(name, prefix)`,
+  `Captured::{endpoint, endpoint_prefix}` and `ENDPOINT_EXTENSION_URL`; the
+  middleware strips the endpoint prefix before classifying and adds the
+  extension to every event of a dispatched request.
+- **Subscriptions.** `BaseUrlResolver` (`rest::endpoint::base_url`) is
+  implemented by `SnapshotBaseUrlResolver` and handed to the engine through its
+  existing `public_base_url_for_tenant` closure — no change to
+  `helios-subscriptions::notification::builder`.
+- **Batch/transaction `response.location`** stays relative
+  (`Patient/1/_history/1`) as before the manager; it resolves against the
+  endpoint base. Every absolute URL carries the endpoint prefix.
+- **CapabilityStatement** is built per request (there is no cache to key);
+  endpoint `auth` advertises the endpoint's SMART `oauth-uris` (only
+  `smart.authorizationEndpoint` + `tokenEndpoint` when set; issuer discovery
+  stays P2), endpoint `cors` sets `security.cors`.
+- **FHIR version.** `FhirVersionExtractor::{storage,accept}_version_or(default)`
+  substitute the endpoint release for `default`; the resource-type gate,
+  `$versions` and `/metadata` follow. Handlers that read
+  `config.default_fhir_version` directly (not through the extractor) still use
+  the server default — only relevant for a non-default release in a
+  multi-version build.
+- **Terminology.** `AppState::search_terminology_for_request()` (endpoint
+  binding, cached per URL) is used by search; the validation service caches
+  providers per `mode|url|timeout|version`. SOF `$translate`
+  (`terminology_server_url()`) and IG-package HTS imports still use the
+  environment server (the latter is P4's endpoint-scoped package API).
+- **One-door rule details.** On the default endpoint a bound tenant is refused
+  whatever selected it (header, token claim, URL prefix); named endpoints skip
+  `HFS_TENANT_REQUIRE_PROVISIONED` (the endpoint is the provisioning).
+- **CORS.** `/ui`, `/admin`, `/console`, `/metrics` always use the global
+  layer; other paths use the resolved endpoint's section when set.
+- **`HFS_ENDPOINTS_FILE`.** An env-managed endpoint missing from the file is
+  set `disabled` (never deleted). With `HFS_MANAGER=off` the default endpoint
+  row is still written on PostgreSQL (R0); nothing is done on other backends.
+- **PG tests location.** The PostgreSQL store tests are
+  `crates/rest/tests/endpoints_postgres.rs` (`postgres_integration_pg_store_*`,
+  CI group `rest-postgres`), not an endpoints PG group, so `helios-endpoints`
+  needs no `helios-persistence` dev-dependency. They honour
+  `HFS_TEST_PG_HOST`/`HFS_TEST_PG_PORT`.
+- **Not in P1** (owned elsewhere): per-endpoint rate limits (P2; the effective
+  section is exposed as `EffectiveConfig::rate_limit`), SMART discovery (P2),
+  admin API reload-before-reply (P4 calls `EndpointRuntime::reload_if_stale`).
