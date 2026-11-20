@@ -109,8 +109,8 @@ async fn figtree_woff2_is_served_under_hts_assets() {
 
 #[tokio::test]
 async fn sidebar_renders_brand_logo() {
-    // Reviewer complaint: HTS sidebar was missing the brand logo. HFS
-    // renders `<img class="brand__logo">`; HTS must render the same.
+    // Reviewer complaint: HTS sidebar was missing the brand logo. Both
+    // consoles render the shared HealthyMind brand (helios_ui_chrome::brand).
     let response = app()
         .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
         .await
@@ -118,11 +118,11 @@ async fn sidebar_renders_brand_logo() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("class=\"brand__logo\""),
-        "sidebar must render <img class=\"brand__logo\"> (HFS parity)",
+        html.contains("class=\"brand__logo-full\""),
+        "sidebar must render <img class=\"brand__logo-full\"> (HFS parity)",
     );
     assert!(
-        html.contains("/ui/hts/assets/logo.png"),
+        html.contains("/ui/hts/assets/brand/healthymind-logo-horizontal.png"),
         "brand logo src must resolve under /ui/hts/assets/",
     );
 }
@@ -759,7 +759,7 @@ fn neither_layout_carries_its_own_copy_of_the_account_menu() {
 
 #[tokio::test]
 async fn favicon_link_resolves_under_the_hts_mount() {
-    // HFS points its `rel="icon"` at `/ui/assets/logo.png`; HTS must point at
+    // HFS points its `rel="icon"` at `/ui/assets/brand/favicon-32.png`; HTS must point at
     // the same file under its own mount. Asserting only the markup would miss
     // a prefix typo, so the second leg fetches it — the same two-legged shape
     // `figtree_woff2_is_served_under_hts_assets` uses for the font.
@@ -770,13 +770,13 @@ async fn favicon_link_resolves_under_the_hts_mount() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("<link rel=\"icon\" type=\"image/png\" href=\"/ui/hts/assets/logo.png\">"),
-        "HTS must declare a favicon link to /ui/hts/assets/logo.png (HFS parity)",
+        html.contains("<link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/ui/hts/assets/brand/favicon-32.png\">"),
+        "HTS must declare a favicon link to /ui/hts/assets/brand/favicon-32.png (HFS parity)",
     );
 
     let response = app()
         .oneshot(
-            Request::get("/ui/hts/assets/logo.png")
+            Request::get("/ui/hts/assets/brand/favicon-32.png")
                 .body(Body::empty())
                 .unwrap(),
         )

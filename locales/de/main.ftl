@@ -7,13 +7,15 @@
 
 ## Marke / gemeinsame Begriffe
 
--app-name = Helios FHIR-Server
--org-name = Helios Software
+-app-name = HealthyMind FHIR Server Manager
+-org-name = HealthyMind Tech
 
 ## Seitenstruktur
 
 app-title = { -app-name }
-app-tagline = Ein schneller, versionsübergreifender FHIR-Server
+app-short-name = HealthyMind FHIR
+app-product-line = FHIR Server Manager
+app-tagline = Viele FHIR-Endpunkte, ein Manager — basierend auf Helios FHIR Server
 
 nav-dashboard = Übersicht
 nav-terminology = Terminologie
@@ -1314,8 +1316,10 @@ sql-param-default = Standardwert
 ## Seitennavigation und den Dashboard-Platzhalter der Phase-1-Blocker-Slice ab.
 ## Sie müssen paritätisch zu en/es/main.ftl bleiben.
 
--hts-app-name = Helios Terminologieserver
+-hts-app-name = HealthyMind Terminologieserver
 hts-app-title = { -hts-app-name }
+hts-app-short-name = HealthyMind Terminology
+hts-app-product-line = Terminology Server
 
 hts-nav-section-work = Terminologie
 hts-nav-section-tools = Werkzeuge

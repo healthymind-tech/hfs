@@ -43,6 +43,13 @@ fn request_authorization() -> Option<String> {
     REQUEST_AUTHORIZATION.try_with(Clone::clone).ok().flatten()
 }
 
+/// The credential of the request being served, when one is in scope
+/// ([`with_request_authorization`]) — for self-calls made outside this module
+/// (the manager's audit reads).
+pub(crate) fn current_request_authorization() -> Option<String> {
+    request_authorization()
+}
+
 /// Who is asking on the loopback self-call that backs `$sql-export` (#833):
 /// the effective tenant, and — when the browser sent one — the
 /// `Authorization` header verbatim.

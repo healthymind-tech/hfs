@@ -1,0 +1,27 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# Sync jobs touching this endpoint (entry point; job and run pages are P6's /ui/sync/…). #}
+{% block title %}{{ i18n.t("mgr-nav-sync") }} — {{ head.display_name }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+{% call ui::ep_head(head, i18n.t("mgr-nav-sync"), false, can_admin) %}{% endcall %}
+<section class="card table-card">
+  <div class="card-head">
+    <h2>{{ i18n.t("mgr-sync-jobs") }}</h2>
+    {% if available && can_admin %}<a class="btn btn--primary btn--small" href="/ui/sync/new?source={{ head.name }}">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("mgr-sync-new") }}</a>{% endif %}
+  </div>
+  {% if sync_rows.is_empty() %}
+    {% if available %}
+    {% call ui::empty_state("sync", i18n.t("mgr-sync-empty-title"), i18n.t("mgr-sync-empty-text")) %}
+      {% if can_admin %}<a class="btn btn--primary" href="/ui/sync/new?source={{ head.name }}">{{ i18n.t("mgr-sync-new") }}</a>{% endif %}
+      <a class="btn" href="/ui/sync">{{ i18n.t("mgr-sync-all") }}</a>
+    {% endcall %}
+    {% else %}
+    {% call ui::empty_state("sync", i18n.t("mgr-sync-unavailable-title"), i18n.t("mgr-sync-unavailable")) %}
+      <a class="btn" href="/ui/e/{{ head.name }}/duplicate">{% call ui::icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
+    {% endcall %}
+    {% endif %}
+  {% else %}
+  {% include "partials/manager/sync-table.html" %}
+  {% endif %}
+</section>
+{% endblock %}
