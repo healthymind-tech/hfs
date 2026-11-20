@@ -1,0 +1,257 @@
+# HealthyMind CI — the fork's gating CI, on GitHub-hosted runners only.
+#
+# The upstream workflows (ci.yml and most others) run on self-hosted agents
+# that this repository does not have; see docs/ops/ci.md for which of them are
+# disabled here and why. This workflow is the fork's replacement: lint (fmt,
+# clippy for the production feature set and for --all-features) and the unit
+# and integration tests split into crate-group shards that each fit one
+# `ubuntu-latest` runner (4 vCPU, 16 GB RAM). Every test shard runs under
+# cargo-llvm-cov; the `coverage` job merges the shards' lcov files into one
+# report (artifact + job summary). No external services or secrets.
+#
+# Feature set: the tests build the crates' default features plus the backends
+# the production image uses (R4, sqlite, postgres), i.e. what is deployed. The
+# other FHIR versions and backends are compiled by the --all-features clippy.
+# PostgreSQL comes from a `postgres:16` service container through the fork's
+# HFS_TEST_PG_HOST / HFS_TEST_PG_PORT and HTS_TEST_PG_URL switches; suites
+# without such a switch start their own containers with testcontainers on the
+# runner's Docker. MongoDB, Elasticsearch and MinIO/S3 suites are not run.
+#
+# Run the same commands locally: see docs/ops/ci.md.
+name: HealthyMind CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, hm/main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hm-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned (rust-toolchain.toml says `stable`, which rustup ranks below this
+  # variable), so a new stable release cannot turn the build red overnight.
+  # Bump deliberately: change it here and in the toolchain steps below.
+  RUSTUP_TOOLCHAIN: "1.100.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+  # The production image's features (hfs-eval/deploy/remote-build.sh FEATURES).
+  PROD_FEATURES: helios-hfs/R4,helios-hfs/sqlite,helios-hfs/postgres,helios-hfs/ui,helios-hfs/xml,helios-hfs/subscriptions,helios-hfs/bulk-submit-jwe,helios-hts/postgres,helios-hfs/otel,helios-hts/otel,helios-hfs/mimalloc
+  # Same allow-list as upstream ci.yml / windows-nightly.yml.
+  CLIPPY_ARGS: >-
+    -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant
+    -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if
+    -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items
+    -A clippy::doc-lazy-continuation
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: production features
+            args: --all-targets -p helios-hfs -p helios-hts --features "$PROD_FEATURES"
+            jobs: 4
+          - name: all features
+            args: --all-targets --all-features
+            # helios-fhir with all four FHIR versions is the memory peak.
+            jobs: 3
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: .github/scripts/hm-free-disk.sh
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.name }}
+      - name: cargo clippy
+        run: eval cargo clippy --locked ${{ matrix.args }} -- $CLIPPY_ARGS
+      - name: Disk after build
+        if: always()
+        run: df -h / ; du -sh target 2>/dev/null || true
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            packages: -p helios-fhir -p helios-fhir-macro -p helios-fhirpath-support -p helios-serde -p helios-serde-support -p helios-cds-hooks -p helios-observability
+            features: ""
+            select: printf '%s\n' --lib --bins --tests
+          - name: fhirpath+sof
+            packages: -p helios-fhirpath -p helios-sof
+            features: ""
+            select: printf '%s\n' --lib --bins --tests
+          - name: persistence-sqlite
+            packages: -p helios-persistence
+            features: ""
+            select: python3 .github/scripts/hm-test-args.py helios-persistence --docker-free
+          - name: persistence-postgres
+            packages: -p helios-persistence
+            features: helios-persistence/postgres
+            select: printf '%s\n' --lib --test postgres_tests --test postgres_write_concurrency --test sof_pg_runner --test sof_columnar_profile
+          - name: rest+hfs
+            packages: -p helios-rest -p helios-hfs
+            features: ""
+            select: .github/scripts/hm-select-multi.sh helios-rest helios-hfs
+          - name: rest-postgres
+            packages: -p helios-rest
+            features: helios-rest/postgres
+            select: python3 .github/scripts/hm-test-args.py helios-rest --docker --exclude 'mongo|elasticsearch|minio|s3'
+          - name: hts-sqlite
+            packages: -p helios-hts
+            features: ""
+            select: printf '%s\n' --lib --bins --tests
+          - name: hts-postgres
+            packages: -p helios-hts
+            features: helios-hts/postgres
+            select: printf '%s\n' --lib --bins --tests
+          - name: fhir-validator
+            packages: -p helios-fhir-validator
+            features: helios-fhir-validator/fhirpath,helios-fhir-validator/xml
+            select: printf '%s\n' --lib --bins --tests
+          - name: services+ui
+            packages: -p helios-auth -p helios-admin-auth -p helios-audit -p helios-subscriptions -p helios-ui -p helios-ui-chrome -p helios-hts-ui
+            features: helios-admin-auth/postgres,helios-subscriptions/postgres
+            select: printf '%s\n' --lib --bins --tests
+    env:
+      CARGO_BUILD_JOBS: 4
+      HFS_TEST_PG_HOST: localhost
+      HFS_TEST_PG_PORT: "5432"
+      HTS_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: .github/scripts/hm-free-disk.sh
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.name }}
+      - name: Select test targets
+        run: |
+          set -euo pipefail
+          ${{ matrix.select }} > "$RUNNER_TEMP/sel.txt"
+          tr '\n' ' ' < "$RUNNER_TEMP/sel.txt"; echo
+      - name: Build tests (instrumented)
+        run: |
+          set -euo pipefail
+          mapfile -t sel < "$RUNNER_TEMP/sel.txt"
+          build=()
+          for a in "${sel[@]}"; do [ "$a" = "--" ] && break; build+=("$a"); done
+          feat=()
+          [ -n "${{ matrix.features }}" ] && feat=(--features "${{ matrix.features }}")
+          start=$(date +%s)
+          cargo llvm-cov --no-report --locked ${{ matrix.packages }} "${feat[@]}" "${build[@]}" --no-run
+          echo "build: $(( ($(date +%s) - start) / 60 )) min"
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          mapfile -t sel < "$RUNNER_TEMP/sel.txt"
+          feat=()
+          [ -n "${{ matrix.features }}" ] && feat=(--features "${{ matrix.features }}")
+          start=$(date +%s)
+          cargo llvm-cov --no-report --locked ${{ matrix.packages }} "${feat[@]}" "${sel[@]}"
+          echo "tests: $(( ($(date +%s) - start) / 60 )) min"
+      - name: Coverage report (lcov)
+        if: success()
+        run: |
+          set -euo pipefail
+          safe=$(echo "${{ matrix.name }}" | tr -c 'a-zA-Z0-9-\n' '_')
+          echo "SAFE_NAME=$safe" >> "$GITHUB_ENV"
+          cargo llvm-cov report --lcov --output-path "lcov-$safe.info"
+      - uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: lcov-${{ env.SAFE_NAME }}
+          path: lcov-${{ env.SAFE_NAME }}.info
+          retention-days: 14
+      - name: Disk after tests
+        if: always()
+        run: df -h / ; du -sh target 2>/dev/null || true
+
+  coverage:
+    name: coverage summary
+    needs: test
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: lcov-*
+          path: lcov
+          merge-multiple: true
+      - name: Merge and summarise
+        run: |
+          set -euo pipefail
+          ls -la lcov
+          python3 .github/scripts/hm-coverage-summary.py lcov.info coverage.md lcov/*.info
+          {
+            echo "## Line coverage per crate (all test shards merged)"
+            echo
+            if [ "${{ needs.test.result }}" != "success" ]; then
+              echo "> Some test shards failed; their coverage is missing from this table."
+              echo
+            fi
+            cat coverage.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: |
+            lcov.info
+            coverage.md
+          retention-days: 30
