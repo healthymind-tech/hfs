@@ -127,8 +127,8 @@ jobs:
             packages: -p helios-persistence
             features: helios-persistence/postgres
             select: printf '%s\n' --lib --test postgres_tests --test postgres_write_concurrency --test sof_pg_runner --test sof_columnar_profile --test hm_postgres_coordination
-            # helios-endpoints' PostgreSQL stores (manager branches).
-            optional: endpoints:helios-endpoints:postgres:pg_console
+            # helios-endpoints' / helios-sync's PostgreSQL stores (manager branches).
+            optional: endpoints:helios-endpoints:postgres:pg_console sync:helios-sync:postgres:postgres_sync
           - name: rest+hfs
             packages: -p helios-rest -p helios-hfs
             features: ""
@@ -155,7 +155,7 @@ jobs:
             select: printf '%s\n' --lib --bins --tests
             # Crates that exist only on some branches (the FHIR servers
             # manager's helios-endpoints): tested when crates/<dir> exists.
-            optional: endpoints:helios-endpoints
+            optional: endpoints:helios-endpoints sync:helios-sync
     env:
       CARGO_BUILD_JOBS: 4
       HFS_TEST_PG_HOST: localhost
