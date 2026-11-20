@@ -410,6 +410,57 @@ pub trait ConsoleStore: Send + Sync {
         &self,
         subject: &str,
     ) -> Result<BTreeMap<String, ConsoleRole>, ConsoleStoreError>;
+
+    // ---- added by P3 (default methods, so P0 implementations stay valid) ----
+
+    /// One user by id.
+    async fn user_by_id(&self, id: &str) -> Result<Option<ConsoleUser>, ConsoleStoreError> {
+        Ok(self.list_users().await?.into_iter().find(|u| u.id == id))
+    }
+
+    /// Every per-endpoint role binding.
+    async fn list_role_bindings(&self) -> Result<Vec<RoleBinding>, ConsoleStoreError> {
+        Err(ConsoleStoreError::Unavailable(
+            "role bindings are not supported by this store".into(),
+        ))
+    }
+
+    /// Creates or replaces the binding of `subject` on endpoint `endpoint`
+    /// (by name). `NotFound` when the endpoint does not exist.
+    async fn set_role_binding(
+        &self,
+        _subject: &str,
+        _endpoint: &str,
+        _role: ConsoleRole,
+        _actor: &str,
+    ) -> Result<(), ConsoleStoreError> {
+        Err(ConsoleStoreError::Unavailable(
+            "role bindings are not supported by this store".into(),
+        ))
+    }
+
+    /// Removes a binding; `NotFound` when there was none.
+    async fn delete_role_binding(
+        &self,
+        _subject: &str,
+        _endpoint: &str,
+    ) -> Result<(), ConsoleStoreError> {
+        Err(ConsoleStoreError::Unavailable(
+            "role bindings are not supported by this store".into(),
+        ))
+    }
+}
+
+/// A per-endpoint role binding (`hfs_console_role_bindings`), endpoint by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleBinding {
+    /// `local:{username}`, `oidc:{iss}|{sub}`.
+    pub subject: String,
+    /// Endpoint name.
+    pub endpoint: String,
+    /// Role on that endpoint.
+    pub role: ConsoleRole,
 }
 
 #[cfg(test)]

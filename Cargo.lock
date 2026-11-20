@@ -198,6 +198,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1299,6 +1311,15 @@ dependencies = [
  "radium",
  "tap",
  "wyz",
+]
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -3301,17 +3322,26 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "helios-admin-auth"
 version = "0.2.9"
 dependencies = [
+ "argon2",
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "deadpool-postgres",
+ "form_urlencoded",
+ "helios-auth",
+ "helios-endpoints",
  "http-body-util",
  "rand 0.8.8",
+ "reqwest",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tower",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3381,11 +3411,14 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "deadpool-postgres",
+ "helios-persistence",
  "rand 0.8.8",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "url",
  "uuid",
@@ -3508,9 +3541,11 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "deadpool-postgres",
  "helios-admin-auth",
  "helios-audit",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-observability",
  "helios-persistence",
@@ -3532,6 +3567,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -3882,6 +3918,7 @@ dependencies = [
  "futures-lite",
  "helios-admin-auth",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
  "helios-observability",
@@ -5809,6 +5846,17 @@ dependencies = [
  "regex-syntax 0.8.11",
  "structmeta",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]
