@@ -1,9 +1,14 @@
-# Build the hfs binary on GitHub-hosted runners (free for public repos),
-# package it with the repo's runtime-only Dockerfile, and push to a PRIVATE
-# Google Artifact Registry repo. Auth = Workload Identity Federation (no keys).
-# Repo variables needed: GCP_WIF_PROVIDER, GCP_IMAGE (see DEPLOY-GCP.md).
+# Build the hfs and hts binaries on GitHub-hosted runners (free for public
+# repos), package each with the repo's runtime-only Dockerfile, and push both
+# to a PRIVATE Google Artifact Registry repo. Auth = Workload Identity
+# Federation (no keys).
+# Repo variables needed: GCP_WIF_PROVIDER, GCP_IMAGE (the hfs image path).
+# Optional: GCP_HTS_IMAGE (default: GCP_IMAGE with its last path segment
+# replaced by "hts", i.e. <registry>/<project>/<repo>/hts).
 # Deploy branch = hm/main (HealthyMind's integration branch). The GCE VM pulls
-# :latest every few minutes, so a push to hm/main = a deploy.
+# :latest every few minutes, so a push to hm/main = a deploy. Only hm/main gets
+# :latest; a manual run on any other branch pushes :sha-<commit> tags only, so
+# it can be used to test this workflow without deploying.
 name: Build & publish HFS image
 
 on:
@@ -16,14 +21,33 @@ permissions:
   id-token: write   # OIDC token for Workload Identity Federation
 
 concurrency:
-  group: hfs-image
+  group: hfs-image-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Production feature set, identical to hfs-eval/deploy/remote-build.sh
+  # (hfs.gugulu.tw). Both packages are built in ONE cargo invocation so the
+  # shared crates (helios-fhir, persistence, audit, ...) compile once.
+  # otel: OTLP traces, inert unless OTEL_EXPORTER_OTLP_ENDPOINT is set.
+  # mimalloc: global allocator (peak RSS 6.6 -> 2.6 GB under load).
+  FEATURES: >-
+    helios-hfs/R4,helios-hfs/sqlite,helios-hfs/postgres,helios-hfs/ui,helios-hfs/xml,helios-hfs/subscriptions,helios-hfs/bulk-submit-jwe,helios-hfs/mimalloc,helios-hfs/otel,helios-hts/postgres,helios-hts/otel
 
 jobs:
   image:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
+      # The runner image ships ~30 GB of SDKs this job never uses; a release
+      # target for both binaries plus the cargo registry needs ~15 GB.
+      - name: Free disk space
+        run: |
+          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/local/share/powershell
+          sudo docker image prune -af >/dev/null || true
+          df -h / /mnt
+
       - uses: actions/checkout@v5
 
       - name: Install Rust (stable) + clang/lld
@@ -43,20 +67,59 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: hfs-release
+          shared-key: hfs-hts-release
+          # Only hm/main saves the cache, so test runs on other branches
+          # cannot evict the deploy branch's entry (10 GB repo limit).
+          save-if: ${{ github.ref == 'refs/heads/hm/main' }}
 
-      - name: Build hfs (release)
+      - name: Build hfs + hts (release)
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-zstack-size=8388608
           CARGO_BUILD_JOBS: "3"
-        run: cargo build --release --locked -p helios-hfs --bin hfs --features postgres
-
-      - name: Stage Docker build context
         run: |
-          mkdir -p docker-context
-          cp target/release/hfs docker-context/
-          cp -r data docker-context/data
+          start=$(date +%s)
+          cargo build --release --locked --features "$FEATURES" -p helios-hfs -p helios-hts
+          echo "build: $(( $(date +%s) - start ))s"
+          ls -l target/release/hfs target/release/hts
+          df -h /
+
+      - name: Stage Docker build contexts
+        run: |
+          mkdir -p docker-context/hfs docker-context/hts
+          cp target/release/hfs docker-context/hfs/
+          cp -r data docker-context/hfs/data
+          cp target/release/hts docker-context/hts/
+          # BOOTSTRAP_DIR seed set (first boot on an empty DB) and the spec
+          # SearchParameters for HTS's embedded resource store (without data/
+          # it falls back to 10 built-in parameters).
+          cp -r crates/hts/terminology-data docker-context/hts/terminology-data
+          cp -r data docker-context/hts/data
+
+      - name: Compute image names and tags
+        id: img
+        env:
+          GCP_IMAGE: ${{ vars.GCP_IMAGE }}
+          GCP_HTS_IMAGE: ${{ vars.GCP_HTS_IMAGE }}
+          IS_DEPLOY_BRANCH: ${{ github.ref == 'refs/heads/hm/main' }}
+          SHA: ${{ github.sha }}
+        run: |
+          test -n "$GCP_IMAGE" || { echo "repo variable GCP_IMAGE is not set" >&2; exit 1; }
+          hfs="$GCP_IMAGE"
+          hts="${GCP_HTS_IMAGE:-${GCP_IMAGE%/*}/hts}"
+          hfs_tags="$hfs:sha-$SHA"
+          hts_tags="$hts:sha-$SHA"
+          if [ "$IS_DEPLOY_BRANCH" = true ]; then
+            hfs_tags="$hfs_tags,$hfs:latest"
+            hts_tags="$hts_tags,$hts:latest"
+          fi
+          {
+            echo "registry=${GCP_IMAGE%%/*}"
+            echo "hfs_tags=$hfs_tags"
+            echo "hts_tags=$hts_tags"
+          } >> "$GITHUB_OUTPUT"
+          echo "hfs: $hfs_tags"
+          echo "hts: $hts_tags"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -67,13 +130,32 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Docker login to Artifact Registry
-        run: gcloud auth configure-docker -q "${GCP_IMAGE%%/*}"
+        run: gcloud auth configure-docker -q "$REGISTRY"
         env:
-          GCP_IMAGE: ${{ vars.GCP_IMAGE }}
+          REGISTRY: ${{ steps.img.outputs.registry }}
 
-      - uses: docker/build-push-action@v7
+      # hts first: the VM's update timer pulls both, and a new hfs that
+      # expects a newer hts should never land before it.
+      - name: Build & push hts image
+        uses: docker/build-push-action@v7
         with:
-          context: docker-context
+          context: docker-context/hts
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BINARY_NAME=hts
+            EXPOSE_PORT=8090
+            BOOTSTRAP_DIR=/app/terminology-data
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          tags: ${{ steps.img.outputs.hts_tags }}
+
+      - name: Build & push hfs image
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-context/hfs
           file: Dockerfile
           platforms: linux/amd64
           push: true
@@ -83,6 +165,4 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          tags: |
-            ${{ vars.GCP_IMAGE }}:latest
-            ${{ vars.GCP_IMAGE }}:sha-${{ github.sha }}
+          tags: ${{ steps.img.outputs.hfs_tags }}
