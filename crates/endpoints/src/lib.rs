@@ -14,6 +14,7 @@
 //! | [`console`] | console auth modes, roles, [`ConsoleSessionResolver`], [`ConsoleStore`] | P3 (impl), P2 + P5 (consumers) |
 //! | [`sync`] | sync job / run model, [`SyncStore`] | P6 (impl), P4/P5 (API/UI) |
 //! | [`outbound`] | [`OutboundPolicy`] SSRF guard | P2, P3, P6 |
+//! | `pg` (feature `postgres`) | PostgreSQL [`EndpointStore`] + `LISTEN hfs_config` task | P1 |
 //!
 //! The crate deliberately has no HTTP framework, FHIR model or persistence
 //! dependency so that every other crate can depend on it.
@@ -22,6 +23,8 @@ pub mod console;
 pub mod model;
 pub mod name;
 pub mod outbound;
+#[cfg(feature = "postgres")]
+pub mod pg;
 pub mod registry;
 pub mod secret;
 pub mod snapshot;

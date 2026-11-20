@@ -155,6 +155,7 @@ pub mod bulk_submit_oauth;
 pub mod cluster_sync;
 pub mod config;
 mod dashboard;
+pub mod endpoint;
 pub mod error;
 pub mod export;
 pub mod extractors;
@@ -367,6 +368,11 @@ pub struct OperationsBundle {
     /// worker, conformance seeding) so their writes reach the same consumers;
     /// `None` creates a fresh one.
     pub observability: Option<WriteObservability>,
+    /// FHIR server manager runtime (`HFS_MANAGER=on`): the endpoint registry
+    /// and store. `Some` installs the endpoint dispatcher in front of the FHIR
+    /// stack (see [`endpoint`]); `None` leaves the app exactly as without the
+    /// manager.
+    pub endpoints: Option<endpoint::EndpointRuntime>,
 }
 
 /// The bulk-submit job store, input fetcher, output store, and download
@@ -650,7 +656,11 @@ where
         purge: ops_purge,
         reindex: ops_reindex,
         observability,
+        endpoints,
     } = ops;
+    if endpoints.is_some() {
+        info!("FHIR server manager is ENABLED: endpoint dispatcher in front of the FHIR API");
+    }
     let observability = observability.unwrap_or_default();
 
     // Register the process-global dashboard data provider so the web UI can
@@ -708,6 +718,9 @@ where
         app_audit_source_observer,
     )
     .with_write_observability(observability.clone());
+    if let Some(runtime) = &endpoints {
+        state = state.with_endpoints(runtime.clone());
+    }
 
     // Stored StructureDefinitions are replayed into the profile registries
     // (the registries are in-memory; without this every restart forgot
@@ -931,6 +944,7 @@ where
             let public_url = PublicUrl::parse(&config.base_url)
                 .expect("validated ServerConfig has a valid public base URL");
             let tenant_path_routing = config.multitenancy.routing_mode.supports_url_path();
+            let server_base = public_url.as_str().to_string();
             let public_base_url_for_tenant: Arc<dyn Fn(&str) -> String + Send + Sync> =
                 Arc::new(move |tenant_id| {
                     if tenant_path_routing {
@@ -939,6 +953,26 @@ where
                         public_url.as_str().to_string()
                     }
                 });
+            // Manager on: a tenant bound to a named endpoint publishes its
+            // notification `fullUrl`s and `SubscriptionStatus` references
+            // under that endpoint's base.
+            let public_base_url_for_tenant = match &endpoints {
+                Some(runtime) => {
+                    let resolver = endpoint::SnapshotBaseUrlResolver::new(
+                        Arc::clone(&runtime.registry),
+                        server_base,
+                        public_base_url_for_tenant,
+                    );
+                    Arc::new(move |tenant_id: &str| {
+                        use endpoint::BaseUrlResolver;
+                        resolver.public_base_for_tenant(tenant_id)
+                    }) as Arc<dyn Fn(&str) -> String + Send + Sync>
+                }
+                None => {
+                    let _ = server_base;
+                    public_base_url_for_tenant
+                }
+            };
             let mut engine =
                 helios_subscriptions::SubscriptionEngine::with_outbound_auth_and_url_resolver(
                     sub_config,
@@ -1142,39 +1176,23 @@ where
         .enabled()
         .then(|| middleware::client_rate_limit::ClientRateLimiter::new(rate_limit));
 
-    // Apply auth middleware if enabled. Just inside authentication, the
-    // authenticated principal is reported to the audit context (the audit
-    // layer itself sits outside auth, see below).
-    let router = if let Some(ref auth) = auth_state {
-        let router = router
-            .layer(axum::middleware::from_fn_with_state(
-                auth.clone(),
-                middleware::auth::authz_middleware,
-            ))
-            // Between authentication and authorization, so a request
-            // authorization refuses (403) is still attributed to its user.
-            .layer(axum::middleware::from_fn(
-                middleware::audit::capture_principal,
-            ));
-        let router = match rate_limiter {
-            Some(limiter) => router.layer(axum::middleware::from_fn_with_state(
-                limiter,
-                middleware::client_rate_limit::client_rate_limit_middleware,
-            )),
-            None => router,
-        };
-        router.layer(axum::middleware::from_fn_with_state(
-            auth.clone(),
-            middleware::auth::auth_middleware,
-        ))
-    } else {
-        match rate_limiter {
-            Some(limiter) => router.layer(axum::middleware::from_fn_with_state(
-                limiter,
-                middleware::client_rate_limit::client_rate_limit_middleware,
-            )),
-            None => router,
-        }
+    // Authentication, authorization and rate limiting of the FHIR stack
+    // (package P2 makes this per endpoint; see `endpoint::auth`). Just inside
+    // authentication, the authenticated principal is reported to the audit
+    // context (the audit layer itself sits outside auth, see below).
+    let router = endpoint::auth::auth_layer(
+        router,
+        endpoint::auth::AuthHook {
+            auth_state: auth_state.clone(),
+            rate_limiter,
+        },
+    );
+
+    // FHIR server manager: the dispatcher resolves the endpoint, strips a
+    // named endpoint's `/{path}` and hands the request to the stack above.
+    let router = match &endpoints {
+        Some(runtime) => endpoint::dispatch::install(router, Arc::clone(&runtime.registry)),
+        None => router,
     };
 
     // Public console metrics — only the server-global `uptime` endpoint — are
@@ -1297,12 +1315,24 @@ where
         .layer(RequestDecompressionLayer::new())
         .layer(CompressionLayer::new().compress_when(compress_predicate));
 
-    // Add CORS if enabled
-    let router = if config.enable_cors {
-        let cors = build_cors_layer(&config);
-        router.layer(cors)
-    } else {
-        router
+    // Add CORS if enabled. With the manager on, the endpoint-aware layer
+    // decides per request (an endpoint's own `cors` section, or the global
+    // `HFS_CORS_*` layer for inherited endpoints and the console surface).
+    let router = match &endpoints {
+        Some(runtime) => router.layer(axum::middleware::from_fn_with_state(
+            endpoint::cors::EndpointCors::new(
+                Arc::clone(&runtime.registry),
+                config.enable_cors.then(|| build_cors_layer(&config)),
+                config.cors_methods.clone(),
+                config.cors_headers.clone(),
+            ),
+            endpoint::cors::endpoint_cors,
+        )),
+        None if config.enable_cors => {
+            let cors = build_cors_layer(&config);
+            router.layer(cors)
+        }
+        None => router,
     };
 
     // Raise the body-size limit from axum's 2 MiB default to the configured

@@ -172,6 +172,15 @@ pub struct AppState<S> {
     /// `:below` expansion through `HFS_TERMINOLOGY_SERVER`, with its cache).
     /// `None` when no terminology server is configured.
     search_terminology: Option<Arc<crate::terminology::SearchTerminology>>,
+
+    /// FHIR server manager runtime (registry + store); `None` without the
+    /// manager (`HFS_MANAGER=off`).
+    endpoints: Option<crate::endpoint::EndpointRuntime>,
+
+    /// Search-time terminology services of endpoints that bind their own
+    /// terminology server, by server URL.
+    endpoint_search_terminology:
+        Arc<dashmap::DashMap<String, Arc<crate::terminology::SearchTerminology>>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -204,6 +213,8 @@ impl<S> Clone for AppState<S> {
             validation: Arc::clone(&self.validation),
             write_observability: self.write_observability.clone(),
             search_terminology: self.search_terminology.clone(),
+            endpoints: self.endpoints.clone(),
+            endpoint_search_terminology: Arc::clone(&self.endpoint_search_terminology),
         }
     }
 }
@@ -257,6 +268,8 @@ impl<S: ResourceStorage> AppState<S> {
             validation,
             write_observability: WriteObservability::new(),
             search_terminology,
+            endpoints: None,
+            endpoint_search_terminology: Default::default(),
         }
     }
 
@@ -320,6 +333,8 @@ impl<S: ResourceStorage> AppState<S> {
             validation,
             write_observability: WriteObservability::new(),
             search_terminology,
+            endpoints: None,
+            endpoint_search_terminology: Default::default(),
         }
     }
 
@@ -534,14 +549,17 @@ impl<S: ResourceStorage> AppState<S> {
     }
 
     /// Returns the public base for the way this request selected its tenant.
+    ///
+    /// The URL segment is the named endpoint's path when the request came
+    /// through one (FHIR server manager), else the tenant id when the tenant
+    /// came from a URL prefix, else nothing.
     pub(crate) fn public_base_url_for_request(
         &self,
         tenant: &crate::extractors::TenantExtractor,
     ) -> String {
-        if tenant.is_url_based() {
-            self.public_url.with_segments([tenant.tenant_id()])
-        } else {
-            self.public_url.as_str().to_string()
+        match tenant.url_segment() {
+            Some(segment) => self.public_url.with_segments([segment]),
+            None => self.public_url.as_str().to_string(),
         }
     }
 
@@ -552,8 +570,8 @@ impl<S: ResourceStorage> AppState<S> {
         segments: impl IntoIterator<Item = &'a str>,
     ) -> String {
         let mut all_segments: Vec<String> = Vec::new();
-        if tenant.is_url_based() {
-            all_segments.push(tenant.tenant_id().to_string());
+        if let Some(segment) = tenant.url_segment() {
+            all_segments.push(segment.to_string());
         }
         all_segments.extend(segments.into_iter().map(str::to_string));
         self.public_url.with_segments(all_segments)
@@ -594,8 +612,8 @@ impl<S: ResourceStorage> AppState<S> {
         query: Option<&str>,
     ) -> String {
         let mut all_segments: Vec<String> = Vec::new();
-        if tenant.is_url_based() {
-            all_segments.push(tenant.tenant_id().to_string());
+        if let Some(segment) = tenant.url_segment() {
+            all_segments.push(segment.to_string());
         }
         all_segments.extend(segments.into_iter().map(str::to_string));
         self.public_url
@@ -654,6 +672,56 @@ impl<S: ResourceStorage> AppState<S> {
     /// configured (`HFS_TERMINOLOGY_SERVER`).
     pub fn search_terminology(&self) -> Option<&crate::terminology::SearchTerminology> {
         self.search_terminology.as_deref()
+    }
+
+    /// The search-time terminology service of the request running on this
+    /// task: its endpoint's own terminology binding when it has one (`None`
+    /// when that binding names no server), else [`Self::search_terminology`].
+    /// Services per bound URL are built once and shared.
+    pub fn search_terminology_for_request(
+        &self,
+    ) -> Option<Arc<crate::terminology::SearchTerminology>> {
+        let binding =
+            crate::endpoint::with_current(|r| r.endpoint.spec.terminology.clone()).flatten();
+        let Some(binding) = binding else {
+            return self.search_terminology.clone();
+        };
+        let url = binding.server_url?;
+        if self.config.terminology_server.as_deref() == Some(url.as_str()) {
+            return self.search_terminology.clone();
+        }
+        let service = self
+            .endpoint_search_terminology
+            .entry(url.clone())
+            .or_insert_with(|| {
+                Arc::new(crate::terminology::SearchTerminology::from_config(
+                    &url,
+                    &self.config.search_terminology,
+                ))
+            })
+            .clone();
+        Some(service)
+    }
+
+    /// Installs the FHIR server manager runtime.
+    pub fn with_endpoints(mut self, runtime: crate::endpoint::EndpointRuntime) -> Self {
+        self.endpoints = Some(runtime);
+        self
+    }
+
+    /// The FHIR server manager runtime, when the manager is on.
+    pub fn endpoint_runtime(&self) -> Option<&crate::endpoint::EndpointRuntime> {
+        self.endpoints.as_ref()
+    }
+
+    /// The endpoint registry, when the manager is on.
+    pub fn endpoints(&self) -> Option<&Arc<helios_endpoints::EndpointRegistry>> {
+        self.endpoints.as_ref().map(|r| &r.registry)
+    }
+
+    /// The endpoint store, when the manager is on.
+    pub fn endpoint_store(&self) -> Option<&Arc<dyn helios_endpoints::EndpointStore>> {
+        self.endpoints.as_ref().map(|r| &r.store)
     }
 
     /// What a search does when a terminology expansion behind one of its

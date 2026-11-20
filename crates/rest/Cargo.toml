@@ -33,7 +33,7 @@ xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml", "helios-fhir-
 
 # Database backends (pass through to helios-persistence)
 sqlite = ["helios-persistence/sqlite"]
-postgres = ["helios-persistence/postgres"]
+postgres = ["helios-persistence/postgres", "helios-endpoints/postgres"]
 mongodb = ["helios-persistence/mongodb"]
 elasticsearch = ["helios-persistence/elasticsearch"]
 s3 = ["helios-persistence/s3", "dep:aws-sdk-s3", "dep:aws-config"]
@@ -62,6 +62,8 @@ helios-audit = { path = "../audit", version = "0.2.9", default-features = false 
 helios-subscriptions = { path = "../subscriptions", version = "0.2.9", optional = true, default-features = false }
 helios-fhir-validator = { path = "../fhir-validator", version = "0.2.9", default-features = false, features = ["fhirpath"] }
 helios-observability = { path = "../observability", version = "0.2.9" }
+# FHIR server manager contracts (endpoint model, routing snapshot, registry).
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -108,6 +110,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
 futures = "0.3"
 dashmap = "6"
+# Per-endpoint request counters (FHIR server manager dispatcher).
+metrics = "0.24"
 # The SMART access layer holds the tenant's search-parameter registry, which
 # `SearchProvider::search_param_registry` hands out behind a `parking_lot` lock.
 parking_lot = "0.12"
