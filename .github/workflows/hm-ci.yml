@@ -126,7 +126,7 @@ jobs:
           - name: persistence-postgres
             packages: -p helios-persistence
             features: helios-persistence/postgres
-            select: printf '%s\n' --lib --test postgres_tests --test postgres_write_concurrency --test sof_pg_runner --test sof_columnar_profile
+            select: printf '%s\n' --lib --test postgres_tests --test postgres_write_concurrency --test sof_pg_runner --test sof_columnar_profile --test hm_postgres_coordination
           - name: rest+hfs
             packages: -p helios-rest -p helios-hfs
             features: ""
