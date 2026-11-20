@@ -170,6 +170,8 @@ pub(crate) struct EndpointChip {
     pub tone: &'static str,
     pub status_key: &'static str,
     pub href: String,
+    /// The endpoint's URL path under the FHIR base (`/` for the default).
+    pub path: String,
     pub serving: bool,
 }
 
@@ -195,6 +197,11 @@ impl EndpointChip {
             tone: badge.tone,
             status_key: badge.key,
             href: format!("/ui/e/{}", e.name()),
+            path: if e.spec.path.is_root() {
+                "/".to_string()
+            } else {
+                format!("/{}", e.spec.path.as_str())
+            },
             serving: e.spec.status.is_serving(),
         }
     }

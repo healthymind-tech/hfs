@@ -11,7 +11,7 @@
         <span class="avatar avatar--brand">{{ ep.initials }}</span>
         <span class="selector__label">
           <span class="endpoint-switch__name">{{ ep.display }}</span>
-          <span class="endpoint-switch__path">/{{ ep.name }}</span>
+          <span class="endpoint-switch__path">{{ ep.path }}</span>
         </span>
         {% else %}
         <span class="avatar avatar--brand">{% include "icons/grid.svg" %}</span>
@@ -34,7 +34,7 @@
         {% for ep in status.endpoint_options() %}
         <a class="menu__option" href="{{ ep.href }}"{% if let Some(cur) = status.current_endpoint() %}{% if cur.name == ep.name %} aria-current="true"{% endif %}{% endif %}>
           <span class="avatar">{{ ep.initials }}</span>
-          <span class="menu__option-text">{{ ep.display }} <small>/{{ ep.name }}</small></span>
+          <span class="menu__option-text">{{ ep.display }} <small>{{ ep.path }}</small></span>
           {% if !ep.serving %}<span class="tag tag--{{ ep.tone }}">{{ i18n.t(ep.status_key) }}</span>{% endif %}
         </a>
         {% endfor %}

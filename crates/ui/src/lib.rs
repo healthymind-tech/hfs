@@ -2538,7 +2538,16 @@ async fn scope_request_authorization(
     let authorization = login::caller_for(&state, request.headers(), "")
         .await
         .authorization;
-    conformance::with_request_authorization(authorization, next.run(request)).await
+    let prefix = request
+        .extensions()
+        .get::<manager::EndpointScope>()
+        .map(|scope| scope.self_call_prefix())
+        .unwrap_or_default();
+    conformance::with_endpoint_prefix(
+        prefix,
+        conformance::with_request_authorization(authorization, next.run(request)),
+    )
+    .await
 }
 
 /// Middleware: tell a HTS console served from the same origin that this
