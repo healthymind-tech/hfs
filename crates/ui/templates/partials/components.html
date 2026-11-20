@@ -84,11 +84,11 @@
 {% endmacro %}
 
 {% macro pill(b) %}
-<span class="pill pill--{{ b.tone }}">{% call icon(b.icon) %}{% endcall %}<span>{{ i18n.t(b.key) }}</span>{% if b.inherited %}<span class="pill__note">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
+<span class="status-pill status-pill--{{ b.tone }}">{% call icon(b.icon) %}{% endcall %}<span>{{ i18n.t(b.key) }}</span>{% if b.inherited %}<span class="status-pill__note">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
 {%- endmacro %}
 
 {% macro pill_raw(tone, icon_name, text) %}
-<span class="pill pill--{{ tone }}">{% call icon(icon_name) %}{% endcall %}<span>{{ text }}</span></span>
+<span class="status-pill status-pill--{{ tone }}">{% call icon(icon_name) %}{% endcall %}<span>{{ text }}</span></span>
 {%- endmacro %}
 
 {% macro form_section(id, title, desc="") %}
@@ -241,7 +241,7 @@
       <a class="btn" href="/ui/e/{{ head.name }}/duplicate">{% call icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
       {% if !head.is_default && !head.env_managed %}
       <form method="post" action="/ui/e/{{ head.name }}/status" class="inline-form">
-        {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+        {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
         <input type="hidden" name="revision" value="{{ head.revision }}">
         {% if head.enabled %}
         <input type="hidden" name="action" value="disable">

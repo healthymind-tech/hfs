@@ -296,7 +296,7 @@ fn builtin() -> Vec<NavItem> {
         item(Settings, "about", "mgr-nav-about", "/ui/about", "info", 90),
     ];
     v.iter_mut()
-        .filter(|i| i.id == "tenants")
+        .filter(|i| matches!(i.id, "tenants" | "settings-auth" | "settings-users"))
         .for_each(|i| i.min_role = ConsoleRole::Admin);
     v
 }

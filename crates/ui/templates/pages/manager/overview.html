@@ -107,7 +107,7 @@
             <a class="menu__option" href="/ui/e/{{ card.name }}/duplicate">{% call ui::icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
             {% if card.can_toggle %}
             <form method="post" action="/ui/e/{{ card.name }}/status">
-              {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+              {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
               <input type="hidden" name="revision" value="{{ card.revision }}">
               <input type="hidden" name="back" value="/ui?changed={{ card.name }}">
               {% if card.status_slug == "enabled" %}

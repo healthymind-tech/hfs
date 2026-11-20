@@ -431,3 +431,6 @@ mgr-about-licenses = Open-source components
 mgr-about-component = Component
 mgr-about-license = License
 mgr-updated-at = Last changed { $at }
+mgr-nav-settings-auth = Console sign-in
+mgr-nav-settings-users = Users & roles
+mgr-nav-account = My account

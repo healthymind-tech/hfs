@@ -24,7 +24,7 @@
 {% endif %}
 
 <form method="post" action="/ui/endpoints" class="wizard" id="new-endpoint" novalidate data-wizard data-unsaved-form>
-  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   <ol class="stepper" role="list" data-wizard-steps hidden>
     <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="0"><span class="stepper__num">1</span><span class="stepper__label">{{ i18n.t("mgr-new-step-basics") }}</span></button></li>
     <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="1"><span class="stepper__num">2</span><span class="stepper__label">{{ i18n.t("mgr-new-step-data") }}</span></button></li>

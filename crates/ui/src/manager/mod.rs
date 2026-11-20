@@ -150,8 +150,12 @@ pub(crate) fn role_of(
     }
 }
 
-/// The console session's CSRF synchronizer token (design §7.3). The console
-/// guard (package P3) inserts it into request extensions; the layout then
+/// The console session's CSRF synchronizer token (design §7.3).
+///
+/// Integration note: once package P3 is merged this becomes
+/// `pub use helios_admin_auth::console::guard::CsrfToken;` (P3's gate inserts
+/// that type and accepts the token as `X-CSRF-Token` or form field `_csrf`).
+/// Until then the console guard inserts this type; the layout then
 /// emits `<meta name="csrf-token">`, htmx sends it as `X-CSRF-Token` and every
 /// manager form carries it as the hidden field `csrf`.
 #[derive(Debug, Clone, PartialEq, Eq)]
