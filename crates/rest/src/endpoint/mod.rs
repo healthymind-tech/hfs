@@ -30,6 +30,7 @@ use helios_endpoints::{
 };
 use helios_fhir::FhirVersion;
 
+pub use auth::{AuthBase, AuthHook, EffectiveAuth, auth_layer};
 pub use base_url::{BaseUrlResolver, SnapshotBaseUrlResolver};
 pub use effective::EffectiveConfig;
 

@@ -74,6 +74,7 @@ pub async fn capabilities_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    effective_auth: Option<axum::Extension<std::sync::Arc<crate::endpoint::EffectiveAuth>>>,
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
@@ -97,8 +98,24 @@ where
 
     let base_url = state.public_base_url_for_request(&tenant);
 
-    let capability_statement =
+    let mut capability_statement =
         build_capability_statement(&state, tenant.context(), fhir_version, &base_url);
+
+    // An endpoint with its own auth section (FHIR server manager P2)
+    // describes its own IdP in `rest.security`, SMART endpoints it leaves
+    // unset discovered from its issuer (the statement above only knows the
+    // configured ones). The `cors` flag stays the one computed above.
+    if let Some(axum::Extension(auth)) = effective_auth
+        && !auth.inherited
+        && let Some(rest) = capability_statement
+            .get_mut("rest")
+            .and_then(|r| r.get_mut(0))
+    {
+        let cors = rest["security"]["cors"]
+            .as_bool()
+            .unwrap_or(state.config().enable_cors);
+        rest["security"] = auth.capability_security(cors).await;
+    }
 
     // Negotiate response format
     let negotiated = negotiate_format(&req_headers, None);

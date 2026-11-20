@@ -19,6 +19,17 @@
 //! A rejected request gets `429` with an `OperationOutcome` (`throttled`)
 //! and `Retry-After`. Health probes are never limited, and neither is the
 //! administrator credential.
+//!
+//! **Per endpoint** (FHIR server manager, design §5.2): the per-endpoint auth
+//! layer stores a [`RateBudget`] in the request extensions — the endpoint's
+//! `rateLimit` section, or the `HFS_RATE_LIMIT_*` values when the endpoint
+//! inherits them — and [`endpoint_rate_limit_middleware`] bills the request
+//! to `(endpoint, client)`: each endpoint has its own buckets, so a client
+//! exhausting one endpoint's budget is not throttled on another. Buckets of
+//! an endpoint that no longer exists are dropped
+//! ([`ClientRateLimiter::retain_endpoints`]). Requests that carry no budget
+//! (no manager) are billed exactly as before, with the limiter's own
+//! configuration.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -101,6 +112,42 @@ impl RateLimitConfig {
     }
 }
 
+/// The limits that apply to one request (see the module documentation).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RateBudget {
+    /// Prefix of the bucket keys, `ep:{endpoint id}|` (empty without an
+    /// endpoint, which keeps the keys of the environment configuration).
+    pub key_prefix: String,
+    /// Requests / minute / anonymous client address (0 = unlimited).
+    pub anonymous_per_minute: u32,
+    /// Requests / minute / authenticated client (0 = unlimited).
+    pub authenticated_per_minute: u32,
+    /// Seconds of budget a bucket holds.
+    pub burst_seconds: u32,
+}
+
+impl RateBudget {
+    /// The budget of `config` (no endpoint prefix).
+    pub fn of(config: &RateLimitConfig) -> Self {
+        Self {
+            key_prefix: String::new(),
+            anonymous_per_minute: config.anonymous_per_minute,
+            authenticated_per_minute: config.authenticated_per_minute,
+            burst_seconds: config.burst_seconds.max(1),
+        }
+    }
+
+    /// The bucket-key prefix of an endpoint id.
+    pub fn endpoint_prefix(endpoint_id: &str) -> String {
+        format!("ep:{endpoint_id}|")
+    }
+
+    /// Whether any limit is on.
+    pub fn enabled(&self) -> bool {
+        self.anonymous_per_minute > 0 || self.authenticated_per_minute > 0
+    }
+}
+
 struct Bucket {
     tokens: f64,
     updated: Instant,
@@ -126,9 +173,21 @@ impl ClientRateLimiter {
 
     /// Takes one token for `key` at `per_minute`; `Err(seconds)` until the
     /// bucket has one again.
+    #[cfg(test)]
     fn take(&self, key: &str, per_minute: u32, now: Instant) -> Result<(), u64> {
+        self.take_with(key, per_minute, self.config.burst_seconds, now)
+    }
+
+    /// [`take`](Self::take) with an explicit burst.
+    fn take_with(
+        &self,
+        key: &str,
+        per_minute: u32,
+        burst_seconds: u32,
+        now: Instant,
+    ) -> Result<(), u64> {
         let rate = per_minute as f64 / 60.0;
-        let capacity = (rate * self.config.burst_seconds as f64).max(1.0);
+        let capacity = (rate * burst_seconds.max(1) as f64).max(1.0);
         let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
         if buckets.len() > PRUNE_AT {
             buckets.retain(|_, b| {
@@ -148,6 +207,30 @@ impl ClientRateLimiter {
         } else {
             Err(((1.0 - bucket.tokens) / rate).ceil().max(1.0) as u64)
         }
+    }
+}
+
+impl ClientRateLimiter {
+    /// The limiter's own configuration (`HFS_RATE_LIMIT_*`).
+    pub fn config(&self) -> &RateLimitConfig {
+        &self.config
+    }
+
+    /// Drops the buckets of endpoints not in `live` (endpoint ids). Buckets
+    /// without an endpoint prefix are kept.
+    pub fn retain_endpoints(&self, live: &std::collections::HashSet<String>) {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        buckets.retain(|key, _| match key.strip_prefix("ep:") {
+            Some(rest) => rest
+                .split_once('|')
+                .is_some_and(|(id, _)| live.contains(id)),
+            None => true,
+        });
+    }
+
+    /// Number of buckets (tests, diagnostics).
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 
@@ -181,26 +264,67 @@ fn exempt(path: &str) -> bool {
 }
 
 /// The rate-limit middleware. Runs after authentication, so the principal
-/// (when any) is known.
+/// (when any) is known. Uses the limiter's own configuration.
 pub async fn client_rate_limit_middleware(
     State(limiter): State<Arc<ClientRateLimiter>>,
     request: Request,
     next: Next,
 ) -> Response {
-    if exempt(request.uri().path()) {
-        return next.run(request).await;
+    let budget = RateBudget::of(&limiter.config);
+    limit(&limiter, &budget, request, next).await
+}
+
+/// The per-endpoint rate-limit middleware: the request's [`RateBudget`]
+/// (stored by the per-endpoint auth layer), else the limiter's own
+/// configuration.
+pub async fn endpoint_rate_limit_middleware(
+    State(limiter): State<Arc<ClientRateLimiter>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let budget = request
+        .extensions()
+        .get::<RateBudget>()
+        .cloned()
+        .unwrap_or_else(|| RateBudget::of(&limiter.config));
+    limit(&limiter, &budget, request, next).await
+}
+
+async fn limit(
+    limiter: &ClientRateLimiter,
+    budget: &RateBudget,
+    request: Request,
+    next: Next,
+) -> Response {
+    match check(limiter, budget, &request) {
+        Some(refusal) => refusal,
+        None => next.run(request).await,
+    }
+}
+
+/// Bills `request` to its bucket under `budget`: `None` when it may proceed,
+/// the `429` otherwise. Health probes and the administrator credential are
+/// never limited.
+pub(crate) fn check(
+    limiter: &ClientRateLimiter,
+    budget: &RateBudget,
+    request: &Request,
+) -> Option<Response> {
+    if !budget.enabled() || exempt(request.uri().path()) {
+        return None;
     }
     let config = &limiter.config;
     let (key, per_minute) = match request.extensions().get::<Principal>() {
-        Some(p) if p.issuer == crate::middleware::auth::ADMIN_ISSUER => {
-            return next.run(request).await;
-        }
+        Some(p) if p.issuer == crate::middleware::auth::ADMIN_ISSUER => return None,
         Some(p) => {
             let who = p
                 .client_id()
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{}|{}", p.issuer, p.subject));
-            (format!("client:{who}"), config.authenticated_per_minute)
+            (
+                format!("{}client:{who}", budget.key_prefix),
+                budget.authenticated_per_minute,
+            )
         }
         None => {
             let peer = request
@@ -209,38 +333,40 @@ pub async fn client_rate_limit_middleware(
                 .map(|c| c.0.ip());
             let ip = client_ip(request.headers(), peer, &config.trusted_proxies);
             (
-                format!("ip:{}", ip.map(|ip| ip.to_string()).unwrap_or_default()),
-                config.anonymous_per_minute,
+                format!(
+                    "{}ip:{}",
+                    budget.key_prefix,
+                    ip.map(|ip| ip.to_string()).unwrap_or_default()
+                ),
+                budget.anonymous_per_minute,
             )
         }
     };
     if per_minute == 0 {
-        return next.run(request).await;
+        return None;
     }
-    match limiter.take(&key, per_minute, Instant::now()) {
-        Ok(()) => next.run(request).await,
-        Err(retry_after) => {
-            tracing::warn!(key = %key, retry_after, "Rate limit exceeded");
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "throttled",
-                        "diagnostics": format!(
-                            "rate limit of {per_minute} requests per minute exceeded; retry in {retry_after} s"
-                        ),
-                    }]
-                })),
-            )
-                .into_response();
-            if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, v);
-            }
-            response
-        }
+    let retry_after = limiter
+        .take_with(&key, per_minute, budget.burst_seconds, Instant::now())
+        .err()?;
+    tracing::warn!(key = %key, retry_after, "Rate limit exceeded");
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "throttled",
+                "diagnostics": format!(
+                    "rate limit of {per_minute} requests per minute exceeded; retry in {retry_after} s"
+                ),
+            }]
+        })),
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, v);
     }
+    Some(response)
 }
 
 #[cfg(test)]
@@ -287,6 +413,41 @@ mod tests {
             client_ip(&headers, Some("198.51.100.1".parse().unwrap()), &trusted),
             Some("198.51.100.1".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn endpoint_buckets_are_separate_and_pruned_with_their_endpoint() {
+        let l = limiter(1);
+        let t0 = Instant::now();
+        let a = format!("{}ip:1.2.3.4", RateBudget::endpoint_prefix("A"));
+        let b = format!("{}ip:1.2.3.4", RateBudget::endpoint_prefix("B"));
+        assert!(l.take_with(&a, 60, 1, t0).is_ok());
+        assert!(l.take_with(&a, 60, 1, t0).is_err(), "A's bucket is empty");
+        assert!(l.take_with(&b, 60, 1, t0).is_ok(), "B has its own bucket");
+        assert!(l.take("ip:1.2.3.4", 60, t0).is_ok(), "env bucket untouched");
+        assert_eq!(l.bucket_count(), 3);
+        l.retain_endpoints(&std::collections::HashSet::from(["B".to_string()]));
+        assert_eq!(l.bucket_count(), 2, "A's buckets dropped, env kept");
+        // A larger burst holds more.
+        let c = "ep:C|ip:x";
+        for _ in 0..30 {
+            assert!(l.take_with(c, 60, 30, t0).is_ok());
+        }
+        assert!(l.take_with(c, 60, 30, t0).is_err());
+    }
+
+    #[test]
+    fn budgets_follow_the_config() {
+        let c = RateLimitConfig {
+            anonymous_per_minute: 5,
+            ..RateLimitConfig::default()
+        };
+        let b = RateBudget::of(&c);
+        assert!(b.enabled());
+        assert_eq!(b.key_prefix, "");
+        assert_eq!(b.burst_seconds, 10);
+        assert!(!RateBudget::default().enabled());
+        assert_eq!(RateBudget::endpoint_prefix("x"), "ep:x|");
     }
 
     #[test]
