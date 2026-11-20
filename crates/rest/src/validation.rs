@@ -164,6 +164,12 @@ pub struct ValidationService {
     /// ([`crate::packages::pins`]), applied when a profile is registered.
     binding_pins:
         RwLock<std::collections::HashMap<String, Arc<crate::packages::pins::ProfilePins>>>,
+    /// `Bundle.signature` verification (`HFS_VALIDATION_SIGNATURES`);
+    /// `None` = off.
+    signatures: Option<helios_fhir_validator::SignatureOptions>,
+    /// Severity of an unresolvable HL7-namespace uri
+    /// (`HFS_VALIDATION_HL7_URLS`); `None` = off.
+    hl7_urls: Option<Severity>,
 }
 
 impl Default for ValidationService {
@@ -189,6 +195,8 @@ impl Default for ValidationService {
             stored_index: Default::default(),
             cache_dirty: tokio::sync::Notify::new(),
             binding_pins: Default::default(),
+            signatures: Some(helios_fhir_validator::SignatureOptions::default()),
+            hl7_urls: Some(Severity::Error),
         }
     }
 }
@@ -248,9 +256,33 @@ impl ValidationService {
             "closed-required" => TerminologyFailMode::ClosedRequired,
             _ => TerminologyFailMode::Open,
         };
+        let signatures = (config.signatures != "off").then(|| {
+            let paths: Vec<std::path::PathBuf> =
+                config.signature_certs.iter().map(std::path::PathBuf::from).collect();
+            let (keys, problems) = helios_fhir_validator::SignatureOptions::load_keys(&paths);
+            for problem in problems {
+                warn!("HFS_VALIDATION_SIGNATURE_CERTS: {problem}");
+            }
+            helios_fhir_validator::SignatureOptions {
+                keys,
+                trust: if config.signature_trust == "listed" {
+                    helios_fhir_validator::SignatureTrust::Listed
+                } else {
+                    helios_fhir_validator::SignatureTrust::Any
+                },
+                untrusted_severity: if config.signature_untrusted == "error" {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                },
+            }
+        });
+        let empty_fails = config.empty_invariant == "fail";
         Self {
             mode,
-            constraint_evaluator: config.constraints.then(FhirPathConstraintEvaluator::new),
+            constraint_evaluator: config
+                .constraints
+                .then(|| FhirPathConstraintEvaluator::new().with_empty_fails(empty_fails)),
             terminology,
             suppress_constraints: config.suppress_constraints.clone(),
             terminology_fail,
@@ -275,6 +307,12 @@ impl ValidationService {
             stored_index: Default::default(),
             cache_dirty: tokio::sync::Notify::new(),
             binding_pins: Default::default(),
+            signatures,
+            hl7_urls: match config.hl7_urls.as_str() {
+                "off" => None,
+                "warning" => Some(Severity::Warning),
+                _ => Some(Severity::Error),
+            },
         }
     }
 
@@ -370,6 +408,7 @@ impl ValidationService {
             check_extension_context: true,
             unknown_extensions: self.unknown_extensions,
             global_profiles: self.global_profiles_for(tenant, version),
+            hl7_urls: self.hl7_urls,
         };
         let handlers = EffectHandlers {
             constraints: self
@@ -388,6 +427,7 @@ impl ValidationService {
             // Identifier rules, as the HL7 validator reports them.
             resource_rules: true,
             best_practice: self.best_practice,
+            signatures: self.signatures.as_ref(),
         };
         validator
             .validate(resource, version, &opts, &handlers)
@@ -2458,7 +2498,9 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         | ErrorKind::Narrative
         | ErrorKind::BestPractice
         | ErrorKind::DuplicateId
-        | ErrorKind::ResourceRule => IssueType::Invalid,
+        | ErrorKind::ResourceRule
+        | ErrorKind::Signature
+        | ErrorKind::UrlUnresolved => IssueType::Invalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
         // slicing, choices, wrong container type.

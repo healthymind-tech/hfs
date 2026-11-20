@@ -123,6 +123,102 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
             ErrorKind::PrimitiveValue,
             errors::msg_primitive_regex(type_name, s),
         );
+        return;
+    }
+
+    if let Some(severity) = ctx.hl7_urls
+        && matches!(type_name, "uri" | "url")
+        && let Some(url) = data.as_str()
+        && hl7_url_names_nothing(ctx, url)
+        && !url_check_exempt_path(&ctx.path.render_dotted())
+    {
+        ctx.error_with_severity(
+            ErrorKind::UrlUnresolved,
+            errors::msg_url_unresolved(url),
+            severity,
+        );
+    }
+}
+
+/// A uri in the HL7 FHIR namespace that the HL7 validator cannot resolve
+/// whatever packages are loaded (`StandAloneValidatorFetcher.resolveURL`:
+/// no path segment names a resource type, so there is no base URL to look a
+/// package up by, and an `http://hl7.org/fhir…` url without one is not
+/// found). Known non-definition namespaces are exempt as there: `sid/`
+/// identifier systems, the spec's mapping URIs, FHIRPath type URLs, and the
+/// legacy `v2/` / `v3/` code system URLs.
+fn hl7_url_names_nothing(ctx: &WalkCtx<'_>, url: &str) -> bool {
+    if !url.starts_with("http://hl7.org/fhir") {
+        return false;
+    }
+    let url = url.split('|').next().unwrap_or(url);
+    const KNOWN: &[&str] = &[
+        "http://hl7.org/fhir/auditevent",
+        "http://hl7.org/fhir/composition",
+        "http://hl7.org/fhir/consent",
+        "http://hl7.org/fhir/documentreference",
+        "http://hl7.org/fhir/fivews",
+        "http://hl7.org/fhir/interface",
+        "http://hl7.org/fhir/logical",
+        "http://hl7.org/fhir/object-implementation",
+        "http://hl7.org/fhir/provenance",
+        "http://hl7.org/fhir/rr",
+        "http://hl7.org/fhir/w5",
+        "http://hl7.org/fhir/workflow",
+    ];
+    if KNOWN.contains(&url)
+        || url.starts_with("http://hl7.org/fhirpath/System.")
+        || url.starts_with("http://hl7.org/fhir/sid/")
+        || url.starts_with("http://hl7.org/fhir/v2/")
+        || url.starts_with("http://hl7.org/fhir/v3/")
+    {
+        return false;
+    }
+    // `findBaseUrl`: the base is everything before the first segment that
+    // names a resource type. Without one, the url names nothing.
+    let resolver = ctx.resolver();
+    let segments: Vec<&str> = url.split('/').collect();
+    let Some(index) = segments.iter().enumerate().skip(1).find_map(|(i, segment)| {
+        (segment.starts_with(|c: char| c.is_ascii_uppercase())
+            && resolver
+                .resolve(segment)
+                .is_some_and(|s| crate::editor::is_resource(&s)))
+        .then_some(i)
+    }) else {
+        return true;
+    };
+    // With a base, the HL7 validator looks a package up by it and fails
+    // when no package has that canonical. A package canonical is
+    // `http://hl7.org/fhir` (core), `…/fhir/<code>`, `…/fhir/<realm>/<code>`
+    // or a version url `…/fhir/<n.n>`; a deeper base is no package.
+    let base = segments[..index].join("/");
+    let below_fhir = base
+        .strip_prefix("http://hl7.org/fhir")
+        .map(|rest| rest.split('/').filter(|s| !s.is_empty()).count());
+    below_fhir.is_some_and(|depth| depth > 2)
+}
+
+/// Elements whose uri is checked elsewhere or is a definition, not a
+/// reference: `system` (code systems are resolved by the terminology pass;
+/// identifier and quantity systems are namespaces), extension urls, a
+/// resource's own canonical `url`, `fullUrl`, and `meta.source` (a hint in
+/// the HL7 validator).
+fn url_check_exempt_path(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('.').collect();
+    let n = segments.len();
+    let last = segments[n - 1];
+    let parent = if n >= 2 { segments[n - 2] } else { "" };
+    let grandparent = if n >= 3 { segments[n - 3] } else { "" };
+    match last {
+        "system" | "fullUrl" | "implicitRules" => true,
+        "source" => parent == "meta",
+        "url" => {
+            n == 2
+                || parent == "resource"
+                || (parent.bytes().all(|b| b.is_ascii_digit())
+                    && matches!(grandparent, "extension" | "modifierExtension" | "contained"))
+        }
+        _ => false,
     }
 }
 

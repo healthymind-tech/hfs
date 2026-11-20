@@ -87,6 +87,12 @@ pub struct ValidationOptions {
     /// the HL7 validator applies the global profiles of its loaded IGs.
     /// An unresolvable one follows [`Self::unknown_profile`].
     pub global_profiles: Vec<(String, String)>,
+    /// uri / url values in the HL7 FHIR namespace (`http://hl7.org/fhir…`)
+    /// that cannot name a definition — no path segment is a resource type,
+    /// so no canonical resource can have that URL — reported at this
+    /// severity (the HL7 validator: Type_Specific_Checks_DT_URL_Resolve,
+    /// error). `None` skips the check.
+    pub hl7_urls: Option<Severity>,
 }
 
 /// Policy for extensions whose url resolves to no StructureDefinition.
@@ -113,6 +119,7 @@ impl Default for ValidationOptions {
             unknown_profile: UnknownProfilePolicy::default(),
             unknown_extensions: UnknownExtensionPolicy::default(),
             global_profiles: Vec::new(),
+            hl7_urls: None,
         }
     }
 }
@@ -362,6 +369,9 @@ impl Validator {
         }
         if effects.best_practice {
             errors.extend(narrative::best_practice_warnings(resource));
+        }
+        if let Some(signatures) = effects.signatures {
+            errors.extend(crate::signature::signature_issues(resource, signatures));
         }
         let resolver = Arc::clone(&self.resolver);
         let conformance: crate::effects::Conformance = Arc::new(move |value, profile| {

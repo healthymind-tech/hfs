@@ -97,6 +97,8 @@ pub(super) struct WalkCtx<'a> {
     unknown_extensions: UnknownExtensionPolicy,
     /// `ImplementationGuide.global` profiles, `(resource type, canonical)`.
     global_profiles: Vec<(String, String)>,
+    /// See [`ValidationOptions::hl7_urls`].
+    pub(super) hl7_urls: Option<Severity>,
     /// Issues already emitted, by `(kind, severity, path, message)`. A
     /// profile compiled from its snapshot repeats every keyword it inherits
     /// (`required`, `min`, slice cardinalities, ...), and each layer of the
@@ -243,6 +245,7 @@ impl<'a> WalkCtx<'a> {
             check_extension_context: false,
             unknown_extensions: self.unknown_extensions,
             global_profiles: Vec::new(),
+            hl7_urls: None,
         };
         let mut nested = WalkCtx {
             resolver: self.resolver,
@@ -259,6 +262,7 @@ impl<'a> WalkCtx<'a> {
             unknown_profile: UnknownProfilePolicy::Ignore,
             unknown_extensions: self.unknown_extensions,
             global_profiles: Vec::new(),
+            hl7_urls: None,
             emitted: HashSet::new(),
             deferred_bindings: HashSet::new(),
             contained: Vec::new(),
@@ -371,6 +375,7 @@ pub(super) fn validate<'a>(
         unknown_profile: opts.unknown_profile,
         unknown_extensions: opts.unknown_extensions,
         global_profiles: opts.global_profiles.clone(),
+        hl7_urls: opts.hl7_urls,
         emitted: HashSet::new(),
         deferred_bindings: HashSet::new(),
         contained: Vec::new(),

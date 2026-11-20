@@ -47,6 +47,9 @@ roxmltree = { version = "0.20", optional = true }
 # Attachment.data checks (base64 validity, SHA-1 hash).
 base64 = "0.22"
 sha1 = "0.10"
+# Bundle.signature (JWS) verification: RSA / ECDSA with keys from X.509
+# certificates or JWKs (already in the dependency tree via rustls).
+ring = "0.17"
 
 [dev-dependencies]
 serde = { workspace = true }

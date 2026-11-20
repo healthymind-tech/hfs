@@ -481,6 +481,9 @@ pub struct EffectHandlers<'a> {
     /// The HL7 validator's best-practice warnings (an Observation without
     /// a subject or performer).
     pub best_practice: bool,
+    /// Verify `Bundle.signature` (JWS) as the HL7 validator does; `None`
+    /// skips signatures.
+    pub signatures: Option<&'a crate::signature::SignatureOptions>,
 }
 
 impl Default for EffectHandlers<'_> {
@@ -495,6 +498,7 @@ impl Default for EffectHandlers<'_> {
             narrative_links: false,
             resource_rules: false,
             best_practice: false,
+            signatures: None,
         }
     }
 }
