@@ -107,9 +107,15 @@ gh workflow list -R healthymind-tech/hfs --all     # shows active / disabled_man
 Left enabled on purpose:
 
 - **build-image.yml** — the team's CD image build (ubuntu-24.04).
-- **windows-nightly.yml** — its `Test Rust (Windows, no Docker)` and
-  `Test Python` jobs run on `windows-latest`; its `Linting (clippy, Windows
-  target)` job is self-hosted and stays queued until cancelled.
+- **windows-nightly.yml** — its `Test Rust (Windows, no Docker)` (~60 min
+  build + ~20 min tests) and `Test Python` jobs run on `windows-latest`; its
+  `Linting (clippy, Windows target)` job is self-hosted and stays queued.
+  Because of that queued job a run never finishes on its own (GitHub cancels
+  it after 24 h), and the workflow's concurrency group (one run per ref, no
+  cancel-in-progress outside PRs) holds the next run of the same ref as
+  `pending` until then. After a run's Windows jobs have finished, cancel it
+  (`gh run cancel -R healthymind-tech/hfs <run-id>`) before dispatching the
+  next one on that ref: `gh workflow run windows-nightly.yml --ref <branch>`.
 - **fhir-bench-tests.yml** — benchmark script tests and shellcheck/actionlint,
   on `ubuntu-latest`.
 - **hm-ci.yml** — this fork's CI.
