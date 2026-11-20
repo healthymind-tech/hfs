@@ -15,6 +15,7 @@
 //! built exactly as before; on PostgreSQL the default endpoint row is still
 //! written (rollout step R0), which nothing reads.
 
+pub mod console_auth;
 pub mod endpoints;
 
 use std::sync::Arc;

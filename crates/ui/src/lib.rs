@@ -38,6 +38,7 @@
 //! picker's option list widens from the tenant's stored types to every
 //! resource type of the active FHIR version, offering the untouched ones at 0.
 
+mod account;
 mod admin_login;
 mod bulk_export;
 mod bulk_import;
@@ -47,6 +48,9 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
+mod console_settings;
+mod console_users;
+mod csrf;
 mod login;
 mod lookup;
 mod navigation;
@@ -2263,6 +2267,8 @@ pub fn mount_with_conformance_source_and_runtime(
 
     router
         .route("/ui/{*rest}", axum::routing::any(ui_not_found))
+        // Console sign-in, account and users/roles settings (P3).
+        .merge(login::console_routes())
         .merge(assets)
         // With authentication on and no browser sign-in installed, nothing a
         // browser sends can be authenticated, so the handlers that reach the

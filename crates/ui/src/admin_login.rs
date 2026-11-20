@@ -153,10 +153,17 @@ pub(crate) async fn login_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    console: Option<Extension<std::sync::Arc<helios_admin_auth::console::ConsoleAuth>>>,
     headers: HeaderMap,
     Query(query): Query<NextQuery>,
 ) -> Response {
     let next = target(query.next.as_deref());
+    // With console sign-in (P3) the break-glass administrator signs in on
+    // the console's own page.
+    if console.is_some() {
+        return Redirect::to(&helios_admin_auth::console::guard::sign_in_target(&next, true))
+            .into_response();
+    }
     let gate = &state.admin_gate;
     match gate {
         AdminGate::Open => Redirect::to(&next).into_response(),
@@ -196,15 +203,20 @@ pub(crate) async fn login_page(
 }
 
 /// `POST /ui/admin/login` (form: `username`, `password`, `next`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn login_submit(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    console: Option<Extension<std::sync::Arc<helios_admin_auth::console::ConsoleAuth>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if console.is_some() {
+        return crate::login::login_local_submit(locale, console, connect, headers, body).await;
+    }
     let mut user = String::new();
     let mut password = String::new();
     let mut next = None;
@@ -279,7 +291,14 @@ pub(crate) async fn login_submit(
 }
 
 /// `POST /ui/admin/logout`.
-pub(crate) async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
+pub(crate) async fn logout(
+    State(state): State<WebState>,
+    console: Option<Extension<std::sync::Arc<helios_admin_auth::console::ConsoleAuth>>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(Extension(console)) = console {
+        return crate::login::console_logout(&console, &headers).await;
+    }
     let Some(auth) = state.admin_gate.auth() else {
         return Redirect::to("/ui").into_response();
     };
