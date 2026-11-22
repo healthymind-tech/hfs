@@ -4,7 +4,7 @@
 //!
 //! Each console keeps its own `layouts/auth.html` (its own asset paths and
 //! catalog), and composes it from the pieces here so the two cannot drift:
-//! [`auth_brand`] (logo + product name at the top of the card), [`auth_toolbar`] (language segmented
+//! [`auth_brand`] (square English logo + product name at the top of the card), [`auth_toolbar`] (language segmented
 //! control + theme button), [`auth_footer`] (attribution + version) and
 //! [`password_toggle`]. [`theme_attributes`] lets the server stamp a stored
 //! theme on `<html>` so even the first byte matches the console's theme; the
@@ -173,7 +173,12 @@ mod tests {
     #[test]
     fn card_brand_shows_the_logo_and_the_product_name() {
         let html = auth_brand(&Lang("en"), brand()).unwrap();
-        assert!(html.contains("/ui/assets/brand/healthymind-logo-horizontal@2x.png"));
+        // The square English logo (heart + "HealthyMind"), never the
+        // horizontal logo with the Chinese company name.
+        assert!(html.contains(r#"src="/ui/assets/brand/healthymind-logo-en.png""#));
+        assert!(html.contains("/ui/assets/brand/healthymind-logo-en@2x.png 2x"));
+        assert!(html.contains("/ui/assets/brand/healthymind-logo-en@3x.png 3x"));
+        assert!(!html.contains("logo-horizontal"));
         assert!(html.contains(r#"<p class="auth-logo__name">[console-product]</p>"#));
         assert!(html.contains(r#"href="/ui""#));
         assert!(html.contains(r#"alt="""#), "the wordmark is decorative");

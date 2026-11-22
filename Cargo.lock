@@ -3981,6 +3981,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-terminology"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "helios-endpoints",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "url",
+]
+
+[[package]]
 name = "helios-ui"
 version = "0.2.9"
 dependencies = [
@@ -4036,6 +4053,7 @@ dependencies = [
  "form_urlencoded",
  "intl-memoizer",
  "serde_json",
+ "tokio",
  "unic-langid",
  "url",
 ]

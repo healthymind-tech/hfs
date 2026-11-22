@@ -48,3 +48,10 @@ form_urlencoded = "1"
 fluent-bundle = "0.16"
 intl-memoizer = "0.5"
 unic-langid = "0.9"
+
+# `shell::scope_host_frame`: the host shell travels to the embedded
+# terminology console in a task-local.
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }

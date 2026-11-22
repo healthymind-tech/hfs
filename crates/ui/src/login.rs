@@ -1965,7 +1965,8 @@ mod console_tests {
             body.contains("prefers-color-scheme"),
             "boot follows the system"
         );
-        assert!(body.contains("/ui/assets/brand/healthymind-logo-horizontal@2x.png"));
+        assert!(body.contains("/ui/assets/brand/healthymind-logo-en@2x.png 2x"));
+        assert!(!body.contains("logo-horizontal"));
         assert!(body.contains("/ui/assets/brand/favicon.svg"));
         assert!(body.contains("data-theme-cycle"), "theme button");
         assert!(
