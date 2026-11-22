@@ -3691,6 +3691,7 @@ dependencies = [
  "chrono",
  "helios-endpoints",
  "helios-idp",
+ "helios-idp-server",
  "http-body-util",
  "jsonwebtoken",
  "rand 0.8.8",
@@ -3700,6 +3701,27 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "helios-idp-server"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "helios-endpoints",
+ "helios-idp",
+ "http-body-util",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tracing",

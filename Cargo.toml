@@ -22,6 +22,7 @@ default-members = [
 	"crates/idp",
 	"crates/idp-admin",
 	"crates/terminology",
+	"crates/idp-server",
 	"crates/sync",
 	"crates/persistence",
 	"crates/rest",
