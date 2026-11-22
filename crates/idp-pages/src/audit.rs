@@ -12,6 +12,7 @@
 //! | login success / failure, lockout | type DCM 110114, subtype DCM 110122 *Login* | — (BALP defines no login profile; ATNA pattern) |
 //! | logout | type DCM 110114, subtype DCM 110123 *Logout* | — |
 //! | consent denied / withdrawn, consent without a patient | type DCM 110113 | — |
+//! | lockout | type DCM 110114, subtype DCM 110122, outcome 8 | — |
 //! | revocation, refresh reuse, code replay, client-auth failure, key change | type DCM 110113 *Security Alert* | — |
 //!
 //! Events never carry credentials. Usernames of *failed* sign-ins are kept
@@ -214,6 +215,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             gid,
             jti,
             grant_type,
+            patient,
             ip,
         } => {
             let mut query = format!(
@@ -232,6 +234,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
                 (grant_type != "client_credentials").then_some(subject.as_str()),
                 &query,
                 &[("gid", gid), ("jti", jti), ("grant_type", grant_type)],
+                patient.as_deref(),
             )
         }
         IdpEvent::TokenRefreshed {
@@ -255,6 +258,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
                 Some(subject),
                 &query,
                 &[("gid", gid), ("jti", jti), ("grant_type", "refresh_token")],
+                None,
             )
         }
         IdpEvent::LoginSucceeded {
@@ -351,6 +355,8 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             client_id,
             endpoint,
             scopes,
+            patient,
+            remembered,
             ip,
         } => consent_event(
             observer,
@@ -358,11 +364,57 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             user_id,
             client_id,
             endpoint,
-            patient_of(scopes),
+            patient.as_deref(),
             "consent-granted",
             "0",
-            &[("scope", &scopes.join(" "))],
+            &[
+                ("scope", &scopes.join(" ")),
+                ("remembered", if *remembered { "true" } else { "false" }),
+            ],
         ),
+        IdpEvent::ConsentDenied {
+            realm,
+            user_id,
+            client_id,
+            endpoint,
+            ip,
+        } => consent_event(
+            observer,
+            &origin(realm, ip),
+            user_id,
+            client_id,
+            endpoint,
+            None,
+            "consent-denied",
+            "4",
+            &[],
+        ),
+        IdpEvent::LockedOut {
+            realm,
+            username,
+            until_unix,
+            ip,
+        } => {
+            let o = origin(realm, ip);
+            let mut ev = base(
+                observer,
+                coding(DCM, "110114", "User Authenticated"),
+                vec![coding(DCM, "110122", "Login")],
+                "8",
+                Some(&format!("account locked until {until_unix}")),
+            );
+            let name = username.clone().unwrap_or_else(|| "(none)".into());
+            let mut user = json!({
+                "type": {"coding": [coding(PARTICIPATION, "IRCP", "information recipient")]},
+                "who": {"display": name},
+                "requestor": true,
+            });
+            if let Some(ip) = &o.ip {
+                user["network"] = json!({"address": ip, "type": "2"});
+            }
+            ev["agent"] = json!([user, server_agent(&o, false)]);
+            ev
+        }
         IdpEvent::ConsentWithdrawn {
             realm,
             user_id,
@@ -448,12 +500,6 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
     }
 }
 
-/// The patient a consent was given for, when the pages recorded it as the
-/// pseudo-scope `patient:{id}` (stripped before the scopes are stored).
-fn patient_of(scopes: &[String]) -> Option<&str> {
-    scopes.iter().find_map(|s| s.strip_prefix("patient:"))
-}
-
 fn push_agent(ev: &mut Value, agent: Value) {
     if let Some(a) = ev["agent"].as_array_mut() {
         a.push(agent);
@@ -472,6 +518,7 @@ fn token_event(
     user: Option<&str>,
     query: &str,
     details: &[(&str, &str)],
+    patient: Option<&str>,
 ) -> Value {
     let mut ev = base(
         observer,
@@ -488,7 +535,10 @@ fn token_event(
         agents[0]["requestor"] = json!(true);
     }
     ev["agent"] = json!(agents);
-    let det: Vec<Value> = details.iter().map(|(n, v)| detail(n, v)).collect();
+    let mut det: Vec<Value> = details.iter().map(|(n, v)| detail(n, v)).collect();
+    if let Some(p) = patient {
+        det.push(detail("patient", p));
+    }
     ev["entity"] = json!([{
         "type": coding(ENTITY_TYPE, "2", "System Object"),
         "role": coding(OBJECT_ROLE, "24", "Query"),
@@ -590,6 +640,7 @@ mod tests {
                 gid: "g1".into(),
                 jti: "j1".into(),
                 grant_type: "authorization_code".into(),
+                patient: Some("p1".into()),
                 ip: ip(),
             },
             "Device/hfs",
@@ -639,6 +690,7 @@ mod tests {
                 gid: "g".into(),
                 jti: "j".into(),
                 grant_type: "client_credentials".into(),
+                patient: None,
                 ip: None,
             },
             "Device/hfs",
@@ -690,6 +742,18 @@ mod tests {
             BASE,
         );
         assert_eq!(locked["outcome"], "8");
+        let lo = to_audit_json(
+            &IdpEvent::LockedOut {
+                realm: "clinic".into(),
+                username: Some("alice".into()),
+                until_unix: 1,
+                ip: ip(),
+            },
+            "Device/hfs",
+            BASE,
+        );
+        assert_eq!(lo["outcome"], "8");
+        parse(lo);
         let out = to_audit_json(
             &IdpEvent::Logout {
                 realm: "clinic".into(),
@@ -712,7 +776,9 @@ mod tests {
                 user_id: "u1".into(),
                 client_id: "app".into(),
                 endpoint: "lab".into(),
-                scopes: vec!["patient/*.rs".into(), "patient:p1".into()],
+                scopes: vec!["patient/*.rs".into()],
+                patient: Some("p1".into()),
+                remembered: true,
                 ip: ip(),
             },
             "Device/hfs",
@@ -730,6 +796,8 @@ mod tests {
                 client_id: "app".into(),
                 endpoint: "lab".into(),
                 scopes: vec!["user/*.rs".into()],
+                patient: None,
+                remembered: false,
                 ip: None,
             },
             "Device/hfs",
@@ -775,6 +843,13 @@ mod tests {
                 user_id: "u".into(),
                 client_id: "app".into(),
                 endpoint: Some("lab".into()),
+                ip: ip(),
+            },
+            IdpEvent::ConsentDenied {
+                realm: "clinic".into(),
+                user_id: "u".into(),
+                client_id: "app".into(),
+                endpoint: "lab".into(),
                 ip: ip(),
             },
         ] {

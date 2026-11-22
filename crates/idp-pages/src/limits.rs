@@ -27,6 +27,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 
+/// The caller address as resolved by the limiter (trusted proxy aware),
+/// stored in the request extensions for the handlers and audit events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerIp(pub String);
+
 /// Per-minute budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitConfig {
@@ -129,26 +134,35 @@ impl RateLimiter {
     }
 
     fn client_ip(&self, req: &Request) -> String {
-        if self.trust_forwarded {
-            let h = req.headers();
-            if let Some(v) = h
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(',').next())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            {
-                return v.to_string();
-            }
-            if let Some(v) = h.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-                return v.trim().to_string();
-            }
+        if self.trust_forwarded && let Some(ip) = crate::limits::forwarded_ip(req.headers()) {
+            return ip;
         }
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0.ip().to_string())
             .unwrap_or_else(|| "unknown".into())
     }
+}
+
+/// The caller address set by the trusted reverse proxy: `X-Real-IP`
+/// (nginx overwrites it with `$remote_addr`), else the **last**
+/// `X-Forwarded-For` hop (the one the proxy appended — earlier hops are
+/// client-controlled and never trusted).
+pub fn forwarded_ip(h: &axum::http::HeaderMap) -> Option<String> {
+    let valid = |s: &str| s.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string());
+    if let Some(v) = h.get("x-real-ip").and_then(|v| v.to_str().ok())
+        && let Some(ip) = valid(v.trim())
+    {
+        return Some(ip);
+    }
+    h.get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .last()
+        .and_then(valid)
 }
 
 /// The route class of a request path under `/idp/{realm}/…`.
@@ -210,13 +224,18 @@ fn too_many(retry_after: u64) -> Response {
 }
 
 /// The middleware: `axum::middleware::from_fn_with_state(limiter, layer)`.
-pub async fn layer(State(limiter): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {
+pub async fn layer(
+    State(limiter): State<Arc<RateLimiter>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let ip = limiter.client_ip(&req);
+    req.extensions_mut().insert(CallerIp(ip.clone()));
     let Some((realm, class)) = classify(req.method(), req.uri().path()) else {
         return next.run(req).await;
     };
     let now = Instant::now();
     let c = limiter.config;
-    let ip = limiter.client_ip(&req);
     let mut checks: Vec<(String, u32)> = Vec::new();
     match class {
         Class::Token => {
@@ -262,6 +281,19 @@ mod tests {
         assert!(l.take("k", 20, t0 + Duration::from_secs(3)).is_ok());
         assert!(l.take("other", 20, t0).is_ok(), "separate keys");
         assert!(l.take("unlimited", 0, t0).is_ok());
+    }
+
+    #[test]
+    fn forwarded_address_cannot_be_forged() {
+        use axum::http::HeaderMap;
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "6.6.6.6, 203.0.113.5".parse().unwrap());
+        assert_eq!(forwarded_ip(&h).as_deref(), Some("203.0.113.5"));
+        h.insert("x-real-ip", "198.51.100.1".parse().unwrap());
+        assert_eq!(forwarded_ip(&h).as_deref(), Some("198.51.100.1"));
+        h.insert("x-real-ip", "not-an-ip".parse().unwrap());
+        assert_eq!(forwarded_ip(&h).as_deref(), Some("203.0.113.5"));
+        assert_eq!(forwarded_ip(&HeaderMap::new()), None);
     }
 
     #[test]

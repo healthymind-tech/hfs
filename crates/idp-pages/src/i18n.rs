@@ -195,13 +195,30 @@ mod tests {
                 .map(|l| l.split(" =").next().unwrap().trim().to_string())
                 .collect()
         };
+        let plain = |l: &str| -> std::collections::BTreeSet<String> {
+            let src = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("locales")
+                    .join(l)
+                    .join("idp.ftl"),
+            )
+            .unwrap();
+            src.lines()
+                .filter(|l| !l.starts_with('#') && l.contains(" =") && !l.contains("{ $"))
+                .map(|l| l.split(" =").next().unwrap().trim().to_string())
+                .collect()
+        };
         let en = keys("en");
         assert!(en.len() > 40);
         assert_eq!(en, keys("zh-Hant"), "zh-Hant must define the same keys as en");
         let zh = I18n { locale: &ZH_HANT };
-        for k in &en {
+        for k in &plain("zh-Hant") {
             assert_ne!(zh.t(k), *k, "{k} unresolved in zh-Hant");
         }
+        assert_eq!(
+            zh.t_arg("idp-apps-granted", "date", "2026-01-02"),
+            "於 2026-01-02 允許"
+        );
         // The brand stays English in every language.
         assert_eq!(zh.t("idp-brand"), "HealthyMind");
     }

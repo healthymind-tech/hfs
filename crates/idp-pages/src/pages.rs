@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{ConnectInfo, Form, Path, Query, State};
+use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -379,10 +379,6 @@ impl Page {
         self.status = s;
         self
     }
-    fn cookie(mut self, c: String) -> Self {
-        self.cookies.push(c);
-        self
-    }
     fn cookies(mut self, c: Vec<String>) -> Self {
         self.cookies.extend(c);
         self
@@ -423,23 +419,36 @@ fn redirect(location: &str, cookies: Vec<String>) -> Response {
 
 // ------------------------------------------------------------- request ctx
 
-fn client_ip(cfg: &PagesConfig, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    if cfg.trust_forwarded {
-        if let Some(v) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            return v.to_string();
+/// The caller: the address the rate limiter resolved ([`crate::limits::CallerIp`],
+/// trusted proxy aware) or the socket peer.
+pub struct Peer(Option<String>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Peer {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(crate::limits::CallerIp(ip)) = parts.extensions.get::<crate::limits::CallerIp>() {
+            return Ok(Peer(Some(ip.clone())));
         }
-        if let Some(v) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            return v.trim().to_string();
-        }
+        Ok(Peer(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip().to_string()),
+        ))
     }
-    peer.map(|p| p.ip().to_string())
-        .unwrap_or_else(|| "unknown".into())
+}
+
+fn client_ip(cfg: &PagesConfig, headers: &HeaderMap, peer: Option<String>) -> String {
+    if let Some(p) = &peer {
+        return p.clone();
+    }
+    if cfg.trust_forwarded && let Some(ip) = crate::limits::forwarded_ip(headers) {
+        return ip;
+    }
+    "unknown".into()
 }
 
 /// What the pages record on the interaction between steps. Not trusted for
@@ -837,8 +846,15 @@ async fn authenticate(
         client_id: client_id.map(String::from),
         ip: Some(ip.to_string()),
     };
+    let locked = |until: i64| IdpEvent::LockedOut {
+        realm: realm_name.clone(),
+        username: Some(username.chars().take(256).collect()),
+        until_unix: until,
+        ip: Some(ip.to_string()),
+    };
     if let Some(until) = pages.lockout.locked_until(&attempt).await {
         pages.runtime.emit(fail("locked out"));
+        pages.runtime.emit(locked(until));
         let minutes = ((until - Utc::now().timestamp()).max(60) + 59) / 60;
         return Err(Banner::danger(
             i18n.t_arg("idp-locked", "minutes", minutes.to_string()),
@@ -861,7 +877,7 @@ async fn authenticate(
         let reason = if !has_hash { "unknown user, disabled or no password" } else { "wrong password" };
         pages.runtime.emit(fail(reason));
         if let Some(until) = pages.lockout.failed(&attempt, policy).await {
-            pages.runtime.emit(fail("locked out"));
+            pages.runtime.emit(locked(until));
             let minutes = ((until - Utc::now().timestamp()).max(60) + 59) / 60;
             return Err(Banner::danger(
                 i18n.t_arg("idp-locked", "minutes", minutes.to_string()),
@@ -917,7 +933,7 @@ async fn authenticate(
 async fn login_submit(
     State(pages): State<Pages>,
     Path(realm): Path<String>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Peer,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -928,7 +944,7 @@ async fn login_submit(
     if let Err(r) = check_post(&pages, &step, &headers, "login", &form.csrf) {
         return r;
     }
-    let ip = client_ip(&pages.config, &headers, peer.map(|c| c.0));
+    let ip = client_ip(&pages.config, &headers, peer.0);
     match authenticate(
         &pages,
         &step.realm,
@@ -1437,7 +1453,7 @@ async fn consent_page(
 async fn consent_submit(
     State(pages): State<Pages>,
     Path(realm): Path<String>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Peer,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1452,14 +1468,14 @@ async fn consent_submit(
     let Some((user, session, progress)) = bound_user(&pages, &step, &headers).await else {
         return redirect(&step.path("login"), step.cookies(&pages));
     };
-    let ip = client_ip(&pages.config, &headers, peer.map(|c| c.0));
+    let ip = client_ip(&pages.config, &headers, peer.0);
     let p = step.pending.clone();
     if form.decision != "allow" {
-        pages.runtime.emit(IdpEvent::ConsentWithdrawn {
+        pages.runtime.emit(IdpEvent::ConsentDenied {
             realm: realm.clone(),
             user_id: user.id.clone(),
             client_id: p.client_id.clone(),
-            endpoint: Some(p.endpoint.clone()),
+            endpoint: p.endpoint.clone(),
             ip: Some(ip),
         });
         return deny(&pages, &step, &headers, OAuthErrorCode::AccessDenied, "the user denied the request").await;
@@ -1497,16 +1513,14 @@ async fn consent_submit(
         .patient
         .clone()
         .or_else(|| p.launch_context.patient.clone());
-    let mut event_scopes = granted.clone();
-    if let Some(pt) = &patient {
-        event_scopes.push(format!("patient:{pt}"));
-    }
     pages.runtime.emit(IdpEvent::ConsentGranted {
         realm: realm.clone(),
         user_id: user.id.clone(),
         client_id: p.client_id.clone(),
         endpoint: p.endpoint.clone(),
-        scopes: event_scopes,
+        scopes: granted.clone(),
+        patient,
+        remembered: form.remember,
         ip: Some(ip),
     });
     let cookies = step.cookies(&pages);
@@ -1619,7 +1633,7 @@ fn logged_out_page(headers: &HeaderMap, realm: &RealmRuntime, i18n: I18n, cookie
 async fn logout_page(
     State(pages): State<Pages>,
     Path(realm_name): Path<String>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Peer,
     Query(q): Query<LogoutQuery>,
     headers: HeaderMap,
 ) -> Response {
@@ -1640,7 +1654,7 @@ async fn logout_page(
         }
     };
     let session = current_session(&pages, &realm, &headers).await;
-    let ip = client_ip(&pages.config, &headers, peer.map(|c| c.0));
+    let ip = client_ip(&pages.config, &headers, peer.0);
     let mut cookies = vec![];
     if explicit {
         cookies.push(i18n.cookie());
@@ -1706,7 +1720,7 @@ async fn logout_page(
 async fn logout_submit(
     State(pages): State<Pages>,
     Path(realm_name): Path<String>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Peer,
     headers: HeaderMap,
     Form(q): Form<LogoutQuery>,
 ) -> Response {
@@ -1733,7 +1747,7 @@ async fn logout_submit(
             return error_page(&headers, Some(&realm), i18n, StatusCode::BAD_REQUEST, i18n.t("idp-logout-invalid"));
         }
     };
-    let ip = client_ip(&pages.config, &headers, peer.map(|c| c.0));
+    let ip = client_ip(&pages.config, &headers, peer.0);
     let cookie = end_session(&pages, &realm, session.as_ref(), plan.client_id.clone(), ip).await;
     match plan.redirect {
         Some(to) => redirect(&to, vec![cookie]),
@@ -1855,7 +1869,7 @@ async fn apps_page(
 async fn account_login(
     State(pages): State<Pages>,
     Path(realm_name): Path<String>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Peer,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -1870,7 +1884,7 @@ async fn account_login(
     {
         return error_page(&headers, Some(&realm), i18n, StatusCode::FORBIDDEN, i18n.t("idp-csrf"));
     }
-    let ip = client_ip(&pages.config, &headers, peer.map(|c| c.0));
+    let ip = client_ip(&pages.config, &headers, peer.0);
     match authenticate(&pages, &realm, &headers, &ip, &form.username, &form.password, None, i18n).await {
         Ok((_, _, cookie)) => redirect(
             &format!("/idp/{}/account/apps", realm.spec.name.as_str()),
@@ -1895,7 +1909,7 @@ pub struct RevokeForm {
 async fn apps_revoke(
     State(pages): State<Pages>,
     Path(realm_name): Path<String>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Peer,
     headers: HeaderMap,
     Form(form): Form<RevokeForm>,
 ) -> Response {
@@ -1914,7 +1928,7 @@ async fn apps_revoke(
         return error_page(&headers, Some(&realm), i18n, StatusCode::FORBIDDEN, i18n.t("idp-csrf"));
     }
     let store = pages.store();
-    let ip = client_ip(&pages.config, &headers, peer.map(|c| c.0));
+    let ip = client_ip(&pages.config, &headers, peer.0);
     let user = session.user_id.clone();
     let _ = store
         .delete_consent(&realm.id, &user, &form.client_id, &form.endpoint)
