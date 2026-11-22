@@ -4,7 +4,7 @@
 //!
 //! Each console keeps its own `layouts/auth.html` (its own asset paths and
 //! catalog), and composes it from the pieces here so the two cannot drift:
-//! [`auth_brand`] (brand panel), [`auth_toolbar`] (language segmented
+//! [`auth_brand`] (logo + product name at the top of the card), [`auth_toolbar`] (language segmented
 //! control + theme button), [`auth_footer`] (attribution + version) and
 //! [`password_toggle`]. [`theme_attributes`] lets the server stamp a stored
 //! theme on `<html>` so even the first byte matches the console's theme; the
@@ -14,17 +14,7 @@ use askama::Template;
 
 use crate::{ChromeLabels, THEME_COOKIE, theme_toggle};
 
-/// The official product names, used for the second-language line under the
-/// localized name in the brand panel.
-#[derive(Debug, Clone, Copy)]
-pub struct ProductNames<'a> {
-    /// English name (`HealthyMind FHIR Server Manager`).
-    pub en: &'a str,
-    /// Traditional Chinese name (`療心智能 FHIR 伺服器管理平台`).
-    pub zh_hant: &'a str,
-}
-
-/// What the brand panel says and where its assets live.
+/// What the card's brand header says and where its assets live.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthBrand<'a> {
     /// Console home (`/ui`, `/ui/hts`) the logo links to.
@@ -33,13 +23,6 @@ pub struct AuthBrand<'a> {
     pub assets: &'a str,
     /// Fluent key of the localized product name.
     pub product_key: &'a str,
-    /// Both official names; the one *not* in the request's language is shown
-    /// as the second line.
-    pub names: ProductNames<'a>,
-    /// Fluent key of the one-line tagline.
-    pub tagline_key: &'a str,
-    /// Fluent keys of the highlights (may be empty).
-    pub highlight_keys: &'a [&'a str],
 }
 
 #[derive(Template)]
@@ -47,29 +30,15 @@ pub struct AuthBrand<'a> {
 struct AuthBrandTemplate<'a> {
     i18n: &'a dyn ChromeLabels,
     brand: AuthBrand<'a>,
-    alt_name: &'a str,
-    alt_lang: &'a str,
 }
 
-/// The brand panel.
+/// The brand header of the sign-in card: logo + product name.
 ///
 /// # Errors
 ///
 /// Propagates [`askama::Error`] from rendering.
 pub fn auth_brand(i18n: &dyn ChromeLabels, brand: AuthBrand<'_>) -> Result<String, askama::Error> {
-    let zh = i18n.lang().starts_with("zh");
-    let (alt_name, alt_lang) = if zh {
-        (brand.names.en, "en")
-    } else {
-        (brand.names.zh_hant, "zh-Hant")
-    };
-    AuthBrandTemplate {
-        i18n,
-        brand,
-        alt_name,
-        alt_lang,
-    }
-    .render()
+    AuthBrandTemplate { i18n, brand }.render()
 }
 
 /// One entry of the language segmented control.
@@ -198,24 +167,16 @@ mod tests {
             home: "/ui",
             assets: "/ui/assets",
             product_key: "console-product",
-            names: ProductNames {
-                en: "HealthyMind FHIR Server Manager",
-                zh_hant: "療心智能 FHIR 伺服器管理平台",
-            },
-            tagline_key: "auth-tagline",
-            highlight_keys: &["auth-point-1", "auth-point-2"],
         }
     }
 
     #[test]
-    fn brand_panel_shows_the_logo_and_both_official_names() {
-        let en = auth_brand(&Lang("en"), brand()).unwrap();
-        assert!(en.contains("/ui/assets/brand/healthymind-logo-horizontal@2x.png"));
-        assert!(en.contains("[console-product]"));
-        assert!(en.contains(r#"lang="zh-Hant">療心智能 FHIR 伺服器管理平台"#));
-        assert!(en.contains("[auth-point-2]"));
-        let zh = auth_brand(&Lang("zh-Hant"), brand()).unwrap();
-        assert!(zh.contains(r#"lang="en">HealthyMind FHIR Server Manager"#));
+    fn card_brand_shows_the_logo_and_the_product_name() {
+        let html = auth_brand(&Lang("en"), brand()).unwrap();
+        assert!(html.contains("/ui/assets/brand/healthymind-logo-horizontal@2x.png"));
+        assert!(html.contains(r#"<p class="auth-logo__name">[console-product]</p>"#));
+        assert!(html.contains(r#"href="/ui""#));
+        assert!(html.contains(r#"alt="""#), "the wordmark is decorative");
     }
 
     #[test]

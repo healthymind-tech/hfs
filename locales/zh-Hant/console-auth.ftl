@@ -123,14 +123,6 @@ console-error-conflict = 此項目已被他人變更，請重新整理後再試�
 console-error-unavailable = 主控台資料庫無法使用：{ $detail }
 
 # 獨立頁面（登入、緊急登入、首次登入改密碼、權限與登入訊息、登出）。
-auth-tagline = 以單一主控台管理本伺服器的所有 FHIR 端點：設定、安全、驗證與資料同步。
-auth-point-endpoints = 每個端點擁有獨立的網址、FHIR 版本與資料
-auth-point-security = 依端點設定 SMART on FHIR 安全性、資料驗證與術語服務
-auth-point-sync = 在端點之間複製與同步資料，全程留存稽核紀錄
-auth-hts-tagline = 為本伺服器的所有 FHIR 端點提供代碼系統、值集與概念對應。
-auth-hts-point-browse = 瀏覽 SNOMED CT、LOINC、ICD-10 與自訂代碼系統
-auth-hts-point-operations = 執行 $lookup、$validate-code、$expand 與 $translate
-auth-hts-point-import = 匯入術語套件並追蹤匯入作業
 auth-hts-lede = 請使用術語伺服器的管理員帳號登入。
 auth-password-show = 顯示密碼
 auth-password-hide = 隱藏密碼

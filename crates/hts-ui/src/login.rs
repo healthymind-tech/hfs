@@ -183,11 +183,6 @@ struct AuthShell {
 }
 
 const ASSETS: &str = "/ui/hts/assets";
-const HIGHLIGHTS: &[&str] = &[
-    "auth-hts-point-browse",
-    "auth-hts-point-operations",
-    "auth-hts-point-import",
-];
 
 impl AuthShell {
     fn new(i18n: &I18n, headers: &HeaderMap, next: &str) -> Self {
@@ -218,12 +213,6 @@ impl AuthShell {
                 home: helios_ui_chrome::HTS_CONSOLE_PATH,
                 assets: ASSETS,
                 product_key: "hts-app-title",
-                names: helios_ui_chrome::ProductNames {
-                    en: "HealthyMind Terminology Server",
-                    zh_hant: "療心智能 術語伺服器",
-                },
-                tagline_key: "auth-hts-tagline",
-                highlight_keys: HIGHLIGHTS,
             },
         )
     }

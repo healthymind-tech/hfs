@@ -113,8 +113,8 @@ pub mod auth;
 pub mod tokens;
 
 pub use auth::{
-    AuthBrand, LangLink, ProductNames, auth_brand, auth_footer, auth_toolbar, lang_links,
-    password_toggle, theme_attributes,
+    AuthBrand, LangLink, auth_brand, auth_footer, auth_toolbar, lang_links, password_toggle,
+    theme_attributes,
 };
 pub use brand::{BrandLinks, brand, brand_head, site_footer};
 pub use navigation::{

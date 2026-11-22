@@ -33,7 +33,7 @@
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-users-list") }}</h2></header>
   <div class="form-section__body">
   <div class="table-wrap">
-  <table class="data-table" id="users-table">
+  <table class="data-table data-table--stack" id="users-table">
     <thead><tr>
       <th>{{ i18n.t("admin-login-user") }}</th><th>{{ i18n.t("console-users-name") }}</th>
       <th>{{ i18n.t("console-users-role") }}</th><th>{{ i18n.t("console-users-status") }}</th>
@@ -42,9 +42,9 @@
     <tbody>
     {% for u in users %}
     <tr data-user="{{ u.username }}">
-      <td>{{ u.username }}</td>
-      <td>{{ u.display }}</td>
-      <td colspan="2">
+      <td class="col-name">{{ u.username }}</td>
+      <td data-label="{{ i18n.t("console-users-name") }}">{{ u.display }}</td>
+      <td colspan="2" data-label="{{ i18n.t("console-users-role") }}">
         <form method="post" action="/ui/settings/users/{{ u.id }}" class="row-form">
           {{ csrf_html|safe }}
           <input type="hidden" name="revision" value="{{ u.revision }}">
@@ -55,7 +55,7 @@
           <button class="btn btn--small" type="submit">{{ i18n.t("console-save") }}</button>
         </form>
       </td>
-      <td>{{ u.last_login }}</td>
+      <td data-label="{{ i18n.t("console-users-last-login") }}">{{ u.last_login }}</td>
       <td class="data-table__actions">
         <div class="row-actions">
         <form method="post" action="/ui/settings/users/{{ u.id }}/reset-password" class="inline-form">{{ csrf_html|safe }}<button class="btn btn--small" type="submit">{% call ui::icon("key") %}{% endcall %}{{ i18n.t("console-users-reset") }}</button></form>
@@ -123,11 +123,11 @@
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-sessions-title") }}</h2></header>
   <div class="form-section__body">
   <div class="table-wrap">
-  <table class="data-table" id="sessions-table">
+  <table class="data-table data-table--stack" id="sessions-table">
     <thead><tr><th>{{ i18n.t("console-users-name") }}</th><th>{{ i18n.t("console-users-role") }}</th><th>{{ i18n.t("console-sessions-via") }}</th><th>{{ i18n.t("console-sessions-client") }}</th><th>{{ i18n.t("console-sessions-last-seen") }}</th><th></th></tr></thead>
     <tbody>
     {% for s in sessions %}
-    <tr><td>{{ s.display }} <code class="mono muted">{{ s.subject }}</code></td><td>{{ s.role }}</td><td>{{ i18n.t(s.via) }}</td><td>{{ s.client }}</td><td>{{ s.last_seen }}</td>
+    <tr><td class="col-name">{{ s.display }} <code class="mono muted">{{ s.subject }}</code></td><td data-label="{{ i18n.t("console-users-role") }}">{{ s.role }}</td><td data-label="{{ i18n.t("console-sessions-via") }}">{{ i18n.t(s.via) }}</td><td data-label="{{ i18n.t("console-sessions-client") }}">{{ s.client }}</td><td data-label="{{ i18n.t("console-sessions-last-seen") }}">{{ s.last_seen }}</td>
       <td class="data-table__actions">{% if s.current %}<span class="status-pill status-pill--ok status-pill--sm">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("console-sessions-current") }}</span></span>{% else %}<form method="post" action="/ui/settings/sessions/{{ s.key }}/revoke" class="inline-form">{{ csrf_html|safe }}<button class="btn btn--small" type="submit">{{ i18n.t("console-sessions-revoke") }}</button></form>{% endif %}</td></tr>
     {% endfor %}
     </tbody>

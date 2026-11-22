@@ -336,8 +336,8 @@ async fn locked_gate_explains_and_open_gate_needs_no_sign_in() {
     assert_eq!(headers[header::LOCATION], "/ui/hts/jobs");
 }
 
-/// The sign-in page is the shared standalone frame (UI polish): brand panel
-/// with the official logo and both product names, language segmented
+/// The sign-in page is the shared standalone frame (UI polish): centred card
+/// with the official logo and the product name, language segmented
 /// control, theme button, the console's stylesheet and theme boot, and the
 /// stored dark theme stamped on `<html>` before any script runs.
 #[tokio::test]
@@ -361,8 +361,11 @@ async fn sign_in_page_uses_the_shared_standalone_frame_and_theme() {
     assert!(html.contains("/ui/hts/assets/auth.js"));
     assert!(html.contains("hfs_theme"), "theme boot script");
     assert!(html.contains("/ui/hts/assets/brand/healthymind-logo-horizontal@2x.png"));
-    assert!(html.contains("療心智能 術語伺服器"));
-    assert!(html.contains(r#"lang="en">HealthyMind Terminology Server"#));
+    assert!(
+        html.contains(r#"<p class="auth-logo__name">療心智能 術語伺服器</p>"#),
+        "{html}"
+    );
+    assert!(!html.contains("auth-brand"), "no marketing panel");
     assert!(
         html.contains(r#"href="?lang=en&amp;next=%2Fui%2Fhts%2Fjobs""#)
             || html.contains("?lang=en&#38;next=%2Fui%2Fhts%2Fjobs"),

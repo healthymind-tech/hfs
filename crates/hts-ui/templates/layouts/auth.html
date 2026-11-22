@@ -21,11 +21,11 @@
 <body class="auth-page">
   <a class="skip-link" href="#auth-main">{{ chrome.i18n.t("mgr-skip-to-content") }}</a>
   <div class="auth">
-    {{ auth.brand(chrome.i18n)?|safe }}
     <main class="auth-main" id="auth-main" tabindex="-1">
       {{ auth.toolbar(chrome.i18n)?|safe }}
       <div class="auth-center">
         <section class="auth-card" aria-labelledby="auth-title">
+          {{ auth.brand(chrome.i18n)?|safe }}
 {% block card %}{% endblock %}
         </section>
       </div>

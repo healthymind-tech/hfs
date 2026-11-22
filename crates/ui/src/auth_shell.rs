@@ -14,13 +14,6 @@ use crate::I18n;
 /// Asset base of this console.
 const ASSETS: &str = "/ui/assets";
 
-/// The brand panel's highlights.
-const HIGHLIGHTS: &[&str] = &[
-    "auth-point-endpoints",
-    "auth-point-security",
-    "auth-point-sync",
-];
-
 /// Request-derived parts of the standalone page frame.
 #[derive(Debug, Clone)]
 pub(crate) struct AuthShell {
@@ -66,12 +59,6 @@ impl AuthShell {
                 home: helios_ui_chrome::HFS_CONSOLE_PATH,
                 assets: ASSETS,
                 product_key: "console-product",
-                names: helios_ui_chrome::ProductNames {
-                    en: "HealthyMind FHIR Server Manager",
-                    zh_hant: "療心智能 FHIR 伺服器管理平台",
-                },
-                tagline_key: "auth-tagline",
-                highlight_keys: HIGHLIGHTS,
             },
         )
     }

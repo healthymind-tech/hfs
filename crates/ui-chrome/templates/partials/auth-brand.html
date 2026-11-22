@@ -1,30 +1,12 @@
 {#
-  SHARED CHROME -- the brand panel of the sign-in and other standalone pages
-  of both consoles (`helios_ui_chrome::auth_brand()`): the official
-  horizontal logo on a subtle brand-gradient field, the product name as real
-  text in the request's language (and the other official name under it), a
-  short tagline and three highlights. Decorative art is aria-hidden; the
-  panel is not a landmark (the page's <main> is the form).
-#}<div class="auth-brand">
-      <div class="auth-brand__glow" aria-hidden="true"></div>
-      <img class="auth-brand__art" src="{{ brand.assets }}/brand/favicon.svg" alt="" aria-hidden="true">
-      <div class="auth-brand__inner">
-        <a class="auth-brand__logo-link" href="{{ brand.home }}" aria-label="{{ i18n.t(brand.product_key) }}">
-          <img class="auth-brand__logo" src="{{ brand.assets }}/brand/healthymind-logo-horizontal@2x.png" alt="" width="290" height="64">
-        </a>
-        <div class="auth-brand__copy">
-          <p class="auth-brand__name">{{ i18n.t(brand.product_key) }}</p>
-          <p class="auth-brand__alt" lang="{{ alt_lang }}">{{ alt_name }}</p>
-          <span class="auth-brand__rule" aria-hidden="true"></span>
-          <p class="auth-brand__tagline">{{ i18n.t(brand.tagline_key) }}</p>
-          {%- if !brand.highlight_keys.is_empty() %}
-          <ul class="auth-brand__points">
-            {%- for key in brand.highlight_keys %}
-            <li><span class="auth-brand__tick" aria-hidden="true">{% include "icons/check-small.svg" %}</span><span>{{ i18n.t(key) }}</span></li>
-            {%- endfor %}
-          </ul>
-          {%- endif %}
-        </div>
-      </div>
-    </div>
+  SHARED CHROME -- the brand header at the top of the sign-in card of both
+  consoles (`helios_ui_chrome::auth_brand()`): the official horizontal logo,
+  modest and centred, and the product name as a small title in the request's
+  language. The logo's wordmark is decorative; the name is real text.
+#}<div class="auth-logo">
+            <a class="auth-logo__link" href="{{ brand.home }}" aria-label="{{ i18n.t(brand.product_key) }}">
+              <img class="auth-logo__img" src="{{ brand.assets }}/brand/healthymind-logo-horizontal@2x.png" alt="" width="181" height="40">
+            </a>
+            <p class="auth-logo__name">{{ i18n.t(brand.product_key) }}</p>
+          </div>
 {#- -#}

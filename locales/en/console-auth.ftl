@@ -127,14 +127,6 @@ console-error-unavailable = The console store is unavailable: { $detail }
 # Standalone pages (sign-in, break-glass, forced password change, access and
 # sign-in messages, sign-out): crates/ui/templates/layouts/auth.html, the HTS
 # console's sign-in, and the shared pieces in crates/ui-chrome (auth-*.html).
-auth-tagline = One console for every FHIR endpoint on this server — configure, secure, validate and keep them in sync.
-auth-point-endpoints = Endpoints with their own address, FHIR version and data
-auth-point-security = SMART on FHIR security, validation and terminology per endpoint
-auth-point-sync = Copy and synchronise data between endpoints, with a full audit trail
-auth-hts-tagline = Code systems, value sets and concept maps for every FHIR endpoint of this server.
-auth-hts-point-browse = Browse SNOMED CT, LOINC, ICD-10 and your own code systems
-auth-hts-point-operations = Run $lookup, $validate-code, $expand and $translate
-auth-hts-point-import = Import terminology packages and follow the jobs
 auth-hts-lede = Sign in with the terminology server's administrator account.
 auth-password-show = Show password
 auth-password-hide = Hide password

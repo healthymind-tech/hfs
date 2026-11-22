@@ -6,8 +6,8 @@
   system: app.css tokens, Figtree, the shared theme cookie + boot script
   (light / dark / follow system) and the shared brand pieces from
   helios-ui-chrome (brand panel, language segmented control, theme button,
-  attribution footer). Desktop: brand panel | form panel; phones: one
-  column with a compact brand header.
+  attribution footer). One sign-in card centred on the page, the logo and
+  product name at its top; language and theme top right, footer below.
 #}
 <html lang="{{ i18n.lang() }}"{{ auth.theme_attrs()|safe }}>
 <head>
@@ -24,11 +24,11 @@
 <body class="auth-page">
   <a class="skip-link" href="#auth-main">{{ i18n.t("mgr-skip-to-content") }}</a>
   <div class="auth">
-    {{ auth.brand(i18n)?|safe }}
     <main class="auth-main" id="auth-main" tabindex="-1">
       {{ auth.toolbar(i18n)?|safe }}
       <div class="auth-center">
         <section class="auth-card" aria-labelledby="auth-title">
+          {{ auth.brand(i18n)?|safe }}
 {% block card %}{% endblock %}
         </section>
 {% block after_card %}{% endblock %}

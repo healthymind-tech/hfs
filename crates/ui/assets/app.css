@@ -11887,182 +11887,68 @@ body.auth-page {
 }
 
 .auth {
-  display: grid;
-  grid-template-columns: minmax(440px, 44%) minmax(0, 1fr);
+  position: relative;
   min-height: 100vh;
   min-height: 100dvh;
-}
-
-/* ---- brand panel -------------------------------------------------------- */
-.auth-brand {
-  --auth-brand-bg: linear-gradient(160deg, #f5f8ff 0%, #e9effc 55%, #eceafd 100%);
-  position: relative;
-  display: flex;
-  overflow: hidden;
   isolation: isolate;
-  padding: 48px 56px;
-  background: var(--auth-brand-bg);
-  border-right: 1px solid var(--surface-border);
 }
 
-[data-theme="dark"] .auth-brand {
-  --auth-brand-bg: linear-gradient(160deg, #0d1626 0%, #0b1320 55%, #100f24 100%);
-}
-
-/* The console topbar's brand line, on the panel's top edge. */
-.auth-brand::before {
+/* The console topbar's brand line on the page's top edge, and one faint
+   glow behind the card: nothing that competes with it. */
+.auth::before {
   content: "";
   position: absolute;
   inset: 0 0 auto 0;
   height: 4px;
   background: var(--brand-gradient);
-  z-index: 2;
 }
 
-.auth-brand__glow {
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background:
-    radial-gradient(520px 420px at 0% 0%, rgb(10 234 255 / 22%), transparent 70%),
-    radial-gradient(640px 520px at 100% 100%, rgb(117 109 255 / 24%), transparent 70%),
-    radial-gradient(420px 320px at 85% 15%, rgb(62 173 255 / 12%), transparent 70%);
-}
-
-/* Fine dot grid, fading out towards the form. */
-.auth-brand__glow::after {
+.auth::after {
   content: "";
   position: absolute;
   inset: 0;
-  background-image: radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--accent) 22%, transparent) 1px, transparent 1.5px);
-  background-size: 22px 22px;
-  -webkit-mask-image: linear-gradient(115deg, #000 0%, transparent 70%);
-  mask-image: linear-gradient(115deg, #000 0%, transparent 70%);
-  opacity: 0.6;
-}
-
-/* The heart mark, large and faint, bottom right. */
-.auth-brand__art {
-  position: absolute;
-  right: -110px;
-  bottom: -120px;
-  width: 520px;
-  height: 520px;
-  opacity: 0.1;
   z-index: -1;
   pointer-events: none;
-  user-select: none;
+  background:
+    radial-gradient(640px 420px at 50% 38%, color-mix(in srgb, var(--brand-mid) 9%, transparent), transparent 70%);
 }
 
-[data-theme="dark"] .auth-brand__art {
-  opacity: 0.14;
-}
-
-.auth-brand__inner {
+/* Logo and product name at the top of the card. */
+.auth-logo {
   display: flex;
   flex-direction: column;
-  width: 100%;
-  max-width: 520px;
-  min-height: 100%;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 24px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--divider);
+  text-align: center;
 }
 
-.auth-brand__logo-link {
+.auth-logo__link {
   display: inline-flex;
-  color: inherit;
-  align-self: flex-start;
   border-radius: var(--radius);
+  color: inherit;
 }
 
-.auth-brand__logo-link:focus-visible {
+.auth-logo__link:focus-visible {
   outline: 2px solid var(--color-focus-ring);
-  outline-offset: 6px;
+  outline-offset: 4px;
 }
 
-.auth-brand__logo {
+.auth-logo__img {
   display: block;
   width: auto;
-  height: 56px;
+  height: 40px;
 }
 
-.auth-brand__copy {
-  margin: auto 0;
-  padding: 48px 0 24px;
-}
-
-.auth-brand__name {
+.auth-logo__name {
   margin: 0;
-  max-width: 16em;
   color: var(--text-strong);
-  font-size: 34px;
-  font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: -0.01em;
-  text-wrap: balance;
-}
-
-:lang(zh-Hant) .auth-brand__name,
-.auth-brand__name:lang(zh-Hant) {
-  letter-spacing: 0.02em;
-  line-height: 1.3;
-}
-
-.auth-brand__alt {
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 16px;
-  font-weight: 500;
-}
-
-.auth-brand__rule {
-  display: block;
-  width: 56px;
-  height: 4px;
-  margin: 24px 0;
-  border-radius: 999px;
-  background: var(--brand-gradient);
-}
-
-.auth-brand__tagline {
-  margin: 0;
-  max-width: 34em;
-  text-wrap: balance;
-  color: var(--text);
-  font-size: 17px;
-  line-height: 1.6;
-}
-
-.auth-brand__points {
-  display: grid;
-  gap: 14px;
-  margin: 28px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.auth-brand__points li {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  color: var(--muted);
   font-size: 15px;
-  line-height: 1.5;
-}
-
-.auth-brand__tick {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  margin-top: 1px;
-  border-radius: 50%;
-  background: var(--brand-gradient);
-  color: #ffffff;
-}
-
-.auth-brand__tick svg {
-  width: 12px;
-  height: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-wrap: balance;
 }
 
 /* ---- form panel --------------------------------------------------------- */
@@ -12070,7 +11956,9 @@ body.auth-page {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  padding: 24px 40px;
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 20px 24px;
   outline: none;
 }
 
@@ -12108,8 +11996,8 @@ body.auth-page {
 .auth-card {
   position: relative;
   width: 100%;
-  max-width: 440px;
-  padding: 40px 40px 36px;
+  max-width: 420px;
+  padding: 32px 36px 32px;
   background: var(--surface);
   border: 1px solid var(--surface-border);
   border-radius: 16px;
@@ -12131,7 +12019,8 @@ body.auth-page {
 }
 
 .auth-head {
-  margin: 0 0 24px;
+  margin: 0 0 22px;
+  text-align: center;
 }
 
 .auth-head--center {
@@ -12141,7 +12030,7 @@ body.auth-page {
 .auth-title {
   margin: 0;
   color: var(--text-strong);
-  font-size: 26px;
+  font-size: 22px;
   font-weight: 700;
   line-height: 1.25;
   letter-spacing: -0.01em;
@@ -12578,113 +12467,13 @@ body.auth-page {
   font-size: 12px;
 }
 
-/* ---- tablet: one column, brand header with the tagline ------------------- */
-@media (max-width: 959px) {
-  .auth {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto 1fr;
-  }
-
-  .auth-brand {
-    padding: 28px 32px 24px;
-    border-right: 0;
-    border-bottom: 1px solid var(--surface-border);
-  }
-
-  .auth-brand__inner {
-    max-width: none;
-    min-height: 0;
-  }
-
-  .auth-brand__logo {
-    height: 44px;
-  }
-
-  .auth-brand__copy {
-    margin: 0;
-    padding: 20px 0 0;
-  }
-
-  .auth-brand__name {
-    max-width: none;
-    font-size: 24px;
-  }
-
-  .auth-brand__alt {
-    margin-top: 4px;
-    font-size: 14px;
-  }
-
-  .auth-brand__rule,
-  .auth-brand__points {
-    display: none;
-  }
-
-  .auth-brand__tagline {
-    margin-top: 10px;
-    font-size: 15px;
-  }
-
-  .auth-brand__art {
-    right: -60px;
-    bottom: -150px;
-    width: 300px;
-    height: 300px;
-  }
-
-  .auth-main {
-    padding: 20px 32px 24px;
-  }
-
-  /* On one column the toolbar sits on the brand header's top right. */
-  .auth-toolbar {
-    position: absolute;
-    top: 24px;
-    right: 32px;
-    z-index: 3;
-  }
-
-  .auth-center {
-    justify-content: flex-start;
-    padding: 24px 0 32px;
-  }
-
-  .auth-card {
-    max-width: 480px;
-  }
-}
-
-/* ---- phones ----------------------------------------------------------- */
+/* ---- phones: the same card, full width with a 16px gutter ------------ */
 @media (max-width: 599px) {
-  .auth-brand {
-    padding: 20px 16px 18px;
+  .auth-main {
+    padding: 14px 16px 18px;
   }
 
-  .auth-brand__logo {
-    height: 34px;
-  }
-
-  .auth-brand__copy {
-    padding-top: 14px;
-  }
-
-  .auth-brand__name {
-    font-size: 19px;
-  }
-
-  .auth-brand__alt {
-    font-size: 13px;
-  }
-
-  .auth-brand__tagline,
-  .auth-brand__art {
-    display: none;
-  }
-
-  /* Too narrow to share the header with the logo: back in the flow,
-     above the card. */
   .auth-toolbar {
-    position: static;
     gap: 8px;
   }
 
@@ -12699,21 +12488,21 @@ body.auth-page {
     height: 40px;
   }
 
-  .auth-main {
-    padding: 16px 16px 20px;
-  }
-
   .auth-center {
-    padding: 8px 0 24px;
+    padding: 16px 0 24px;
   }
 
   .auth-card {
-    padding: 28px 20px 24px;
+    padding: 26px 20px 24px;
     border-radius: 14px;
   }
 
+  .auth-logo__img {
+    height: 34px;
+  }
+
   .auth-title {
-    font-size: 23px;
+    font-size: 21px;
   }
 
   /* One item per line: no separator left dangling at a line end. */
@@ -12843,6 +12632,23 @@ body.auth-page {
   }
 }
 
+@media (max-width: 767px) {
+  .data-table--stack td:empty {
+    display: none;
+  }
+
+  .data-table--stack td.data-table__actions {
+    display: block;
+    text-align: left;
+    white-space: normal;
+    padding-top: 8px;
+  }
+
+  .data-table--stack .row-actions {
+    justify-content: flex-start;
+  }
+}
+
 /* A tag never breaks inside (zh-Hant "預 / 設" stacked vertically). */
 .tag,
 .status-pill {
@@ -12867,6 +12673,20 @@ body.auth-page {
   margin: 0;
   font-size: 13.5px;
   line-height: 1.5;
+}
+
+/* Right-anchored menu panels (search "Recent", account) ran 36px past a
+   390px screen when opened: on phones they span the screen width. */
+@media (max-width: 599px) {
+  .menu__panel--right {
+    position: fixed;
+    top: auto;
+    left: 16px;
+    right: 16px;
+    width: auto;
+    max-width: none;
+    margin-top: 8px;
+  }
 }
 
 /* Progressive disclosure (manager.js `data-show-when`). */

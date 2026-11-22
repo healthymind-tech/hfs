@@ -2015,12 +2015,13 @@ mod console_tests {
             r.body
         );
         assert!(r.body.contains(r#"hreflang="en" aria-current="true""#));
-        // Both official names: the localized one, and the other under it.
-        assert!(r.body.contains("HealthyMind FHIR Server Manager"));
+        // The product name under the logo, in the request's language;
+        // a plain sign-in card, no marketing panel.
         assert!(
             r.body
-                .contains(r#"lang="zh-Hant">療心智能 FHIR 伺服器管理平台"#)
+                .contains(r#"<p class="auth-logo__name">HealthyMind FHIR Server Manager</p>"#)
         );
+        assert!(!r.body.contains("tagline"), "no marketing panel");
         let zh = call_h(
             &app,
             "/ui/login",
@@ -2029,10 +2030,9 @@ mod console_tests {
         .await;
         assert_standalone(&zh.body);
         assert!(zh.body.contains(r#"<html lang="zh-Hant""#));
-        assert!(zh.body.contains("療心智能 FHIR 伺服器管理平台"));
         assert!(
             zh.body
-                .contains(r#"lang="en">HealthyMind FHIR Server Manager"#)
+                .contains(r#"<p class="auth-logo__name">療心智能 FHIR 伺服器管理平台</p>"#)
         );
         assert!(zh.body.contains("顯示密碼"));
     }
@@ -2088,7 +2088,7 @@ mod console_tests {
         // The dark tokens the stamped attribute selects exist in app.css.
         let css = include_str!("../assets/app.css");
         assert!(css.contains("[data-theme=\"dark\"] {\n  color-scheme: dark;"));
-        assert!(css.contains("[data-theme=\"dark\"] .auth-brand"));
+        assert!(css.contains("[data-theme=\"dark\"] .auth-card"));
         assert!(css.contains("body.auth-page {"));
         // Message pages and the forced password change too.
         let r = call_h(
@@ -2481,7 +2481,9 @@ mod console_tests {
                         .next()
                         .is_some_and(|c| !(c.is_ascii_alphanumeric() || c == '-'))
                 });
-                if key.len() < 7 || key.ends_with('-') || is_class {
+                // File names (`partials/auth-brand.html`) share it too.
+                let is_file = src[i + 1 + key.len()..].starts_with('.');
+                if key.len() < 7 || key.ends_with('-') || is_class || is_file {
                     continue;
                 }
                 seen += 1;
