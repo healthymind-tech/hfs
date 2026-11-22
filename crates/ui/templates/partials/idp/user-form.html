@@ -7,7 +7,7 @@
     <label class="mfield__label" for="f-user_kind">{{ i18n.t("idpc-user-kind") }}</label>
     <select class="mfield__input" id="f-user_kind" name="user_kind">
       {% for (val, key) in [("patient", "idpc-user-kind-patient"), ("practitioner", "idpc-user-kind-practitioner"), ("related-person", "idpc-user-kind-related-person"), ("staff", "idpc-user-kind-staff")] %}
-      <option value="{{ val }}"{% if val.to_string() == self.v("user_kind") %} selected{% endif %}>{{ i18n.t(key) }}</option>
+      <option value="{{ val }}"{% if self.is_v("user_kind", val) %} selected{% endif %}>{{ i18n.t(key) }}</option>
       {% endfor %}
     </select>
   </div>

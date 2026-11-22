@@ -10,6 +10,9 @@
 //! alive (refresh-reuse detection revokes a family, revocation kills a
 //! grant), and reported in design order.
 
+// Step helpers return `Result<_, Check>` (a failed check is the error).
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1035,10 +1038,9 @@ async fn step_authorization_code(cx: &mut Ctx, jwks_ok: bool) -> (Step, Option<T
                 if let (Some(ah), Some(alg)) = (
                     c.get("at_hash").and_then(Value::as_str),
                     h.get("alg").and_then(Value::as_str).and_then(|a| a.parse::<SigningAlg>().ok()),
-                ) {
-                    if ah != helios_idp::token::at_hash(&access, alg) {
-                        problems.push("at_hash does not match the access token".into());
-                    }
+                ) && ah != helios_idp::token::at_hash(&access, alg)
+                {
+                    problems.push("at_hash does not match the access token".into());
                 }
                 tokens.id_sub = c.get("sub").and_then(Value::as_str).map(String::from);
                 if problems.is_empty() {

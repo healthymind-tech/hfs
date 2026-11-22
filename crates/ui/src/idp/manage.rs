@@ -504,6 +504,9 @@ pub(crate) struct UsersPage {
 }
 
 impl UsersPage {
+    pub fn is_v(&self, k: &str, val: &str) -> bool {
+        self.v(k) == val
+    }
     pub fn v(&self, k: &str) -> &str {
         self.form.get(k).map(String::as_str).unwrap_or("")
     }
@@ -615,6 +618,9 @@ pub(crate) struct UserPage {
 }
 
 impl UserPage {
+    pub fn is_v(&self, k: &str, val: &str) -> bool {
+        self.v(k) == val
+    }
     pub fn back(&self) -> String {
         format!("/ui/idp/{}/users/{}", self.head.name, self.user.id)
     }

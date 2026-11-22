@@ -166,6 +166,9 @@ pub(crate) struct FinishView {
 }
 
 impl WizardPage {
+    pub fn is_v(&self, k: &str, val: &str) -> bool {
+        self.v(k) == val
+    }
     pub fn v(&self, k: &str) -> &str {
         self.form.get(k).map(String::as_str).unwrap_or("")
     }
@@ -521,10 +524,10 @@ pub(crate) async fn step_page(
         Ok(p) => p,
         Err(r) => return r,
     };
-    if step == 7 {
-        if let Ok(r) = c.preflight(&realm, None).await {
-            p.verify = Some(verify::view(&p.i18n, &r, true));
-        }
+    if step == 7
+        && let Ok(r) = c.preflight(&realm, None).await
+    {
+        p.verify = Some(verify::view(&p.i18n, &r, true));
     }
     render(p)
 }

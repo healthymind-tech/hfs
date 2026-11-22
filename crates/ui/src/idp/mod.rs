@@ -11,6 +11,11 @@
 //! service (`HFS_IDP=on`). Every POST is a write behind the console's
 //! administrator guard and CSRF check.
 
+// Page handlers return `Result<_, Response>` (both arms are responses).
+#![allow(clippy::result_large_err)]
+// Page renderers take the request context pieces explicitly.
+#![allow(clippy::too_many_arguments)]
+
 pub(crate) mod manage;
 pub(crate) mod security;
 pub(crate) mod verify;

@@ -15,6 +15,9 @@
 //! [`ROUTES`] lists every route; a test checks it against the OpenAPI
 //! document served at `/admin/idp/openapi.json` and against the router.
 
+// Handlers return `Result<Response, Response>` (both arms are responses).
+#![allow(clippy::result_large_err)]
+
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
@@ -35,9 +38,24 @@ use serde_json::{Value, json};
 use crate::binding::BindMode;
 use crate::service::{self, DIAGNOSTIC_PREFIX, DiagnoseOptions, IdpConsole, OpError, error_json};
 
-/// Decides whether a request may use the API, and who it acts as.
-pub type Authorize =
-    Arc<dyn Fn(&axum::http::request::Parts) -> Result<Actor, (StatusCode, String)> + Send + Sync>;
+/// Result of an authorization decision.
+pub type AuthResult = Result<Actor, (StatusCode, String)>;
+
+/// Decides whether a request may use the API, and who it acts as (async:
+/// the host's authorizer may consult session stores).
+pub type Authorize = Arc<
+    dyn for<'a> Fn(&'a axum::http::request::Parts) -> std::pin::Pin<Box<dyn std::future::Future<Output = AuthResult> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
+/// An [`Authorize`] from a synchronous decision.
+pub fn authorize_sync(f: impl Fn(&axum::http::request::Parts) -> AuthResult + Send + Sync + 'static) -> Authorize {
+    Arc::new(move |p| {
+        let r = f(p);
+        Box::pin(async move { r })
+    })
+}
 
 /// The OpenAPI 3.1 description of this API.
 pub const OPENAPI: &str = include_str!("../openapi/admin-idp.json");
@@ -117,7 +135,7 @@ async fn authorize(State(st): State<ApiState>, req: Request, next: Next) -> Resp
     let Some(auth) = st.auth.as_ref() else {
         return err(&OpError::other(401, "the IdP admin API has no authorizer configured"));
     };
-    match auth(&parts) {
+    match auth(&parts).await {
         Ok(actor) => {
             parts.extensions.insert(actor);
             next.run(Request::from_parts(parts, body)).await

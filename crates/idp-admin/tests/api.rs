@@ -17,7 +17,7 @@ use tower::ServiceExt;
 use url::Url;
 
 fn auth() -> Authorize {
-    Arc::new(|parts| {
+    api::authorize_sync(|parts| {
         if parts.headers.get("x-test-admin").is_some() {
             Ok(Actor { subject: "local:admin".into(), display: None, via: "console-session".into() })
         } else {
