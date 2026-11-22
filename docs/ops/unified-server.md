@@ -142,7 +142,7 @@ terminology from the copy during the move, probed every 250 ms.
 | `test_hts` battery | 112/112 statuses identical |
 | write after the switch | lands in `terminology.code_systems` / `terminology.resources`, none in `public` |
 | re-run after success | no-op |
-| `--snapshot dump` | see `hfs-eval/eval/results-unify/U1.md` |
+| `--snapshot dump` (second run) | **no terminology read outage** (0 failed `$expand`), snapshot 413 s instead of 27 s, total 695 s, WAL 9.5 GB; verified identical, answers 556/556 |
 
 **Production estimate.** The production data directory is on a rotational
 disk. The template copy is a sequential read + write of 9.5 GB on one disk
