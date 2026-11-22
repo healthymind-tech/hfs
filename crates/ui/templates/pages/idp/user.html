@@ -1,0 +1,55 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ user.username }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% include "partials/idp/errors.html" %}
+<form method="post" action="/ui/idp/{{ head.name }}/users/{{ user.id }}" novalidate data-idp-track>
+  {% call ui::form_section("user", user.username.clone(), i18n.t(user.kind_key)) %}
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("idpc-user-display"), "user_display", self.v("user_display"), self.err("user_display")) %}{% endcall %}
+      {% call ui::field_text(i18n.t("idpc-user-email"), "user_email", self.v("user_email"), self.err("user_email"), "", "email") %}{% endcall %}
+      <div class="mfield">
+        <label class="mfield__label" for="f-user_kind">{{ i18n.t("idpc-user-kind") }}</label>
+        <select class="mfield__input" id="f-user_kind" name="user_kind">
+          {% for (val, key) in [("patient", "idpc-user-kind-patient"), ("practitioner", "idpc-user-kind-practitioner"), ("related-person", "idpc-user-kind-related-person"), ("staff", "idpc-user-kind-staff")] %}
+          <option value="{{ val }}"{% if val.to_string() == self.v("user_kind") %} selected{% endif %}>{{ i18n.t(key) }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <fieldset class="idp-link">
+      <legend class="mfield__label">{{ i18n.t("idpc-user-link") }}</legend>
+      <p class="mfield__hint">{{ i18n.t("idpc-user-link-hint") }}</p>
+      <div class="form-grid">
+        <div class="mfield">
+          <label class="mfield__label" for="f-user_endpoint">{{ i18n.t("idpc-user-endpoint") }}</label>
+          <select class="mfield__input" id="f-user_endpoint" name="user_endpoint">
+            <option value="">{{ i18n.t("idpc-user-endpoint-none") }}</option>
+            {% for e in endpoint_names %}<option value="{{ e }}"{% if self.v("user_endpoint") == e.as_str() %} selected{% endif %}>{{ e }}</option>{% endfor %}
+          </select>
+        </div>
+        {% call ui::field_text(i18n.t("idpc-user-reference"), "user_reference", self.v("user_reference"), self.err("user_reference"), i18n.t("idpc-user-reference-hint"), "text", false, "Patient/123", false, true) %}{% endcall %}
+      </div>
+    </fieldset>
+    {% call ui::checkbox(i18n.t("idpc-user-disabled"), "disabled", user.disabled, i18n.t("idpc-user-disabled-hint")) %}{% endcall %}
+  {% endcall %}
+  <div class="form-actions"><a class="btn" href="/ui/idp/{{ head.name }}/users">{{ i18n.t("idpc-cancel") }}</a><button type="submit" class="btn btn--primary">{{ i18n.t("idpc-save") }}</button></div>
+</form>
+<form method="post" action="/ui/idp/{{ head.name }}/users/{{ user.id }}/password" novalidate>
+  {% call ui::form_section("password", i18n.t("idpc-user-set-password"), i18n.t_arg("idpc-user-password-hint", "min", password_min.to_string())) %}
+    <div class="form-grid">{% call ui::field_text(i18n.t("idpc-user-password"), "user_password", "", self.err("user_password"), "", "password", true, "", false, false, "new-password") %}{% endcall %}</div>
+    {% call ui::checkbox(i18n.t("idpc-user-must-change"), "user_must_change", false) %}{% endcall %}
+    <button type="submit" class="btn">{% call ui::icon("key") %}{% endcall %}{{ i18n.t("idpc-user-set-password") }}</button>
+  {% endcall %}
+</form>
+{% include "partials/idp/session-tables.html" %}
+<section class="card danger-zone">
+  <h2 class="danger-zone__heading">{{ i18n.t("idpc-danger") }}</h2>
+  <div class="danger-zone__row">
+    <div><strong>{{ i18n.t("idpc-user-delete") }}</strong><p>{{ i18n.t("idpc-user-delete-detail") }}</p></div>
+    <form method="post" action="/ui/idp/{{ head.name }}/users/{{ user.id }}/delete"><button type="submit" class="btn btn--danger" data-confirm="{{ i18n.t_arg("idpc-user-delete-confirm", "user", user.username.clone()) }}">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("idpc-user-delete") }}</button></form>
+  </div>
+</section>
+{% endblock %}

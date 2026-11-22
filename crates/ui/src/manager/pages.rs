@@ -1159,7 +1159,12 @@ pub(crate) async fn save_section(
         .update(&ep, expected, spec.clone(), secrets, &actor)
         .await
     {
-        Ok(_) => Redirect::to(&format!("/ui/e/{ep}/{}?saved=1", section.slug())).into_response(),
+        Ok(_) => {
+            if section == Section::Security {
+                crate::idp::security::after_save(&ep, &spec).await;
+            }
+            Redirect::to(&format!("/ui/e/{ep}/{}?saved=1", section.slug())).into_response()
+        }
         Err(BackendError::Conflict { current }) => {
             section_response(c, section, &e, &spec, errors, false, Some(current), &others)
         }

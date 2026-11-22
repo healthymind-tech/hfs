@@ -1,0 +1,1 @@
+{%- if let Some(f) = flash %}<p class="notice notice--ok idp-flash" role="status">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t(f) }}</span></p>{% endif -%}

@@ -1,0 +1,62 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("idpc-tab-settings") }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% include "partials/idp/errors.html" %}
+<form method="post" action="/ui/idp/{{ head.name }}/settings" novalidate data-idp-track>
+  <input type="hidden" name="revision" value="{{ revision }}">
+  {% call ui::form_section("general", i18n.t("idpc-step-basics"), i18n.t("idpc-settings-general-desc")) %}
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("idpc-field-display-name"), "display_name", display_name, self.err("display_name"), "", "text", true) %}{% endcall %}
+      <div class="mfield"><span class="mfield__label">{{ i18n.t("idpc-field-name") }}</span><code>{{ head.name }}</code><p class="mfield__hint">{{ i18n.t("idpc-name-immutable") }}</p></div>
+    </div>
+  {% endcall %}
+  {% call ui::form_section("capabilities", i18n.t("idpc-step-capabilities"), i18n.t("idpc-step-capabilities-desc")) %}
+    {% include "partials/idp/capabilities.html" %}
+  {% endcall %}
+  {% call ui::form_section("security", i18n.t("idpc-settings-security"), "") %}
+    <div class="form-grid form-grid--3">
+      {% call ui::field_text(i18n.t("idpc-password-min"), "security.passwordMinLength", password_min, self.err("security.passwordMinLength"), i18n.t("idpc-password-min-hint"), "number") %}{% endcall %}
+      {% call ui::field_text(i18n.t("idpc-lockout"), "security.lockoutThreshold", lockout, self.err("security.lockoutThreshold"), i18n.t("idpc-lockout-hint"), "number") %}{% endcall %}
+      {% call ui::field_text(i18n.t("idpc-rotate-days"), "rotation.rotateAfterDays", rotate_days, self.err("rotation.rotateAfterDays"), i18n.t("idpc-rotate-days-hint"), "number") %}{% endcall %}
+    </div>
+  {% endcall %}
+  <div class="form-actions"><button type="submit" class="btn btn--primary">{{ i18n.t("idpc-save") }}</button></div>
+</form>
+<section class="card table-card" id="endpoints">
+  <header class="card-head"><h2>{{ i18n.t("idpc-step-endpoints") }}</h2><p class="card-head__meta">{{ i18n.t("idpc-settings-endpoints-desc") }}</p></header>
+  {% if endpoints.is_empty() %}<div class="card__body"><p>{{ i18n.t("idpc-no-endpoints") }}</p></div>{% else %}
+  <div class="table-wrap" tabindex="0"><table class="data-table data-table--stack">
+    <thead><tr><th scope="col">{{ i18n.t("idpc-col-endpoint") }}</th><th scope="col">{{ i18n.t("idpc-ep-today") }}</th><th scope="col"><span class="visually-hidden">{{ i18n.t("idpc-col-actions") }}</span></th></tr></thead>
+    <tbody>{% for e in endpoints %}<tr id="ep-{{ e.name }}">
+      <td data-label="{{ i18n.t("idpc-col-endpoint") }}"><a href="/ui/e/{{ e.name }}/security">{{ e.name }}</a><div class="idp-sub"><code class="idp-wrap">{{ e.base_url }}</code></div></td>
+      <td data-label="{{ i18n.t("idpc-ep-today") }}">{{ i18n.t(e.state_key) }}{% if !e.state_detail.is_empty() %} <code class="idp-wrap">{{ e.state_detail }}</code>{% endif %}{% if e.listed && !e.bound_here %} <span class="tag tag--warn">{{ i18n.t("idpc-ep-listed-not-bound") }}</span>{% endif %}</td>
+      <td class="data-table__actions">
+        {% if e.bound_here %}
+        <form method="post" action="/ui/idp/{{ head.name }}/settings/unbind"><input type="hidden" name="endpoint" value="{{ e.name }}"><button type="submit" class="btn btn--small btn--danger-outline" data-confirm="{{ i18n.t_arg("idpc-unbind-confirm", "endpoint", e.name.clone()) }}">{{ i18n.t("idpc-unbind") }}</button></form>
+        {% else %}
+        <form method="post" action="/ui/idp/{{ head.name }}/settings/bind" class="idp-inline"><input type="hidden" name="endpoint" value="{{ e.name }}">
+          <select class="mfield__input mfield__input--small" name="bind_mode" aria-label="{{ i18n.t("idpc-bind-mode") }}"><option value="keep">{{ i18n.t("idpc-bind-mode-keep") }}</option><option value="write-protect">{{ i18n.t("idpc-bind-mode-write-protect") }}</option><option value="full">{{ i18n.t("idpc-bind-mode-full") }}</option></select>
+          <button type="submit" class="btn btn--small" data-confirm="{{ i18n.t_arg("idpc-bind-confirm", "endpoint", e.name.clone()) }}">{{ i18n.t("idpc-bind") }}</button></form>
+        {% endif %}
+      </td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+</section>
+<section class="card danger-zone">
+  <h2 class="danger-zone__heading">{{ i18n.t("idpc-danger") }}</h2>
+  <div class="danger-zone__row" id="f-enabled">
+    <div><strong>{% if head.enabled %}{{ i18n.t("idpc-disable") }}{% else %}{{ i18n.t("idpc-enable") }}{% endif %}</strong><p>{{ i18n.t("idpc-disable-detail") }}</p></div>
+    <form method="post" action="/ui/idp/{{ head.name }}/settings/{% if head.enabled %}disable{% else %}enable{% endif %}"><button type="submit" class="btn btn--danger-outline"{% if head.enabled %} data-confirm="{{ i18n.t("idpc-disable-confirm") }}"{% endif %}>{% call ui::icon("power") %}{% endcall %}{% if head.enabled %}{{ i18n.t("idpc-disable") }}{% else %}{{ i18n.t("idpc-enable") }}{% endif %}</button></form>
+  </div>
+  <form method="post" action="/ui/idp/{{ head.name }}/settings/delete" class="danger-zone__row" data-typed-confirm="{{ head.name }}">
+    <div><strong>{{ i18n.t("idpc-delete-realm") }}</strong><p>{{ i18n.t("idpc-delete-realm-detail") }}</p>
+      <label class="mfield__label" for="f-confirm">{{ i18n.t_arg("idpc-type-name", "name", head.name.clone()) }}</label>
+      <input class="mfield__input" id="f-confirm" name="confirm" autocomplete="off">{% if !self.err("confirm").is_empty() %}<p class="mfield__error">{{ self.err("confirm") }}</p>{% endif %}</div>
+    <button type="submit" class="btn btn--danger" data-typed-confirm-submit>{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("idpc-delete-realm") }}</button>
+  </form>
+</section>
+{% endblock %}

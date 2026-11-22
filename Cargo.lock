@@ -4026,6 +4026,8 @@ dependencies = [
  "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
+ "helios-idp",
+ "helios-idp-admin",
  "helios-observability",
  "helios-persistence",
  "helios-sof",

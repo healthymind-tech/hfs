@@ -181,6 +181,13 @@ helios-persistence = { path = "../persistence", version = "0.2.9", default-featu
 # sync service.
 helios-sync = { path = "../sync", version = "0.2.9", default-features = false }
 
+# Built-in authorization server console (docs/design/authorization-server.md
+# I6): realm list, creation wizard, management pages and the diagnostic,
+# server-rendered over helios-idp-admin's console service (in-process, no
+# self-calls). Inert unless the server installs the service (HFS_IDP=on).
+helios-idp = { path = "../idp", version = "0.2.9" }
+helios-idp-admin = { path = "../idp-admin", version = "0.2.9" }
+
 
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.

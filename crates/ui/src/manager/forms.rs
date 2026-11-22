@@ -376,7 +376,11 @@ pub fn apply_section(
             spec.auth = if form.checked("auth_inherit") {
                 None
             } else {
-                Some(parse_auth(form, spec.auth.as_ref(), errs))
+                let mut auth = parse_auth(form, spec.auth.as_ref(), errs);
+                // Built-in authorization server: "Internal" generates the
+                // issuer / JWKS / SMART fields from the realm (crate::idp).
+                crate::idp::security::apply_form(form, spec.name.as_str(), &mut auth, errs);
+                Some(auth)
             };
             spec.cors = if form.checked("cors_inherit") {
                 None

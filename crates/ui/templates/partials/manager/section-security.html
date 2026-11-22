@@ -19,6 +19,7 @@
         <span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-full-desc") }}</span>
       </label>
     </div>
+    {% include "partials/idp/security-provider.html" %}
     <div class="form-grid">
       {% call ui::field_text(i18n.t("mgr-field-issuer"), "auth_issuer", v.auth_issuer, self.err("auth.issuer"), i18n.t("mgr-field-issuer-hint"), "url", false, "https://idp.example.org/realms/fhir", false, true) %}{% endcall %}
       {% call ui::field_text(i18n.t("mgr-field-jwks"), "auth_jwks_url", v.auth_jwks_url, self.err("auth.jwksUrl"), i18n.t("mgr-field-jwks-hint"), "url", false, "", false, true) %}{% endcall %}

@@ -1,0 +1,42 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+<div class="stat-grid idp-stats">
+  <a class="health-tile health-tile--info" href="/ui/idp/{{ head.name }}/clients"><span class="health-tile__label">{{ i18n.t("idpc-tab-clients") }}</span><span class="health-tile__value">{{ clients }}</span></a>
+  <a class="health-tile health-tile--info" href="/ui/idp/{{ head.name }}/users"><span class="health-tile__label">{{ i18n.t("idpc-tab-users") }}</span><span class="health-tile__value">{{ users }}</span></a>
+  <a class="health-tile health-tile--{% if active_keys > 0 %}ok{% else %}danger{% endif %}" href="/ui/idp/{{ head.name }}/keys"><span class="health-tile__label">{{ i18n.t("idpc-active-keys") }}</span><span class="health-tile__value">{{ active_keys }}</span></a>
+  <a class="health-tile health-tile--info" href="/ui/idp/{{ head.name }}/sessions"><span class="health-tile__label">{{ i18n.t("idpc-active-sessions") }}</span><span class="health-tile__value">{{ sessions }}</span></a>
+</div>
+<div class="idp-cols">
+  <section class="card">
+    <header class="card-head"><h2>{{ i18n.t("idpc-endpoints-bound") }}</h2></header>
+    <div class="card__body">
+    {% if endpoints.is_empty() %}
+      <p>{{ i18n.t("idpc-endpoints-none") }}</p>
+      <a class="btn btn--small" href="/ui/idp/{{ head.name }}/settings#endpoints">{{ i18n.t("idpc-bind-endpoint") }}</a>
+    {% else %}
+      <ul class="idp-list">{% for (name, base) in endpoints %}<li><a href="/ui/e/{{ name }}/security">{{ name }}</a> {% call ui::copy_field(base, i18n.t("idpc-copy")) %}{% endcall %}</li>{% endfor %}</ul>
+    {% endif %}
+    </div>
+  </section>
+  <section class="card">
+    <header class="card-head"><h2>{{ i18n.t("idpc-discovery") }}</h2></header>
+    <div class="card__body">
+      <dl class="idp-links">
+      {% for l in links %}<dt>{{ i18n.t(l.label_key) }}</dt><dd>{% call ui::copy_field(l.url, i18n.t("idpc-copy")) %}{% endcall %}</dd>{% endfor %}
+      </dl>
+      <p class="idp-sub">{{ i18n.t("idpc-capabilities") }}: {% for c in capabilities %}<span class="tag tag--info">{{ c }}</span> {% endfor %}</p>
+    </div>
+  </section>
+</div>
+<section class="card">
+  <header class="card-head"><h2>{{ i18n.t("idpc-last-test") }}</h2>
+    <div class="card-head__tools"><a class="btn btn--small" href="/ui/idp/{{ head.name }}/test">{{ i18n.t("idpc-test-run") }}</a></div></header>
+  <div class="card__body">
+  {% if verify.is_some() %}{% include "partials/idp/verify.html" %}{% else %}<p>{{ i18n.t("idpc-never-tested") }}</p>{% endif %}
+  </div>
+</section>
+{% endblock %}

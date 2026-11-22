@@ -1,0 +1,45 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("idpc-tab-test") }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+<form method="post" action="/ui/idp/{{ head.name }}/test" hx-post="/ui/idp/{{ head.name }}/test" hx-target="#idp-verify" hx-swap="outerHTML" hx-indicator="#idp-running" data-idp-test>
+  {% call ui::form_section("test", i18n.t("idpc-test-title"), i18n.t("idpc-test-lede")) %}
+    <details class="disclosure"{% if !self.v("app_client").is_empty() || !self.v("patient").is_empty() %} open{% endif %}>
+      <summary class="disclosure__summary">{{ i18n.t("idpc-test-options") }}</summary>
+      <div class="disclosure__body">
+        <div class="form-grid">
+          <div class="mfield">
+            <label class="mfield__label" for="f-app_client">{{ i18n.t("idpc-test-app") }}</label>
+            <select class="mfield__input" id="f-app_client" name="app_client" data-idp-app-select>
+              <option value="">{{ i18n.t("idpc-test-app-none") }}</option>
+              {% for (cid, ru) in clients %}<option value="{{ cid }}" data-redirect="{{ ru }}"{% if self.v("app_client") == cid.as_str() %} selected{% endif %}>{{ cid }}</option>{% endfor %}
+            </select>
+            <p class="mfield__hint">{{ i18n.t("idpc-test-app-hint") }}</p>
+          </div>
+          {% call ui::field_text(i18n.t("idpc-test-app-redirect"), "app_redirect", self.v("app_redirect"), "", i18n.t("idpc-test-app-redirect-hint"), "url", false, "https://app.example.org/callback", false, true) %}{% endcall %}
+          {% call ui::field_text(i18n.t("idpc-test-patient"), "patient", self.v("patient"), "", i18n.t("idpc-test-patient-hint"), "text", false, "example", false, true) %}{% endcall %}
+        </div>
+      </div>
+    </details>
+    <div class="form-actions form-actions--start">
+      <button type="submit" class="btn btn--primary">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("idpc-test-run") }}</button>
+      <span id="idp-running" class="htmx-indicator idp-running" role="status">{{ i18n.t("idpc-test-running") }}</span>
+      {% if verify.is_some() %}<a class="btn" href="/ui/idp/{{ head.name }}/test/report.json" download>{{ i18n.t("idpc-test-download") }}</a>{% endif %}
+    </div>
+  {% endcall %}
+</form>
+<section class="card"><div class="card__body">
+{% if verify.is_none() %}<p class="idp-sub">{{ i18n.t("idpc-never-tested") }}</p>{% endif %}
+{% include "partials/idp/verify.html" %}
+</div></section>
+{% if !history.is_empty() %}
+<section class="card table-card">
+  <header class="card-head"><h2>{{ i18n.t("idpc-test-history") }}</h2></header>
+  <div class="table-wrap" tabindex="0"><table class="data-table data-table--stack">
+    <thead><tr><th scope="col">{{ i18n.t("idpc-col-when") }}</th><th scope="col">{{ i18n.t("idpc-col-status") }}</th><th scope="col">{{ i18n.t("idpc-col-problems") }}</th></tr></thead>
+    <tbody>{% for h in history %}<tr><td data-label="{{ i18n.t("idpc-col-when") }}">{{ h.when }}</td><td data-label="{{ i18n.t("idpc-col-status") }}">{% call ui::pill_raw(h.tone, h.icon, h.label) %}{% endcall %}</td><td data-label="{{ i18n.t("idpc-col-problems") }}">{{ h.problems }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+</section>
+{% endif %}
+{% endblock %}

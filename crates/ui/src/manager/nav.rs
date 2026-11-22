@@ -36,6 +36,10 @@ pub enum NavSection {
     EndpointConfigure,
     /// The current endpoint: operations (sync, audit, history).
     EndpointOperate,
+    /// Built-in authorization servers (line IdP; only registered with
+    /// `HFS_IDP=on`). Between the endpoint/terminology block and Server, as
+    /// in the unified console's `ui-chrome` registry.
+    AuthorizationServers,
     /// Server-wide operations (sync jobs of every endpoint).
     Server,
     /// Console settings (users, sign-in, server).
@@ -50,6 +54,7 @@ impl NavSection {
             NavSection::EndpointData => "mgr-nav-section-data",
             NavSection::EndpointConfigure => "mgr-nav-section-configure",
             NavSection::EndpointOperate => "mgr-nav-section-operate",
+            NavSection::AuthorizationServers => "mgr-nav-section-idp",
             NavSection::Server => "mgr-nav-section-server",
             NavSection::Settings => "mgr-nav-section-settings",
         }

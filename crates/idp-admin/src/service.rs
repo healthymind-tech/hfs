@@ -230,6 +230,9 @@ pub struct IdpConsole {
     /// In-network origin for the diagnostic (`HFS_IDP_DIAGNOSTIC_VIA`).
     pub fetch_via: Option<Url>,
     pub timeout: Duration,
+    /// Test hook: shifts the diagnostic's own clock (simulated skew).
+    #[doc(hidden)]
+    pub clock_offset_secs: i64,
     history: Mutex<HashMap<String, VecDeque<Report>>>,
 }
 
@@ -263,6 +266,7 @@ impl IdpConsole {
             binder,
             fetch_via: None,
             timeout: Duration::from_secs(10),
+            clock_offset_secs: 0,
             history: Mutex::new(HashMap::new()),
         }
     }
@@ -370,8 +374,6 @@ impl IdpConsole {
             }
         }
         WizardState::clear(&mut spec);
-        let mut keep = w.clone();
-        keep.draft = false;
         let rec = self.admin.update_realm(&rec.id, spec, rec.revision).await?;
         let opts = DiagnoseOptions { patient: w.test_patient.clone(), endpoints_override: Some(w.endpoints.clone()), audience_only: true, ..Default::default() };
         let pre = self.diagnose(name, opts).await?;
@@ -393,6 +395,16 @@ impl IdpConsole {
         } else {
             self.diagnose(name, DiagnoseOptions { patient: w.test_patient.clone(), ..Default::default() }).await?
         };
+        if !not_bound.is_empty() {
+            // Keep the wizard resumable at "Review & test" for a retry.
+            let pending = WizardState { draft: true, step: 7, endpoints: not_bound.clone(), ..w.clone() };
+            let _ = self
+                .update(name, None, |s| {
+                    pending.store(s);
+                    Ok(())
+                })
+                .await;
+        }
         Ok(FinishOutcome { realm: name.to_string(), bound, not_bound, report })
     }
 
@@ -530,6 +542,7 @@ impl IdpConsole {
                 cfg.app = opts.app.clone();
                 cfg.timeout = self.timeout;
                 cfg.audience_only = opts.audience_only;
+                cfg.clock_offset_secs = self.clock_offset_secs;
                 let r = diagnostic::diagnose(&pre, cfg).await;
                 self.cleanup_fixture(&rec.id, cleanup).await;
                 r
