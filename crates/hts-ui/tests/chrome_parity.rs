@@ -118,13 +118,66 @@ async fn sidebar_renders_brand_logo() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(
-        html.contains("class=\"brand__logo-full\""),
-        "sidebar must render <img class=\"brand__logo-full\"> (HFS parity)",
+        html.contains(r#"<img class="brand__mark" src="/ui/hts/assets/brand/heart-mark.png""#),
+        "sidebar must render the heart mark under /ui/hts/assets/ (HFS parity)",
     );
+    assert!(html.contains(r#"<span class="brand__name">HealthyMind</span>"#));
+    assert!(html.contains(r#"<span class="brand__product">Terminology Server</span>"#));
+    assert!(html.contains(r#"<a class="topbar__brand" href="/ui/hts""#));
+    assert!(!html.contains("logo-horizontal"), "no horizontal logo");
+}
+
+/// User feedback: no Chinese characters in the brand, in any language.
+#[tokio::test]
+async fn brand_has_no_chinese_characters_in_chinese() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts?lang=zh-Hant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
     assert!(
-        html.contains("/ui/hts/assets/brand/healthymind-logo-horizontal.png"),
-        "brand logo src must resolve under /ui/hts/assets/",
+        html.contains(r#"<html lang="zh-Hant""#),
+        "rendered in Chinese"
     );
+    for class in ["brand", "topbar__brand"] {
+        let open = format!(r#"<a class="{class}""#);
+        let start = html.find(&open).expect("brand link");
+        let end = start
+            + html[start..]
+                .find(r#"<span class="visually-hidden">"#)
+                .unwrap();
+        let visible = &html[start..end];
+        assert!(
+            !visible
+                .chars()
+                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "{class}: {visible}"
+        );
+    }
+}
+
+/// Loading feedback shared with HFS (request-busy.js).
+#[tokio::test]
+async fn layout_loads_the_request_busy_indicator() {
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<script src="/ui/hts/assets/request-busy.js" defer></script>"#));
+    let response = app()
+        .oneshot(
+            Request::get("/ui/hts/assets/request-busy.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

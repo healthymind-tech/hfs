@@ -1698,7 +1698,7 @@ mod console_tests {
         .await;
         assert_eq!(r.status, StatusCode::OK);
         assert!(r.body.contains(r#"id="signin-form""#), "{}", r.body);
-        assert!(r.body.contains("HealthyMind FHIR Server Manager"));
+        assert!(r.body.contains("FHIR Server Manager"));
         assert!(!r.body.contains("signin-idp"));
         let zh = call(&app, Method::GET, "/ui/login?lang=zh-Hant", "", "", None).await;
         assert!(zh.body.contains("療心智能"), "zh-Hant title");
@@ -1965,7 +1965,8 @@ mod console_tests {
             body.contains("prefers-color-scheme"),
             "boot follows the system"
         );
-        assert!(body.contains("/ui/assets/brand/healthymind-logo-horizontal@2x.png"));
+        assert!(body.contains("/ui/assets/brand/healthymind-logo-en@2x.png 2x"));
+        assert!(!body.contains("logo-horizontal"));
         assert!(body.contains("/ui/assets/brand/favicon.svg"));
         assert!(body.contains("data-theme-cycle"), "theme button");
         assert!(
@@ -2019,7 +2020,7 @@ mod console_tests {
         // a plain sign-in card, no marketing panel.
         assert!(
             r.body
-                .contains(r#"<p class="auth-logo__name">HealthyMind FHIR Server Manager</p>"#)
+                .contains(r#"<p class="auth-logo__name">FHIR Server Manager</p>"#)
         );
         assert!(!r.body.contains("tagline"), "no marketing panel");
         let zh = call_h(
@@ -2032,7 +2033,7 @@ mod console_tests {
         assert!(zh.body.contains(r#"<html lang="zh-Hant""#));
         assert!(
             zh.body
-                .contains(r#"<p class="auth-logo__name">療心智能 FHIR 伺服器管理平台</p>"#)
+                .contains(r#"<p class="auth-logo__name">FHIR 伺服器管理平台</p>"#)
         );
         assert!(zh.body.contains("顯示密碼"));
     }

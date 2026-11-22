@@ -168,14 +168,15 @@ async fn every_manager_page_renders_in_en_and_zh_hant_without_missing_keys() {
                 "{page}"
             );
             assert!(html.contains("Helios FHIR Server"), "{page} attribution");
-            assert!(
-                html.contains("brand/healthymind-logo-horizontal.png"),
-                "{page}"
-            );
+            assert!(html.contains("/ui/assets/brand/heart-mark.png"), "{page}");
+            assert!(!html.contains("logo-horizontal"), "{page} [{lang}]");
         }
     }
     let (_, zh) = get_lang(&f.app, "/ui", "zh-Hant").await;
-    assert!(zh.contains("療心智能 FHIR 伺服器管理平台"));
+    // The brand block is English in every language (it is the wordmark);
+    // the localized company name stays in the attribution footer.
+    assert!(zh.contains(r#"<span class="brand__product">FHIR Server Manager</span>"#));
+    assert!(zh.contains("療心智能 HealthyMind Tech"));
     let (_, en) = get_lang(&f.app, "/ui", "en").await;
     assert!(en.contains("HealthyMind FHIR Server Manager"));
 }
@@ -474,7 +475,7 @@ async fn data_pages_are_scoped_to_their_endpoint() {
 async fn about_names_the_brand_and_the_upstream_license() {
     let f = fixture().await;
     let (_, html) = get(&f.app, "/ui/about").await;
-    assert!(html.contains("healthymind-logo-square.png"));
+    assert!(html.contains("/ui/assets/brand/healthymind-logo-en@2x.png"));
     assert!(html.contains("MIT"));
     assert!(html.contains("github.com/HeliosSoftware/hfs"));
 }
@@ -487,11 +488,92 @@ async fn brand_assets_are_served() {
         "/ui/assets/brand/favicon-32.png",
         "/ui/assets/brand/healthymind-logo-horizontal.png",
         "/ui/assets/brand/healthymind-logo-square.png",
+        "/ui/assets/brand/healthymind-logo-en.png",
+        "/ui/assets/brand/healthymind-logo-en@2x.png",
+        "/ui/assets/brand/healthymind-logo-en@3x.png",
+        "/ui/assets/brand/heart-mark.png",
+        "/ui/assets/brand/heart-mark@2x.png",
+        "/ui/assets/brand/heart-mark@3x.png",
         "/ui/assets/brand/manifest.webmanifest",
         "/ui/assets/manager.js",
+        "/ui/assets/request-busy.js",
     ] {
         let (status, _) = get(&f.app, asset).await;
         assert_eq!(status, StatusCode::OK, "{asset}");
+    }
+}
+
+/// The `<a class="{class}" …>…</a>` element of `html`.
+fn element<'a>(html: &'a str, class: &str) -> &'a str {
+    let open = format!(r#"<a class="{class}""#);
+    let start = html.find(&open).unwrap_or_else(|| panic!("{open} in page"));
+    let end = start + html[start..].find("</a>").expect("closing </a>") + 4;
+    &html[start..end]
+}
+
+/// The sidebar brand and its topbar twin: heart mark + English wordmark in
+/// every language, linking home, no version line, no Chinese characters
+/// (user feedback: no horizontal logo with 療心智能 in the console chrome).
+#[tokio::test]
+async fn brand_block_is_the_heart_mark_and_an_english_wordmark_in_every_language() {
+    let f = fixture().await;
+    for lang in ["en", "zh-Hant"] {
+        let (_, html) = get_lang(&f.app, "/ui", lang).await;
+        for class in ["brand", "topbar__brand"] {
+            let a = element(&html, class);
+            assert!(a.contains(r#"href="/ui""#), "{class} [{lang}]: {a}");
+            assert!(a.contains("/ui/assets/brand/heart-mark.png"), "{a}");
+            assert!(a.contains("/ui/assets/brand/heart-mark@2x.png 2x"), "{a}");
+            assert!(
+                a.contains(r#"<span class="brand__name">HealthyMind</span>"#),
+                "{a}"
+            );
+            assert!(
+                a.contains(r#"<span class="brand__product">FHIR Server Manager</span>"#),
+                "{a}"
+            );
+            assert!(!a.contains("brand__version"), "version left the block: {a}");
+            // Only the screen-reader-only "Home" hint follows the language.
+            let visible = match a.find(r#"<span class="visually-hidden">"#) {
+                Some(i) => &a[..i],
+                None => a,
+            };
+            assert!(
+                !visible
+                    .chars()
+                    .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "Chinese characters in the {class} brand [{lang}]: {a}"
+            );
+        }
+    }
+}
+
+/// Loading feedback (request-busy.js): the layout loads it, and the
+/// stylesheet carries the dimmed target, its ring and the field ring.
+#[tokio::test]
+async fn layout_loads_the_request_busy_indicator() {
+    let f = fixture().await;
+    let (_, html) = get(&f.app, "/ui").await;
+    assert!(html.contains(r#"<script src="/ui/assets/request-busy.js" defer></script>"#));
+    let css = include_str!("../assets/app.css");
+    for needle in [
+        ".is-loading {",
+        ".is-loading > * {",
+        ".is-loading::after {",
+        "form.is-requesting .toolbar__search:has(> svg)::before {",
+    ] {
+        assert!(css.contains(needle), "{needle} in app.css");
+    }
+    let js = include_str!("../assets/request-busy.js");
+    for needle in [
+        "htmx:beforeSend",
+        r#"setAttribute("aria-busy", "true")"#,
+        "loadend",
+        "is-loading",
+        "is-requesting",
+        "var DELAY = 300;",
+    ] {
+        assert!(js.contains(needle), "{needle} in request-busy.js");
     }
 }
 

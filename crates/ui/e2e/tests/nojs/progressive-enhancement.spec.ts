@@ -21,7 +21,8 @@ test("the landing page renders server-side with no JavaScript", async ({ page, c
 test("the sidebar brand is an accessible native Home link", async ({ page }) => {
   await page.goto("/ui/resources");
   const brand = page.locator("a.brand");
-  const name = /^Helios FHIR Server hfs v.+ — Home$/;
+  // The visible wordmark plus a screen-reader-only "Home".
+  const name = /^HealthyMind\s*FHIR Server Manager\s*—\s*Home$/;
 
   await expect(brand).toHaveAttribute("href", "/ui");
   await expect(brand).not.toHaveAttribute("aria-current", "page");

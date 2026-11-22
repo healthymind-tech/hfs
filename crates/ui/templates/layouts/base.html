@@ -31,6 +31,9 @@
   <!-- The shared busy states (#679); ahead of every page script by defer's
        document order, because page scripts call into window.hfsBusy. -->
   <script src="/ui/assets/busy.js" defer></script>
+  <!-- Loading feedback for htmx requests slower than 300ms (aria-busy, a
+       dimmed target with a ring), shared with HTS. -->
+  <script src="/ui/assets/request-busy.js" defer></script>
   <!-- Shared locale number formatting, window.HfsNumber: page scripts and
        dashboard.js call it when they write a figure into the page. -->
   <script src="/ui/assets/number.js" defer></script>
@@ -256,10 +259,7 @@
       <button type="button" class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false" aria-label="{{ i18n.t("nav-menu-open") }}">
         {% include "icons/menu.svg" %}
       </button>
-      <a class="topbar__brand" href="/ui" aria-label="{{ i18n.t("app-title") }} — {{ i18n.t("nav-home") }}">
-        <img src="/ui/assets/brand/mark-64.png" alt="" width="32" height="32">
-        <span class="topbar__brand-name">{{ i18n.t("app-short-name") }}</span>
-      </a>
+{{ status.topbar_brand(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/brand.html #}
       <!-- FHIR Server | Terminology (UI/UX review §4.2): the same switcher
            HTS renders, so an operator moves between the two consoles from
            the same place in either. Absent when no terminology server is

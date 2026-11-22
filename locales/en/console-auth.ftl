@@ -2,7 +2,7 @@
 # console_settings,console_users}.rs). en is the source; zh-Hant must define
 # the same keys (checked by a test); de and es fall back to en.
 
-console-product = HealthyMind FHIR Server Manager
+console-product = FHIR Server Manager
 console-product-short = HealthyMind FHIR
 console-login-title = Sign in
 console-login-lede-oidc = Sign in with your organization's account.

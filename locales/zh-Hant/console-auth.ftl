@@ -1,6 +1,6 @@
 # 主控台登入、使用者與角色（工作包 P3）。鍵值須與 en/console-auth.ftl 相同。
 
-console-product = 療心智能 FHIR 伺服器管理平台
+console-product = FHIR 伺服器管理平台
 console-product-short = HealthyMind FHIR
 console-login-title = 登入
 console-login-lede-oidc = 請使用貴單位的帳號登入。

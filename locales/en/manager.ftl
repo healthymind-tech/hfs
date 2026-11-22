@@ -28,7 +28,7 @@ mgr-endpoint-count = { $count ->
 }
 mgr-breadcrumb = Breadcrumb
 mgr-skip-to-content = Skip to content
-mgr-footer-brand = 療心智能 HealthyMind Tech
+mgr-footer-brand = HealthyMind Tech
 mgr-footer-based-on = Based on Helios FHIR Server (MIT License) by Helios Software
 mgr-copied = Copied to clipboard
 mgr-back = Back
@@ -426,7 +426,7 @@ mgr-about-version = Version
 mgr-about-default-fhir = Default FHIR version
 mgr-about-endpoints = Endpoints
 mgr-about-attribution = Attribution
-mgr-about-attribution-text = 療心智能 FHIR 伺服器管理平台 (HealthyMind FHIR Server Manager) by HealthyMind Tech is based on Helios FHIR Server by Helios Software, used under the MIT License. The original copyright notice is kept in the bundled LICENSE.md.
+mgr-about-attribution-text = HealthyMind FHIR Server Manager by HealthyMind Tech is based on Helios FHIR Server by Helios Software, used under the MIT License. The original copyright notice is kept in the bundled LICENSE.md.
 mgr-about-licenses = Open-source components
 mgr-about-component = Component
 mgr-about-license = License
