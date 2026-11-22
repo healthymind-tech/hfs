@@ -22,6 +22,10 @@ pub enum HandleKind {
     ParRequestUri,
     RegistrationAccessToken,
     InitialAccessToken,
+    /// Pending authorization between `/authorize` and the hosted pages.
+    Interaction,
+    /// Browser SSO session cookie value.
+    SsoSession,
 }
 
 impl HandleKind {
@@ -35,6 +39,8 @@ impl HandleKind {
             HandleKind::ParRequestUri => "urn:ietf:params:oauth:request_uri:hmpar_",
             HandleKind::RegistrationAccessToken => "hmrat_",
             HandleKind::InitialAccessToken => "hmiat_",
+            HandleKind::Interaction => "hmix_",
+            HandleKind::SsoSession => "hmss_",
         }
     }
 }
@@ -193,9 +199,21 @@ pub fn at_hash(access_token: &str, alg: crate::keys::SigningAlg) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct RefreshFamily {
     pub family_id: String,
+    /// The grant (`gid`) the family belongs to.
+    #[serde(default)]
+    pub grant_id: String,
     pub client_id: String,
     pub subject: String,
     pub scopes: Vec<String>,
+    /// `aud` of the tokens (endpoint base URL).
+    #[serde(default)]
+    pub audience: Vec<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub fhir_user: Option<String>,
+    #[serde(default)]
+    pub auth_time: Option<DateTime<Utc>>,
     pub context: LaunchContext,
     /// Generation of the only refresh token currently valid.
     pub current_generation: u32,
@@ -319,6 +337,11 @@ mod tests {
     fn family(now: DateTime<Utc>) -> RefreshFamily {
         RefreshFamily {
             family_id: "f".into(),
+            grant_id: "g".into(),
+            audience: vec![],
+            endpoint: None,
+            fhir_user: None,
+            auth_time: None,
             client_id: "app".into(),
             subject: "u".into(),
             scopes: vec!["offline_access".into()],

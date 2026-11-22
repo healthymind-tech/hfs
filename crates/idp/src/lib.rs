@@ -20,18 +20,34 @@
 //! | [`launch`] | SMART launch context and EHR launch handles |
 //! | [`user`] | realm users and their FHIR resource links |
 //! | [`metadata`] | OIDC / RFC 8414 metadata and SMART configuration |
-//! | [`store`] | the store contract |
+//! | [`store`] | the store contract ([`memory`] in-memory, `pg` PostgreSQL) |
 //! | [`schema`] | fork migration SQL (`hm-0020-idp-core`) |
+//! | [`interaction`] | contract between `/authorize` and the hosted pages |
+//! | [`runtime`] | hot per-instance snapshot (keys, JWKS, deny set) |
+//! | [`admin`] | administrative service used by the console and `/admin/idp` |
+//! | [`jws`] | JWS verification (client assertions, own tokens) |
+//! | [`password`] | argon2id for user passwords and client secrets |
+//! | [`logout`] | RP-initiated logout validation |
 //!
 //! Everything is inert unless `HFS_IDP=on` ([`FLAG_ENV`]).
 
+pub mod admin;
 pub mod client;
 pub mod error;
+pub mod events;
+pub mod interaction;
+pub mod jws;
 pub mod keys;
 pub mod launch;
+pub mod logout;
+pub mod memory;
 pub mod metadata;
+pub mod password;
+#[cfg(feature = "postgres")]
+pub mod pg;
 pub mod pkce;
 pub mod realm;
+pub mod runtime;
 pub mod schema;
 pub mod scope;
 pub mod store;

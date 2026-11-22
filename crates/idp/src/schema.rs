@@ -151,6 +151,9 @@ CREATE TABLE IF NOT EXISTS hfs_idp_grants (
     scopes     TEXT[] NOT NULL,
     audience   TEXT[] NOT NULL,
     context    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fhir_user  TEXT,
+    sso_session_id TEXT,                 -- digest of the SSO cookie (online_access)
+    auth_time  TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,     -- last access/refresh token expiry
     revoked_at TIMESTAMPTZ,
@@ -170,6 +173,7 @@ CREATE TABLE IF NOT EXISTS hfs_idp_codes (
 -- A consumed code leaves a tombstone so a replay revokes its grant (RFC 6749 §4.1.2).
 CREATE TABLE IF NOT EXISTS hfs_idp_code_tombstones (
     code_hash  TEXT PRIMARY KEY,
+    realm_id   TEXT NOT NULL,
     grant_id   TEXT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
@@ -180,6 +184,15 @@ CREATE TABLE IF NOT EXISTS hfs_idp_launches (
     payload     JSONB NOT NULL,
     expires_at  TIMESTAMPTZ NOT NULL
 );
+
+-- Pending authorizations between /authorize and the hosted pages (hmix_ handles).
+CREATE TABLE IF NOT EXISTS hfs_idp_interactions (
+    id_hash    TEXT PRIMARY KEY,
+    realm_id   TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    payload    JSONB NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_interactions_expiry ON hfs_idp_interactions (expires_at);
 
 CREATE TABLE IF NOT EXISTS hfs_idp_refresh_families (
     family_id          TEXT PRIMARY KEY,
@@ -196,6 +209,7 @@ CREATE TABLE IF NOT EXISTS hfs_idp_refresh_families (
     revoked_at         TIMESTAMPTZ,
     revoked_reason     TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_refresh_families_grant ON hfs_idp_refresh_families (grant_id);
 CREATE TABLE IF NOT EXISTS hfs_idp_refresh_tokens (
     token_hash TEXT PRIMARY KEY,
     family_id  TEXT NOT NULL REFERENCES hfs_idp_refresh_families (family_id) ON DELETE CASCADE,
