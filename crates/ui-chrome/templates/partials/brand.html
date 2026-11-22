@@ -1,15 +1,18 @@
 {#
-  SHARED CHROME -- the sidebar brand of both consoles (design §10.2): the
-  official HealthyMind horizontal logo when the sidebar is expanded, the
-  heart mark alone on the collapsed rail. The logo's wordmark is decorative;
-  the product line is real text, and the link's accessible name is the full
-  product name in the request's language.
-#}    <a class="brand" href="{{ links.home }}" aria-label="{{ i18n.t(links.title_key) }} {{ links.version }} — {{ i18n.t(links.home_key) }}">
-      <img class="brand__mark" src="{{ links.assets }}/brand/mark-64.png" alt="" width="36" height="36">
+  SHARED CHROME -- the brand link of both consoles (design §10.2), in the
+  sidebar (class `brand`) and, below the drawer breakpoint, in the topbar
+  (class `topbar__brand`): the official HealthyMind heart mark (cut from the
+  transparent square English logo, 1x/2x/3x) followed by the wordmark as real
+  text in the console's own font -- "HealthyMind" over the product line. The
+  wordmark is English in every UI language (it is the brand, not UI copy);
+  the link's name is that visible text plus a screen-reader-only "Home". The
+  version is a tooltip here; the footer and the About page show it.
+#}    <a class="{{ class }}" href="{{ links.home }}" title="HealthyMind {{ links.product_line }} {{ links.version }}">
+      <img class="brand__mark" src="{{ links.assets }}/brand/heart-mark.png" srcset="{{ links.assets }}/brand/heart-mark@2x.png 2x, {{ links.assets }}/brand/heart-mark@3x.png 3x" alt="" width="30" height="30">
       <span class="brand__text">
-        <img class="brand__logo-full" src="{{ links.assets }}/brand/healthymind-logo-horizontal.png" alt="" height="28">
-        <span class="brand__name">{{ i18n.t(links.product_line_key) }}</span>
-        <span class="brand__version">{{ links.version }}</span>
+        <span class="brand__name">HealthyMind</span>
+        <span class="brand__product">{{ links.product_line }}</span>
       </span>
+      <span class="visually-hidden"> — {{ i18n.t(links.home_key) }}</span>
     </a>
 {#- -#}

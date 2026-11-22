@@ -477,7 +477,9 @@ svg {
   display: flex;
   flex-direction: column;
   gap: 20px;
-  padding: 20px 24px;
+  /* No top padding: the brand block on top is exactly as tall as the
+     topbar, so the mark and the wordmark sit on the topbar's centre line. */
+  padding: 0 24px 20px;
   border-right: 1px solid var(--divider);
   box-shadow: 1px 0 0 var(--divider-glint);
   /* Whenever the rail overflows (a shorter screen, or the expanded rail with
@@ -499,46 +501,6 @@ svg {
 .sidebar:hover,
 .sidebar:focus-within {
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.14);
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 4px 0;
-  color: inherit;
-  text-decoration: none;
-}
-
-.brand:hover .brand__name,
-.brand:focus-visible .brand__name {
-  color: var(--accent-text);
-}
-
-.brand:focus-visible {
-  outline: 2px solid var(--accent-text);
-  outline-offset: 2px;
-}
-
-.brand__logo {
-  width: 40px;
-  height: 39px;
-}
-
-.brand__name {
-  display: block;
-  font-weight: 650;
-  color: var(--text-strong);
-  font-size: 13px;
-  letter-spacing: 0.1px;
-}
-
-.brand__version {
-  display: block;
-  margin-top: 0;
-  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
-  font-size: 10px;
-  color: var(--muted);
 }
 
 .divider {
@@ -609,14 +571,6 @@ a.nav-item:hover {
 
 /* ---------- Collapsed (icon-only) rail ---------- */
 
-.brand__text {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
 /*
  * Collapsed rail: the resting state, whenever the pointer and the keyboard
  * focus are both elsewhere (#438 dropped the explicit toggle). Labels are
@@ -631,17 +585,8 @@ a.nav-item:hover {
 @media (min-width: 1025px) {
 .sidebar:not(:hover):not(:focus-within) {
   width: 76px;
-  padding: 20px 14px;
+  padding: 0 14px 20px;
   align-items: center;
-}
-
-.sidebar:not(:hover):not(:focus-within) .brand {
-  flex-direction: column;
-  gap: 10px;
-}
-
-.sidebar:not(:hover):not(:focus-within) .brand__text {
-  display: none;
 }
 
 .sidebar:not(:hover):not(:focus-within) .nav__section {
@@ -668,8 +613,7 @@ a.nav-item:hover {
 /* Hide the text of labels/selectors without removing them from the a11y tree. */
 .sidebar:not(:hover):not(:focus-within) .nav-item__label,
 .sidebar:not(:hover):not(:focus-within) .selector__label,
-.sidebar:not(:hover):not(:focus-within) .selector__chevrons,
-.sidebar:not(:hover):not(:focus-within) .brand__version {
+.sidebar:not(:hover):not(:focus-within) .selector__chevrons {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -688,7 +632,7 @@ a.nav-item:hover {
   .sidebar,
   .sidebar:not(:hover):not(:focus-within) {
     gap: 10px;
-    padding-top: 12px;
+    padding-top: 0;
     padding-bottom: 12px;
   }
 
@@ -706,11 +650,6 @@ a.nav-item:hover {
 
   .sidebar:not(:hover):not(:focus-within) .nav__section {
     margin: 4px 0;
-  }
-
-  .brand__logo {
-    width: 34px;
-    height: 33px;
   }
 }
 
@@ -1334,7 +1273,8 @@ html.theme-fade *::after {
     display: grid;
     place-items: center;
     position: absolute;
-    top: 12px;
+    /* Centred on the brand row (topbar height). */
+    top: calc((var(--topbar-h) - 44px) / 2);
     right: 12px;
     width: 44px;
     height: 44px;
@@ -1360,11 +1300,6 @@ html.theme-fade *::after {
   .sidebar__close svg {
     width: 18px;
     height: 18px;
-  }
-
-  /* Room for the close control beside the brand row. */
-  .sidebar .brand {
-    padding-right: 48px;
   }
 
   .topbar {
@@ -2292,6 +2227,69 @@ form.htmx-request .btn[type="submit"]::after,
 .btn--primary[aria-busy="true"]::after {
   border-color: rgb(255 255 255 / 45%);
   border-top-color: #ffffff;
+}
+
+/* A user-initiated htmx request still running after 300ms
+   (request-busy.js, both consoles): its swap target dims and a ring sits
+   over it, near the top so it is in view on a long table; the issuing
+   filter field's magnifier turns into the same ring. Opacity and absolutely
+   positioned pseudo-elements only, so nothing moves when it starts or
+   stops. The target carries aria-busy="true" for the whole request. */
+.is-loading {
+  position: relative;
+  cursor: progress;
+}
+
+.is-loading > * {
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+
+.is-loading::after,
+form.is-requesting .toolbar__search:has(> svg)::before {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 2px solid var(--outline);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+  pointer-events: none;
+}
+
+.is-loading::after {
+  z-index: 2;
+  top: min(96px, calc(50% - 12px));
+  left: calc(50% - 12px);
+  width: 24px;
+  height: 24px;
+  border-width: 3px;
+}
+
+form.is-requesting .toolbar__search:has(> svg) {
+  position: relative;
+}
+
+form.is-requesting .toolbar__search:has(> svg) > svg {
+  visibility: hidden;
+}
+
+form.is-requesting .toolbar__search:has(> svg)::before {
+  top: calc(50% - 8px);
+  left: 14px;
+  width: 16px;
+  height: 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .is-loading::after,
+  form.is-requesting .toolbar__search:has(> svg)::before {
+    animation: none;
+  }
+
+  .is-loading > * {
+    transition: none;
+  }
 }
 
 /* Inline working state (#679): spinner plus a short label, role="status" in
@@ -10801,31 +10799,131 @@ html.js .reveal:not(.is-shown) {
 @layer pages {
 /* ---------- Shell refresh: brand, pinned sidebar, footer ---------- */
 
-.brand__mark {
-  display: none;
-  width: 36px;
-  height: 36px;
+/* ---------- Brand block: sidebar + phone/tablet topbar ----------
+   Shared markup: helios-ui-chrome partials/brand.html. The official heart
+   mark (30px, 1x/2x/3x from the transparent square English logo) and the
+   wordmark as real text: "HealthyMind" semibold over the muted product
+   line. The sidebar block is exactly as tall as the topbar (the sidebar has
+   no top padding) so both read on one centre line, and its left padding
+   equals a nav item's (padding + 1px border) so the mark's left edge lines
+   up with the nav icons below. */
+.brand,
+.topbar__brand {
+  position: relative;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+  border-radius: 10px;
+}
+
+.brand {
+  display: flex;
   flex: none;
+  box-sizing: border-box;
+  height: var(--topbar-h);
+  padding: 0 17px;
 }
 
-
-.brand__logo-full {
+.brand__mark {
   display: block;
-  width: auto;
-  height: 28px;
-  max-width: 100%;
-  object-fit: contain;
-  object-position: left center;
+  flex: none;
+  width: 30px;
+  height: 30px;
 }
 
+.brand__text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
 
+.brand__name {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 18px;
+  letter-spacing: 0.1px;
+  color: var(--text-strong);
+  white-space: nowrap;
+}
 
-@media (min-width: 1025px) and (max-width: 1279px) {
-  .sidebar:not(:hover):not(:focus-within) .brand__mark {
-    display: block;
+.brand__product {
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 15px;
+  color: var(--muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.brand:hover .brand__name,
+.topbar__brand:hover .brand__name {
+  color: var(--accent-text);
+}
+
+.topbar__brand {
+  display: none;
+  margin: 0 auto 0 4px;
+  padding: 4px 6px;
+}
+
+.topbar__brand:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1024px) {
+  .topbar__brand {
+    display: flex;
+  }
+
+  /* Room for the drawer's close control at the brand row's right. */
+  .brand {
+    padding-right: 64px;
   }
 }
 
+/* A divider right under the brand (HTS) continues the topbar's bottom
+   border instead of running a few pixels below it: pull it up by the
+   sidebar's gap plus its own 1px line. */
+.brand + .divider {
+  margin-top: -21px;
+}
+
+@media (max-height: 1040px) {
+  .brand + .divider {
+    margin-top: -11px;
+  }
+}
+
+/* Resting rail: the mark alone, centred over the 48px nav items; the
+   wordmark stays in the accessibility tree. */
+@media (min-width: 1025px) and (max-width: 1279px) {
+  .sidebar:not(:hover):not(:focus-within) .brand {
+    justify-content: center;
+    width: 48px;
+    padding: 0;
+  }
+
+  .sidebar:not(:hover):not(:focus-within) .brand__text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+}
+
+/* Pinned sidebar: nav items are 12px + 1px border from the rail's edge. */
+@media (min-width: 1280px) {
+  .sidebar .brand {
+    padding: 0 13px;
+  }
+}
 /* Wide screens: the sidebar is pinned open with its labels — no
    hover-to-discover rail where there is room for words. */
 @media (min-width: 1280px) {
@@ -10838,17 +10936,9 @@ html.js .reveal:not(.is-shown) {
   .sidebar:focus-within,
   .sidebar:not(:hover):not(:focus-within) {
     width: 264px;
-    padding: 18px 16px;
+    padding: 0 16px 18px;
     align-items: stretch;
     box-shadow: 1px 0 0 var(--divider-glint);
-  }
-
-  .sidebar:not(:hover):not(:focus-within) .brand {
-    flex-direction: row;
-  }
-
-  .sidebar:not(:hover):not(:focus-within) .brand__text {
-    display: flex;
   }
 
   .sidebar:not(:hover):not(:focus-within) .nav__section {
@@ -10873,8 +10963,7 @@ html.js .reveal:not(.is-shown) {
 
   .sidebar:not(:hover):not(:focus-within) .nav-item__label,
   .sidebar:not(:hover):not(:focus-within) .selector__label,
-  .sidebar:not(:hover):not(:focus-within) .selector__chevrons,
-  .sidebar:not(:hover):not(:focus-within) .brand__version {
+  .sidebar:not(:hover):not(:focus-within) .selector__chevrons {
     position: static;
     width: auto;
     height: auto;
@@ -10935,31 +11024,7 @@ html.js .reveal:not(.is-shown) {
 }
 
 
-.topbar__brand {
-  display: none;
-  align-items: center;
-  gap: 8px;
-  margin-right: auto;
-  color: var(--text-strong);
-  font-weight: 650;
-  text-decoration: none;
-}
-
-.topbar__brand img {
-  width: 32px;
-  height: 32px;
-}
-
-.topbar__brand:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
-}
-
 @media (max-width: 1024px) {
-  .topbar__brand {
-    display: inline-flex;
-  }
-
   .topbar .product-switch {
     display: none;
   }
@@ -11939,7 +12004,7 @@ body.auth-page {
 .auth-logo__img {
   display: block;
   width: auto;
-  height: 40px;
+  height: 80px;
 }
 
 .auth-logo__name {
@@ -12498,7 +12563,7 @@ body.auth-page {
   }
 
   .auth-logo__img {
-    height: 34px;
+    height: 64px;
   }
 
   .auth-title {

@@ -360,7 +360,8 @@ async fn sign_in_page_uses_the_shared_standalone_frame_and_theme() {
     assert!(html.contains("/ui/hts/assets/app.css"));
     assert!(html.contains("/ui/hts/assets/auth.js"));
     assert!(html.contains("hfs_theme"), "theme boot script");
-    assert!(html.contains("/ui/hts/assets/brand/healthymind-logo-horizontal@2x.png"));
+    assert!(html.contains("/ui/hts/assets/brand/healthymind-logo-en@2x.png 2x"));
+    assert!(!html.contains("logo-horizontal"));
     assert!(
         html.contains(r#"<p class="auth-logo__name">療心智能 術語伺服器</p>"#),
         "{html}"

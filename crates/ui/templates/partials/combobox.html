@@ -62,7 +62,7 @@
              hx-post="{{ endpoint }}"
              hx-trigger="input changed delay:300ms, search"
              hx-target="#{{ id }}-listbox" hx-swap="innerHTML"
-             hx-sync="this:replace">
+             hx-sync="this:replace" data-busy="off">
       <div id="{{ id }}-listbox" class="combobox__listbox" data-combobox-listbox
            role="listbox" aria-multiselectable="true" hidden></div>
     </div>
