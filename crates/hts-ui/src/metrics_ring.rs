@@ -67,6 +67,18 @@ pub const POLL_INTERVAL_SECS: f64 = 15.0;
 /// server, and the chart says so with a break rather than interpolating.
 pub const MAX_CONTINUOUS_GAP_SECS: f64 = POLL_INTERVAL_SECS * 4.0;
 
+/// Shortest spacing between two retained samples.
+///
+/// A rate is `delta / dt`, so a tiny `dt` turns a handful of requests into an
+/// absurd per-minute figure. That is exactly what production showed (UIF
+/// defect 1): the full-page render and the htmx refresh that follows it
+/// scraped `/metrics` ~70 ms apart, 6 requests landed in between, and the
+/// headline read "5.4k requests per minute" beside a legend counting 5. A
+/// sample arriving sooner than this after the previous one is dropped — the
+/// counters are cumulative, so nothing is lost: the next accepted sample
+/// differences over the whole interval.
+pub const MIN_SAMPLE_SPACING_SECS: f64 = 5.0;
+
 /// One `/metrics` scrape, reduced to the numbers the chart differences.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MetricsSample {
@@ -140,10 +152,17 @@ impl MetricsRing {
     /// inside it.
     pub fn push(&self, sample: MetricsSample) {
         let mut samples = self.samples.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(last) = samples.back()
-            && sample.uptime_secs < last.uptime_secs
-        {
-            samples.clear();
+        if let Some(last) = samples.back() {
+            if sample.uptime_secs < last.uptime_secs {
+                samples.clear();
+            } else if sample.at_secs - last.at_secs < MIN_SAMPLE_SPACING_SECS
+                && sample.at_secs >= last.at_secs
+            {
+                // Too close to the previous scrape to difference honestly
+                // (see `MIN_SAMPLE_SPACING_SECS`). A clock that stepped
+                // backwards is still recorded so `rates` can break on it.
+                return;
+            }
         }
         samples.push_back(sample);
         while samples.len() > self.capacity {
@@ -251,6 +270,56 @@ pub fn window_total(
         }
     }
     total
+}
+
+/// What the chart card says about one series inside one window.
+///
+/// Every figure is derived from the same set of usable intervals, so the
+/// headline, the legend and the plotted line cannot disagree: `total` is the
+/// legend number, `avg_per_min` is `total / observed minutes`, and every
+/// plotted point is one of the intervals summed here.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowSummary {
+    /// Requests observed inside the window (sum of usable deltas).
+    pub total: u64,
+    /// Seconds of the window actually covered by usable intervals.
+    pub observed_secs: f64,
+    /// Highest per-interval rate inside the window, requests per minute.
+    pub peak_per_min: u64,
+    /// Rate of the most recent usable interval inside the window.
+    pub latest_per_min: Option<u64>,
+}
+
+impl WindowSummary {
+    /// Average requests per minute over the observed part of the window, or
+    /// `None` when no interval was observed (nothing to divide by).
+    pub fn avg_per_min(&self) -> Option<f64> {
+        (self.observed_secs > 0.0).then(|| self.total as f64 / self.observed_secs * 60.0)
+    }
+}
+
+/// Summarise one counter over `[start, end]`. Intervals are attributed to the
+/// window by their *later* scrape, like [`window_total`].
+pub fn window_summary(
+    samples: &[MetricsSample],
+    start: f64,
+    end: f64,
+    pick: impl Fn(&StatusCounts) -> u64,
+) -> WindowSummary {
+    let mut out = WindowSummary::default();
+    for pair in samples.windows(2) {
+        if pair[1].at_secs < start || pair[1].at_secs > end {
+            continue;
+        }
+        if let Some((dt, delta)) = usable_interval(&pair[0], &pair[1], &pick) {
+            out.total = out.total.saturating_add(delta);
+            out.observed_secs += dt;
+            let rate = (delta as f64 / dt * 60.0).round().max(0.0) as u64;
+            out.peak_per_min = out.peak_per_min.max(rate);
+            out.latest_per_min = Some(rate);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -460,6 +529,66 @@ mod tests {
         assert_eq!(rates(&s, |c| c.s2xx)[0].per_min, 60);
         assert_eq!(rates(&s, |c| c.s5xx)[0].per_min, 12);
         assert_eq!(rates(&s, all)[0].per_min, 72);
+    }
+
+    #[test]
+    fn samples_closer_than_the_minimum_spacing_are_dropped() {
+        // Production regression (UIF defect 1): a full-page render and its
+        // htmx refresh scraped 70 ms apart; 6 requests between them read as
+        // 5,143 requests per minute.
+        let ring = MetricsRing::new();
+        ring.push(sample(1_000.0, 100.0, 278));
+        ring.push(sample(1_000.07, 100.07, 284));
+        assert_eq!(ring.len(), 1, "a scrape 70 ms later must not be kept");
+        ring.push(sample(1_015.0, 115.0, 289));
+        let points = rates(&ring.snapshot(), all);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].per_min, 44, "11 requests over 15 s is 44/min");
+    }
+
+    #[test]
+    fn a_restart_is_recorded_even_inside_the_minimum_spacing() {
+        let ring = MetricsRing::new();
+        ring.push(sample(1_000.0, 3_600.0, 5_000));
+        ring.push(sample(1_001.0, 1.0, 3));
+        assert_eq!(
+            ring.snapshot()[0].counts.all,
+            3,
+            "restart clears and records"
+        );
+    }
+
+    #[test]
+    fn window_summary_agrees_with_the_plotted_points_and_the_legend() {
+        let s = [
+            sample(0.0, 100.0, 0),
+            sample(15.0, 115.0, 5),          // 20/min
+            sample(30.0, 130.0, 35),         // 120/min
+            sample(3_630.0, 3_730.0, 9_000), // gap: nothing
+            sample(3_645.0, 3_745.0, 9_001), // 4/min
+        ];
+        let sum = window_summary(&s, 0.0, 10_000.0, all);
+        assert_eq!(sum.total, 36);
+        assert_eq!(sum.total, window_total(&s, 0.0, 10_000.0, all));
+        assert_eq!(sum.observed_secs, 45.0);
+        assert_eq!(sum.peak_per_min, 120);
+        assert_eq!(sum.latest_per_min, Some(4));
+        let avg = sum.avg_per_min().unwrap();
+        assert!(
+            (avg - 36.0 / 45.0 * 60.0).abs() < 1e-9,
+            "avg = total / observed minutes"
+        );
+        let plotted: Vec<u64> = rates(&s, all).iter().map(|p| p.per_min).collect();
+        assert_eq!(plotted.iter().max().copied(), Some(sum.peak_per_min));
+        assert_eq!(plotted.last().copied(), sum.latest_per_min);
+    }
+
+    #[test]
+    fn window_summary_of_nothing_has_no_average() {
+        let sum = window_summary(&[sample(0.0, 1.0, 5)], 0.0, 100.0, all);
+        assert_eq!(sum.total, 0);
+        assert_eq!(sum.avg_per_min(), None);
+        assert_eq!(sum.latest_per_min, None);
     }
 
     #[test]

@@ -1364,7 +1364,7 @@ hts-home-chart-series-5xx = 5xx
 hts-home-chart-empty-unreachable = /metrics no está accesible: no llegan muestras nuevas.
 hts-home-chart-empty-none = Aún no se ha recogido ninguna muestra.
 hts-home-chart-empty-first = Recogiendo el primer intervalo: una tasa necesita dos muestras.
-hts-home-chart-empty-window = No hay muestras en esta ventana. El muestreo solo se ejecuta mientras esta página está abierta.
+hts-home-chart-empty-window = Todavía no hay muestras en esta ventana. La consola lee /metrics cada 15 s.
 hts-home-chart-axis-now = ahora
 hts-home-chart-axis-minutes = -{ $n } min
 hts-home-chart-axis-hours = -{ $n } h
@@ -1918,11 +1918,12 @@ hts-home-tile-status-sub = backend { $backend } · FHIR { $version }
 hts-home-tile-uptime-sub = hts v{ $version } · sin reinicios desde las { $since } UTC
 hts-home-tile-uptime-sub-noclock = hts v{ $version }
 hts-home-tile-loaded-systems-sub = { $mib } MiB empaquetados en disco
-hts-home-tile-requests-sub = { $ms } ms de media · desde /metrics
+hts-home-tile-requests-sub = { $ms } ms de media · todas las rutas desde el inicio
 
 # Chart caption, composed from the SELECTED window and status class.
 # Each locale owns its own word order through the two placeables.
-hts-home-chart-hint = { $window }, { $classes }. Se muestrea mientras esta página está abierta. Excluye el refresco propio de 15 s y las lecturas de /metrics.
+hts-home-chart-hint = { $window }, { $classes }: media por minuto durante el tiempo observado. Se muestrea cada 15 s; excluye el refresco propio de la consola y las lecturas de /metrics.
+hts-home-chart-stats = { $total } solicitudes en { $minutes } min observados · última { $latest }/min · pico { $peak }/min
 hts-home-chart-hint-window-15m = Últimos 15 minutos
 hts-home-chart-hint-window-1h = Última hora
 hts-home-chart-hint-window-6h = Últimas 6 horas
@@ -2427,3 +2428,16 @@ sql-library-select-title = Selecciona una consulta o vista
 sql-library-select-lede = Elige un elemento de la lista o crea uno nuevo.
 sql-library-unavailable-title = La selección no está disponible
 sql-library-unavailable-lede = No se pudieron verificar las consultas y vistas disponibles.
+
+# UIF functional fixes: browser sort/total, terminology inventory, HTS topbar.
+hts-browser-sort = Ordenar por
+hts-browser-sort-name = Nombre (A–Z)
+hts-browser-sort-title = Título (A–Z)
+hts-browser-sort-url = URL canónica
+hts-browser-sort-updated = Actualizados recientemente
+hts-browser-total = { $total } coincidencias
+hts-term-sort-concepts = Más conceptos primero
+hts-term-sizes-pending = Conceptos contados. Midiendo el tamaño en disco: en una base de datos grande tarda unos minutos; la tabla se actualiza sola.
+hts-term-stat-systems-counting = contando conceptos…
+hts-term-stat-concepts-counting = contando…
+hts-term-stat-concepts-shown = en todos los sistemas de códigos coincidentes

@@ -1367,7 +1367,7 @@ hts-home-chart-series-5xx = 5xx
 hts-home-chart-empty-unreachable = 無法連線至/metrics — 沒有新的取樣資料進來。
 hts-home-chart-empty-none = 尚未收集任何取樣資料。
 hts-home-chart-empty-first = 正在收集第一個區間 — 計算速率需要兩個取樣點。
-hts-home-chart-empty-window = 此時間範圍內沒有取樣資料。只有在此頁面開啟時才會取樣。
+hts-home-chart-empty-window = 此時間範圍內尚無取樣資料。主控台每 15 秒讀取一次 /metrics。
 hts-home-chart-axis-now = 現在
 hts-home-chart-axis-minutes = -{ $n } 分
 hts-home-chart-axis-hours = -{ $n } 小時
@@ -1941,11 +1941,12 @@ hts-home-tile-status-sub = 後端 { $backend } · FHIR { $version }
 hts-home-tile-uptime-sub = hts v{ $version } · 自 { $since } UTC 起未曾重啟
 hts-home-tile-uptime-sub-noclock = hts v{ $version }
 hts-home-tile-loaded-systems-sub = 磁碟上的隨附資料 { $mib } MiB
-hts-home-tile-requests-sub = 平均 { $ms } ms · 來自/metrics
+hts-home-tile-requests-sub = 平均 { $ms } ms · 啟動以來所有路由
 
 # Chart caption, composed from the SELECTED window and status class.
 # Each locale owns its own word order through the two placeables.
-hts-home-chart-hint = { $window }，{ $classes }。在此頁面開啟期間取樣。不含本頁自身每 15 秒的重新整理與/metrics 的抓取。
+hts-home-chart-hint = { $window }，{ $classes }：觀測期間的每分鐘平均值。每 15 秒取樣一次；不含主控台自身的重新整理與 /metrics 抓取。
+hts-home-chart-stats = 觀測 { $minutes } 分鐘共 { $total } 個請求 · 最近 { $latest }/分 · 峰值 { $peak }/分
 hts-home-chart-hint-window-15m = 最近 15 分鐘
 hts-home-chart-hint-window-1h = 最近 1 小時
 hts-home-chart-hint-window-6h = 最近 6 小時
@@ -2534,3 +2535,16 @@ sql-library-select-title = 選擇一個查詢或檢視
 sql-library-select-lede = 從清單中選擇一個項目，或建立新的項目。
 sql-library-unavailable-title = 無法使用此選取項目
 sql-library-unavailable-lede = 無法確認可用的查詢與檢視。
+
+# UIF functional fixes: browser sort/total, terminology inventory, HTS topbar.
+hts-browser-sort = 排序方式
+hts-browser-sort-name = 名稱（A–Z）
+hts-browser-sort-title = 標題（A–Z）
+hts-browser-sort-url = 正式網址
+hts-browser-sort-updated = 最近更新
+hts-browser-total = 共 { $total } 筆符合
+hts-term-sort-concepts = 概念數最多優先
+hts-term-sizes-pending = 概念已計數完成。正在量測儲存大小——大型資料庫需要幾分鐘，表格會自動更新。
+hts-term-stat-systems-counting = 正在計算概念數…
+hts-term-stat-concepts-counting = 計算中…
+hts-term-stat-concepts-shown = 所有符合的代碼系統合計

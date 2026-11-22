@@ -346,8 +346,9 @@ async fn browser_renders_v2_top_strip_shell() {
         r#"<body class="app-shell">"#,
         r#"class="content content--app""#,
         r#"class="card table-card""#,
-        r#"class="toolbar""#,
+        r#"class="toolbar toolbar--filters""#,
         r#"class="toolbar__search""#,
+        r#"name="sort""#,
         r#"class="facets facets--bare""#,
         r#"class="facet-label""#,
         r#"class="chip""#,
@@ -566,8 +567,10 @@ async fn row_link_percent_encodes_the_id_path_segment() {
     // Phase 5 column set survives the relayout: Name . Title . URL .
     // Version . Status, with the canonical URL in a `.url` span.
     assert!(
-        html.contains(r#"<span class="url">http://hl7.org/fhir/sid/icd-9-cm</span>"#),
-        "canonical URLs render in a `.url` span",
+        html.contains(
+            r#"<span class="url url--clip" title="http://hl7.org/fhir/sid/icd-9-cm">http://hl7.org/fhir/sid/icd-9-cm</span>"#
+        ),
+        "canonical URLs render in a clipped `.url` span with the full URL as tooltip",
     );
     assert!(
         html.contains(r#"<span class="tag tag--retired">"#),

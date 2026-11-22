@@ -272,6 +272,59 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Fold one parsed `/metrics` scrape into the chart's sample ring.
+///
+/// Self-traffic is excluded *here*, before it is ever recorded, so a stale
+/// sample can never reintroduce it. `uptime_seconds` rides along so the ring
+/// can detect an upstream restart; a missing gauge is treated as 0, which
+/// never looks like a regression against a real uptime and so never
+/// spuriously clears the ring. Synchronous — no `.await` is reachable while
+/// the ring's guard is held.
+fn record_sample(
+    state: &HtsUiState,
+    map: &std::collections::HashMap<String, Vec<metrics_parse::Sample>>,
+) {
+    let counts = metrics_parse::request_counts_by_status_class(map, &metrics_parse::SELF_ROUTES);
+    let uptime_secs = metrics_parse::gauge(map, "uptime_seconds").unwrap_or(0.0);
+    state.metrics_ring.push(MetricsSample {
+        at_secs: now_secs(),
+        uptime_secs,
+        counts,
+    });
+}
+
+/// Keep the request-rate chart sampled whether or not anybody has the Home
+/// page open.
+///
+/// Before UIF the ring only grew from the Home page's own 15 s poll, so a
+/// console opened after a quiet spell always showed an empty chart and the
+/// first render's two back-to-back scrapes produced a bogus spike (defect
+/// 1). This task scrapes `/metrics` every [`metrics_ring::POLL_INTERVAL_SECS`]
+/// — one small request, excluded from the plotted traffic — and stops on its
+/// own once the UI state is dropped. Call it once, from inside a Tokio
+/// runtime, after building the state; tests that want a quiet ring simply
+/// don't.
+pub fn spawn_metrics_sampler(state: &Arc<HtsUiState>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(state);
+    handle.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(
+            metrics_ring::POLL_INTERVAL_SECS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(state) = weak.upgrade() else { break };
+            if let Ok(text) = state.upstream.metrics_text().await {
+                let map = metrics_parse::parse(&text);
+                record_sample(&state, &map);
+            }
+        }
+    });
+}
+
 /// Why the chart has no line to draw. Each maps to a Fluent key rendered in
 /// the card's `.stat__sub` — the honest alternative to plotting a flat zero,
 /// which would claim we observed silence when in fact we observed nothing.
@@ -331,6 +384,18 @@ pub struct HomeChart {
     pub legend: Vec<LegendItem>,
     /// `Some` when there is nothing to plot; the reason goes in `.stat__sub`.
     pub empty: Option<ChartEmpty>,
+    /// The card's headline: the selected series' **average** requests per
+    /// minute over the observed part of the window (`total / observed
+    /// minutes`). `None` renders an em-dash.
+    ///
+    /// Until UIF this was the *latest single interval's* rate, which made the
+    /// headline (5.4k) contradict the legend (5 requests) whenever one short
+    /// interval spiked. An average of the same intervals the legend sums
+    /// cannot contradict it.
+    pub headline: Option<String>,
+    /// "N requests in M min observed · latest X/min · peak Y/min" — the
+    /// numbers behind the headline, from the same intervals.
+    pub stats_line: Option<String>,
 }
 
 /// One shared card model, so the page and the refresh fragment render from
@@ -398,18 +463,7 @@ impl HomeCards {
                 // ring can detect an upstream restart; a missing gauge is
                 // treated as 0, which never looks like a regression against
                 // a real uptime and so never spuriously clears the ring.
-                let counts = metrics_parse::request_counts_by_status_class(
-                    &map,
-                    &metrics_parse::SELF_ROUTES,
-                );
-                let uptime_secs = metrics_parse::gauge(&map, "uptime_seconds").unwrap_or(0.0);
-                // Synchronous, allocation-free critical section — no `.await`
-                // is reachable from here while the ring's guard is held.
-                state.metrics_ring.push(MetricsSample {
-                    at_secs: now_secs(),
-                    uptime_secs,
-                    counts,
-                });
+                record_sample(state, &map);
 
                 (requests, latency, true)
             }
@@ -537,6 +591,7 @@ fn build_home_chart(
         })
         .collect();
 
+    let lang = i18n.lang();
     let legend = SeriesFilter::ALL
         .iter()
         .map(|s| LegendItem {
@@ -549,16 +604,44 @@ fn build_home_chart(
             // nothing rather than dumping its whole backlog on the window.
             total: chart::compact_count(
                 metrics_ring::window_total(&samples, start, now, |c| s.pick(c)),
-                &i18n.lang(),
+                &lang,
             ),
         })
         .collect();
+
+    // Headline and stats line come from the very intervals the legend sums
+    // and the line plots, so the three always agree.
+    let summary = metrics_ring::window_summary(&samples, start, now, |c| series.pick(c));
+    let headline = summary.avg_per_min().map(|avg| per_min_label(avg, i18n));
+    let stats_line = summary.latest_per_min.map(|latest| {
+        i18n.t_args(
+            "hts-home-chart-stats",
+            &[
+                ("total", i18n.num(summary.total)),
+                ("minutes", i18n.dec(summary.observed_secs / 60.0, 1)),
+                ("latest", chart::compact_count(latest, &lang)),
+                ("peak", chart::compact_count(summary.peak_per_min, &lang)),
+            ],
+        )
+    });
 
     HomeChart {
         view,
         windows,
         legend,
         empty,
+        headline,
+        stats_line,
+    }
+}
+
+/// A per-minute rate for the headline: one decimal below 10 (an idle server
+/// averaging 0.4/min must not read "0"), compact above.
+fn per_min_label(avg: f64, i18n: &I18n) -> String {
+    if avg < 10.0 {
+        i18n.dec(avg, 1)
+    } else {
+        chart::compact_count(avg.round() as u64, &i18n.lang())
     }
 }
 
@@ -797,12 +880,21 @@ mod tests {
             !hint.contains("hts-home-chart-hint"),
             "no key should leak into the rendered hint; got {hint:?}",
         );
-        // The sampling caveat the V3 mockup drops: it is the only thing that
-        // explains an otherwise inexplicably sparse chart.
+        // The headline is an average; the hint must say so.
         assert!(
-            hint.contains("while this page is open"),
-            "the sampling caveat must survive; got {hint:?}",
+            hint.contains("average"),
+            "the hint must say the headline is an average; got {hint:?}",
         );
+        let stats = i18n.t_args(
+            "hts-home-chart-stats",
+            &[
+                ("total", "11".into()),
+                ("minutes", "0.5".into()),
+                ("latest", "4".into()),
+                ("peak", "40".into()),
+            ],
+        );
+        assert!(!stats.contains('{') && stats.contains("40"), "{stats}");
     }
 
     // ── Empty-state arms (§7.1: never fabricate a line) ────────────────────
@@ -878,7 +970,11 @@ mod tests {
         assert_eq!(chart.empty, None);
         assert!(chart.view.has_data);
         assert_eq!(chart.view.polylines.len(), 1);
-        assert_eq!(chart.view.latest, "60", "15 requests over 15 s is 60/min");
+        assert_eq!(
+            chart.headline.as_deref(),
+            Some("60"),
+            "15 requests over 15 s is 60/min"
+        );
     }
 
     #[test]
@@ -916,6 +1012,52 @@ mod tests {
             chart.legend.iter().filter(|l| l.active).count() == 1,
             "exactly one legend entry is the active selection",
         );
+    }
+
+    #[test]
+    fn headline_legend_and_line_agree_on_sparse_data() {
+        // UIF defect 1, reproduced: the page render and its first htmx
+        // refresh scraped back to back, then nothing for a minute. The old
+        // headline read the latest interval (thousands per minute) while the
+        // legend counted a handful of requests.
+        let ring = metrics_ring::MetricsRing::new();
+        let now = now_secs();
+        ring.push(sample(now - 90.0, 278));
+        ring.push(sample(now - 89.93, 284)); // dropped: too close
+        ring.push(sample(now - 75.0, 288)); // +10 over 15 s
+        ring.push(sample(now - 60.0, 289)); // +1 over 15 s
+        let chart = ring_chart(&ring, true);
+        assert_eq!(chart.legend[0].total, "11");
+        // 11 requests over 30 s observed = 22.0/min.
+        assert_eq!(chart.headline.as_deref(), Some("22"));
+        let stats = chart.stats_line.as_deref().unwrap();
+        assert!(stats.contains("11"), "{stats}");
+        assert!(stats.contains("0.5"), "observed minutes: {stats}");
+        assert!(stats.contains("40"), "peak 40/min: {stats}");
+        let top: u64 = chart.view.y_ticks[0].label.parse().unwrap();
+        assert!((40..=50).contains(&top), "axis fits the peak, got {top}");
+        assert_eq!(chart.view.ends.len(), 1, "the run's end is marked");
+    }
+
+    #[test]
+    fn a_quiet_server_reads_a_fractional_average_not_zero() {
+        let ring = metrics_ring::MetricsRing::new();
+        let now = now_secs();
+        ring.push(sample(now - 60.0, 10));
+        ring.push(sample(now - 45.0, 10));
+        ring.push(sample(now - 30.0, 10));
+        ring.push(sample(now - 15.0, 11));
+        let chart = ring_chart(&ring, true);
+        // 1 request over 45 s = 1.3/min.
+        assert_eq!(chart.headline.as_deref(), Some("1.3"));
+    }
+
+    #[test]
+    fn no_samples_means_no_headline() {
+        let ring = metrics_ring::MetricsRing::new();
+        let chart = ring_chart(&ring, true);
+        assert_eq!(chart.headline, None);
+        assert_eq!(chart.stats_line, None);
     }
 
     #[tokio::test]

@@ -1185,7 +1185,7 @@ async fn browser_rows_render_the_stacked_mapping_cell() {
         "both sides of the mapping render",
     );
     assert!(
-        html.contains(r#"<span class="url">http://example.org/cm/example</span>"#),
+        html.contains(r#"<span class="url url--clip" title="http://example.org/cm/example">http://example.org/cm/example</span>"#),
         "the canonical URL column renders in a `.url` span",
     );
 }

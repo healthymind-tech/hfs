@@ -209,9 +209,10 @@ where
             upstream,
             bundled_data_bytes,
             // Rolling `/metrics` samples for the Home request-rate chart.
-            // Starts empty; the Home page's own 15 s poll fills it.
+            // Filled every 15 s by the sampler below (and by the Home page).
             metrics_ring: Default::default(),
         });
+        helios_hts_ui::spawn_metrics_sampler(&ui_state);
         Some(helios_hts_ui::router_with_admin(
             ui_state,
             admin.clone(),

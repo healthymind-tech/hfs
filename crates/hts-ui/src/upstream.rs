@@ -507,6 +507,7 @@ impl OutcomeView {
 /// substring behavior operators already expect.
 fn build_upstream_browser_query<const N: usize>(
     filters: [(&str, &Option<String>); N],
+    sort: &str,
     count: u32,
     offset: u32,
 ) -> Vec<(String, String)> {
@@ -522,9 +523,36 @@ fn build_upstream_browser_query<const N: usize>(
         };
         query.push((upstream_field.to_owned(), value.clone()));
     }
+    query.push(("_sort".to_owned(), sort.to_owned()));
     query.push(("_count".to_owned(), count.to_string()));
     query.push(("_offset".to_owned(), offset.to_string()));
     query
+}
+
+/// Sort keys the three terminology browsers offer (`_sort` values HTS
+/// understands), in the order the sort control lists them.
+pub const BROWSER_SORTS: [&str; 4] = ["name", "title", "url", "-_lastUpdated"];
+
+/// The browsers' default order: name A→Z. Before UIF the browsers sent no
+/// `_sort` and listed rows in import order, which put ICD-9-CM, NCIt and MeSH
+/// first for no reason an operator could see (defect 3).
+pub const DEFAULT_BROWSER_SORT: &str = "name";
+
+/// Keep a requested sort only when it is one we offer and not the default
+/// (so default URLs stay clean). Anything else falls back to the default.
+pub fn sanitize_browser_sort(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_owned())
+        .filter(|s| s != DEFAULT_BROWSER_SORT && BROWSER_SORTS.contains(&s.as_str()))
+}
+
+/// Fluent key labelling one [`BROWSER_SORTS`] entry.
+pub fn browser_sort_label_key(sort: &str) -> &'static str {
+    match sort {
+        "title" => "hts-browser-sort-title",
+        "url" => "hts-browser-sort-url",
+        "-_lastUpdated" => "hts-browser-sort-updated",
+        _ => "hts-browser-sort-name",
+    }
 }
 
 /// Filters accepted by the CS browser page and its rows fragment.
@@ -540,6 +568,10 @@ pub struct CsBrowserFilters {
     pub name: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
+    /// `_sort` key chosen in the browser's sort control, or `None` for the
+    /// default ([`DEFAULT_BROWSER_SORT`]). Only [`BROWSER_SORTS`] values
+    /// survive [`sanitize_browser_sort`].
+    pub sort: Option<String>,
     pub count: u32,
     pub offset: u32,
 }
@@ -579,9 +611,15 @@ impl CsBrowserFilters {
                 ("title", &self.title),
                 ("status", &self.status),
             ],
+            self.effective_sort(),
             self.effective_count(),
             self.offset,
         )
+    }
+
+    /// The `_sort` sent upstream: the chosen key, or name A→Z.
+    pub fn effective_sort(&self) -> &str {
+        self.sort.as_deref().unwrap_or(DEFAULT_BROWSER_SORT)
     }
 
     /// URL for the Load-more button that preserves every active filter
@@ -602,6 +640,7 @@ impl CsBrowserFilters {
             ("name", &self.name),
             ("title", &self.title),
             ("status", &self.status),
+            ("sort", &self.sort),
         ] {
             if let Some(v) = value {
                 if !v.is_empty() {
@@ -627,6 +666,7 @@ impl CsBrowserFilters {
             ("name", &self.name),
             ("title", &self.title),
             ("status", &self.status),
+            ("sort", &self.sort),
         ] {
             if let Some(v) = value
                 && !v.is_empty()
@@ -1739,6 +1779,10 @@ pub struct VsBrowserFilters {
     pub name: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
+    /// `_sort` key chosen in the browser's sort control, or `None` for the
+    /// default ([`DEFAULT_BROWSER_SORT`]). Only [`BROWSER_SORTS`] values
+    /// survive [`sanitize_browser_sort`].
+    pub sort: Option<String>,
     pub count: u32,
     pub offset: u32,
 }
@@ -1770,9 +1814,15 @@ impl VsBrowserFilters {
                 ("title", &self.title),
                 ("status", &self.status),
             ],
+            self.effective_sort(),
             self.effective_count(),
             self.offset,
         )
+    }
+
+    /// The `_sort` sent upstream: the chosen key, or name A→Z.
+    pub fn effective_sort(&self) -> &str {
+        self.sort.as_deref().unwrap_or(DEFAULT_BROWSER_SORT)
     }
 
     /// See [`CsBrowserFilters::load_more_url`].
@@ -1784,6 +1834,7 @@ impl VsBrowserFilters {
             ("name", &self.name),
             ("title", &self.title),
             ("status", &self.status),
+            ("sort", &self.sort),
         ] {
             if let Some(v) = value {
                 if !v.is_empty() {
@@ -1809,6 +1860,7 @@ impl VsBrowserFilters {
             ("name", &self.name),
             ("title", &self.title),
             ("status", &self.status),
+            ("sort", &self.sort),
         ] {
             if let Some(v) = value
                 && !v.is_empty()
@@ -2761,6 +2813,10 @@ pub struct CmBrowserFilters {
     pub source: Option<String>,
     pub target: Option<String>,
     pub status: Option<String>,
+    /// `_sort` key chosen in the browser's sort control, or `None` for the
+    /// default ([`DEFAULT_BROWSER_SORT`]). Only [`BROWSER_SORTS`] values
+    /// survive [`sanitize_browser_sort`].
+    pub sort: Option<String>,
     pub count: u32,
     pub offset: u32,
 }
@@ -2793,9 +2849,15 @@ impl CmBrowserFilters {
                 ("target-uri", &self.target),
                 ("status", &self.status),
             ],
+            self.effective_sort(),
             self.effective_count(),
             self.offset,
         )
+    }
+
+    /// The `_sort` sent upstream: the chosen key, or name A→Z.
+    pub fn effective_sort(&self) -> &str {
+        self.sort.as_deref().unwrap_or(DEFAULT_BROWSER_SORT)
     }
 
     /// See [`CsBrowserFilters::load_more_url`]. CM omits `version` from
@@ -2810,6 +2872,7 @@ impl CmBrowserFilters {
             ("source", &self.source),
             ("target", &self.target),
             ("status", &self.status),
+            ("sort", &self.sort),
         ] {
             if let Some(v) = value {
                 if !v.is_empty() {
@@ -2836,6 +2899,7 @@ impl CmBrowserFilters {
             ("source", &self.source),
             ("target", &self.target),
             ("status", &self.status),
+            ("sort", &self.sort),
         ] {
             if let Some(v) = value
                 && !v.is_empty()
@@ -4704,6 +4768,7 @@ mod tests {
             name: Some("ExampleCodeSystem".into()),
             title: Some("Anatomy Code".into()),
             status: Some("active".into()),
+            sort: None,
             count: 50,
             offset: 25,
         };
@@ -4715,6 +4780,7 @@ mod tests {
                 ("name:contains".into(), "ExampleCodeSystem".into()),
                 ("title:contains".into(), "Anatomy Code".into()),
                 ("status".into(), "active".into()),
+                ("_sort".into(), "name".into()),
                 ("_count".into(), "50".into()),
                 ("_offset".into(), "25".into()),
             ]
@@ -4734,6 +4800,7 @@ mod tests {
             vec![
                 ("name:contains".into(), "ExampleLimbsVS".into()),
                 ("title:contains".into(), "Limbs Value".into()),
+                ("_sort".into(), "name".into()),
                 ("_count".into(), "25".into()),
                 ("_offset".into(), "0".into()),
             ]
@@ -4750,6 +4817,7 @@ mod tests {
             source: Some("http://example.org/cs/source".into()),
             target: Some("http://example.org/cs/target".into()),
             status: Some("active".into()),
+            sort: Some("title".into()),
             count: 100,
             offset: 50,
         };
@@ -4762,11 +4830,20 @@ mod tests {
                 ("source-uri".into(), "http://example.org/cs/source".into()),
                 ("target-uri".into(), "http://example.org/cs/target".into()),
                 ("status".into(), "active".into()),
+                ("_sort".into(), "title".into()),
                 ("_count".into(), "100".into()),
                 ("_offset".into(), "50".into()),
             ]
         );
         let cm_load_more = cm.load_more_url(&75);
+        assert!(
+            cm_load_more.contains("sort=title"),
+            "a chosen sort survives paging"
+        );
+        assert!(
+            !cs_load_more.contains("sort="),
+            "the default sort stays out of URLs"
+        );
         assert!(cm_load_more.contains("name=ExampleCM"));
         assert!(cm_load_more.contains("title=Source-to-Target"));
         assert!(!cm_load_more.contains("%3Acontains"));

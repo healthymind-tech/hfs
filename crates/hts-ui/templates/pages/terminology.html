@@ -36,7 +36,7 @@
   {% include "partials/hts-admin-unavailable.html" %}
 {% else %}
 <div id="hts-term-body"
-     {% if stats_pending %}hx-get="{{ refresh_url }}" hx-trigger="load delay:3s" hx-select="#hts-term-body" hx-swap="outerHTML"{% endif %}>
+     {% if stats_pending || counts_pending %}hx-get="{{ refresh_url }}" hx-trigger="load delay:3s" hx-select="#hts-term-body" hx-swap="outerHTML"{% endif %}>
   <section class="stat-grid" aria-label="{{ chrome.i18n.t("hts-term-summary") }}">
     <article class="card stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-db") }}</span>
@@ -45,13 +45,15 @@
     </article>
     <article class="card stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-systems") }}</span>
-      <span class="stat__value">{{ systems }}</span>
-      <span class="stat__sub">{% if show_all %}{{ chrome.i18n.t("hts-term-stat-systems-all") }}{% else %}{{ chrome.i18n.t("hts-term-stat-systems-populated") }}{% endif %}</span>
+      <span class="stat__value" data-stat="systems">{{ systems }}</span>
+      <span class="stat__sub">{% if show_all %}{{ chrome.i18n.t("hts-term-stat-systems-all") }}{% else if counts_pending %}{{ chrome.i18n.t("hts-term-stat-systems-counting") }}{% else %}{{ chrome.i18n.t("hts-term-stat-systems-populated") }}{% endif %}</span>
     </article>
     <article class="card stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-concepts") }}</span>
-      <span class="stat__value">{% if let Some(c) = concepts %}{{ c }}{% else %}&mdash;{% endif %}</span>
-      {% if let Some(at) = stats_at %}<span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-counted", "when", at.to_string()) }}</span>{% endif %}
+      <span class="stat__value" data-stat="concepts">{% if let Some(c) = concepts %}{{ c }}{% else %}<span class="spinner" aria-hidden="true"></span>{% endif %}</span>
+      {% if let Some(at) = stats_at %}<span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-counted", "when", at.to_string()) }}</span>
+      {% else if counts_pending %}<span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-concepts-counting") }}</span>
+      {% else if !show_all %}<span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-concepts-shown") }}</span>{% endif %}
     </article>
     <article class="card stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-other") }}</span>
@@ -60,16 +62,33 @@
     </article>
   </section>
 
-  {% if stats_pending %}
+  {#- Two stages (UIF defect 2): the cheap concept count arrives within
+      seconds and resolves the Concepts card, the stub filter and the
+      default order; sizes need the full scan and follow later. The notice
+      says which one is still running and disappears when both are done. -#}
+  {% if counts_pending %}
   <p class="notice" role="status" data-stats="pending"><span class="spinner" aria-hidden="true"></span> {{ chrome.i18n.t("hts-term-stats-pending") }}</p>
+  {% else if stats_pending %}
+  <p class="notice" role="status" data-stats="sizes-pending"><span class="spinner" aria-hidden="true"></span> {{ chrome.i18n.t("hts-term-sizes-pending") }}</p>
   {% endif %}
 
   <section class="card table-card">
-    <form class="toolbar" method="get" action="/ui/hts/terminology" aria-label="{{ chrome.i18n.t("hts-term-filter") }}">
+    {#- Sort and the stub checkbox apply on change (htmx swaps the body and
+        pushes the URL); Apply / Enter still submit natively without JS. -#}
+    <form class="toolbar toolbar--filters" method="get" action="/ui/hts/terminology" aria-label="{{ chrome.i18n.t("hts-term-filter") }}"
+          hx-get="/ui/hts/terminology" hx-trigger="change from:select, change from:input[type=checkbox]"
+          hx-target="#hts-term-body" hx-select="#hts-term-body" hx-swap="outerHTML" hx-push-url="true">
       <label class="toolbar__search">
         <input type="search" name="q" value="{{ q }}" placeholder="{{ chrome.i18n.t("hts-term-filter-placeholder") }}" aria-label="{{ chrome.i18n.t("hts-term-filter-placeholder") }}" autocomplete="off" spellcheck="false">
       </label>
-      <label class="chip"><input type="checkbox" name="sort" value="size"{% if sort_size %} checked{% endif %}> {{ chrome.i18n.t("hts-term-sort-size") }}</label>
+      <label class="toolbar__select">
+        <span class="visually-hidden">{{ chrome.i18n.t("hts-browser-sort") }}</span>
+        <select name="sort" aria-label="{{ chrome.i18n.t("hts-browser-sort") }}">
+          <option value="concepts"{% if sort == "concepts" %} selected{% endif %}>{{ chrome.i18n.t("hts-term-sort-concepts") }}</option>
+          <option value="size"{% if sort == "size" %} selected{% endif %}>{{ chrome.i18n.t("hts-term-sort-size") }}</option>
+          <option value="name"{% if sort == "name" %} selected{% endif %}>{{ chrome.i18n.t("hts-browser-sort-name") }}</option>
+        </select>
+      </label>
       <label class="chip"><input type="checkbox" name="all" value="1"{% if show_all %} checked{% endif %}> {{ chrome.i18n.t("hts-term-show-all") }}</label>
       <button class="btn" type="submit">{{ chrome.i18n.t("hts-term-filter-apply") }}</button>
     </form>
@@ -103,26 +122,33 @@
             <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}"><code>{{ r.version }}</code>{% if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}</td>
             <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-concepts") }}">{% if let Some(c) = r.concepts %}{{ c }}{% else %}&mdash;{% endif %}</td>
             <td class="col-num" style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
-            <td data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="/ui/hts/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
-            <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
+            <td style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="/ui/hts/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
+            <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url url--clip" title="{{ s }}">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-current") }}">
               {% if r.current %}<span class="tag tag--active">{{ chrome.i18n.t("hts-term-current") }}</span>{% endif %}
               {% if r.pinned %}<span class="tag tag--config">{{ chrome.i18n.t("hts-term-pinned") }}</span>{% endif %}
             </td>
             <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
+              <div class="row-actions">
               {% if !r.is_supplement %}
-              <form method="post" action="/ui/hts/terminology/current" class="form-actions form-actions--start">
-                <input type="hidden" name="url" value="{{ r.url }}">
-                <input type="hidden" name="version" value="{{ r.version_param }}">
-                <input type="hidden" name="back" value="{{ back }}">
                 {% if r.pinned %}
-                <button class="btn" style="white-space:nowrap" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
-                {% else if r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
-                <button class="btn" style="white-space:nowrap" type="submit" name="action" value="pin">{{ chrome.i18n.t("hts-term-set-current") }}</button>
+                <form method="post" action="/ui/hts/terminology/current">
+                  <input type="hidden" name="url" value="{{ r.url }}">
+                  <input type="hidden" name="version" value="{{ r.version_param }}">
+                  <input type="hidden" name="back" value="{{ back }}">
+                  <button class="btn" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
+                </form>
+                {% else if !r.current && r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
+                <form method="post" action="/ui/hts/terminology/current">
+                  <input type="hidden" name="url" value="{{ r.url }}">
+                  <input type="hidden" name="version" value="{{ r.version_param }}">
+                  <input type="hidden" name="back" value="{{ back }}">
+                  <button class="btn" type="submit" name="action" value="pin">{{ chrome.i18n.t("hts-term-set-current") }}</button>
+                </form>
                 {% endif %}
-              </form>
               {% endif %}
-              <a class="btn btn--danger" href="/ui/hts/terminology/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
+                <a class="btn btn--danger" href="/ui/hts/terminology/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
+              </div>
             </td>
           </tr>
           {% endfor %}

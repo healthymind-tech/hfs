@@ -12944,3 +12944,75 @@ select.ctl {
   }
 }
 }
+
+/* ---------- UIF functional fixes (HTS browsers + terminology inventory) ---------- */
+@layer pages {
+  /* Filter toolbars: every control on the 42px line of the search inputs.
+     The Reset button used to be a 30px .btn beside 42px inputs (defect 3). */
+  .toolbar--filters > .btn,
+  .toolbar--filters > .chip {
+    height: 42px;
+    border-radius: 12px;
+    flex: 0 0 auto;
+  }
+  .toolbar__select {
+    display: flex;
+    flex: 0 0 auto;
+  }
+  .toolbar__select select {
+    appearance: none;
+    height: 42px;
+    padding: 0 36px 0 14px;
+    border: 1px solid var(--surface-border);
+    border-radius: 12px;
+    background: var(--input-bg, var(--surface)) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23888888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 12px center / 12px;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .toolbar__select select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  /* A long canonical URL on one line, clipped, full value in the tooltip
+     (defect 3: it wrapped mid-word across three lines). Stacked phone rows
+     keep wrapping — there is room for it there. */
+  .data-table .url--clip {
+    display: inline-block;
+    max-width: 34ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  @media (max-width: 640px) {
+    .data-table--stack .url--clip {
+      max-width: none;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  .table-meta {
+    padding: 10px 14px 0;
+  }
+
+  /* Row action buttons on one baseline: the pin form used to be a
+     .form-actions block (12px top margin, even when empty) above Delete. */
+  .data-table .row-actions {
+    flex-wrap: nowrap;
+    align-items: center;
+  }
+  .data-table .row-actions form {
+    display: contents;
+  }
+  .data-table .row-actions .btn {
+    white-space: nowrap;
+  }
+  .data-table td.col-actions {
+    width: 1%;
+  }
+}

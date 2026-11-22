@@ -28,6 +28,11 @@
   {% endif %}
 
   <section class="card">
+    {#- Match count up front (UIF defect 3): it used to appear only in the
+        foot, below 25 rows. -#}
+    {% if let Some(page) = view.page() %}{% if let Some(total) = page.total %}
+    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}">{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}</span></div>
+    {% endif %}{% endif %}
     <div class="table-wrap" tabindex="0">
       <table class="data-table data-table--stack" aria-describedby="hts-vs-browser-heading">
         <caption class="visually-hidden">{{ chrome.i18n.t("hts-vs-browser-table-caption") }}</caption>
@@ -61,7 +66,7 @@
                   </a>
                 </td>
                 <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-title") }}">{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url url--clip" title="{{ row.url }}">{{ row.url }}</span>{% endif %}</td>
                 <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-version") }}">{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
                 <td data-label="{{ chrome.i18n.t("hts-vs-browser-column-status") }}">
                   {% if row.status.is_empty() %}
@@ -118,6 +123,7 @@
             <input type="hidden" name="name" value="{% if let Some(v) = view.filters.name %}{{ v }}{% endif %}">
             <input type="hidden" name="title" value="{% if let Some(v) = view.filters.title %}{{ v }}{% endif %}">
             <input type="hidden" name="status" value="{% if let Some(v) = view.filters.status %}{{ v }}{% endif %}">
+            <input type="hidden" name="sort" value="{% if let Some(v) = view.filters.sort %}{{ v }}{% endif %}">
             <input type="hidden" name="_count" value="{{ view.filters.effective_count() }}">
             <label>
               <span>{{ chrome.i18n.t("hts-browser-goto-offset") }}</span>

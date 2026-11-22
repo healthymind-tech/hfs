@@ -265,6 +265,10 @@ pub(crate) struct InvVersion {
     #[serde(default)]
     pub current: bool,
     pub stats: Option<InvStats>,
+    /// Concepts from the cheap count, present even while `stats` (sizes) is
+    /// still being measured. Absent from older HTS releases.
+    #[serde(default)]
+    pub concepts: Option<u64>,
     pub imported_at: Option<String>,
     pub source: Option<String>,
     pub sha256: Option<String>,
@@ -291,6 +295,9 @@ struct InvDb {
 struct Inventory {
     #[serde(default)]
     stats_pending: bool,
+    /// Older HTS releases lack this: then concept counts are pending exactly
+    /// when the full stats are.
+    counts_pending: Option<bool>,
     stats_computed_at: Option<String>,
     database: Option<InvDb>,
     #[serde(default)]
@@ -331,6 +338,7 @@ struct InvQuery {
     q: Option<String>,
     /// Number of code systems to show (default 50).
     limit: Option<usize>,
+    /// `concepts` (default), `size` or `name`.
     sort: Option<String>,
     all: Option<String>,
     notice: Option<String>,
@@ -343,10 +351,14 @@ struct InventoryPage<'a> {
     chrome: Chrome<'a>,
     unavailable: Option<Unavailable>,
     q: String,
-    sort_size: bool,
+    /// The effective sort: `concepts`, `size` or `name`.
+    sort: &'static str,
     show_all: bool,
     rows: Vec<InvRow>,
     stats_pending: bool,
+    /// Concept counts not yet known (the Concepts card and the stub filter
+    /// wait on these); `stats_pending` alone means only sizes are missing.
+    counts_pending: bool,
     stats_at: Option<String>,
     db_size: Option<String>,
     db_reclaimable: Option<String>,
@@ -374,23 +386,10 @@ async fn inventory_page(
     let chrome = chrome(&state, locale, "terminology");
     let i18n = chrome.i18n;
     let query = q.q.clone().unwrap_or_default();
-    let sort_size = q.sort.as_deref() == Some("size");
+    let sort = inventory_sort(q.sort.as_deref());
     let show_all = q.all.is_some();
     let limit = q.limit.unwrap_or(50).clamp(1, 5000);
-    let mut path = format!("/terminology?limit={limit}&q={}", enc(&query));
-    if sort_size {
-        path.push_str("&sort=size");
-    }
-    if !show_all {
-        path.push_str("&populated=true");
-    }
-    let mut back = format!("/ui/hts/terminology?q={}", enc(&query));
-    if sort_size {
-        back.push_str("&sort=size");
-    }
-    if show_all {
-        back.push_str("&all=1");
-    }
+    let (path, back) = inventory_urls(&query, sort, show_all, limit);
     let result = admin_get(&state, &path, SLOW).await.and_then(|v| {
         serde_json::from_value::<Inventory>(v).map_err(|e| Unavailable::Error(e.to_string()))
     });
@@ -398,10 +397,11 @@ async fn inventory_page(
         chrome,
         unavailable: None,
         q: query,
-        sort_size,
+        sort,
         show_all,
         rows: Vec::new(),
         stats_pending: false,
+        counts_pending: false,
         stats_at: None,
         db_size: None,
         db_reclaimable: None,
@@ -419,6 +419,7 @@ async fn inventory_page(
         Err(u) => page.unavailable = Some(u),
         Ok(inv) => {
             page.stats_pending = inv.stats_pending;
+            page.counts_pending = inv.counts_pending.unwrap_or(inv.stats_pending);
             page.stats_at = inv.stats_computed_at.as_deref().map(when);
             if let Some(db) = &inv.database {
                 page.db_size = Some(bytes_label(&i18n, db.bytes));
@@ -447,6 +448,38 @@ async fn inventory_page(
     render_page(page.render())
 }
 
+/// The inventory's sort: real content first by default (UIF defect 2).
+pub(crate) fn inventory_sort(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("size") => "size",
+        Some("name") => "name",
+        _ => "concepts",
+    }
+}
+
+/// `(admin API path, page URL)` for one inventory view. The page URL is the
+/// stats-pending poll target and the `back` of every row action, so it must
+/// carry every choice the operator made.
+pub(crate) fn inventory_urls(
+    query: &str,
+    sort: &str,
+    show_all: bool,
+    limit: usize,
+) -> (String, String) {
+    let mut path = format!("/terminology?limit={limit}&q={}&sort={sort}", enc(query));
+    if !show_all {
+        path.push_str("&populated=true");
+    }
+    let mut back = format!("/ui/hts/terminology?q={}", enc(query));
+    if sort != "concepts" {
+        back.push_str(&format!("&sort={sort}"));
+    }
+    if show_all {
+        back.push_str("&all=1");
+    }
+    (path, back)
+}
+
 pub(crate) fn flatten(i18n: &I18n, systems: Vec<InvSystem>) -> Vec<InvRow> {
     let mut rows = Vec::new();
     for s in systems {
@@ -463,7 +496,12 @@ pub(crate) fn flatten(i18n: &I18n, systems: Vec<InvSystem>) -> Vec<InvRow> {
                 version_param: v.version.clone().unwrap_or_default(),
                 is_supplement: v.content == "supplement",
                 content: v.content,
-                concepts: v.stats.as_ref().map(|st| i18n.num(st.concepts)),
+                concepts: v
+                    .stats
+                    .as_ref()
+                    .map(|st| st.concepts)
+                    .or(v.concepts)
+                    .map(|n| i18n.num(n)),
                 size: match measured {
                     Some(b) => Some(bytes_label(i18n, b as u64)),
                     None => v.stats.as_ref().map(|st| bytes_label(i18n, st.est_bytes)),
@@ -1377,6 +1415,37 @@ mod tests {
         assert_eq!(rows[0].size.as_deref(), Some("3.6 GB"));
         assert_eq!(rows[0].sha_short.as_deref(), Some("0123456789ab"));
         assert_eq!(rows[1].size.as_deref(), Some("2.4 GB"));
+    }
+
+    #[test]
+    fn flatten_shows_counted_concepts_while_sizes_are_pending() {
+        let i18n = I18n::new(RequestLocale::default());
+        let systems: Vec<InvSystem> = serde_json::from_value(json!([{
+            "url": "http://loinc.org", "title": "LOINC",
+            "versions": [{"version": "2.83", "content": "complete", "status": "active",
+                          "current": true, "stats": null, "concepts": 108000}]
+        }]))
+        .unwrap();
+        let rows = flatten(&i18n, systems);
+        assert_eq!(rows[0].concepts.as_deref(), Some("108,000"));
+        assert_eq!(rows[0].size, None, "no size until it is measured");
+    }
+
+    #[test]
+    fn inventory_defaults_to_content_first_and_hides_stubs() {
+        assert_eq!(inventory_sort(None), "concepts");
+        assert_eq!(inventory_sort(Some("size")), "size");
+        assert_eq!(inventory_sort(Some("nope")), "concepts");
+        let (path, back) = inventory_urls("", "concepts", false, 50);
+        assert!(path.contains("populated=true"), "{path}");
+        assert!(path.contains("sort=concepts"), "{path}");
+        assert_eq!(back, "/ui/hts/terminology?q=");
+        let (path, back) = inventory_urls("loinc", "name", true, 50);
+        assert!(!path.contains("populated"), "{path}");
+        assert!(
+            back.contains("sort=name") && back.contains("all=1"),
+            "{back}"
+        );
     }
 
     #[test]
