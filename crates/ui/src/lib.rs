@@ -2448,7 +2448,9 @@ pub fn mount_with_conformance_source_and_runtime(
     let manager_runtime = manager::installed();
     router = match &manager_runtime {
         // The manager console: overview at `/ui`, endpoint pages, About.
-        Some(_) => router.merge(manager::pages::routes()),
+        Some(_) => router
+            .merge(manager::pages::routes())
+            .merge(manager::verify_pages::routes()),
         None => router
             .route("/ui", get(index))
             .route("/ui/about", get(manager::pages::about)),
@@ -2512,6 +2514,10 @@ pub fn mount_with_conformance_source_and_runtime(
         // Console sign-in, account and users/roles settings (P3).
         .merge(login::console_routes())
         .merge(assets)
+        // An in-place page navigation (htmx boost) wants the whole page, as a
+        // plain navigation would: the handlers that answer htmx requests
+        // with a fragment must not see it as one (persistent shell §9.4).
+        .layer(middleware::from_fn(shell::boosted_is_a_page))
         // With authentication on and no browser sign-in installed, nothing a
         // browser sends can be authenticated, so the handlers that reach the
         // tenant registry and the bulk-submit store directly refuse rather

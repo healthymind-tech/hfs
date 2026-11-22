@@ -37,7 +37,7 @@
     {#- Match count up front (UIF defect 3): it used to appear only in the
         foot, below 25 rows. -#}
     {% if let Some(page) = view.page() %}{% if let Some(total) = page.total %}
-    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}">{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}</span></div>
+    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}" data-searching="{{ chrome.i18n.t("tx-searching") }}">{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}</span></div>
     {% endif %}{% endif %}
     <div class="table-wrap" tabindex="0">
       <table class="data-table data-table--stack" aria-describedby="hts-cs-browser-heading">

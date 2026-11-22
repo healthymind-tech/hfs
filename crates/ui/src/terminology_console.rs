@@ -382,6 +382,43 @@ async fn admin_proxy(State(proxy): State<Arc<AdminProxy>>, request: Request) -> 
 mod tests {
     use super::*;
 
+    async fn redirect(method: Method, uri: &str) -> (StatusCode, String) {
+        let app: Router = Router::new().route("/ui/hts/{*rest}", any(legacy_redirect)).route("/ui/hts", any(legacy_redirect));
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder().method(method).uri(uri).body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (response.status(), location)
+    }
+
+    #[tokio::test]
+    async fn legacy_console_urls_redirect_permanently_with_their_query() {
+        assert_eq!(
+            redirect(Method::GET, "/ui/hts").await,
+            (StatusCode::MOVED_PERMANENTLY, "/ui/terminology".into())
+        );
+        assert_eq!(
+            redirect(Method::GET, "/ui/hts/code-systems?sort=name").await,
+            (StatusCode::MOVED_PERMANENTLY, "/ui/terminology/code-systems?sort=name".into())
+        );
+        assert_eq!(
+            redirect(Method::GET, "/ui/hts/terminology?populated=true").await,
+            (StatusCode::MOVED_PERMANENTLY, "/ui/terminology/manage?populated=true".into())
+        );
+        assert_eq!(
+            redirect(Method::POST, "/ui/hts/import").await,
+            (StatusCode::PERMANENT_REDIRECT, "/ui/terminology/import".into())
+        );
+    }
+
     #[test]
     fn active_page_follows_the_path() {
         assert_eq!(active_page("/ui/terminology"), "tx-home");

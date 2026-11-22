@@ -41,6 +41,17 @@ pub(crate) struct ReportView {
     pub steps: Vec<StepView>,
 }
 
+impl ReportView {
+    /// The message of the first failed step ("" when none).
+    pub fn first_failure_message(&self) -> &str {
+        self.steps
+            .iter()
+            .find(|s| s.status == "fail")
+            .map(|s| s.message.as_str())
+            .unwrap_or("")
+    }
+}
+
 /// The rendered fragment.
 #[derive(Template)]
 #[template(path = "partials/manager/verify-report.html")]
@@ -64,7 +75,7 @@ pub(crate) const AUTH_FIELDS: FieldMap = &[
 
 /// Endpoint terminology form (`section-terminology.html`, wizard step 4).
 pub(crate) const TERMINOLOGY_FIELDS: FieldMap = &[
-    ("terminologyUrl", "f-term_server"),
+    ("terminologyUrl", "f-term_server_url"),
     ("terminologyToken", "f-term_token"),
     ("terminologyTimeout", "f-term_timeout"),
 ];

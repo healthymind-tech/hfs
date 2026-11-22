@@ -17,7 +17,7 @@ mgr-nav-endpoint-home = Endpoint home
 mgr-nav-config = General
 mgr-nav-security = Security
 mgr-nav-validation = Validation & IGs
-mgr-nav-terminology = Terminology
+mgr-nav-terminology = Terminology service
 mgr-nav-sync = Sync
 mgr-nav-audit = Audit trail
 mgr-nav-history = Config history
@@ -293,9 +293,9 @@ mgr-term-timeout = Timeout (seconds)
 mgr-term-timeout-hint = Empty means the server default.
 mgr-term-token = Access token
 mgr-term-token-hint = Sent on terminology imports.
-mgr-sec-hts = Terminology console
-mgr-sec-hts-desc = Browse code systems and value sets in the HealthyMind Terminology Server.
-mgr-open-hts = Open the terminology console
+mgr-sec-hts = Terminology section
+mgr-sec-hts-desc = Browse the code systems, value sets and concept maps of the terminology service in this console.
+mgr-open-hts = Open Terminology
 
 mgr-secret-set = Set
 mgr-secret-unset = Not set
@@ -501,3 +501,25 @@ mgr-field-audience-recommended = Audience (recommended)
 mgr-field-audience-hint-recommended = The aud value a token must carry. Give each endpoint its own, so a token for one is refused by the others.
 mgr-field-jwks-hint-optional = Leave empty to use the one the issuer publishes. Set it only when this server must fetch the keys from another (e.g. internal) address.
 mgr-sec-advanced = Advanced
+
+## Field errors in the request's language (UX-21)
+mgr-err-required-auth = Required while tokens are checked.
+mgr-err-url = Enter an absolute http:// or https:// address.
+mgr-err-url-credentials = Remove the user name and password from the address.
+mgr-err-scopes = Allow at least one kind of scope (patient, user or system).
+mgr-err-display-name = Use 1 to 120 characters.
+mgr-err-required = Required.
+mgr-err-algorithm = { $alg } is not a supported signing algorithm.
+mgr-errors-fix-in-step = Fix in step { $step }
+mgr-errors-go = Go to field
+
+## Endpoint status outcomes (UX-14)
+mgr-flash-deleted = Endpoint { $endpoint } was deleted. Its URL now answers 404; its stored FHIR data stays in tenant { $tenant } until you purge it on the Tenants page.
+mgr-flash-disabled = Endpoint { $endpoint } was disabled: its URL answers 503 until you enable it again.
+mgr-flash-enabled = Endpoint { $endpoint } was enabled and serves requests again.
+verify-block-title = This configuration fails verification:
+verify-block-consequence = Saved like this, every request carrying a token would be refused. Fix the setting, or save anyway if you know the authorization server is not reachable from here yet.
+verify-block-details = Show all checks
+verify-block-save-anyway = Save anyway
+verify-block-create-anyway = Create anyway
+verify-block-anyway-hint = Recorded in the configuration history like every change.

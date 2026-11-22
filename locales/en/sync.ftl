@@ -63,3 +63,20 @@ sync-overwrite = Overwrite
 sync-keep = Keep target
 sync-log = Log
 sync-no-log = No log lines.
+
+## Human option labels (UX-08)
+sync-auth-opt-none = None (public server)
+sync-auth-opt-bearer = Bearer token
+sync-auth-opt-basic = Username and password (Basic)
+sync-auth-opt-client-credentials = Client credentials (OAuth 2.0)
+sync-load-opt-paged-read = Read page by page
+sync-load-opt-storage-copy = Copy storage directly (same server only)
+sync-load-opt-bulk-export = Bulk export ($export)
+sync-load-opt-none = No initial load (changes only)
+sync-trigger-opt-manual = Manual
+sync-trigger-opt-interval = On a schedule
+sync-trigger-opt-continuous = Continuous (poll for changes)
+sync-trigger-opt-subscription = On notification (Subscription)
+sync-conflict-opt-source-wins = Source wins
+sync-conflict-opt-skip-if-target-newer = Keep the target when it is newer
+sync-conflict-opt-fail = Stop and report the conflict

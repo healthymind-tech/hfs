@@ -26,6 +26,10 @@ pub mod backend;
 pub(crate) mod forms;
 pub mod nav;
 pub(crate) mod pages;
+/// Verify panels: the checklist view of a verification report.
+pub(crate) mod verify;
+/// Verify panels: their routes.
+pub(crate) mod verify_pages;
 pub(crate) mod scope;
 pub(crate) mod view;
 

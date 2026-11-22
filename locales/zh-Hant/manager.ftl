@@ -16,7 +16,7 @@ mgr-nav-endpoint-home = 端點首頁
 mgr-nav-config = 一般
 mgr-nav-security = 安全性
 mgr-nav-validation = 資料驗證與 IG
-mgr-nav-terminology = 術語
+mgr-nav-terminology = 術語服務設定
 mgr-nav-sync = 同步
 mgr-nav-audit = 稽核紀錄
 mgr-nav-history = 設定歷史
@@ -277,9 +277,9 @@ mgr-term-timeout = 逾時（秒）
 mgr-term-timeout-hint = 留空為伺服器預設。
 mgr-term-token = 存取 token
 mgr-term-token-hint = 術語匯入時送出。
-mgr-sec-hts = 術語主控台
-mgr-sec-hts-desc = 在療心智能術語伺服器中瀏覽代碼系統與值集。
-mgr-open-hts = 開啟術語主控台
+mgr-sec-hts = 術語
+mgr-sec-hts-desc = 在本主控台瀏覽術語服務的代碼系統、值集與概念對應。
+mgr-open-hts = 開啟「術語」
 
 mgr-secret-set = 已設定
 mgr-secret-unset = 未設定
@@ -473,3 +473,25 @@ mgr-field-audience-recommended = 受眾（建議填寫）
 mgr-field-audience-hint-recommended = token 必須帶有的 aud 值。每個端點請各自設定，避免 token 跨端點通用。
 mgr-field-jwks-hint-optional = 留空則使用簽發者公布的位址。只有本伺服器必須從其他（例如內部）位址取得金鑰時才需設定。
 mgr-sec-advanced = 進階
+
+## Field errors in the request's language (UX-21)
+mgr-err-required-auth = 檢查 token 時為必填。
+mgr-err-url = 請輸入以 http:// 或 https:// 開頭的完整網址。
+mgr-err-url-credentials = 網址中請勿包含帳號與密碼。
+mgr-err-scopes = 至少要允許一種 scope（patient、user 或 system）。
+mgr-err-display-name = 請輸入 1 到 120 個字元。
+mgr-err-required = 必填。
+mgr-err-algorithm = { $alg } 不是支援的簽章演算法。
+mgr-errors-fix-in-step = 在第 { $step } 步修正
+mgr-errors-go = 前往欄位
+
+## Endpoint status outcomes (UX-14)
+mgr-flash-deleted = 已刪除端點 { $endpoint }。其網址現在回應 404；已儲存的 FHIR 資料保留在租戶 { $tenant }，直到您在「租戶」頁清除。
+mgr-flash-disabled = 已停用端點 { $endpoint }：在重新啟用之前，其網址會回應 503。
+mgr-flash-enabled = 已啟用端點 { $endpoint }，已重新開始服務。
+verify-block-title = 此設定未通過驗證：
+verify-block-consequence = 若照此儲存，所有帶 token 的請求都會被拒絕。請修正設定；若您確定授權伺服器只是暫時無法從這裡連線，也可以仍要儲存。
+verify-block-details = 顯示全部檢查
+verify-block-save-anyway = 仍要儲存
+verify-block-create-anyway = 仍要建立
+verify-block-anyway-hint = 與其他變更一樣，會記錄在設定歷程中。

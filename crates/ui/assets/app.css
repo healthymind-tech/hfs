@@ -13360,3 +13360,27 @@ select.ctl {
   .verify.htmx-request .verify__progress { display: block; }
   .verify.htmx-request .verify__result { opacity: 0.5; }
 }
+@layer components {
+  .error-summary p { margin: 0 0 4px; font-weight: 600; }
+  .error-summary__list { margin: 0; padding-left: 18px; }
+  .error-summary__list li { margin: 2px 0; }
+  .error-summary__list a { color: inherit; text-decoration: underline; }
+}
+@layer components {
+  .verify-block { align-items: flex-start; }
+  .verify-block__body { flex: 1; display: grid; gap: 6px; }
+  .verify-block__body p { margin: 0; }
+  .verify-block__actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .verify--inline { margin: 8px 0 0; background: var(--surface); }
+}
+@layer components {
+  /* UX-16: while a list is being filtered, its count reads "Searching…". */
+  [aria-busy="true"] .toolbar__count[data-searching] {
+    font-size: 0;
+  }
+  [aria-busy="true"] .toolbar__count[data-searching]::after {
+    content: attr(data-searching);
+    font-size: 13px;
+    color: var(--muted);
+  }
+}

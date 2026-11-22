@@ -17,7 +17,7 @@
 {% endcall %}
 
 {% if !flash_key.is_empty() %}
-<div class="notice notice--ok" role="status">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t_arg(flash_key, "endpoint", flash_arg.clone()) }}</span></div>
+<div class="notice notice--ok" role="status">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t_arg2(flash_key, "endpoint", flash_arg.clone(), "tenant", flash_tenant.clone()) }}</span></div>
 {% endif %}
 
 <section class="health-strip" aria-label="{{ i18n.t("mgr-health-title") }}">

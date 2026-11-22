@@ -49,6 +49,7 @@
         hx-target="#hts-cs-rows"
         hx-swap="outerHTML"
         hx-trigger="input changed delay:300ms, change, submit"
+        hx-sync="this:replace"
         aria-label="{{ chrome.i18n.t("hts-cs-browser-filter-legend") }}">
     <section class="card table-card">
       <div class="toolbar toolbar--filters">

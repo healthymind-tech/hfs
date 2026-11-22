@@ -112,6 +112,22 @@ pub(crate) fn content_security_policy() -> &'static str {
     })
 }
 
+/// Middleware: a boosted request (`HX-Boosted: true`, an in-place page
+/// navigation of the shell) reaches the handlers without `HX-Request` /
+/// `HX-Target` / `HX-Trigger`, so every handler renders its full page; the
+/// shell keeps `#main` of it.
+pub(crate) async fn boosted_is_a_page(mut request: Request, next: Next) -> Response {
+    if request.headers().contains_key("hx-boosted")
+        || request.headers().contains_key("hx-history-restore-request")
+    {
+        let h = request.headers_mut();
+        for name in ["hx-request", "hx-target", "hx-trigger", "hx-trigger-name", "hx-current-url"] {
+            h.remove(name);
+        }
+    }
+    next.run(request).await
+}
+
 /// Middleware on every `/ui` response:
 ///
 /// * HTML pages get the CSP and `Vary: HX-Request, HX-Boosted`;
@@ -154,6 +170,30 @@ mod tests {
         assert_eq!(build_id(), build_id());
         assert_eq!(build_id().len(), 12);
         assert!(asset_base().ends_with(build_id()));
+    }
+
+    #[tokio::test]
+    async fn a_boosted_request_reaches_the_handler_as_a_page_request() {
+        use axum::{Router, body::Body, routing::get};
+        let app = Router::new()
+            .route(
+                "/x",
+                get(|h: axum::http::HeaderMap| async move {
+                    if h.contains_key("hx-request") { "fragment" } else { "page" }
+                }),
+            )
+            .layer(axum::middleware::from_fn(boosted_is_a_page));
+        for (boosted, want) in [(true, "page"), (false, "fragment")] {
+            let mut req = Request::builder().uri("/x").header("hx-request", "true");
+            if boosted {
+                req = req.header("hx-boosted", "true");
+            }
+            let resp = tower::ServiceExt::oneshot(app.clone(), req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+            assert_eq!(&body[..], want.as_bytes());
+        }
     }
 
     #[test]
