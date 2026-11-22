@@ -1,20 +1,21 @@
 //! Binding FHIR endpoints to a realm (design §5.2, wizard step 6).
 //!
-//! Until package I5 adds `EndpointAuth.provider = Internal{realm}`, an
-//! endpoint is bound with the **compatibility binding**: its auth section
-//! names the realm's issuer, JWKS and SMART endpoints exactly as an External
-//! issuer would, with `aud` = the endpoint's public base URL. The resource
-//! server then verifies realm tokens through its existing JWKS path. When
-//! I5 lands, [`apply`] also sets the provider (one place to change).
+//! A bound endpoint's auth section gets `provider = Internal{realm}` (I5):
+//! the resource server verifies with the realm's in-process keys and
+//! revoked-grant set, and SMART discovery is generated from the realm. The
+//! issuer, JWKS, audience and SMART URLs are filled in as well, so the
+//! Security page shows where tokens come from and readers that predate the
+//! provider field still see a consistent External-style binding.
 //!
-//! A binding is recognised by the issuer: an endpoint whose issuer equals
-//! `{public_base}/idp/{realm}` is bound to that realm.
+//! A binding is recognised by the provider; an endpoint whose issuer equals
+//! `{public_base}/idp/{realm}` (written before the provider existed) counts
+//! as bound too.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use helios_endpoints::{
-    Actor, AuthMode, Endpoint, EndpointAuth, EndpointSpec, EndpointStore, StoreError,
+    Actor, AuthMode, AuthProviderRef, Endpoint, EndpointAuth, EndpointSpec, EndpointStore, StoreError,
 };
 use helios_idp::metadata::{RealmUrls, smart_capabilities, smart_configuration};
 use helios_idp::realm::RealmSpec;
@@ -73,6 +74,7 @@ pub fn apply(
 ) {
     let issuer = realm.issuer(public_base);
     let urls = RealmUrls::new(&issuer);
+    auth.provider = AuthProviderRef::Internal { realm: realm.name.as_str().to_string() };
     auth.mode = match (mode, auth.mode) {
         (BindMode::WriteProtect, _) => AuthMode::WriteProtect,
         (BindMode::Full, _) | (BindMode::Keep, AuthMode::Off) => AuthMode::Full,
@@ -117,7 +119,11 @@ pub fn bound_realm<'a>(
     realms: &'a [RealmSpec],
     public_base: &Url,
 ) -> Option<&'a RealmSpec> {
-    let issuer = auth?.issuer.as_deref()?.trim_end_matches('/');
+    let auth = auth?;
+    if let Some(name) = auth.provider.internal_realm() {
+        return realms.iter().find(|r| r.name.as_str() == name);
+    }
+    let issuer = auth.issuer.as_deref()?.trim_end_matches('/');
     realms.iter().find(|r| r.issuer(public_base) == issuer)
 }
 

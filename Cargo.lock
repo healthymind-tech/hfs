@@ -3378,6 +3378,7 @@ dependencies = [
  "chrono",
  "form_urlencoded",
  "helios-endpoints",
+ "helios-idp",
  "http 1.5.0",
  "jsonwebtoken",
  "rand 0.8.8",
@@ -3550,6 +3551,10 @@ dependencies = [
  "helios-auth",
  "helios-endpoints",
  "helios-fhir",
+ "helios-idp",
+ "helios-idp-admin",
+ "helios-idp-pages",
+ "helios-idp-server",
  "helios-observability",
  "helios-persistence",
  "helios-rest",
@@ -3562,6 +3567,7 @@ dependencies = [
  "openssl",
  "parking_lot 0.12.5",
  "reqwest",
+ "serde",
  "serde_json",
  "sqlparser",
  "tempfile",
@@ -3708,6 +3714,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-idp-pages"
+version = "0.2.9"
+dependencies = [
+ "askama",
+ "async-trait",
+ "axum",
+ "axum-test",
+ "base64 0.22.1",
+ "chrono",
+ "fluent-templates",
+ "form_urlencoded",
+ "helios-admin-auth",
+ "helios-audit",
+ "helios-endpoints",
+ "helios-idp",
+ "helios-idp-server",
+ "helios-ui-chrome",
+ "hmac 0.12.1",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tower",
+ "tracing",
+ "unic-langid",
+ "url",
+]
+
+[[package]]
 name = "helios-idp-server"
 version = "0.2.9"
 dependencies = [
@@ -3840,6 +3878,7 @@ dependencies = [
  "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
+ "helios-idp",
  "helios-observability",
  "helios-persistence",
  "helios-serde",

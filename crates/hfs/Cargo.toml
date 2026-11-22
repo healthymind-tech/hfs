@@ -45,7 +45,7 @@ xml = ["helios-rest/xml"]
 
 # Database backends
 sqlite = ["helios-rest/sqlite"]
-postgres = ["helios-rest/postgres", "helios-admin-auth/postgres", "helios-endpoints/postgres", "helios-sync/postgres"]
+postgres = ["helios-rest/postgres", "helios-admin-auth/postgres", "helios-endpoints/postgres", "helios-sync/postgres", "helios-idp/postgres", "helios-idp-pages/postgres"]
 mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
@@ -71,6 +71,12 @@ helios-rest = { path = "../rest", version = "0.2.9", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
 helios-sof = { path = "../sof", version = "0.2.9", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.9" }
+# Built-in authorization server (HFS_IDP, docs/design/authorization-server.md).
+helios-idp = { path = "../idp", version = "0.2.9" }
+helios-idp-server = { path = "../idp-server", version = "0.2.9" }
+helios-idp-pages = { path = "../idp-pages", version = "0.2.9" }
+# Console service + /admin/idp + the diagnostic (I6/I7).
+helios-idp-admin = { path = "../idp-admin", version = "0.2.9" }
 # Administrator sign-in for `/admin` and the console's admin pages
 # (`HFS_ADMIN_PASSWORD`).
 helios-admin-auth = { path = "../admin-auth", version = "0.2.9", features = ["console"] }
@@ -117,6 +123,7 @@ async-trait = "0.1"
 # Time (used by the bulk-export cleanup task)
 chrono = "0.4"
 serde_json = "1"
+serde.workspace = true
 
 
 [dev-dependencies]

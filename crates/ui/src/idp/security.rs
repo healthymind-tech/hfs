@@ -51,8 +51,26 @@ pub fn current_realm(issuer: &str) -> String {
     realm_choices().into_iter().find(|r| r.issuer == issuer).map(|r| r.name).unwrap_or_default()
 }
 
+/// The realm an endpoint is bound to: its `provider = Internal{realm}`, or
+/// (older rows) an issuer equal to a realm's issuer.
+pub fn endpoint_realm(endpoint: &str, issuer: &str) -> String {
+    let provider = crate::manager::installed().and_then(|m| {
+        m.registry
+            .snapshot()
+            .endpoints()
+            .iter()
+            .find(|e| e.name() == endpoint)
+            .and_then(|e| e.spec.auth.as_ref().and_then(|a| a.provider.internal_realm().map(String::from)))
+    });
+    provider.unwrap_or_else(|| current_realm(issuer))
+}
+
 /// Applies `auth_provider=internal` + `auth_realm` to the parsed auth section.
 pub fn apply_form(form: &Form, spec_name: &str, auth: &mut EndpointAuth, errs: &mut FieldErrors) {
+    if form.get("auth_provider") == "external" {
+        auth.provider = helios_endpoints::AuthProviderRef::External;
+        return;
+    }
     if form.get("auth_provider") != "internal" {
         return;
     }
@@ -81,7 +99,13 @@ pub fn apply_form(form: &Form, spec_name: &str, auth: &mut EndpointAuth, errs: &
 /// remove it from any other realm.
 pub async fn after_save(endpoint: &str, spec: &EndpointSpec) {
     let Some(c) = service::global() else { return };
-    let trusted = spec.auth.as_ref().and_then(|a| a.issuer.clone()).map(|i| current_realm(&i)).unwrap_or_default();
+    let trusted = match spec.auth.as_ref() {
+        Some(a) => match a.provider.internal_realm() {
+            Some(r) => r.to_string(),
+            None => a.issuer.as_deref().map(current_realm).unwrap_or_default(),
+        },
+        None => String::new(),
+    };
     let Ok(realms) = c.realms().await else { return };
     for r in realms {
         let name = r.spec.name.as_str().to_string();

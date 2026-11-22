@@ -1,0 +1,74 @@
+{
+  "realms": [
+    {
+      "spec": {
+        "name": "clinic",
+        "displayName": "Riverside Clinic",
+        "enabled": true,
+        "userSource": {"kind": "local"},
+        "signingAlgs": ["RS256", "ES256"],
+        "endpoints": ["lab"],
+        "security": {"lockoutThreshold": 3, "lockoutSecs": 120, "passwordMinLength": 12, "mfa": "optional"}
+      },
+      "clients": [
+        {
+          "clientId": "growth-chart", "name": "Growth Chart",
+          "auth": {"method": "none"},
+          "grantTypes": ["authorization_code", "refresh_token"],
+          "redirectUris": ["https://app.example/cb"],
+          "postLogoutRedirectUris": ["https://app.example/bye"],
+          "launchTypes": ["standalone", "ehr"],
+          "scopes": {"allowed": ["openid", "fhirUser", "profile", "launch", "launch/patient",
+                                  "patient/*.rs", "user/*.rs", "offline_access"], "acceptV1": true},
+          "trusted": false
+        }
+      ],
+      "users": [
+        {"user": {"id": "u-alice", "username": "alice", "kind": "patient", "displayName": "Amy Shaw",
+                  "email": null, "emailVerified": false, "externalSubject": null, "disabled": false,
+                  "links": [{"endpoint": "lab", "reference": "Patient/p1", "isFhirUser": true}]},
+         "password": "alice-password-1"},
+        {"user": {"id": "u-carol", "username": "carol", "kind": "related-person", "displayName": "Carol Shaw",
+                  "email": null, "emailVerified": false, "externalSubject": null, "disabled": false,
+                  "links": [{"endpoint": "lab", "reference": "RelatedPerson/rp1", "isFhirUser": true,
+                             "accessiblePatients": ["p1", "p2"]}]},
+         "password": "carol-password-1"},
+        {"user": {"id": "u-bob", "username": "drbob", "kind": "practitioner", "displayName": "Dr. Bob Lee",
+                  "email": null, "emailVerified": false, "externalSubject": null, "disabled": false,
+                  "links": [{"endpoint": "lab", "reference": "Practitioner/dr1", "isFhirUser": true}]},
+         "password": "drbob-password-1"},
+        {"user": {"id": "u-lock", "username": "lockme", "kind": "patient", "displayName": null,
+                  "email": null, "emailVerified": false, "externalSubject": null, "disabled": false,
+                  "links": [{"endpoint": "lab", "reference": "Patient/p3", "isFhirUser": true}]},
+         "password": "lockme-password-1"}
+      ]
+    },
+    {
+      "spec": {
+        "name": "other",
+        "displayName": "Other Hospital",
+        "enabled": true,
+        "userSource": {"kind": "local"},
+        "signingAlgs": ["RS256", "ES256"],
+        "endpoints": ["ward"]
+      },
+      "clients": [
+        {
+          "clientId": "growth-chart", "name": "Growth Chart",
+          "auth": {"method": "none"},
+          "grantTypes": ["authorization_code"],
+          "redirectUris": ["https://app.example/cb"],
+          "launchTypes": ["standalone"],
+          "scopes": {"allowed": ["openid", "fhirUser", "launch/patient", "patient/*.rs", "user/*.rs"], "acceptV1": true},
+          "trusted": true
+        }
+      ],
+      "users": [
+        {"user": {"id": "u-eve", "username": "eve", "kind": "practitioner", "displayName": "Eve",
+                  "email": null, "emailVerified": false, "externalSubject": null, "disabled": false,
+                  "links": []},
+         "password": "eve-password-123"}
+      ]
+    }
+  ]
+}

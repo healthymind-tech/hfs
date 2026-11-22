@@ -271,6 +271,42 @@ pub struct EndpointAuth {
     /// Accept the administrator credential (`HFS_ADMIN_PASSWORD`, admin
     /// console session) as an all-scopes administrator on this endpoint.
     pub accept_admin_credential: bool,
+    /// Who issues the tokens: an external IdP (`issuer` + `jwksUrl`, the
+    /// default, so rows written before the built-in authorization server
+    /// existed are unchanged) or an internal realm of this HFS
+    /// (docs/design/authorization-server.md §5.2, D-3).
+    pub provider: AuthProviderRef,
+}
+
+/// The authorization server behind an endpoint's auth section
+/// (docs/design/authorization-server.md §5.2, D-3).
+///
+/// `Internal` endpoints verify tokens with the realm's in-process public
+/// keys (no JWKS fetch) and its revoked-grant set (revocation is immediate);
+/// `issuer`, `jwksUrl` and the SMART URLs are derived from the realm, and
+/// `audience` defaults to the endpoint's public FHIR base URL. With
+/// `HFS_IDP=off` an internal endpoint stays closed (`503`), never open.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum AuthProviderRef {
+    /// An external issuer (Keycloak, Entra, Epic, …): `issuer` + `jwksUrl`.
+    #[default]
+    External,
+    /// A realm of the built-in authorization server (`/idp/{realm}`).
+    Internal {
+        /// Realm name (same grammar as endpoint path segments).
+        realm: String,
+    },
+}
+
+impl AuthProviderRef {
+    /// The realm of an internal provider.
+    pub fn internal_realm(&self) -> Option<&str> {
+        match self {
+            Self::Internal { realm } => Some(realm.as_str()),
+            Self::External => None,
+        }
+    }
 }
 
 impl Default for EndpointAuth {
@@ -286,6 +322,7 @@ impl Default for EndpointAuth {
             scopes: ScopePolicy::default(),
             smart: SmartDiscovery::default(),
             accept_admin_credential: true,
+            provider: AuthProviderRef::External,
         }
     }
 }
@@ -572,7 +609,12 @@ impl EndpointSpec {
             );
         }
         if let Some(auth) = &self.auth {
-            if auth.mode != AuthMode::Off {
+            if let AuthProviderRef::Internal { realm } = &auth.provider
+                && let Err(e) = crate::name::check_segment_grammar(realm)
+            {
+                errs.push("auth.provider.realm", e.to_string());
+            }
+            if auth.mode != AuthMode::Off && auth.provider == AuthProviderRef::External {
                 match auth.issuer.as_deref().map(str::trim) {
                     Some(i) if !i.is_empty() => check_http_url(&mut errs, "auth.issuer", i),
                     _ => errs.push("auth.issuer", "required when auth is on"),
@@ -581,12 +623,13 @@ impl EndpointSpec {
                     Some(u) if !u.is_empty() => check_http_url(&mut errs, "auth.jwksUrl", u),
                     _ => errs.push("auth.jwksUrl", "required when auth is on"),
                 }
-                if !(auth.scopes.allow_patient
+            }
+            if auth.mode != AuthMode::Off
+                && !(auth.scopes.allow_patient
                     || auth.scopes.allow_user
                     || auth.scopes.allow_system)
-                {
-                    errs.push("auth.scopes", "at least one scope context must be allowed");
-                }
+            {
+                errs.push("auth.scopes", "at least one scope context must be allowed");
             }
             for a in &auth.algorithms {
                 if !matches!(
@@ -824,6 +867,40 @@ mod tests {
         ] {
             assert!(fields.contains(&f), "missing {f} in {fields:?}");
         }
+    }
+
+    #[test]
+    fn internal_provider_needs_a_realm_not_an_issuer() {
+        let mut spec = EndpointSpec::named(EndpointName::parse("lab").unwrap(), "Lab");
+        spec.auth = Some(EndpointAuth {
+            mode: AuthMode::Full,
+            provider: AuthProviderRef::Internal {
+                realm: "clinic".into(),
+            },
+            ..Default::default()
+        });
+        assert!(spec.validate().is_ok(), "{:?}", spec.validate());
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["auth"]["provider"]["kind"], "internal");
+        assert_eq!(json["auth"]["provider"]["realm"], "clinic");
+        let back: EndpointSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back, spec);
+
+        spec.auth.as_mut().unwrap().provider = AuthProviderRef::Internal {
+            realm: "Bad Realm!".into(),
+        };
+        let errs = spec.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.field == "auth.provider.realm"));
+    }
+
+    #[test]
+    fn rows_without_a_provider_stay_external() {
+        let auth: EndpointAuth = serde_json::from_value(serde_json::json!({
+            "mode": "full", "issuer": "https://idp", "jwksUrl": "https://idp/certs"
+        }))
+        .unwrap();
+        assert_eq!(auth.provider, AuthProviderRef::External);
+        assert_eq!(auth.provider.internal_realm(), None);
     }
 
     #[test]

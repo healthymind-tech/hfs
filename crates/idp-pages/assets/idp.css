@@ -1,0 +1,81 @@
+/*
+ * Hosted pages of the built-in authorization server — additions to the
+ * console's standalone sign-in frame (app.css .auth-*). Only console
+ * tokens are used, so dark and light themes follow automatically.
+ */
+.idp-page .auth-card { max-width: 460px; }
+
+.idp-section { margin: 0; font-weight: 600; color: var(--text-strong); }
+
+.idp-facts {
+  list-style: none; margin: 0 0 var(--space-2); padding: var(--space-3);
+  display: grid; gap: var(--space-1);
+  background: var(--input-bg); border: 1px solid var(--surface-border);
+  border-radius: var(--radius); color: var(--muted); font-size: 0.875rem;
+}
+
+.idp-scopes { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.idp-scope__label {
+  display: grid; grid-template-columns: 20px 1fr; gap: var(--space-2);
+  align-items: start; padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--surface-border); border-radius: var(--radius);
+  background: var(--surface); cursor: pointer;
+}
+.idp-scope__label:hover { border-color: var(--outline); }
+.idp-scope__label--fixed { cursor: default; color: var(--text); }
+.idp-scope__label--fixed svg { color: var(--ok); margin-top: 3px; }
+.idp-scope__label input { margin: 3px 0 0; accent-color: var(--accent); width: 16px; height: 16px; }
+.idp-scope__text { color: var(--text-strong); }
+.idp-scope__detail { color: var(--muted); }
+.idp-scope__code {
+  display: block; margin-top: 2px; font-size: 0.75rem; color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.idp-remember {
+  display: flex; gap: var(--space-2); align-items: center;
+  color: var(--text); font-size: 0.9rem; cursor: pointer;
+}
+.idp-remember input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+
+.idp-actions {
+  display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+.idp-actions .auth-btn { width: 100%; margin: 0; justify-content: center; text-align: center; }
+
+.idp-search { display: grid; gap: var(--space-1); margin-bottom: var(--space-3); }
+.idp-search__row { display: grid; grid-template-columns: 1fr auto; gap: var(--space-2); }
+
+.idp-choices { border: 0; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.idp-choice {
+  display: grid; grid-template-columns: 20px 1fr; gap: var(--space-2);
+  align-items: center; padding: var(--space-3);
+  border: 1px solid var(--surface-border); border-radius: var(--radius);
+  background: var(--surface); cursor: pointer;
+}
+.idp-choice:hover { border-color: var(--outline); }
+.idp-choice:has(input:checked) {
+  border-color: var(--accent); background: var(--accent-soft);
+}
+.idp-choice input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+.idp-choice__body { display: grid; }
+.idp-choice__name { color: var(--text-strong); font-weight: 600; }
+.idp-choice__meta { color: var(--muted); font-size: 0.85rem; }
+
+.idp-empty { color: var(--muted); margin: var(--space-2) 0; }
+
+.idp-apps { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.idp-app {
+  display: grid; grid-template-columns: 1fr auto; gap: var(--space-3); align-items: center;
+  padding: var(--space-3); border: 1px solid var(--surface-border);
+  border-radius: var(--radius); background: var(--surface);
+}
+.idp-app__body { display: grid; min-width: 0; }
+.idp-app__name { color: var(--text-strong); font-weight: 600; }
+.idp-app__meta, .idp-app__scopes { color: var(--muted); font-size: 0.8rem; overflow-wrap: anywhere; }
+
+@media (max-width: 420px) {
+  .idp-actions { grid-template-columns: 1fr; }
+  .idp-actions .auth-btn--secondary { order: 2; }
+}

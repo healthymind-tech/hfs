@@ -245,6 +245,10 @@ pub fn attach(manager: Option<ManagerContext>, app: axum::Router) -> axum::Route
     let Some(mut ctx) = manager else {
         return app;
     };
+    // The built-in authorization server resolves endpoint names to their
+    // public base URLs (`aud`) through the registry.
+    let _ = crate::idp::REGISTRY.set(Arc::clone(&ctx.registry));
+    let _ = crate::idp_console::ENDPOINT_STORE.set(Arc::clone(&ctx.store));
     let app = std::mem::take(&mut ctx.routes)
         .into_iter()
         .fold(app, |app, routes| app.merge(routes));

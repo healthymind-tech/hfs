@@ -5,7 +5,7 @@
   them); the auth mode radio above still applies.
 -#}
 {%- if crate::idp::security::available() %}
-{%- let current = crate::idp::security::current_realm(v.auth_issuer.as_str()) %}
+{%- let current = crate::idp::security::endpoint_realm(head.name.as_str(), v.auth_issuer.as_str()) %}
 {%- let choices = crate::idp::security::realm_choices() %}
 <script src="/ui/assets/idp.js" defer></script>
 <fieldset class="idp-provider" data-idp-provider>
