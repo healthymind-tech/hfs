@@ -24,12 +24,14 @@
 pub mod access;
 pub mod config;
 pub mod loopback;
+pub mod permits;
 pub mod remote;
 pub mod routes;
 pub mod schema;
 pub mod service;
 
 pub use config::{EnvView, TerminologyMode, TerminologySettings};
+pub use permits::PermittedTerminology;
 pub use service::{
     DisabledTerminology, ServiceKind, TerminologyHealth, TerminologyService, TxError, TxPrincipal,
     TxRequest, TxResponse,

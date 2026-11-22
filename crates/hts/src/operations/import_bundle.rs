@@ -14,6 +14,7 @@ use axum::{
 };
 use helios_persistence::tenant::TenantContext;
 use serde::Serialize;
+use std::sync::Arc;
 
 use crate::import::BundleImportBackend;
 use crate::operations::params::parse_query_string;
@@ -158,16 +159,29 @@ where
     let finalize = query_flag(raw.as_deref(), "finalize");
     let defer_closure = finalize || query_flag(raw.as_deref(), "defer_closure");
 
-    let imported = if defer_closure {
-        state.backend.import_bundle_deferred(&ctx, &body).await
-    } else {
-        state.backend.import_bundle(&ctx, &body).await
-    };
+    // Embedded in hfs the parse and write run on the niced terminology-import
+    // runtime (design §8.2), so its `spawn_blocking` parsing uses that
+    // runtime's capped blocking pool instead of the one FHIR requests share.
+    let backend = Arc::clone(state.importing_backend());
+    let imported = state
+        .on_import_runtime(async move {
+            if defer_closure {
+                backend.import_bundle_deferred(&ctx, &body).await
+            } else {
+                backend.import_bundle(&ctx, &body).await
+            }
+        })
+        .await;
     match imported {
         Ok(stats) => {
             // Invalidate cached expansions — newly imported terminology may
             // change which codes belong to a ValueSet.
             state.clear_expand_cache();
+            // Written through the separate import backend: the serving
+            // backend's own response caches did not see the write.
+            if state.import_backend.is_some() {
+                state.backend.invalidate_caches();
+            }
 
             let mut errors = stats.errors;
             let mut closures_rebuilt = 0usize;

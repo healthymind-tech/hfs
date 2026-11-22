@@ -50,6 +50,7 @@ mod console_settings;
 mod console_users;
 mod csrf;
 mod editor;
+pub use editor::set_terminology_service;
 mod history;
 mod i18n;
 mod login;
@@ -5672,9 +5673,12 @@ async fn resolve_terminology_reference(
     reference: &str,
 ) -> Option<(sql_libraries::TableTarget, serde_json::Value)> {
     use helios_sof::sqlquery::TerminologyKind;
-    let base = state.terminology.as_deref()?.trim_end_matches('/');
-    let client = editor::terminology_client();
-    let timeout = std::time::Duration::from_millis(2500);
+    // Through the server's terminology service when installed (embedded or
+    // remote), else `HFS_TERMINOLOGY_SERVER` over HTTP (design §4.3).
+    let base = state.terminology.as_deref();
+    if !editor::has_terminology(base) {
+        return None;
+    }
 
     let expand = serde_json::json!({
         "resourceType": "Parameters",
@@ -5683,16 +5687,11 @@ async fn resolve_terminology_reference(
             {"name": "count", "valueInteger": 0}
         ]
     });
-    if let Ok(response) = client
-        .post(format!("{base}/ValueSet/$expand"))
-        .header("Content-Type", "application/fhir+json")
-        .header("Accept", "application/fhir+json")
-        .json(&expand)
-        .timeout(timeout)
-        .send()
-        .await
-        && response.status().is_success()
-        && let Ok(value_set) = response.json::<serde_json::Value>().await
+    if let Some(value_set) = editor::terminology_json(
+        base,
+        helios_terminology::TxRequest::post_json("ValueSet/$expand", &expand),
+    )
+    .await
         && value_set.get("resourceType").and_then(|t| t.as_str()) == Some("ValueSet")
     {
         let target = sql_libraries::classify_terminology_artifact(
@@ -5704,20 +5703,12 @@ async fn resolve_terminology_reference(
     }
 
     let (canonical, version) = sql_libraries::split_canonical_version(reference);
-    let mut query = vec![("url", canonical)];
+    let mut request =
+        helios_terminology::TxRequest::get("ConceptMap").with_query_param("url", canonical);
     if let Some(version) = version {
-        query.push(("version", version));
+        request = request.with_query_param("version", version);
     }
-    let response = client
-        .get(format!("{base}/ConceptMap"))
-        .query(&query)
-        .header("Accept", "application/fhir+json")
-        .timeout(timeout)
-        .send()
-        .await
-        .ok()
-        .filter(|response| response.status().is_success())?;
-    let bundle = response.json::<serde_json::Value>().await.ok()?;
+    let bundle = editor::terminology_json(base, request).await?;
     let concept_map = sql_libraries::concept_map_in_bundle(&bundle, reference)?.clone();
     let target = sql_libraries::classify_terminology_artifact(
         TerminologyKind::ConceptMap,

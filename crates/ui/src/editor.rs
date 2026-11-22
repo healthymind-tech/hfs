@@ -1297,30 +1297,93 @@ pub(crate) fn terminology_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+static TERMINOLOGY_SERVICE: std::sync::RwLock<
+    Option<Arc<dyn helios_terminology::TerminologyService>>,
+> = std::sync::RwLock::new(None);
+
+/// Install the server's terminology service (embedded or remote, design
+/// §4.3): the editor's `$expand` picker and the SQL editor's terminology
+/// references then call it in-process instead of `HFS_TERMINOLOGY_SERVER`
+/// over HTTP. `None` removes it (tests).
+pub fn set_terminology_service(service: Option<Arc<dyn helios_terminology::TerminologyService>>) {
+    *TERMINOLOGY_SERVICE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = service;
+}
+
+fn terminology_service() -> Option<Arc<dyn helios_terminology::TerminologyService>> {
+    TERMINOLOGY_SERVICE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Whether the console has a terminology service to call: an installed one,
+/// or `HFS_TERMINOLOGY_SERVER` (`base`).
+pub(crate) fn has_terminology(base: Option<&str>) -> bool {
+    base.is_some() || terminology_service().is_some()
+}
+
+/// One terminology read for the console, as JSON when it succeeds (2xx):
+/// through the installed service, else over HTTP to `base`
+/// (`HFS_TERMINOLOGY_SERVER`). `None` on any failure or without either.
+pub(crate) async fn terminology_json(
+    base: Option<&str>,
+    request: helios_terminology::TxRequest,
+) -> Option<Value> {
+    let request = request.with_timeout(std::time::Duration::from_millis(2500));
+    if let Some(service) = terminology_service() {
+        let response = service.call(request).await.ok()?;
+        if !response.is_success() {
+            return None;
+        }
+        return serde_json::from_slice(&response.body).ok();
+    }
+    let base = base?.trim_end_matches('/');
+    // The query is already percent-encoded; it is appended verbatim.
+    let url = if request.query.is_empty() {
+        format!("{base}/{}", request.path)
+    } else {
+        format!("{base}/{}?{}", request.path, request.query)
+    };
+    let client = terminology_client();
+    let builder = match &request.body {
+        Some(body) => client
+            .post(&url)
+            .header("Content-Type", "application/fhir+json")
+            .body(body.clone()),
+        None => client.get(&url),
+    };
+    let response = builder
+        .header("Accept", "application/fhir+json")
+        .timeout(
+            request
+                .timeout
+                .unwrap_or(std::time::Duration::from_millis(2500)),
+        )
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<Value>().await.ok()
+}
+
 pub async fn expand(State(state): State<WebState>, Query(query): Query<ExpandQuery>) -> Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    let Some(base) = state.terminology.as_ref() else {
+    if !has_terminology(state.terminology.as_deref()) {
         return StatusCode::NO_CONTENT.into_response();
-    };
-    let target = format!("{}/ValueSet/$expand", base.trim_end_matches('/'));
-    let mut params: Vec<(&str, &str)> = vec![("url", query.url.as_str()), ("count", "25")];
-    if !query.filter.is_empty() {
-        params.push(("filter", query.filter.as_str()));
     }
-    let response = match terminology_client()
-        .get(&target)
-        .query(&params)
-        .header("Accept", "application/fhir+json")
-        .timeout(std::time::Duration::from_millis(2500))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return StatusCode::NO_CONTENT.into_response(),
-    };
-    let Ok(body) = response.json::<Value>().await else {
+    let mut request = helios_terminology::TxRequest::get("ValueSet/$expand")
+        .with_query_param("url", &query.url)
+        .with_query_param("count", "25");
+    if !query.filter.is_empty() {
+        request = request.with_query_param("filter", &query.filter);
+    }
+    let Some(body) = terminology_json(state.terminology.as_deref(), request).await else {
         return StatusCode::NO_CONTENT.into_response();
     };
     let codes: Vec<Value> = body["expansion"]["contains"]

@@ -222,7 +222,119 @@ where
         None
     };
 
-    let router = Router::new()
+    let router = tx_api_router(
+        state,
+        crate::write_guard::WriteGuard {
+            gate: writes_gate,
+            max_body_size: config.max_body_size,
+            bearer,
+        },
+    );
+
+    // Merge the optional UI router before wrapping the whole app in the
+    // observability / cors / timeout / trace layers so the UI benefits from
+    // the same shared middleware stack (metrics + trace spans).
+    //
+    // `GET /` -> 308 `/ui/hts`: reviewer-requested landing so browsers hitting
+    // the bare root URL end up on the HTS UI home instead of seeing axum's
+    // "405 Method Not Allowed" for the POST-only FHIR batch endpoint.
+    // Registered inside the `ui_enabled` branch so a UI-off deployment keeps
+    // the current 405 behavior (redirecting to `/ui/hts` when that route is
+    // not mounted would send operators to a 404). `Redirect::permanent`
+    // (308) is the idiomatic choice mirrored from `hts-ui/src/home.rs`
+    // trailing-slash canonicalization; the existing `POST /` batch handler
+    // is unaffected because axum's `Router::route` merges compatible method
+    // routers on the same path.
+    let router = match admin {
+        Some(admin) => router.nest("/admin", admin),
+        None => router,
+    };
+
+    // The audit trail (`HTS_AUDIT_*`): `GET /AuditEvent` over the store, for
+    // the administrator only, and the recording layer around the terminology
+    // API and `/admin` (not the console's pages).
+    let router = match &audit {
+        Some(audit) => {
+            // The trail is sensitive: without an administrator password it is
+            // locked rather than open (unlike reads of the terminology).
+            let trail_gate = match &gate {
+                helios_admin_auth::AdminGate::Open => {
+                    helios_admin_auth::AdminGate::Locked(Arc::from(
+                        "the audit trail needs HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
+                    ))
+                }
+                other => other.clone(),
+            };
+            let router = match &audit.search {
+                Some(search) => router.merge(
+                    crate::audit::router(Arc::clone(search))
+                        .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
+                        .route_layer(axum::middleware::from_fn_with_state(
+                            helios_admin_auth::Guard {
+                                gate: trail_gate,
+                                protects: |_, _| true,
+                                style: helios_admin_auth::Style::Api { fhir: true },
+                            },
+                            helios_admin_auth::guard,
+                        )),
+                ),
+                None => router,
+            };
+            router.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&audit.middleware),
+                helios_audit::middleware::audit_middleware,
+            ))
+        }
+        None => router,
+    };
+    let router = if let Some(ui) = hts_ui {
+        router.route("/", get(root_redirect)).nest("/ui", ui)
+    } else {
+        router
+    };
+
+    router
+        // Raise the body-size limit from axum's 2 MiB default to the
+        // configured ceiling. The decompression layer below replaces the
+        // request body before extractors read it, so this limit applies to
+        // the *decompressed* bytes — a small highly-compressed payload
+        // cannot bypass `HTS_MAX_BODY_SIZE`.
+        .layer(DefaultBodyLimit::max(config.max_body_size))
+        // Decompress request bodies sent with `Content-Encoding` (gzip,
+        // deflate, br, zstd); unsupported encodings get 415. Compress
+        // responses when the client sends `Accept-Encoding`.
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new())
+        // Observability: `/metrics` (state-free) + per-request metrics/trace span.
+        .merge(helios_observability::metrics::router())
+        .layer(axum::middleware::from_fn(
+            helios_observability::middleware::track,
+        ))
+        .layer(cors)
+        // `POST /import?finalize=true` stops waiting on its closure rebuild
+        // after `AppState::import_finalize_wait` (20 s) and answers 202, so
+        // keep that below this limit if either changes.
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(config.request_timeout.max(1)),
+        ))
+        // Method and path only: the default span logs the query string (#2149).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(helios_observability::middleware::request_span),
+        )
+}
+
+/// The terminology FHIR API (operations, CRUD, search, batch, `/import`,
+/// `/health`, `/metadata`) with its write guard and admin-user capture, and
+/// no other middleware: [`create_app`] wraps it for the standalone server,
+/// and the embedded service of `hfs` ([`crate::embedded`]) mounts it at `/tx`
+/// and drives it in-process through `LoopbackTerminology`.
+pub fn tx_api_router<B>(state: AppState<B>, guard: crate::write_guard::WriteGuard) -> Router
+where
+    B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
+{
+    Router::new()
         // ── Batch / transaction ───────────────────────────────────────────────
         .route("/", post(batch_handler::<B>))
         // ── Utility ──────────────────────────────────────────────────────────
@@ -325,112 +437,15 @@ where
         // A route layer, so only matched routes are guarded, and inside the
         // decompression layer below, so a batch body is classified decompressed.
         .route_layer(axum::middleware::from_fn_with_state(
-            crate::write_guard::WriteGuard {
-                gate: writes_gate,
-                max_body_size: config.max_body_size,
-                bearer,
-            },
+            guard,
             crate::write_guard::guard,
-        ));
-
-    // Merge the optional UI router before wrapping the whole app in the
-    // observability / cors / timeout / trace layers so the UI benefits from
-    // the same shared middleware stack (metrics + trace spans).
-    //
-    // `GET /` -> 308 `/ui/hts`: reviewer-requested landing so browsers hitting
-    // the bare root URL end up on the HTS UI home instead of seeing axum's
-    // "405 Method Not Allowed" for the POST-only FHIR batch endpoint.
-    // Registered inside the `ui_enabled` branch so a UI-off deployment keeps
-    // the current 405 behavior (redirecting to `/ui/hts` when that route is
-    // not mounted would send operators to a 404). `Redirect::permanent`
-    // (308) is the idiomatic choice mirrored from `hts-ui/src/home.rs`
-    // trailing-slash canonicalization; the existing `POST /` batch handler
-    // is unaffected because axum's `Router::route` merges compatible method
-    // routers on the same path.
-    let router = match admin {
-        Some(admin) => router.nest("/admin", admin),
-        None => router,
-    };
-
-    // The audit trail (`HTS_AUDIT_*`): `GET /AuditEvent` over the store, for
-    // the administrator only, and the recording layer around the terminology
-    // API and `/admin` (not the console's pages).
-    let router = match &audit {
-        Some(audit) => {
-            // The trail is sensitive: without an administrator password it is
-            // locked rather than open (unlike reads of the terminology).
-            let trail_gate = match &gate {
-                helios_admin_auth::AdminGate::Open => {
-                    helios_admin_auth::AdminGate::Locked(Arc::from(
-                        "the audit trail needs HTS_ADMIN_PASSWORD or HTS_ADMIN_PASSWORD_FILE",
-                    ))
-                }
-                other => other.clone(),
-            };
-            let router = match &audit.search {
-                Some(search) => router.merge(
-                    crate::audit::router(Arc::clone(search))
-                        .route_layer(axum::middleware::from_fn(crate::audit::capture_admin_user))
-                        .route_layer(axum::middleware::from_fn_with_state(
-                            helios_admin_auth::Guard {
-                                gate: trail_gate,
-                                protects: |_, _| true,
-                                style: helios_admin_auth::Style::Api { fhir: true },
-                            },
-                            helios_admin_auth::guard,
-                        )),
-                ),
-                None => router,
-            };
-            router.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&audit.middleware),
-                helios_audit::middleware::audit_middleware,
-            ))
-        }
-        None => router,
-    };
-    let router = if let Some(ui) = hts_ui {
-        router.route("/", get(root_redirect)).nest("/ui", ui)
-    } else {
-        router
-    };
-
-    router
-        // Raise the body-size limit from axum's 2 MiB default to the
-        // configured ceiling. The decompression layer below replaces the
-        // request body before extractors read it, so this limit applies to
-        // the *decompressed* bytes — a small highly-compressed payload
-        // cannot bypass `HTS_MAX_BODY_SIZE`.
-        .layer(DefaultBodyLimit::max(config.max_body_size))
-        // Decompress request bodies sent with `Content-Encoding` (gzip,
-        // deflate, br, zstd); unsupported encodings get 415. Compress
-        // responses when the client sends `Accept-Encoding`.
-        .layer(RequestDecompressionLayer::new())
-        .layer(CompressionLayer::new())
-        // Observability: `/metrics` (state-free) + per-request metrics/trace span.
-        .merge(helios_observability::metrics::router())
-        .layer(axum::middleware::from_fn(
-            helios_observability::middleware::track,
         ))
-        .layer(cors)
-        // `POST /import?finalize=true` stops waiting on its closure rebuild
-        // after `AppState::import_finalize_wait` (20 s) and answers 202, so
-        // keep that below this limit if either changes.
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(config.request_timeout.max(1)),
-        ))
-        // Method and path only: the default span logs the query string (#2149).
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(helios_observability::middleware::request_span),
-        )
 }
 
 /// The gate for state-changing terminology requests: the admin gate when
 /// `HTS_REQUIRE_AUTH_FOR_WRITES` is on (default: on when a password is set),
 /// else open — logged, since anyone can then rewrite the terminology.
-fn writes_gate(
+pub fn writes_gate(
     admin: &helios_admin_auth::AdminGate,
     require: Option<bool>,
     bearer: bool,
@@ -483,13 +498,13 @@ fn writes_gate(
 ///
 /// Returns `None` (admin stays off, with an error logged) when the data
 /// directory cannot be created, rather than failing the whole server.
-fn build_admin<B>(config: &HtsConfig, state: &AppState<B>) -> Option<Router>
+pub fn build_admin<B>(config: &HtsConfig, state: &AppState<B>) -> Option<Router>
 where
     B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
 {
     let admin_config = crate::admin::AdminConfig::from_hts(config);
     let ops: Arc<dyn crate::admin::TerminologyAdmin> = state.backend.clone();
-    let importer: Arc<dyn BundleImportBackend> = state.backend.clone();
+    let importer: Arc<dyn BundleImportBackend> = state.importing_backend().clone();
     let on_change = {
         let st = state.clone();
         Arc::new(move || {
@@ -517,7 +532,15 @@ where
         );
     }
     if tokio::runtime::Handle::try_current().is_ok() {
-        crate::admin::jobs::start_worker(core.clone());
+        // Embedded in hfs: the job worker (uploads, imports, package
+        // installs) runs on the niced terminology-import runtime (§8.2).
+        match &state.import_runtime {
+            Some(handle) => {
+                let c = core.clone();
+                handle.spawn(async move { crate::admin::jobs::start_worker(c) });
+            }
+            None => crate::admin::jobs::start_worker(core.clone()),
+        }
         let c = core.clone();
         tokio::spawn(async move {
             let n = c.uploads.purge_stale(chrono::Duration::days(7)).await;

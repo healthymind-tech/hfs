@@ -306,6 +306,7 @@ impl TerminologySession {
         &self,
         key: &LookupKey,
         server_url: &str,
+        transport: Option<&Arc<dyn crate::terminology_client::TerminologyTransport>>,
         fhir_version: FhirVersion,
     ) -> Result<(AnswerCell, Arc<TerminologyClient>), EvaluationError> {
         let limit = self.max_calls();
@@ -328,7 +329,10 @@ impl TerminologySession {
                 client.clone()
             }
             _ => {
-                let client = Arc::new(TerminologyClient::new(server_url.to_string(), fhir_version));
+                let client = Arc::new(match transport {
+                    Some(t) => TerminologyClient::with_transport(Arc::clone(t), fhir_version),
+                    None => TerminologyClient::new(server_url.to_string(), fhir_version),
+                });
                 state.client = Some((server_url.to_string(), fhir_version, client.clone()));
                 client
             }
@@ -349,6 +353,10 @@ impl TerminologySession {
 /// Terminology functions accessible via %terminologies
 pub struct TerminologyFunctions {
     server_url: String,
+    /// The host's terminology service (no server URL configured on the
+    /// context or in `FHIRPATH_TERMINOLOGY_SERVER`); `server_url` is then
+    /// its label.
+    transport: Option<Arc<dyn crate::terminology_client::TerminologyTransport>>,
     fhir_version: FhirVersion,
     session: Arc<TerminologySession>,
 }
@@ -377,12 +385,18 @@ impl TerminologyFunctions {
     /// Returns [`EvaluationError::TerminologyError`] if no terminology server is
     /// configured on the context or via `FHIRPATH_TERMINOLOGY_SERVER`.
     pub fn new(context: &EvaluationContext) -> Result<Self, EvaluationError> {
-        let server_url = context
-            .get_terminology_server_url()
-            .ok_or_else(no_terminology_server)?;
+        let (server_url, transport) = match context.get_terminology_server_url() {
+            Some(url) => (url, None),
+            None => {
+                let transport = crate::terminology_client::default_transport()
+                    .ok_or_else(no_terminology_server)?;
+                (transport.label().to_string(), Some(transport))
+            }
+        };
 
         Ok(Self {
             server_url,
+            transport,
             fhir_version: context.fhir_version,
             session: context.terminology_session.clone(),
         })
@@ -409,9 +423,12 @@ impl TerminologyFunctions {
         F: FnOnce(Arc<TerminologyClient>) -> Fut,
         Fut: std::future::Future<Output = RequestResult<Value>> + Send + 'static,
     {
-        let (cell, client) = self
-            .session
-            .begin(&key, &self.server_url, self.fhir_version)?;
+        let (cell, client) = self.session.begin(
+            &key,
+            &self.server_url,
+            self.transport.as_ref(),
+            self.fhir_version,
+        )?;
         let answer = match cell.get() {
             Some(answer) => answer.clone(),
             None => {

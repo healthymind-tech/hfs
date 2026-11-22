@@ -20,6 +20,8 @@
 
 mod cluster;
 mod manager;
+mod terminology;
+mod terminology_runtime;
 
 use std::sync::Arc;
 
@@ -1650,6 +1652,9 @@ async fn serve(
         ui_bulk_provider,
         write_observer,
     );
+    // The embedded terminology API at `/tx` and its admin API at
+    // `/admin/terminology` (inside the admin guard below).
+    let app = terminology::attach(app);
     // The console admin API, inside the admin guard below.
     let app = manager::console_auth::routes(app, console.as_ref());
     // Outermost of the application layers, so it sees `/admin/...` whether
@@ -2472,6 +2477,17 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // `HFS_TERMINOLOGY=embedded|remote|off` (legacy `HTS_*` folded in):
+    // aligns `terminology_server` with the mode before validation.
+    let terminology_settings = match terminology::resolve(&mut config) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("Configuration error: {}", error);
+            std::process::exit(1);
+        }
+    };
+    terminology::log_deprecations(&terminology_settings.view);
+
     if let Err(errors) = config.validate() {
         for error in &errors {
             eprintln!("Configuration error: {}", error);
@@ -2515,26 +2531,21 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
-    // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology
-    // operations (memberOf, subsumes) to the configured HTS instance.
-    if let Some(ref ts_url) = config.terminology_server {
-        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
-            // Safety: single-threaded at this point (before tokio runtime hands
-            // off to worker threads), so set_var is safe here.
-            // SAFETY: called before any threads are spawned by the tokio runtime.
-            unsafe {
-                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
-            }
-            info!(
-                url = %redact_url(ts_url),
-                "HFS_TERMINOLOGY_SERVER wired to FHIRPath context"
-            );
-        }
-    }
-
     // Initialize audit subsystem
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
+
+    // The terminology service (`HFS_TERMINOLOGY`): embedded HTS, a remote
+    // server or off, installed for validation, search, SoF, FHIRPath, the
+    // package manager and the console before any of them is built. FHIRPath
+    // gets it as its default terminology (no FHIRPATH_TERMINOLOGY_SERVER
+    // environment hand-off any more).
+    terminology::start(
+        &config,
+        &terminology_settings,
+        audit_state.as_ref(),
+        admin_gate(&config),
+    )
+    .await?;
 
     // The REST audit events carry the authenticated user and record the
     // requests auth refuses, so the auth layer's own per-request events are

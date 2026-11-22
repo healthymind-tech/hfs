@@ -237,8 +237,43 @@ struct SearchLinkBase {
 }
 
 impl SearchLinkBase {
+    #[cfg(test)]
     fn new(uri: &axum::http::Uri, headers: &HeaderMap, raw_query: Option<&str>) -> Self {
+        Self::with_base(None, uri, headers, raw_query)
+    }
+
+    /// With `public_base` (`https://host/tx`, the embedded service's
+    /// `HFS_TERMINOLOGY_PUBLIC_URL`), links are `{public_base}{path}`: the
+    /// same URLs nginx's `sub_filter` produced for a standalone HTS.
+    fn with_base(
+        public_base: Option<&str>,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+        raw_query: Option<&str>,
+    ) -> Self {
         let path = uri.path();
+        if let Some(base) = public_base {
+            let params = form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes())
+                .filter(|(key, _)| key != "_count" && key != "_offset")
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            // Behind a nesting router (`/tx` in hfs) `OriginalUri` still
+            // carries the mount prefix that `base` already ends with.
+            let mount = base
+                .find("://")
+                .and_then(|i| base[i + 3..].find('/').map(|j| &base[i + 3 + j..]))
+                .unwrap_or("");
+            let path = match path.strip_prefix(mount) {
+                Some(rest) if !mount.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+                    rest
+                }
+                _ => path,
+            };
+            return Self {
+                url: format!("{base}{path}"),
+                params,
+            };
+        }
         let host = headers
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
@@ -365,7 +400,8 @@ where
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
+    let links =
+        SearchLinkBase::with_base(state.public_base.as_deref(), &uri, &headers, raw.as_deref());
     let backend = state.backend();
     let ctx = ctx();
     // `version=` as a SNOMED CT edition URI → the stored release.
@@ -395,7 +431,8 @@ where
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
+    let links =
+        SearchLinkBase::with_base(state.public_base.as_deref(), &uri, &headers, raw.as_deref());
     let backend = state.backend();
     let ctx = ctx();
     searchset_response(
@@ -423,7 +460,8 @@ where
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    let links = SearchLinkBase::new(&uri, &headers, raw.as_deref());
+    let links =
+        SearchLinkBase::with_base(state.public_base.as_deref(), &uri, &headers, raw.as_deref());
     let backend = state.backend();
     let ctx = ctx();
     searchset_response(
@@ -467,6 +505,20 @@ mod tests {
             ..ResourceSearchQuery::default()
         };
         let links = SearchLinkBase::new(&"/CodeSystem".parse().unwrap(), &HeaderMap::new(), None);
+        // Embedded in hfs: the public base wins over Host, and the `/tx`
+        // mount prefix of the original URI is not repeated.
+        for path in ["/CodeSystem", "/tx/CodeSystem"] {
+            let embedded = SearchLinkBase::with_base(
+                Some("https://hfs.example.org/tx"),
+                &path.parse().unwrap(),
+                &HeaderMap::new(),
+                Some("url=x&_count=5"),
+            );
+            assert_eq!(
+                embedded.page_url(5, 10),
+                "https://hfs.example.org/tx/CodeSystem?url=x&_count=5&_offset=10"
+            );
+        }
         let bundle = build_searchset_bundle(&query, &links, 7, Some(vec![json!({}), json!({})]));
         assert_eq!(bundle["total"], 7);
         assert_eq!(bundle["entry"].as_array().unwrap().len(), 2);

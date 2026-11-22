@@ -20,9 +20,9 @@ The project is a Rust workspace with 24 crates (23 default-members; `pysof` excl
 | **`helios-serde-support`** | Shared serde helpers. |
 | **`helios-rest`** | FHIR RESTful API layer (Axum) - handlers, middleware, extractors, multi-tenancy routing. |
 | **`helios-persistence`** | Polyglot persistence - backends (SQLite, PostgreSQL, Elasticsearch, MongoDB), composite storage, search registry, tenant isolation. |
-| **`helios-hfs`** | Main FHIR server binary. Combines `helios-rest` with storage backends. |
+| **`helios-hfs`** | Main FHIR server binary. Combines `helios-rest` with storage backends. With the default feature `terminology` it embeds HTS: `HFS_TERMINOLOGY=embedded\|remote\|off` (a deployment that sets `HFS_TERMINOLOGY_SERVER` without `HFS_TERMINOLOGY` stays remote), `/tx` served in-process, every terminology caller on one `TerminologyService` - see `docs/design/unified-server.md` U2/U3. |
 | **`helios-sof`** | SQL-on-FHIR implementation - ViewDefinition processing, CLI and HTTP server. |
-| **`helios-hts`** | FHIR Terminology Server (HTS) - CodeSystem/ValueSet/ConceptMap operations and terminology import (SNOMED, LOINC, RxNorm, ICD-10-CM). Provides the `hts` binary. |
+| **`helios-hts`** | FHIR Terminology Server (HTS) - CodeSystem/ValueSet/ConceptMap operations and terminology import (SNOMED, LOINC, RxNorm, ICD-10-CM). Provides the `hts` binary (standalone server and the `hts import` / `hts migrate` CLIs) and `helios_hts::embedded`, the in-process service `hfs` links. |
 | **`helios-auth`** | Authentication & authorization - SMART-on-FHIR / OAuth2 JWT bearer validation, JWKS, scopes. Configured via `HFS_AUTH_*`. |
 | **`helios-audit`** | Audit logging - FHIR AuditEvent with IHE BALP profiles; pluggable sinks (database, file, CloudWatch, S3). Configured via `HFS_AUDIT_*`. |
 | **`helios-subscriptions`** | FHIR topic-based Subscriptions engine - rest-hook, websocket, email, and messaging channels. Configured via `HFS_SUBSCRIPTION(S)_*`. |

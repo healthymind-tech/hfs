@@ -544,8 +544,34 @@ impl PostgresTerminologyBackend {
 
     /// Like [`Self::new`], with at most `pool_size` connections.
     pub async fn with_pool_size(database_url: &str, pool_size: usize) -> Result<Self, HtsError> {
-        let pool = build_pool(database_url, pool_size)?;
+        Self::with_pool(database_url, build_pool(database_url, pool_size)?).await
+    }
 
+    /// Like [`Self::with_pool_size`] with explicit pool timeouts instead of
+    /// the `HTS_PG_*` environment (the embedded service of `hfs` resolves
+    /// them from `HFS_TERMINOLOGY_PG_*`). `None`/zero leaves one unset.
+    pub async fn with_pool_settings(
+        database_url: &str,
+        pool_size: usize,
+        wait_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+        statement_timeout_ms: Option<u64>,
+    ) -> Result<Self, HtsError> {
+        let tuning = PoolTuning {
+            wait_timeout_secs: wait_timeout_secs.filter(|n| *n > 0),
+            connect_timeout_secs: connect_timeout_secs.filter(|n| *n > 0),
+            statement_timeout_ms: statement_timeout_ms.filter(|n| *n > 0),
+        };
+        let mut cfg = Config::new();
+        cfg.url = Some(database_url.to_string());
+        tuning.apply(&mut cfg, pool_size.max(1));
+        let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).map_err(|e| {
+            HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
+        })?;
+        Self::with_pool(database_url, pool).await
+    }
+
+    async fn with_pool(database_url: &str, pool: Pool) -> Result<Self, HtsError> {
         {
             let mut client = pool.get().await.map_err(|e| {
                 HtsError::StorageError(format!(

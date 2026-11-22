@@ -1,0 +1,106 @@
+openapi: 3.0.3
+info:
+  title: HFS terminology admin API
+  version: "1"
+  description: |
+    The embedded terminology service's admin API (docs/design/unified-server.md §10),
+    mounted at `/admin/terminology` when `HFS_TERMINOLOGY=embedded` and
+    `HFS_TERMINOLOGY_ADMIN=true`. The routes are those of the standalone HTS `/admin`
+    API, unchanged; they sit behind the HFS admin guard (console session + CSRF,
+    the break-glass administrator credential, or a system-scope token).
+    `/tx/admin/**` answers 308 to the same path under `/admin/terminology` for one release.
+servers:
+  - url: /admin/terminology
+security:
+  - adminBasic: []
+  - consoleSession: []
+paths:
+  /:
+    get: {summary: Admin status (data dir, import dir, registry), responses: {"200": {description: OK}}}
+  /formats:
+    get: {summary: Import formats, responses: {"200": {description: OK}}}
+  /terminology:
+    get: {summary: Inventory of code systems, value sets and concept maps, responses: {"200": {description: OK}}}
+  /terminology/refresh-stats:
+    post: {summary: Recount inventory statistics, responses: {"200": {description: OK}}}
+  /code-systems:
+    delete: {summary: Delete a code system version (query url, version), responses: {"200": {description: OK}}}
+  /code-systems/delete:
+    post: {summary: Delete a code system version (body), responses: {"200": {description: OK}}}
+  /code-systems/dependents:
+    get: {summary: Value sets depending on a code system version, responses: {"200": {description: OK}}}
+  /code-systems/current:
+    put: {summary: Pin the current version of a code system, responses: {"200": {description: OK}}}
+  /value-sets:
+    delete: {summary: Delete a value set version, responses: {"200": {description: OK}}}
+  /concept-maps:
+    delete: {summary: Delete a concept map version, responses: {"200": {description: OK}}}
+  /maintenance/compact:
+    post: {summary: Compact the store, responses: {"202": {description: Job queued}}}
+  /uploads:
+    get: {summary: List uploads, responses: {"200": {description: OK}}}
+    post: {summary: Start a chunked upload, responses: {"201": {description: Created}}}
+  /uploads/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {summary: Upload status, responses: {"200": {description: OK}}}
+    delete: {summary: Delete an upload, responses: {"204": {description: Deleted}}}
+  /uploads/{id}/chunks/{index}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      - {name: index, in: path, required: true, schema: {type: integer}}
+    put: {summary: Upload one chunk (HFS_TERMINOLOGY_UPLOAD_CHUNK_SIZE), responses: {"200": {description: OK}}}
+  /uploads/{id}/complete:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    post: {summary: Complete an upload, responses: {"200": {description: OK}}}
+  /uploads/{id}/detect:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {summary: Detect the format of an upload, responses: {"200": {description: OK}}}
+  /import-dir:
+    get: {summary: List HFS_TERMINOLOGY_IMPORT_DIR, responses: {"200": {description: OK}}}
+  /import-dir/detect:
+    get: {summary: Detect the format of an import-dir file, responses: {"200": {description: OK}}}
+  /imports:
+    post:
+      summary: Start an import job (runs on the terminology-import runtime)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source]
+              properties:
+                source:
+                  oneOf:
+                    - {type: object, properties: {type: {enum: [upload]}, upload_id: {type: string}}}
+                    - {type: object, properties: {type: {enum: [import-dir]}, path: {type: string}}}
+                    - {type: object, properties: {type: {enum: [registry]}, package: {type: string}, version: {type: string}}}
+                format: {type: string}
+                version: {type: string}
+                languages: {type: string}
+                properties: {oneOf: [{type: string}, {type: array, items: {type: string}}]}
+                batch_size: {type: integer}
+      responses: {"202": {description: Job queued}}
+  /registry/search:
+    get: {summary: Search the package registry, responses: {"200": {description: OK}}}
+  /registry/packages/{name}:
+    parameters: [{name: name, in: path, required: true, schema: {type: string}}]
+    get: {summary: Package versions, responses: {"200": {description: OK}}}
+  /registry/install:
+    post: {summary: Install a terminology package (job), responses: {"202": {description: Job queued}}}
+  /jobs:
+    get: {summary: List jobs, responses: {"200": {description: OK}}}
+  /jobs/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {summary: One job, responses: {"200": {description: OK}}}
+  /jobs/{id}/log:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {summary: Job log tail, responses: {"200": {description: OK}}}
+  /jobs/{id}/cancel:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    post: {summary: Cancel a job, responses: {"200": {description: OK}}}
+  /audit:
+    get: {summary: Admin action log (audit.ndjson), responses: {"200": {description: OK}}}
+components:
+  securitySchemes:
+    adminBasic: {type: http, scheme: basic}
+    consoleSession: {type: apiKey, in: cookie, name: hfs_console}

@@ -283,6 +283,31 @@ pub struct AppState<B: TerminologyBackend> {
     /// Must stay below the router's 30 s request timeout. See
     /// [`DEFAULT_IMPORT_FINALIZE_WAIT`].
     pub import_finalize_wait: Duration,
+
+    /// Public base the terminology API is served under (`https://host/tx`),
+    /// used for absolute links (search paging) instead of `Host` + path.
+    /// Set by the embedded service of `hfs` (`HFS_TERMINOLOGY_PUBLIC_URL`),
+    /// which replaces nginx's `sub_filter` rewrite. `None`: `Host` + path.
+    pub public_base: Option<Arc<str>>,
+
+    /// Terminology change counter: bumped by [`Self::clear_expand_cache`],
+    /// i.e. after every local write and every cross-instance epoch eviction.
+    /// The embedded service exposes it as `TerminologyService::changes()`
+    /// so HFS-side caches (validator, `:in`, SoF) clear with HTS's own.
+    pub changes: Option<Arc<tokio::sync::watch::Sender<u64>>>,
+
+    /// Runtime that runs terminology imports (`POST /import` bodies, admin
+    /// jobs, closure finalize) when HTS is embedded in `hfs` (design §8.2):
+    /// a small niced runtime, so a SNOMED parse cannot starve FHIR requests.
+    /// `None`: the current runtime (standalone `hts`).
+    pub import_runtime: Option<tokio::runtime::Handle>,
+
+    /// A second backend over the same store with its own small connection
+    /// pool, used by `POST /import` bodies and admin import jobs (design
+    /// §8.2 measure 2): bulk `INSERT … UNNEST` batches wait on their own
+    /// pool instead of holding the connections `$validate-code` and
+    /// `$expand` need. `None`: [`Self::backend`].
+    pub import_backend: Option<Arc<B>>,
 }
 
 /// Default for [`AppState::import_finalize_wait`]: comfortably inside the
@@ -320,6 +345,10 @@ impl<B: TerminologyBackend> AppState<B> {
             audit: None,
             closure_rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             import_finalize_wait: DEFAULT_IMPORT_FINALIZE_WAIT,
+            public_base: None,
+            changes: None,
+            import_runtime: None,
+            import_backend: None,
         }
     }
 
@@ -369,6 +398,59 @@ impl<B: TerminologyBackend> AppState<B> {
         }
         #[cfg(feature = "sqlite")]
         self.tx_overlays.clear();
+        if let Some(changes) = &self.changes {
+            changes.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+
+    /// Absolute links use `base` (`https://host/tx`) instead of `Host` + path.
+    pub fn with_public_base(mut self, base: Option<String>) -> Self {
+        self.public_base = base
+            .map(|b| b.trim_end_matches('/').to_string())
+            .filter(|b| !b.is_empty())
+            .map(Arc::from);
+        self
+    }
+
+    /// Publish terminology changes on `changes` (see [`Self::changes`]).
+    pub fn with_changes(mut self, changes: Arc<tokio::sync::watch::Sender<u64>>) -> Self {
+        self.changes = Some(changes);
+        self
+    }
+
+    /// Run imports on `handle` (see [`Self::import_runtime`]).
+    pub fn with_import_runtime(mut self, handle: Option<tokio::runtime::Handle>) -> Self {
+        self.import_runtime = handle;
+        self
+    }
+
+    /// Imports write through `backend` (see [`Self::import_backend`]).
+    pub fn with_import_backend(mut self, backend: Option<B>) -> Self {
+        self.import_backend = backend.map(Arc::new);
+        self
+    }
+
+    /// The backend imports write through.
+    pub fn importing_backend(&self) -> &Arc<B> {
+        self.import_backend.as_ref().unwrap_or(&self.backend)
+    }
+
+    /// Run `fut` on the import runtime when one is configured, else inline.
+    /// The future is spawned there and awaited, so its `spawn_blocking`
+    /// parsing uses that runtime's capped blocking pool.
+    pub async fn on_import_runtime<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.import_runtime {
+            Some(handle) => match handle.spawn(fut).await {
+                Ok(value) => value,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => panic!("terminology import task cancelled: {e}"),
+            },
+            None => fut.await,
+        }
     }
 
     /// Override the maximum expansion size (default: 10 000).

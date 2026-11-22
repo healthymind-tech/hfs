@@ -54,15 +54,25 @@ pub fn bearer_provider_from_env() -> Option<Arc<dyn AuthProvider>> {
 pub fn bearer_provider_from_lookup(
     get: impl Fn(&str) -> Option<String>,
 ) -> Option<Arc<dyn AuthProvider>> {
+    bearer_provider_with_prefix("HTS_AUTH", get)
+}
+
+/// [`bearer_provider_from_lookup`] for the variables `{prefix}_JWKS_URL`,
+/// `{prefix}_ISSUER`, … (`HTS_AUTH` standalone; the embedded service of
+/// `hfs` resolves `HFS_TERMINOLOGY_AUTH_*`, defaulting to `HFS_AUTH_*`).
+pub fn bearer_provider_with_prefix(
+    prefix: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<Arc<dyn AuthProvider>> {
     let var = |k: &str| {
-        get(k)
+        get(&format!("{prefix}_{k}"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let jwks_url = var("HTS_AUTH_JWKS_URL")?;
-    let Some(issuer) = var("HTS_AUTH_ISSUER") else {
+    let jwks_url = var("JWKS_URL")?;
+    let Some(issuer) = var("ISSUER") else {
         tracing::error!(
-            "HTS_AUTH_JWKS_URL is set without HTS_AUTH_ISSUER: bearer tokens are NOT accepted for \
+            "{prefix}_JWKS_URL is set without {prefix}_ISSUER: bearer tokens are NOT accepted for \
              terminology writes until the issuer is pinned"
         );
         return None;
@@ -71,13 +81,13 @@ pub fn bearer_provider_from_lookup(
         enabled: true,
         jwks_url: Some(jwks_url.clone()),
         expected_issuer: Some(issuer.clone()),
-        expected_audience: var("HTS_AUTH_AUDIENCE"),
+        expected_audience: var("AUDIENCE"),
         ..AuthConfig::default()
     };
-    if let Some(algs) = var("HTS_AUTH_ALGORITHMS") {
+    if let Some(algs) = var("ALGORITHMS") {
         config.allowed_algorithms = algs.split(',').map(|a| a.trim().to_string()).collect();
     }
-    if let Some(skew) = var("HTS_AUTH_CLOCK_SKEW_SECONDS").and_then(|v| v.parse().ok()) {
+    if let Some(skew) = var("CLOCK_SKEW_SECONDS").and_then(|v| v.parse().ok()) {
         config.clock_skew_secs = skew;
     }
     tracing::info!(
@@ -224,12 +234,58 @@ pub struct WriteGuard {
     pub bearer: Option<Arc<dyn AuthProvider>>,
 }
 
+/// The console role a terminology write needs (design §7.2/§7.4): one
+/// CodeSystem/ValueSet/ConceptMap create, update or delete needs an editor;
+/// `/import`, write batches and anything else administrative need an admin.
+pub fn console_role_for_write(path: &str) -> helios_endpoints::ConsoleRole {
+    use helios_terminology::access::{TerminologyAction, required_role};
+    let first = path.split('/').find(|s| !s.is_empty());
+    match first {
+        Some(ty) if TERMINOLOGY_TYPES.contains(&ty) => {
+            required_role(TerminologyAction::EditResource)
+        }
+        _ => required_role(TerminologyAction::Import),
+    }
+}
+
+/// What the in-process caller's [`helios_terminology::TxPrincipal`]
+/// (a request extension, never a header) says about a write: `Some(true)`
+/// admit, `Some(false)` refuse, `None` no principal / anonymous — fall
+/// through to the credential checks.
+fn principal_decision(request: &Request) -> Option<bool> {
+    use helios_terminology::TxPrincipal;
+    match request.extensions().get::<TxPrincipal>()? {
+        TxPrincipal::System => Some(true),
+        TxPrincipal::Console { role, .. } => {
+            Some(*role >= console_role_for_write(request.uri().path()))
+        }
+        TxPrincipal::Anonymous => None,
+    }
+}
+
 /// Middleware applying [`WriteGuard`]. Sits inside the request
 /// decompression layer, so a batch body is read decompressed.
+///
+/// Admission order (design §7.4): the in-process principal (`System`, or a
+/// console user with the role the write needs), then a SMART/OIDC bearer
+/// token, then the administrator credential.
 pub async fn guard(State(state): State<WriteGuard>, request: Request, next: Next) -> Response {
-    if matches!(state.gate, AdminGate::Open)
-        || !is_terminology_write(request.method(), request.uri().path())
-    {
+    if !is_terminology_write(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+    match principal_decision(&request) {
+        Some(true) => return next.run(request).await,
+        Some(false) => {
+            return refusal(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "insufficient_scope",
+                "the console role does not allow this terminology write",
+            );
+        }
+        None => {}
+    }
+    if matches!(state.gate, AdminGate::Open) {
         return next.run(request).await;
     }
     let mut request = request;
@@ -287,6 +343,92 @@ pub async fn guard(State(state): State<WriteGuard>, request: Request, next: Next
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn in_process_principal_is_admitted_by_role() {
+        use axum::routing::{delete, post};
+        use helios_endpoints::ConsoleRole;
+        use helios_terminology::TxPrincipal;
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/import", post(|| async { "imported" }))
+            .route("/CodeSystem/{id}", delete(|| async { "deleted" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                WriteGuard {
+                    gate: AdminGate::Locked(Arc::from("locked")),
+                    max_body_size: 1024,
+                    bearer: None,
+                },
+                guard,
+            ));
+        let call = |method: &str, path: &str, principal: Option<TxPrincipal>| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            if let Some(p) = principal {
+                req.extensions_mut().insert(p);
+            }
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+        let console = |role| TxPrincipal::Console {
+            user: "alice".into(),
+            role,
+        };
+        assert_eq!(
+            call("POST", "/import", Some(TxPrincipal::System)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call("POST", "/import", Some(console(ConsoleRole::Admin))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call("POST", "/import", Some(console(ConsoleRole::Editor))).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                "DELETE",
+                "/CodeSystem/x",
+                Some(console(ConsoleRole::Editor))
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                "DELETE",
+                "/CodeSystem/x",
+                Some(console(ConsoleRole::Viewer))
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // Anonymous, or no principal at all: the (locked) credential gate.
+        assert_ne!(
+            call("POST", "/import", Some(TxPrincipal::Anonymous)).await,
+            StatusCode::OK
+        );
+        assert_ne!(call("POST", "/import", None).await, StatusCode::OK);
+    }
+
+    #[test]
+    fn embedded_bearer_prefix_reads_its_own_variables() {
+        let vars = [
+            ("HFS_AUTH_JWKS_URL", "http://idp/jwks"),
+            ("HFS_AUTH_ISSUER", "http://idp"),
+        ];
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        };
+        assert!(bearer_provider_with_prefix("HFS_AUTH", get).is_some());
+        assert!(bearer_provider_with_prefix("HTS_AUTH", get).is_none());
+    }
 
     #[test]
     fn writes_and_reads_are_told_apart() {
