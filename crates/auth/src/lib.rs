@@ -38,6 +38,7 @@ pub mod principal;
 pub mod provider;
 pub mod scope;
 pub mod session;
+pub mod verify;
 pub mod verifier_cache;
 
 // Re-export commonly used types
