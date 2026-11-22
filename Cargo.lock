@@ -3682,6 +3682,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-idp-server"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "helios-endpoints",
+ "helios-idp",
+ "http-body-util",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "helios-observability"
 version = "0.2.9"
 dependencies = [

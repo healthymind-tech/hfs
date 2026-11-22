@@ -173,7 +173,7 @@ pub fn authorization_server_metadata(r: &RealmSpec, urls: &RealmUrls) -> Value {
         "token_endpoint_auth_signing_alg_values_supported": CLIENT_ASSERTION_ALGS,
         "scopes_supported": scopes_supported(r),
         "subject_types_supported": ["public"],
-        "id_token_signing_alg_values_supported": r.signing_algs.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        "id_token_signing_alg_values_supported": ["RS256"],
         "claims_supported": ["iss","sub","aud","exp","iat","auth_time","nonce","acr","amr","sid","at_hash","fhirUser","name","given_name","family_name","email","email_verified"],
         "request_parameter_supported": false,
         "request_uri_parameter_supported": false,
