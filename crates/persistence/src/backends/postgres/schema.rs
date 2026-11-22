@@ -331,8 +331,8 @@ async fn run_migrations_with(
 async fn is_fork_stamped_v47(client: &deadpool_postgres::Client) -> StorageResult<bool> {
     let row = client
         .query_one(
-            "SELECT to_regclass('search_parameter_epochs') IS NOT NULL,
-                    to_regclass('idx_resources_reindex_id') IS NOT NULL",
+            "SELECT to_regclass(format('%I.%I', current_schema(), 'search_parameter_epochs')) IS NOT NULL,
+                    to_regclass(format('%I.%I', current_schema(), 'idx_resources_reindex_id')) IS NOT NULL",
             &[],
         )
         .await
@@ -442,7 +442,7 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
 async fn applied_fork_migrations(client: &deadpool_postgres::Client) -> StorageResult<Vec<String>> {
     let exists: bool = client
         .query_one(
-            "SELECT to_regclass('hm_schema_migrations') IS NOT NULL",
+            "SELECT to_regclass(format('%I.%I', current_schema(), 'hm_schema_migrations')) IS NOT NULL",
             &[],
         )
         .await
@@ -1033,10 +1033,11 @@ async fn build_reference_target(client: &mut deadpool_postgres::Client) -> Stora
         .await
         .map_err(|e| failed("inspect index", &e))?
         .map(|row| row.get(0));
+    let qualified_index = in_store_schema(&*client, REFERENCE_TARGET_INDEX_NAME).await?;
     if invalid == Some(true) {
         client
             .batch_execute(&format!(
-                "DROP INDEX CONCURRENTLY IF EXISTS {REFERENCE_TARGET_INDEX_NAME}"
+                "DROP INDEX CONCURRENTLY IF EXISTS {qualified_index}"
             ))
             .await
             .map_err(|e| failed("drop invalid index", &e))?;
@@ -1051,7 +1052,7 @@ async fn build_reference_target(client: &mut deadpool_postgres::Client) -> Stora
     {
         if let Err(drop_error) = client
             .batch_execute(&format!(
-                "DROP INDEX CONCURRENTLY IF EXISTS {REFERENCE_TARGET_INDEX_NAME}"
+                "DROP INDEX CONCURRENTLY IF EXISTS {qualified_index}"
             ))
             .await
         {
@@ -1325,7 +1326,8 @@ async fn migrate_v5_to_v6(client: &deadpool_postgres::Client) -> StorageResult<(
              BEGIN
                IF NOT EXISTS (
                  SELECT 1 FROM information_schema.key_column_usage
-                 WHERE table_name = 'bulk_entry_results'
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'bulk_entry_results'
                    AND constraint_name = 'bulk_entry_results_pkey'
                    AND column_name = 'file_url'
                ) THEN
@@ -4855,7 +4857,7 @@ async fn date_index_state(
     let Some(row) = client
         .query_opt(
             "SELECT c.relkind::text,
-                    i.indrelid = 'search_index'::regclass,
+                    i.indrelid = to_regclass(format('%I.%I', current_schema(), 'search_index')),
                     i.indisvalid AND i.indisready AND i.indislive,
                     CASE WHEN c.relkind = 'i' THEN pg_get_indexdef(c.oid) END
              FROM pg_class c
@@ -4881,6 +4883,25 @@ async fn date_index_state(
     Ok(Some(usable && indexdef.ends_with(definition)))
 }
 
+/// `name` qualified with the connection's own schema (`"public".x` for HFS,
+/// `terminology.x` for an embedded terminology store), for DDL that names an
+/// existing index: an unqualified `DROP INDEX IF EXISTS x` / `ALTER INDEX x`
+/// resolves through `search_path` and would reach HFS's `public.x` when the
+/// store's own `x` does not exist yet (docs/design/unified-server.md §5.3).
+async fn in_store_schema<C>(client: &C, name: &str) -> StorageResult<String>
+where
+    C: GenericClient + Sync + ?Sized,
+{
+    client
+        .query_one(
+            "SELECT format('%I.%I', current_schema(), $1::text)",
+            &[&name],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(|e| pg_error(format!("Failed to qualify {name}: {e}")))
+}
+
 /// Builds `spec` concurrently under its temporary name and swaps it in.
 async fn rebuild_date_index(
     client: &mut deadpool_postgres::Client,
@@ -4896,13 +4917,14 @@ async fn rebuild_date_index(
     if date_index_state(client, spec.name, spec.definition).await? == Some(true) {
         return Ok(());
     }
+    let qualified_temp = in_store_schema(&*client, spec.temp_name).await?;
+    let qualified_name = in_store_schema(&*client, spec.name).await?;
     // One statement per batch: a multi-statement string is an implicit
     // transaction, which `CONCURRENTLY` rejects.
     if date_index_state(client, spec.temp_name, spec.definition).await? != Some(true) {
         client
             .batch_execute(&format!(
-                "DROP INDEX CONCURRENTLY IF EXISTS {}",
-                spec.temp_name
+                "DROP INDEX CONCURRENTLY IF EXISTS {qualified_temp}"
             ))
             .await
             .map_err(|e| failed(&e))?;
@@ -4917,8 +4939,7 @@ async fn rebuild_date_index(
             // maintains; drop it now if possible, the retry repairs it otherwise.
             if let Err(drop_error) = client
                 .batch_execute(&format!(
-                    "DROP INDEX CONCURRENTLY IF EXISTS {}",
-                    spec.temp_name
+                    "DROP INDEX CONCURRENTLY IF EXISTS {qualified_temp}"
                 ))
                 .await
             {
@@ -4937,8 +4958,8 @@ async fn rebuild_date_index(
         client,
         spec.name,
         &[
-            &format!("DROP INDEX IF EXISTS {}", spec.name),
-            &format!("ALTER INDEX {} RENAME TO {}", spec.temp_name, spec.name),
+            &format!("DROP INDEX IF EXISTS {qualified_name}"),
+            &format!("ALTER INDEX {qualified_temp} RENAME TO {}", spec.name),
         ],
     )
     .await?;
@@ -5539,7 +5560,7 @@ async fn live_tenant_count_index_state(
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attname = 'tenant_id'
              WHERE n.nspname = current_schema()
                AND c.relname = $1
-               AND i.indrelid = 'resources'::regclass",
+               AND i.indrelid = to_regclass(format('%I.%I', current_schema(), 'resources'))",
             &[&LIVE_TENANT_COUNT_INDEX_NAME],
         )
         .await
@@ -5617,11 +5638,12 @@ async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult
         .map_err(|e| failed(&format!("disable statement_timeout: {e}")))?;
     // One statement per batch: a multi-statement string is an implicit
     // transaction, which `CONCURRENTLY` rejects.
+    let qualified_index = in_store_schema(client, LIVE_TENANT_COUNT_INDEX_NAME).await?;
     let build = async {
         if must_drop {
             client
                 .batch_execute(&format!(
-                    "DROP INDEX CONCURRENTLY IF EXISTS {LIVE_TENANT_COUNT_INDEX_NAME}"
+                    "DROP INDEX CONCURRENTLY IF EXISTS {qualified_index}"
                 ))
                 .await?;
         }
@@ -5652,7 +5674,7 @@ async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult
         if matches!(live_tenant_count_index_state(client).await, Ok(Some(false))) {
             if let Err(drop_error) = client
                 .batch_execute(&format!(
-                    "DROP INDEX CONCURRENTLY IF EXISTS {LIVE_TENANT_COUNT_INDEX_NAME}"
+                    "DROP INDEX CONCURRENTLY IF EXISTS {qualified_index}"
                 ))
                 .await
             {
@@ -6012,7 +6034,7 @@ async fn patient_export_index_state(
              JOIN pg_am am ON am.oid = c.relam
              WHERE n.nspname = current_schema()
                AND c.relname = $1
-               AND i.indrelid = 'resources'::regclass",
+               AND i.indrelid = to_regclass(format('%I.%I', current_schema(), 'resources'))",
             &[&PATIENT_EXPORT_INDEX_NAME],
         )
         .await
@@ -6039,6 +6061,13 @@ async fn ensure_patient_export_index(client: &deadpool_postgres::Client) -> Stor
 
     // The configured timeout applies to every pooled session. Disable it only
     // on this migration connection for the potentially long concurrent build.
+    let qualified_index = match in_store_schema(client, PATIENT_EXPORT_INDEX_NAME).await {
+        Ok(name) => name,
+        Err(error) => {
+            tracing::warn!(%error, "Could not qualify the patient export index; using JSON fallback");
+            return Ok(false);
+        }
+    };
     if let Err(error) = client.batch_execute("SET statement_timeout = 0").await {
         tracing::warn!(%error, "Could not disable timeout for patient export index build");
         return Ok(false);
@@ -6046,9 +6075,7 @@ async fn ensure_patient_export_index(client: &deadpool_postgres::Client) -> Stor
     let build_result = async {
         if must_drop {
             client
-                .batch_execute(&format!(
-                    "DROP INDEX CONCURRENTLY {PATIENT_EXPORT_INDEX_NAME}"
-                ))
+                .batch_execute(&format!("DROP INDEX CONCURRENTLY {qualified_index}"))
                 .await?;
         }
         client
@@ -6972,6 +6999,327 @@ async fn fork_subscription_cluster_delivery(
     Ok(())
 }
 
+// ── One database: the store's own schema (docs/design/unified-server.md §5) ──
+
+/// Makes sure the schema this connection's `search_path` names first exists
+/// and is what unqualified DDL and catalog lookups resolve to.
+///
+/// A terminology store connects with `search_path=terminology,public`. If
+/// `terminology` did not exist, PostgreSQL would silently skip it and
+/// `current_schema()` would be `public`: every `CREATE TABLE IF NOT EXISTS`
+/// would then find HFS's tables, and the store would write into them. So the
+/// first explicit entry is created when it is missing (the HFS role owns the
+/// database and may) and the connection must then resolve to it, or startup
+/// fails. Connections without an explicit first entry (the default
+/// `"$user", public`) are left alone. Returns the schema in use.
+pub(crate) async fn ensure_store_schema<C>(client: &C) -> StorageResult<String>
+where
+    C: GenericClient + Sync + ?Sized,
+{
+    let row = client
+        .query_one(
+            "SELECT current_setting('search_path'), current_schema()::text",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to read search_path: {e}")))?;
+    let path: String = row.get(0);
+    let current: Option<String> = row.get(1);
+    let wanted = first_explicit_schema(&path);
+    let Some(wanted) = wanted else {
+        return current
+            .ok_or_else(|| pg_error(format!("search_path {path:?} names no existing schema")));
+    };
+    if current.as_deref() == Some(wanted.as_str()) {
+        return Ok(wanted);
+    }
+    if !is_valid_store_schema_name(&wanted) {
+        return Err(pg_error(format!(
+            "search_path names schema {wanted:?}, which does not exist and is not a valid store schema name"
+        )));
+    }
+    client
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {wanted}"))
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "search_path names schema {wanted}, which does not exist, and creating it failed \
+                 (the database role needs CREATE on the database): {e}"
+            ))
+        })?;
+    let now: Option<String> = client
+        .query_one("SELECT current_schema()::text", &[])
+        .await
+        .map_err(|e| pg_error(format!("Failed to read current_schema(): {e}")))?
+        .get(0);
+    if now.as_deref() == Some(wanted.as_str()) {
+        tracing::info!(schema = %wanted, "Created the store schema named by search_path");
+        Ok(wanted)
+    } else {
+        Err(pg_error(format!(
+            "search_path names schema {wanted} first but connections resolve to {now:?}; \
+             refusing to create tables elsewhere"
+        )))
+    }
+}
+
+/// The first entry of a `search_path` setting that names a schema explicitly
+/// (not `"$user"`, not `public`, not a `pg_*` schema), unquoted.
+pub(crate) fn first_explicit_schema(search_path: &str) -> Option<String> {
+    let first = search_path.split(',').next()?.trim();
+    let name = first.trim_matches('"');
+    if name.is_empty() || name == "$user" || name == "public" || name.starts_with("pg_") {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// `^[a-z_][a-z0-9_]{0,62}$`, not `public`, not `pg_*`, not
+/// `information_schema` — the rule `helios-terminology` applies to
+/// `HFS_TERMINOLOGY_SCHEMA`.
+pub fn is_valid_store_schema_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_');
+    first_ok
+        && name.len() <= 63
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !matches!(name, "public" | "information_schema")
+        && !name.starts_with("pg_")
+}
+
+/// Fork migration `hm-0011-terminology-schema` (unified server, design §5.4):
+/// the terminology schema plus `hfs_terminology_state` in `public`.
+pub const FORK_TERMINOLOGY_SCHEMA: &str = "hm-0011-terminology-schema";
+
+/// Fork migration `hm-0012-console-terminology-bindings` (design §7.2):
+/// console role bindings with a non-endpoint scope (`terminology`).
+pub const FORK_CONSOLE_TERMINOLOGY_BINDINGS: &str = "hm-0012-console-terminology-bindings";
+
+/// The unified server's fork migrations (`hm-0011`..`hm-0019`; `hm-0020`..
+/// `hm-0029` belong to the built-in authorization server). Unlike
+/// [`FORK_MIGRATIONS`] they are **not** applied by `init_schema`: the server
+/// applies them through [`apply_unified_fork_migrations`] only when
+/// terminology is embedded, so an upgrade with the flag off creates nothing,
+/// and a terminology store's own embedded persistence schema never gets them.
+/// Same names as `helios_terminology::schema::UNIFIED_FORK_MIGRATIONS`.
+pub const UNIFIED_FORK_MIGRATIONS: &[&str] =
+    &[FORK_TERMINOLOGY_SCHEMA, FORK_CONSOLE_TERMINOLOGY_BINDINGS];
+
+/// SQL of `hm-0011-terminology-schema`, `{schema}` substituted after
+/// validation. Must stay equal to `helios_terminology::schema::HM_0011_SQL`
+/// (checked by `tests/terminology_schema.rs`).
+pub const HM_0011_SQL: &str = "\
+CREATE SCHEMA IF NOT EXISTS {schema};
+CREATE TABLE IF NOT EXISTS hfs_terminology_state (
+    id          BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    store       TEXT NOT NULL,            -- 'schema:terminology' | 'external-db' | 'sqlite-file'
+    moved_from  TEXT,                     -- e.g. 'database:hts' after hfs-unify-db
+    moved_at    TIMESTAMPTZ,
+    source_fingerprint TEXT,              -- row counts + hts_schema_meta fingerprint of the source
+    note        TEXT,                     -- hfs-unify-db progress: last completed step
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE hfs_terminology_state ADD COLUMN IF NOT EXISTS note TEXT;";
+
+/// SQL of `hm-0012-console-terminology-bindings`. A sibling of
+/// `hfs_console_role_bindings` rather than a new column on it: that table's
+/// key is `(subject, endpoint_id)` with a foreign key to `hfs_endpoints`, and
+/// a scope is not an endpoint. Effective role = max(global role, endpoint
+/// binding, scope binding) as the console decides it.
+pub const HM_0012_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS hfs_console_scope_bindings (
+    subject     TEXT NOT NULL,
+    scope       TEXT NOT NULL CHECK (scope IN ('terminology')),
+    role        TEXT NOT NULL CHECK (role IN ('viewer','editor','admin')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by  TEXT,
+    PRIMARY KEY (subject, scope)
+);
+DROP TRIGGER IF EXISTS trg_hfs_console_scope_bindings_epoch ON hfs_console_scope_bindings;
+CREATE TRIGGER trg_hfs_console_scope_bindings_epoch
+    AFTER INSERT OR UPDATE OR DELETE ON hfs_console_scope_bindings
+    FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('console');";
+
+/// `HM_0011_SQL` for `schema` (validated).
+pub fn hm_0011_sql(schema: &str) -> StorageResult<String> {
+    if !is_valid_store_schema_name(schema) {
+        return Err(pg_error(format!(
+            "terminology schema name {schema:?} must match ^[a-z_][a-z0-9_]{{0,62}}$ and not be reserved"
+        )));
+    }
+    Ok(HM_0011_SQL.replace("{schema}", schema))
+}
+
+/// Applies the unified server's fork migrations ([`UNIFIED_FORK_MIGRATIONS`])
+/// that are not yet recorded in `hm_schema_migrations`, under the migration
+/// advisory lock, on a connection whose schema is HFS's own (`public`).
+/// `hm-0011` first checks that the role may create schemas in the database
+/// and fails with a clear message instead of half-starting. Returns the names
+/// applied by this call (empty when everything was already applied).
+pub async fn apply_unified_fork_migrations(
+    client: &mut deadpool_postgres::Client,
+    terminology_schema: &str,
+) -> StorageResult<Vec<&'static str>> {
+    let sql_0011 = hm_0011_sql(terminology_schema)?;
+    acquire_migration_lock(client).await?;
+    let result = async {
+        ensure_fork_migrations_table(&*client).await?;
+        let mut applied_now = Vec::new();
+        for name in UNIFIED_FORK_MIGRATIONS {
+            let applied = client
+                .query_opt(
+                    "SELECT 1 FROM hm_schema_migrations WHERE name = $1",
+                    &[name],
+                )
+                .await
+                .map_err(|e| pg_error(format!("Failed to read hm_schema_migrations: {e}")))?
+                .is_some();
+            if applied {
+                continue;
+            }
+            match *name {
+                FORK_TERMINOLOGY_SCHEMA => {
+                    let may_create: bool = client
+                        .query_one(
+                            "SELECT has_database_privilege(current_database(), 'CREATE')",
+                            &[],
+                        )
+                        .await
+                        .map_err(|e| pg_error(format!("Failed to check CREATE privilege: {e}")))?
+                        .get(0);
+                    if !may_create {
+                        let who: String = client
+                            .query_one("SELECT current_user::text || ' on ' || current_database()", &[])
+                            .await
+                            .map(|r| r.get(0))
+                            .unwrap_or_else(|_| "this role".into());
+                        return Err(pg_error(format!(
+                            "{FORK_TERMINOLOGY_SCHEMA} needs CREATE on the database to create schema \
+                             {terminology_schema} ({who} lacks it): GRANT CREATE ON DATABASE <db> TO <role>, \
+                             or create the schema beforehand and point HFS_TERMINOLOGY_DATABASE_URL at it"
+                        )));
+                    }
+                    client.batch_execute(&sql_0011).await.map_err(|e| {
+                        pg_error(format!("Fork migration {FORK_TERMINOLOGY_SCHEMA} failed: {e}"))
+                    })?;
+                }
+                FORK_CONSOLE_TERMINOLOGY_BINDINGS => {
+                    client.batch_execute(HM_0012_SQL).await.map_err(|e| {
+                        pg_error(format!(
+                            "Fork migration {FORK_CONSOLE_TERMINOLOGY_BINDINGS} failed: {e}"
+                        ))
+                    })?;
+                }
+                other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
+            }
+            client
+                .execute(
+                    "INSERT INTO hm_schema_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+                    &[name],
+                )
+                .await
+                .map_err(|e| pg_error(format!("Failed to record fork migration {name}: {e}")))?;
+            tracing::info!(migration = *name, "Applied fork schema migration");
+            applied_now.push(*name);
+        }
+        Ok(applied_now)
+    }
+    .await;
+    if let Err(e) = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
+        .await
+    {
+        tracing::warn!("Failed to release migration advisory lock: {}", e);
+    }
+    result
+}
+
+/// The one row of `hfs_terminology_state` (hm-0011): where the terminology
+/// store lives and the status of the `hfs-unify-db` data move.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TerminologyState {
+    /// `schema:terminology` | `external-db` | `sqlite-file`.
+    pub store: String,
+    /// e.g. `database:hts` once the data move recorded itself.
+    pub moved_from: Option<String>,
+    /// When the data move recorded itself.
+    pub moved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Row counts + `hts_schema_meta` fingerprint of the source.
+    pub source_fingerprint: Option<String>,
+    /// Progress of `hfs-unify-db` (last completed step).
+    pub note: Option<String>,
+    /// Last write of the row (set by the database).
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Reads `hfs_terminology_state`; `None` when the table (hm-0011) does not
+/// exist yet or holds no row.
+pub async fn read_terminology_state<C>(client: &C) -> StorageResult<Option<TerminologyState>>
+where
+    C: GenericClient + Sync + ?Sized,
+{
+    let exists: bool = client
+        .query_one(
+            "SELECT to_regclass(format('%I.%I', current_schema(), 'hfs_terminology_state')) IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to inspect hfs_terminology_state: {e}")))?
+        .get(0);
+    if !exists {
+        return Ok(None);
+    }
+    let row = client
+        .query_opt(
+            "SELECT store, moved_from, moved_at, source_fingerprint, note, updated_at
+             FROM hfs_terminology_state WHERE id",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to read hfs_terminology_state: {e}")))?;
+    Ok(row.map(|r| TerminologyState {
+        store: r.get(0),
+        moved_from: r.get(1),
+        moved_at: r.get(2),
+        source_fingerprint: r.get(3),
+        note: r.get(4),
+        updated_at: r.get(5),
+    }))
+}
+
+/// Upserts the one row of `hfs_terminology_state` (`updated_at` = now).
+pub async fn write_terminology_state<C>(client: &C, state: &TerminologyState) -> StorageResult<()>
+where
+    C: GenericClient + Sync + ?Sized,
+{
+    client
+        .execute(
+            "INSERT INTO hfs_terminology_state
+                 (id, store, moved_from, moved_at, source_fingerprint, note, updated_at)
+             VALUES (TRUE, $1, $2, $3, $4, $5, now())
+             ON CONFLICT (id) DO UPDATE SET
+                 store = EXCLUDED.store,
+                 moved_from = EXCLUDED.moved_from,
+                 moved_at = EXCLUDED.moved_at,
+                 source_fingerprint = EXCLUDED.source_fingerprint,
+                 note = EXCLUDED.note,
+                 updated_at = now()",
+            &[
+                &state.store,
+                &state.moved_from,
+                &state.moved_at,
+                &state.source_fingerprint,
+                &state.note,
+            ],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to write hfs_terminology_state: {e}")))?;
+    Ok(())
+}
+
 fn pg_error(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -6984,6 +7332,63 @@ fn pg_error(message: String) -> crate::error::StorageError {
 mod schema_version_tests {
     use super::*;
     use crate::error::StorageError;
+
+    #[test]
+    fn first_explicit_schema_of_a_search_path() {
+        assert_eq!(
+            first_explicit_schema("terminology, public").as_deref(),
+            Some("terminology")
+        );
+        assert_eq!(
+            first_explicit_schema("\"tx_2\",public").as_deref(),
+            Some("tx_2")
+        );
+        assert_eq!(first_explicit_schema("\"$user\", public"), None);
+        assert_eq!(first_explicit_schema("public"), None);
+        assert_eq!(first_explicit_schema("pg_temp"), None);
+        assert_eq!(first_explicit_schema(""), None);
+    }
+
+    #[test]
+    fn store_schema_names_and_hm_0011() {
+        for ok in ["terminology", "tx_2", "_x"] {
+            assert!(is_valid_store_schema_name(ok), "{ok}");
+        }
+        for bad in [
+            "public",
+            "pg_x",
+            "Terminology",
+            "1tx",
+            "tx;drop",
+            "",
+            "a b",
+            "information_schema",
+        ] {
+            assert!(!is_valid_store_schema_name(bad), "{bad}");
+            assert!(hm_0011_sql(bad).is_err(), "{bad}");
+        }
+        let sql = hm_0011_sql("terminology").unwrap();
+        assert!(sql.starts_with("CREATE SCHEMA IF NOT EXISTS terminology;"));
+        assert!(sql.contains("note        TEXT"));
+        assert_eq!(
+            UNIFIED_FORK_MIGRATIONS,
+            [
+                "hm-0011-terminology-schema",
+                "hm-0012-console-terminology-bindings"
+            ]
+        );
+        for name in UNIFIED_FORK_MIGRATIONS {
+            assert!(
+                !FORK_MIGRATIONS.contains(name),
+                "{name} must not run in init_schema"
+            );
+            let n: u16 = name[3..7].parse().unwrap();
+            assert!(
+                (11..=19).contains(&n),
+                "{name} outside the unified block hm-0011..hm-0019"
+            );
+        }
+    }
 
     /// #2367: the refusal of a database that records a newer schema version
     /// names the database and both versions, and says nothing was changed.

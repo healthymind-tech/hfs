@@ -54,8 +54,10 @@ CREATE TABLE IF NOT EXISTS hfs_terminology_state (
     moved_from  TEXT,                     -- e.g. 'database:hts' after hfs-unify-db
     moved_at    TIMESTAMPTZ,
     source_fingerprint TEXT,              -- row counts + hts_schema_meta fingerprint of the source
+    note        TEXT,                     -- hfs-unify-db progress: last completed step
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);";
+);
+ALTER TABLE hfs_terminology_state ADD COLUMN IF NOT EXISTS note TEXT;";
 
 /// HTS-owned tables (crates/hts/src/backends/postgres/schema.rs) — what the
 /// data move verifies table by table (row counts).
@@ -95,6 +97,8 @@ pub const EMBEDDED_STORE_TABLES: &[&str] = &[
 /// `public` (design §5.3). Package U1 qualifies each and the isolation test
 /// guards the class.
 pub const SCHEMA_SENSITIVE_LOOKUPS: &[&str] = &[
+    // U1: all qualified with current_schema(); the class is guarded by
+    // crates/persistence/tests/terminology_schema.rs (static scan + PG test).
     "persistence postgres/schema.rs: to_regclass('search_parameter_epochs'|'idx_resources_reindex_id')",
     "persistence postgres/schema.rs: to_regclass('hm_schema_migrations')",
     "persistence postgres/schema.rs: to_regclass('schema_version')",
