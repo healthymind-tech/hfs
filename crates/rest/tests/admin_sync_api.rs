@@ -518,7 +518,7 @@ async fn verify_peer_reports_steps_and_reuses_stored_secrets() {
     assert_eq!(s, StatusCode::OK, "{r}");
     assert_eq!(r["kind"], "sync-source");
     assert_eq!(r["steps"][0]["code"], "input-required", "{r}");
-    assert_eq!(r["steps"][0]["field"], "source_secret");
+    assert_eq!(r["steps"][0]["field"], "token");
     // With it, the stored token is used.
     let (s, _, r) = call(
         &app,

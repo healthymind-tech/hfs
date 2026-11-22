@@ -1823,7 +1823,7 @@ fn grouped(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -1871,10 +1871,9 @@ async fn client_credentials_token(
     client_id: &str,
     client_secret: &str,
     scope: Option<&str>,
-    field_prefix: &str,
 ) -> TokenOutcome {
     let started = Instant::now();
-    let field = |f: &str| format!("{field_prefix}_{f}");
+    let field = |f: &str| f.to_string();
     if let Err(reason) = guard.check_url(token_url) {
         return TokenOutcome::Step(
             VerifyStep::new(
@@ -1883,7 +1882,7 @@ async fn client_credentials_token(
                 "token-endpoint-unreachable",
                 format!("The token endpoint is refused by the outbound policy: {reason}."),
             )
-            .field(field("token_url"))
+            .field(field("tokenUrl"))
             .param("url", display_url(token_url))
             .param("reason", "blocked")
             .url(token_url)
@@ -1922,7 +1921,7 @@ async fn client_credentials_token(
                     "token-endpoint-unreachable",
                     format!("The token endpoint could not be reached: {e}."),
                 )
-                .field(field("token_url"))
+                .field(field("tokenUrl"))
                 .param("reason", transport_reason(&e)),
             );
         }
@@ -1950,7 +1949,7 @@ async fn client_credentials_token(
             "token-invalid-client",
             format!("The token endpoint refused the client ({error}: {description})."),
         )
-        .field(field("client_id")),
+        .field(field("clientId")),
         "invalid_scope" => step(
             Fail,
             "token-invalid-scope",
@@ -1962,7 +1961,7 @@ async fn client_credentials_token(
             "token-endpoint-404",
             "No token endpoint at this URL (HTTP 404).".into(),
         )
-        .field(field("token_url")),
+        .field(field("tokenUrl")),
         "" => step(
             Fail,
             "token-bad-response",
@@ -1971,16 +1970,25 @@ async fn client_credentials_token(
                 raw.status
             ),
         )
-        .field(field("token_url"))
+        .field(field("tokenUrl"))
         .param("status", raw.status.to_string()),
         other => step(
             Fail,
             "token-error",
             format!("The token endpoint answered {other}: {description}."),
         )
-        .field(field("client_id")),
+        .field(field("clientId")),
     };
     TokenOutcome::Step(s.param("error", error).param("description", description))
+}
+
+/// The form field holding the secret of `auth`.
+fn secret_field(auth: &PeerAuth) -> &'static str {
+    match auth {
+        PeerAuth::Basic { .. } => "password",
+        PeerAuth::ClientCredentials { .. } => "clientSecret",
+        _ => "token",
+    }
 }
 
 /// Verifies the external side of a sync job (kind `sync-source` /
@@ -1988,7 +1996,7 @@ async fn client_credentials_token(
 /// release against `expected_fhir`), `token`, `counts` (per type
 /// `_summary=count`), `write` (target: create/update advertised) or
 /// `incremental` (source: `_lastUpdated` / history advertised). Fields are
-/// the sync form's (`source_url`, `target_token_url`, …, `resource_types`).
+/// the console's sync form fields (`url`, `authType`, `tokenUrl`, `clientId`, `clientSecret`, `token`, `username`, `password`, `scope`, `resourceTypes`).
 pub async fn verify_fhir_peer(
     side: &PeerConfig,
     role: PeerRole,
@@ -2021,8 +2029,7 @@ pub async fn verify_fhir_peer_with_timeout(
         PeerRole::Target => "sync-target",
     };
     let mut r = Builder::new(kind);
-    let p = role.as_str();
-    let f = |name: &str| format!("{p}_{name}");
+    let f = |name: &str| name.to_string();
     let base = side.url.trim().trim_end_matches('/').to_string();
     let last = match role {
         PeerRole::Source => "incremental",
@@ -2037,7 +2044,7 @@ pub async fn verify_fhir_peer_with_timeout(
 
     // input
     let url_field = f("url");
-    let token_field = f("token_url");
+    let token_field = f("tokenUrl");
     let mut urls: Vec<(&str, &str)> = vec![(url_field.as_str(), base.as_str())];
     let started = Instant::now();
     let mut input = None;
@@ -2050,13 +2057,13 @@ pub async fn verify_fhir_peer_with_timeout(
         } => {
             urls.push((token_field.as_str(), token_url.as_str()));
             if client_id.trim().is_empty() {
-                input = Some(("client_id", "Client id"));
+                input = Some(("clientId", "Client id"));
             } else if client_secret.is_empty() {
-                input = Some(("secret", "Client secret"));
+                input = Some(("clientSecret", "Client secret"));
             }
         }
         PeerAuth::Bearer { token } if token.trim().is_empty() => {
-            input = Some(("secret", "Token"));
+            input = Some(("token", "Token"));
         }
         PeerAuth::Basic { username, .. } if username.trim().is_empty() => {
             input = Some(("username", "User name"));
@@ -2110,7 +2117,6 @@ pub async fn verify_fhir_peer_with_timeout(
                 client_id.trim(),
                 client_secret,
                 scope.as_deref(),
-                p,
             )
             .await
             {
@@ -2122,7 +2128,7 @@ pub async fn verify_fhir_peer_with_timeout(
                             "token-issued",
                             "The token endpoint issued an access token.",
                         )
-                        .field(f("client_id"))
+                        .field(f("clientId"))
                         .url(token_url)
                         .since(started),
                     );
@@ -2244,7 +2250,7 @@ pub async fn verify_fhir_peer_with_timeout(
                     "counts-no-types",
                     "No resource types selected: every type is copied, so none is counted.",
                 )
-                .field("resource_types"),
+                .field("resourceTypes"),
             );
         } else {
             let mut parts = Vec::new();
@@ -2302,7 +2308,7 @@ pub async fn verify_fhir_peer_with_timeout(
                         unknown.join(", ")
                     ),
                 )
-                .field("resource_types")
+                .field("resourceTypes")
                 .param("type", first.clone())
                 .param("types", unknown.join(", "))
                 .param("summary", summary)
@@ -2331,28 +2337,28 @@ pub async fn verify_fhir_peer_with_timeout(
                 "token-required",
                 "The server requires authentication; choose an authentication type.",
             )
-            .field(f("auth")),
+            .field(f("authType")),
             (PeerAuth::None, false) => VerifyStep::new(
                 "token",
                 Pass,
                 "token-not-needed",
                 "The server answers without credentials.",
             )
-            .field(f("auth")),
+            .field(f("authType")),
             (_, true) => VerifyStep::new(
                 "token",
                 Fail,
                 "token-refused",
                 "The server refuses the credentials (HTTP 401/403).",
             )
-            .field(f("secret")),
+            .field(secret_field(&side.auth)),
             (_, false) => VerifyStep::new(
                 "token",
                 Pass,
                 "token-accepted",
                 "The server accepts the credentials.",
             )
-            .field(f("secret")),
+            .field(secret_field(&side.auth)),
         },
     };
     let token_failed = r.push(token) == Fail;
@@ -2409,7 +2415,7 @@ pub async fn verify_fhir_peer_with_timeout(
                         shown.join(", ")
                     ),
                 )
-                .field("resource_types")
+                .field("resourceTypes")
                 .param("types", shown.join(", "))
             };
             r.push(step);
@@ -3279,7 +3285,7 @@ mod tests {
                 "incremental"
             ]
         );
-        expect(&r, "token", Pass, "token-issued", Some("source_client_id"));
+        expect(&r, "token", Pass, "token-issued", Some("clientId"));
         expect(&r, "counts", Pass, "counts-ok", None);
         assert_eq!(
             step(&r, "counts").params["summary"],
@@ -3297,20 +3303,14 @@ mod tests {
         )
         .await;
         assert!(!r.ok);
-        expect(
-            &r,
-            "token",
-            Fail,
-            "token-invalid-client",
-            Some("target_client_id"),
-        );
+        expect(&r, "token", Fail, "token-invalid-client", Some("clientId"));
         expect(&r, "counts", Skipped, "skipped-after-failure", None);
         expect(
             &r,
             "write",
             Warn,
             "write-not-advertised",
-            Some("resource_types"),
+            Some("resourceTypes"),
         );
         assert_eq!(step(&r, "write").params["types"], "Observation");
 
@@ -3327,7 +3327,7 @@ mod tests {
             "metadata",
             Fail,
             "metadata-version-mismatch",
-            Some("target_url"),
+            Some("url"),
         );
         assert_eq!(step(&r, "metadata").params["expected"], "R5");
 
@@ -3344,7 +3344,7 @@ mod tests {
             "counts",
             Warn,
             "counts-unknown-type",
-            Some("resource_types"),
+            Some("resourceTypes"),
         );
         assert_eq!(step(&r, "counts").params["type"], "Basic");
 
@@ -3361,14 +3361,14 @@ mod tests {
         )
         .await;
         // Counts without the token are not mocked (404 → unknown); metadata is open.
-        expect(&r, "token", Pass, "token-not-needed", Some("source_auth"));
+        expect(&r, "token", Pass, "token-not-needed", Some("authType"));
 
         let bad = PeerConfig {
             url: "fhir.example.org".into(),
             auth: PeerAuth::None,
         };
         let r = verify_fhir_peer(&bad, PeerRole::Target, None, &[], &loopback()).await;
-        expect(&r, "input", Fail, "input-not-url", Some("target_url"));
+        expect(&r, "input", Fail, "input-not-url", Some("url"));
         expect(&r, "write", Skipped, "skipped-after-failure", None);
 
         let unreachable = PeerConfig {
@@ -3381,13 +3381,13 @@ mod tests {
             },
         };
         let r = verify_fhir_peer(&unreachable, PeerRole::Source, None, &[], &loopback()).await;
-        expect(&r, "connect", Fail, "connect-refused", Some("source_url"));
+        expect(&r, "connect", Fail, "connect-refused", Some("url"));
         expect(
             &r,
             "token",
             Fail,
             "token-endpoint-unreachable",
-            Some("source_token_url"),
+            Some("tokenUrl"),
         );
     }
 
