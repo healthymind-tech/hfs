@@ -16,6 +16,12 @@ keywords = ["helios-software", "fhir", "smart-on-fhir", "oauth2", "openid-connec
 # rules, the store contract and the fork migration SQL). No axum, no
 # persistence, no HTTP: the protocol endpoints (package I1+) depend on this
 # crate; this crate depends only on helios-endpoints (names, sealed secrets).
+# Package I2 adds the PostgreSQL store behind feature `postgres` (the
+# server's shared deadpool pool; tables from fork migration hm-0020).
+[features]
+default = []
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+
 [dependencies]
 helios-endpoints = { path = "../endpoints", version = "0.2.9" }
 serde.workspace = true
@@ -34,8 +40,22 @@ ring = "0.17"
 # ring. aws-lc-rs is already in the lock (rustls); it is constant time and
 # avoids the RustCrypto `rsa` crate (RUSTSEC-2023-0071, no fix).
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
+# argon2id for user passwords and client secrets (same parameters as the console).
+argon2 = { version = "0.5", features = ["std"] }
+arc-swap = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"], optional = true }
 
 [dev-dependencies]
 # Cross-check: tokens signed here verify with the resource server's library.
 jsonwebtoken = "9"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# PG integration tests (feature `postgres`): the real fork migrations create the tables.
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false, features = ["R4", "postgres"] }
+uuid = { version = "1", features = ["v4"] }
+
+[[test]]
+name = "pg_idp"
+required-features = ["postgres"]

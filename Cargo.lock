@@ -3658,11 +3658,15 @@ dependencies = [
 name = "helios-idp"
 version = "0.2.9"
 dependencies = [
+ "arc-swap",
+ "argon2",
  "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",
  "chrono",
+ "deadpool-postgres",
  "helios-endpoints",
+ "helios-persistence",
  "jsonwebtoken",
  "rand 0.8.8",
  "ring",
@@ -3671,7 +3675,10 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-postgres",
+ "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
