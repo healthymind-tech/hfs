@@ -106,9 +106,16 @@ pub mod navigation;
 /// The HealthyMind brand chrome: sidebar brand, favicons, attribution footer.
 pub mod brand;
 
+/// The frame of the standalone (sign-in and message) pages of both consoles.
+pub mod auth;
+
 /// HealthyMind design tokens and their WCAG contrast guarantees (design §10.2).
 pub mod tokens;
 
+pub use auth::{
+    AuthBrand, LangLink, ProductNames, auth_brand, auth_footer, auth_toolbar, lang_links,
+    password_toggle, theme_attributes,
+};
 pub use brand::{BrandLinks, brand, brand_head, site_footer};
 pub use navigation::{
     Crumb, HFS_CONSOLE_COOKIE, HFS_CONSOLE_PATH, HTS_CONSOLE_PATH, Product, ProductLinks,

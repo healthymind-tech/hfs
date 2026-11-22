@@ -1,0 +1,36 @@
+<!doctype html>
+{#
+  Standalone sign-in frame of the HTS console (crates/hts-ui/src/login.rs),
+  built from the same helios-ui-chrome pieces as the HFS console's
+  (crates/ui/templates/layouts/auth.html): brand panel, language segmented
+  control, theme button, attribution footer; same app.css tokens and theme
+  boot (shared `hfs_theme` cookie, follows the system otherwise).
+#}
+<html lang="{{ chrome.i18n.lang() }}"{{ auth.theme_attrs()|safe }}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>{% block title %}{% endblock %} — {{ chrome.i18n.t("hts-app-short-name") }}</title>
+{{ chrome.brand_head()?|safe }}
+  <link rel="stylesheet" href="/ui/hts/assets/app.css">
+  {{ chrome.theme_boot()?|safe }}
+  <script src="/ui/hts/assets/theme.js" defer></script>
+  <script src="/ui/hts/assets/auth.js" defer></script>
+</head>
+<body class="auth-page">
+  <a class="skip-link" href="#auth-main">{{ chrome.i18n.t("mgr-skip-to-content") }}</a>
+  <div class="auth">
+    {{ auth.brand(chrome.i18n)?|safe }}
+    <main class="auth-main" id="auth-main" tabindex="-1">
+      {{ auth.toolbar(chrome.i18n)?|safe }}
+      <div class="auth-center">
+        <section class="auth-card" aria-labelledby="auth-title">
+{% block card %}{% endblock %}
+        </section>
+      </div>
+      {{ auth.footer(chrome.i18n, chrome.version)?|safe }}
+    </main>
+  </div>
+</body>
+</html>

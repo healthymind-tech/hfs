@@ -1,0 +1,13 @@
+{#
+  SHARED CHROME -- the top-right tools of the standalone pages: the language
+  switch as a segmented control (links, so it works without script and keeps
+  the page's own query such as `next`) and the shared theme button.
+#}<div class="auth-toolbar">
+          <nav class="segmented auth-lang" aria-label="{{ i18n.t("language-label") }}">
+            {%- for link in langs %}
+            <a class="segmented__item" href="{{ link.href }}" lang="{{ link.code }}" hreflang="{{ link.code }}"{% if link.current %} aria-current="true"{% endif %}>{{ link.label }}</a>
+            {%- endfor %}
+          </nav>
+{{ toggle|safe }}
+        </div>
+{#- -#}

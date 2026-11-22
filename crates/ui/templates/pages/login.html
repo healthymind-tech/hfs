@@ -1,75 +1,55 @@
-<!doctype html>
+{% extends "layouts/auth.html" %}
 {#
-  Console sign-in (package P3, crates/ui/src/login.rs). Standalone — no
-  shell, nothing behind it is reachable before signing in. Modes:
-  oidc → "Sign in with …" (Authorization Code + PKCE at the IdP);
-  local (and ?local=1 in any mode) → user name / password form; the
-  break-glass link is small at the bottom. Kept to the shared app.css
-  classes so the manager design system (P5) can restyle it in one place.
+  Console sign-in (package P3, crates/ui/src/login.rs), on the standalone
+  frame (layouts/auth.html). Modes: oidc → "Sign in with …" (Authorization
+  Code + PKCE at the IdP), break-glass link small at the bottom; local (and
+  ?local=1 in any mode) → user name / password form. Behaviour lives in the
+  handler; the markup only adds the field affordances (assets/auth.js:
+  show password, caps-lock hint, inline required-field messages, one submit).
 #}
-<html lang="{{ i18n.lang() }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="robots" content="noindex">
-  <title>{{ i18n.t("console-login-title") }} — {{ i18n.t("console-product-short") }}</title>
-  <link rel="icon" type="image/png" href="/ui/assets/logo.png">
-  <link rel="stylesheet" href="/ui/assets/app.css">
-  <style>
-    body.signin-page { display: block; }
-    .signin { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
-    .signin__band { position: fixed; inset: 0 0 auto 0; height: 6px;
-      background: linear-gradient(135deg, #0AEAFF, #3EADFF 50%, #756DFF); }
-    .signin__card { width: 100%; max-width: 420px; }
-    .signin__logo { display: block; width: 72px; height: 72px; margin: 0 auto 8px; }
-    .signin__title { text-align: center; margin: 0 0 4px; font-size: 1.35rem; }
-    .signin__lede { text-align: center; margin: 0 0 16px; }
-    .signin__idp { width: 100%; justify-content: center; }
-    .signin__foot { margin-top: 16px; text-align: center; font-size: .875rem; }
-    .signin__langs { margin-top: 12px; text-align: center; font-size: .8125rem; }
-    .signin__langs a { margin: 0 6px; }
-    .signin form .btn { width: 100%; justify-content: center; }
-  </style>
-</head>
-<body class="signin-page">
-<div class="signin__band" aria-hidden="true"></div>
-<main class="signin">
-  <section class="card signin__card" aria-labelledby="signin-title">
-    <img class="signin__logo" src="/ui/assets/brand/healthymind-logo-square.png" onerror="this.onerror=null;this.src='/ui/assets/logo.png'" alt="">
-    <h1 class="signin__title" id="signin-title">{{ i18n.t("console-product") }}</h1>
-    <p class="signin__lede">{{ lede }}</p>
-    {% if let Some(message) = notice %}<div class="card notice" role="status">{{ message }}</div>{% endif %}
-    {% if let Some(message) = error %}<div class="alert" role="alert">{{ message }}</div>{% endif %}
-    {% if show_idp %}
-    <a class="btn btn--primary signin__idp" href="{{ idp_href }}" id="signin-idp">{{ i18n.t("console-login-with-idp") }}</a>
-    {% endif %}
-    {% if show_form %}
-    <form method="post" action="/ui/login/local" id="signin-form">
-      <input type="hidden" name="next" value="{{ next }}">
-      <label class="field">
-        <span class="field__label">{{ i18n.t("admin-login-user") }}</span>
-        <input class="field__input" type="text" name="username" value="{{ user }}" autocomplete="username" autocapitalize="none" spellcheck="false" required{% if user.is_empty() %} autofocus{% endif %}>
-      </label>
-      <label class="field">
-        <span class="field__label">{{ i18n.t("admin-login-password") }}</span>
-        <input class="field__input" type="password" name="password" autocomplete="current-password" required{% if !user.is_empty() %} autofocus{% endif %}>
-      </label>
-      <div class="form-actions form-actions--start">
-        <button class="btn btn--primary" type="submit">{{ i18n.t("admin-login-submit") }}</button>
-      </div>
-    </form>
-    {% endif %}
-    {% if show_break_glass_link %}
-    <p class="signin__foot"><a href="{{ break_glass_href }}" id="signin-break-glass">{{ i18n.t("console-login-break-glass") }}</a></p>
-    {% endif %}
-    {% if show_idp_link %}
-    <p class="signin__foot"><a href="{{ idp_page_href }}">{{ i18n.t("console-login-back-to-idp") }}</a></p>
-    {% endif %}
-    <p class="signin__langs">
-      <a href="?lang=en{{ lang_suffix }}" lang="en">English</a>
-      <a href="?lang=zh-Hant{{ lang_suffix }}" lang="zh-Hant">繁體中文</a>
-    </p>
-  </section>
-</main>
-</body>
-</html>
+{% block title %}{{ heading }}{% endblock %}
+
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ heading }}</h1>
+            <p class="auth-lede">{{ lede }}</p>
+          </header>
+          {%- if let Some(b) = notice %}{% let banner_id = "signin-notice" %}
+          {% include "partials/auth-banner.html" %}
+          {%- endif %}
+          {%- if let Some(b) = error %}{% let banner_id = "signin-error" %}
+          {% include "partials/auth-banner.html" %}
+          {%- endif %}
+          {%- if show_idp %}
+          <a class="btn btn--primary auth-btn" href="{{ idp_href }}" id="signin-idp">{% include "icons/key.svg" %}<span>{{ i18n.t("console-login-with-idp") }}</span></a>
+          {%- if !idp_host.is_empty() %}
+          <p class="auth-idp-host">{{ i18n.t_arg("auth-idp-via", "host", idp_host.clone()) }}</p>
+          {%- endif %}
+          {%- endif %}
+          {%- if show_form %}
+          <form method="post" action="/ui/login/local" id="signin-form" class="auth-form" data-auth-form>
+            <input type="hidden" name="next" value="{{ next }}">
+            <div class="auth-field">
+              <label class="auth-label" for="signin-username">{{ i18n.t("admin-login-user") }}</label>
+              <input class="auth-input" id="signin-username" type="text" name="username" value="{{ user }}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required aria-describedby="signin-username-msg"{% if user.is_empty() %} autofocus{% endif %}{% if field_error %} aria-invalid="true"{% endif %} data-msg-required="{{ i18n.t("auth-required-username") }}">
+              <p class="auth-msg" id="signin-username-msg" aria-live="polite"></p>
+            </div>
+            <div class="auth-field">
+              <label class="auth-label" for="signin-password">{{ i18n.t("admin-login-password") }}</label>
+              <div class="auth-input-wrap">
+                <input class="auth-input" id="signin-password" type="password" name="password" autocomplete="current-password" required aria-describedby="signin-password-msg"{% if !user.is_empty() %} autofocus{% endif %}{% if field_error %} aria-invalid="true"{% endif %} data-msg-required="{{ i18n.t("auth-required-password") }}" data-caps="{{ i18n.t("auth-caps-lock") }}">
+                {{ auth.reveal(i18n)?|safe }}
+              </div>
+              <p class="auth-msg" id="signin-password-msg" aria-live="polite"></p>
+            </div>
+            <button class="btn btn--primary auth-btn" type="submit" data-busy-label="{{ i18n.t("auth-signing-in") }}">{{ i18n.t("admin-login-submit") }}</button>
+          </form>
+          {%- endif %}
+          {%- if show_idp_link %}
+          <div class="auth-divider" role="presentation"><span>{{ i18n.t("auth-or") }}</span></div>
+          <a class="btn auth-btn auth-btn--secondary" href="{{ idp_page_href }}" id="signin-back-to-idp">{% include "icons/key.svg" %}<span>{{ i18n.t("console-login-back-to-idp") }}</span></a>
+          {%- endif %}
+          {%- if show_break_glass_link %}
+          <p class="auth-aside"><a href="{{ break_glass_href }}" id="signin-break-glass">{% include "icons/lock.svg" %}<span>{{ i18n.t("console-login-break-glass") }}</span></a></p>
+          {%- endif %}
+{% endblock %}

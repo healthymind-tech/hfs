@@ -40,6 +40,7 @@
 
 mod account;
 mod admin_login;
+mod auth_shell;
 mod bulk_export;
 mod bulk_import;
 mod capability;
@@ -2333,7 +2334,10 @@ pub fn mount_with_conformance_source_and_runtime(
         // Answer 404 until a login is installed (see `login::installed`).
         .route("/ui/login", get(login::login))
         .route("/ui/callback", get(login::callback))
-        .route("/ui/logout", axum::routing::post(login::logout))
+        .route(
+            "/ui/logout",
+            axum::routing::get(login::logout_confirm).post(login::logout),
+        )
         // Administrator sign-in (`HFS_ADMIN_PASSWORD`): the form, and the
         // sign-out its session's account menu offers.
         .route(
@@ -10139,7 +10143,13 @@ fn build_chart(
         .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
-    let axis_max = nice_ceil(peak).max(1);
+    // Small peaks round up to a multiple of 4, so the five gridlines (max,
+    // ¾, ½, ¼, 0) carry distinct whole numbers: a peak of 3 used to label
+    // the axis 3, 2, 1, 0, 0.
+    let axis_max = match nice_ceil(peak).max(1) {
+        m if m < 40 => m.div_ceil(4) * 4,
+        m => m,
+    };
 
     // Map sample index -> x, cumulative value -> y (SVG y grows downward).
     let x_at = |i: i64| -> i64 {

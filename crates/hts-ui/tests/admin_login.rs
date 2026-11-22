@@ -335,3 +335,51 @@ async fn locked_gate_explains_and_open_gate_needs_no_sign_in() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(headers[header::LOCATION], "/ui/hts/jobs");
 }
+
+/// The sign-in page is the shared standalone frame (UI polish): brand panel
+/// with the official logo and both product names, language segmented
+/// control, theme button, the console's stylesheet and theme boot, and the
+/// stored dark theme stamped on `<html>` before any script runs.
+#[tokio::test]
+async fn sign_in_page_uses_the_shared_standalone_frame_and_theme() {
+    let app = app_with(password_gate()).await;
+    let (status, _, html) = send(
+        &app,
+        "GET",
+        "/ui/hts/login?next=/ui/hts/jobs",
+        &[("cookie", "hfs_lang=zh-Hant; hfs_theme=dark")],
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"data-theme-pref="dark" data-theme="dark""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"<body class="auth-page">"#));
+    assert!(html.contains("/ui/hts/assets/app.css"));
+    assert!(html.contains("/ui/hts/assets/auth.js"));
+    assert!(html.contains("hfs_theme"), "theme boot script");
+    assert!(html.contains("/ui/hts/assets/brand/healthymind-logo-horizontal@2x.png"));
+    assert!(html.contains("療心智能 術語伺服器"));
+    assert!(html.contains(r#"lang="en">HealthyMind Terminology Server"#));
+    assert!(
+        html.contains(r#"href="?lang=en&amp;next=%2Fui%2Fhts%2Fjobs""#)
+            || html.contains("?lang=en&#38;next=%2Fui%2Fhts%2Fjobs"),
+        "{html}"
+    );
+    assert!(html.contains(r#"hreflang="zh-Hant" aria-current="true""#));
+    assert!(html.contains("data-theme-cycle"));
+    assert!(html.contains("data-pw-reveal"));
+    assert!(html.contains(r#"autocomplete="current-password""#));
+    assert!(html.contains("Helios FHIR Server"), "attribution footer");
+    assert_eq!(html.matches("<h1").count(), 1);
+    // The administrator lede is about terminology, not the HFS pages.
+    assert!(!html.contains("tenants"), "{html}");
+
+    let (_, _, html) = send(&app, "GET", "/ui/hts/login", &[], "").await;
+    assert!(
+        !html.contains("data-theme=\""),
+        "no stored theme: the boot script decides"
+    );
+}

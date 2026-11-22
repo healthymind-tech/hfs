@@ -176,7 +176,27 @@
     show(current, false);
   }
 
+  // `data-show-when="field=value1|value2"`: show the block only while the
+  // form's control `field` has one of the values (the sync job form's
+  // per-kind / per-auth fields). Without script every block stays visible.
+  function syncShowWhen(root) {
+    each("[data-show-when]", root || document, function (el) {
+      var rule = el.getAttribute("data-show-when").split("=");
+      var form = el.closest("form");
+      var control = form && form.elements[rule[0]];
+      if (!control) return;
+      var value = control.value;
+      el.hidden = rule[1].split("|").indexOf(value) < 0;
+    });
+  }
+
+  document.addEventListener("change", function (event) {
+    var form = event.target && event.target.form;
+    if (form && form.querySelector("[data-show-when]")) syncShowWhen(form);
+  });
+
   function init() {
+    syncShowWhen(document);
     each("[data-inherit-target]", document, syncInherit);
     each("form[data-typed-confirm]", document, wireTyped);
     var names = {};

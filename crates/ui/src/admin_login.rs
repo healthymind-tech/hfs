@@ -31,7 +31,8 @@ use axum::{
 use helios_admin_auth::{AdminGate, LoginOutcome, is_read_only, safe_next, under};
 use serde::Deserialize;
 
-use crate::{I18n, RequestLocale, RequestTenant, RequestVersion, Status, WebState};
+use crate::auth_shell::AuthShell;
+use crate::{I18n, RequestLocale, RequestTenant, RequestVersion, WebState};
 
 /// Browser path of the sign-in page.
 pub(crate) const LOGIN_PATH: &str = "/ui/admin/login";
@@ -96,9 +97,8 @@ pub(crate) fn protects(method: &Method, path: &str) -> bool {
 #[derive(Template)]
 #[template(path = "pages/admin-login.html")]
 struct AdminLoginPage {
-    status: Status,
     i18n: I18n,
-    active_page: &'static str,
+    auth: AuthShell,
     next: String,
     user: String,
     error: Option<String>,
@@ -122,17 +122,17 @@ struct PageInput {
     locked: bool,
 }
 
-fn page(
-    state: &WebState,
-    locale: RequestLocale,
-    rv: &RequestVersion,
-    rt: &RequestTenant,
-    input: PageInput,
-) -> Response {
+fn page(locale: RequestLocale, headers: &HeaderMap, input: PageInput) -> Response {
+    let i18n = I18n::new(locale);
+    let suffix = format!(
+        "&{}",
+        form_urlencoded::Serializer::new(String::new())
+            .append_pair("next", &input.next)
+            .finish()
+    );
     let mut response = crate::render(AdminLoginPage {
-        status: crate::current_status(state, rv.0, rt),
-        i18n: I18n::new(locale),
-        active_page: "",
+        auth: AuthShell::new(&i18n, Some(headers), &suffix),
+        i18n,
         next: input.next,
         user: input.user,
         error: input.error,
@@ -151,8 +151,8 @@ fn page(
 pub(crate) async fn login_page(
     State(state): State<WebState>,
     locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
+    _rv: RequestVersion,
+    _rt: RequestTenant,
     console: Option<Extension<std::sync::Arc<helios_admin_auth::console::ConsoleAuth>>>,
     headers: HeaderMap,
     Query(query): Query<NextQuery>,
@@ -170,10 +170,8 @@ pub(crate) async fn login_page(
     match gate {
         AdminGate::Open => Redirect::to(&next).into_response(),
         AdminGate::Locked(_) => page(
-            &state,
             locale,
-            &rv,
-            &rt,
+            &headers,
             PageInput {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 next,
@@ -188,10 +186,8 @@ pub(crate) async fn login_page(
             }
             let user = auth.user().to_string();
             page(
-                &state,
                 locale,
-                &rv,
-                &rt,
+                &headers,
                 PageInput {
                     status: StatusCode::OK,
                     next,
@@ -209,8 +205,8 @@ pub(crate) async fn login_page(
 pub(crate) async fn login_submit(
     State(state): State<WebState>,
     locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
+    _rv: RequestVersion,
+    _rt: RequestTenant,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     console: Option<Extension<std::sync::Arc<helios_admin_auth::console::ConsoleAuth>>>,
     headers: HeaderMap,
@@ -235,10 +231,8 @@ pub(crate) async fn login_submit(
     let i18n = I18n::new(locale);
     let failed = |status, error: Option<String>, user: String, locked| {
         page(
-            &state,
             locale,
-            &rv,
-            &rt,
+            &headers,
             PageInput {
                 status,
                 next: next.clone(),

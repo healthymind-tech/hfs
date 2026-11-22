@@ -158,6 +158,7 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
 #[template(path = "pages/login.html")]
 struct LoginPage<'a> {
     chrome: Chrome<'a>,
+    auth: AuthShell,
     next: String,
     user: String,
     error: Option<String>,
@@ -173,16 +174,87 @@ fn target(next: Option<&str>) -> String {
     safe_next(next, "/ui/hts", "/ui/hts")
 }
 
+/// Request-derived parts of the standalone sign-in frame
+/// (`templates/layouts/auth.html`), composed from the same
+/// `helios_ui_chrome::auth` pieces as the HFS console's sign-in.
+struct AuthShell {
+    theme: &'static str,
+    langs: Vec<helios_ui_chrome::LangLink>,
+}
+
+const ASSETS: &str = "/ui/hts/assets";
+const HIGHLIGHTS: &[&str] = &[
+    "auth-hts-point-browse",
+    "auth-hts-point-operations",
+    "auth-hts-point-import",
+];
+
+impl AuthShell {
+    fn new(i18n: &I18n, headers: &HeaderMap, next: &str) -> Self {
+        let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let suffix = format!(
+            "&{}",
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("next", next)
+                .finish()
+        );
+        Self {
+            theme: helios_ui_chrome::theme_attributes(
+                get(header::COOKIE.as_str()),
+                get("sec-ch-prefers-color-scheme"),
+            ),
+            langs: helios_ui_chrome::lang_links(&i18n.lang(), &suffix),
+        }
+    }
+
+    fn theme_attrs(&self) -> &'static str {
+        self.theme
+    }
+
+    fn brand(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::auth_brand(
+            i18n,
+            helios_ui_chrome::AuthBrand {
+                home: helios_ui_chrome::HTS_CONSOLE_PATH,
+                assets: ASSETS,
+                product_key: "hts-app-title",
+                names: helios_ui_chrome::ProductNames {
+                    en: "HealthyMind Terminology Server",
+                    zh_hant: "療心智能 術語伺服器",
+                },
+                tagline_key: "auth-hts-tagline",
+                highlight_keys: HIGHLIGHTS,
+            },
+        )
+    }
+
+    fn toolbar(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::auth_toolbar(i18n, &self.langs)
+    }
+
+    fn footer(&self, i18n: &I18n, version: &str) -> Result<String, askama::Error> {
+        helios_ui_chrome::auth_footer(i18n, &format!("hts v{version}"))
+    }
+
+    fn reveal(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::password_toggle(i18n)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn page(
     state: &HtsUiState,
     locale: RequestLocale,
+    headers: &HeaderMap,
     status: StatusCode,
     next: String,
     user: String,
     error: Option<String>,
     locked: bool,
 ) -> Response {
+    let i18n = I18n::new(locale);
     let page = LoginPage {
+        auth: AuthShell::new(&i18n, headers, &next),
         chrome: Chrome {
             i18n: I18n::new(locale),
             active_page: "",
@@ -218,6 +290,7 @@ async fn login_page(
         AdminGate::Locked(_) => page(
             &state,
             locale,
+            &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             next,
             String::new(),
@@ -231,6 +304,7 @@ async fn login_page(
             page(
                 &state,
                 locale,
+                &headers,
                 StatusCode::OK,
                 next,
                 auth.user().to_string(),
@@ -278,6 +352,7 @@ async fn login_submit(
         LoginOutcome::Invalid => page(
             &state,
             locale,
+            &headers,
             StatusCode::UNAUTHORIZED,
             next,
             user,
@@ -289,6 +364,7 @@ async fn login_submit(
             let mut response = page(
                 &state,
                 locale,
+                &headers,
                 StatusCode::TOO_MANY_REQUESTS,
                 next,
                 user,
@@ -303,6 +379,7 @@ async fn login_submit(
         LoginOutcome::CrossOrigin => page(
             &state,
             locale,
+            &headers,
             StatusCode::FORBIDDEN,
             next,
             user,
@@ -314,6 +391,7 @@ async fn login_submit(
             _ => page(
                 &state,
                 locale,
+                &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
                 next,
                 String::new(),
