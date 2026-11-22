@@ -166,6 +166,9 @@ pub(crate) struct FinishView {
 }
 
 impl WizardPage {
+    pub fn finished_ok(&self) -> bool {
+        self.finish.as_ref().is_some_and(|f| f.not_bound.is_empty())
+    }
     pub fn is_v(&self, k: &str, val: &str) -> bool {
         self.v(k) == val
     }

@@ -24,8 +24,8 @@
     </details>
     <div class="form-actions form-actions--start">
       <button type="submit" class="btn btn--primary">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("idpc-test-run") }}</button>
-      <span id="idp-running" class="htmx-indicator idp-running" role="status">{{ i18n.t("idpc-test-running") }}</span>
       {% if verify.is_some() %}<a class="btn" href="/ui/idp/{{ head.name }}/test/report.json" download>{{ i18n.t("idpc-test-download") }}</a>{% endif %}
+      <span id="idp-running" class="htmx-indicator idp-running" role="status">{{ i18n.t("idpc-test-running") }}</span>
     </div>
   {% endcall %}
 </form>

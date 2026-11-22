@@ -224,7 +224,7 @@ fn clients(step: &mut Step, input: &PreflightInput<'_>) {
                             .param("client", &c.client_id)
                             .field(format!("client.{}.disabled", c.client_id))
                             .spec("RFC 6749 §5.2 invalid_client")
-                            .fix("Open the app and switch “Enabled” on."),
+                            .fix("Open the app and clear “Disabled”."),
                     );
                 }
                 if c.redirect_uri_allowed(&app.redirect_uri) {

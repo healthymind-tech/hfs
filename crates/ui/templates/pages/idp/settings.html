@@ -13,7 +13,7 @@
       <div class="mfield"><span class="mfield__label">{{ i18n.t("idpc-field-name") }}</span><code>{{ head.name }}</code><p class="mfield__hint">{{ i18n.t("idpc-name-immutable") }}</p></div>
     </div>
   {% endcall %}
-  {% call ui::form_section("capabilities", i18n.t("idpc-step-capabilities"), i18n.t("idpc-step-capabilities-desc")) %}
+  {% call ui::form_section("capabilities", i18n.t("idpc-step-capabilities"), i18n.t("idpc-settings-capabilities-desc")) %}
     {% include "partials/idp/capabilities.html" %}
   {% endcall %}
   {% call ui::form_section("security", i18n.t("idpc-settings-security"), "") %}

@@ -79,3 +79,5 @@
   .idp-review__row { grid-template-columns: 1fr; gap: 2px; }
   .idp-links { grid-template-columns: 1fr; }
 }
+.idp-result { padding: 16px 18px; }
+.idp-result .notice { margin: 0 0 12px; }
