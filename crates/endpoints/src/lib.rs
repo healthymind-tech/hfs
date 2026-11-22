@@ -40,8 +40,8 @@ pub use console::{
     ConsoleSessionResolver, ConsoleStore, ConsoleUser,
 };
 pub use model::{
-    AuthMode, ConsoleAccess, CorsSettings, Endpoint, EndpointAuth, EndpointSpec, EndpointStatus,
-    FhirRelease, ManagedBy, RateLimitSettings, StorageBinding, TerminologyBinding,
+    AuthMode, AuthProviderRef, ConsoleAccess, CorsSettings, Endpoint, EndpointAuth, EndpointSpec,
+    EndpointStatus, FhirRelease, ManagedBy, RateLimitSettings, StorageBinding, TerminologyBinding,
     ValidationErrors, ValidationMode, ValidationSettings,
 };
 pub use name::{DEFAULT_ENDPOINT_NAME, EndpointName, EndpointPath, RESERVED_SEGMENTS};
