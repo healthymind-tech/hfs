@@ -130,7 +130,12 @@ pub async fn start(
             .map_err(|e| anyhow::anyhow!("HFS_TERMINOLOGY_SERVER: {e}"))?;
             Arc::new(remote)
         }
-        TerminologyMode::Embedded => start_embedded(resolved, audit, admin_gate).await?,
+        TerminologyMode::Embedded => {
+            match start_embedded(config, resolved, audit, admin_gate).await? {
+                Some(service) => service,
+                None => return Ok(()),
+            }
+        }
     };
     let url = match settings.mode {
         TerminologyMode::Remote => settings.server_url.clone(),
@@ -148,22 +153,41 @@ pub async fn start(
     Ok(())
 }
 
+/// The terminology store when no URL was resolved from the environment:
+/// derived from the FHIR store the server actually opens (`fhir.db` by
+/// default) — schema `terminology` of a PostgreSQL database, or
+/// `terminology.db` next to a SQLite file. `None` for an in-memory store.
+fn derived_store(config: &ServerConfig, schema: &str) -> Option<String> {
+    let fhir = config.database_url.as_deref().unwrap_or("fhir.db");
+    if helios_terminology::schema::is_postgres_url(fhir) {
+        helios_terminology::schema::with_search_path(fhir, schema).ok()
+    } else {
+        helios_terminology::schema::sqlite_terminology_url(fhir)
+    }
+}
+
 #[cfg(feature = "terminology")]
 async fn start_embedded(
+    config: &ServerConfig,
     resolved: &Resolved,
     audit: Option<&Arc<helios_audit::AuditMiddlewareState>>,
     admin_gate: helios_admin_auth::AdminGate,
-) -> anyhow::Result<Arc<dyn TerminologyService>> {
+) -> anyhow::Result<Option<Arc<dyn TerminologyService>>> {
     use helios_hts::embedded::{EmbeddedOptions, PoolSettings};
     let settings = &resolved.settings;
     let view = &resolved.view;
     let embedded = &settings.embedded;
-    let database_url = embedded.database_url.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "HFS_TERMINOLOGY=embedded needs a terminology store: set HFS_TERMINOLOGY_DATABASE_URL \
-             (or HFS_DATABASE_URL)"
-        )
-    })?;
+    let Some(database_url) = embedded
+        .database_url
+        .clone()
+        .or_else(|| derived_store(config, &embedded.schema))
+    else {
+        warn!(
+            "HFS_TERMINOLOGY=embedded with an in-memory FHIR store and no \
+             HFS_TERMINOLOGY_DATABASE_URL: terminology is off for this process"
+        );
+        return Ok(None);
+    };
     // A store derived from HFS_DATABASE_URL lives in its own schema of the
     // hfs database; create the schema first so HTS's tables cannot land in
     // `public` (design §5).
@@ -178,7 +202,7 @@ async fn start_embedded(
         embedded.import_threads,
         embedded.import_blocking_threads,
     )?;
-    let config = hts_config(view, &database_url)?;
+    let hts = hts_config(view, &database_url)?;
     let bearer = {
         let prefix = if view.get("HFS_TERMINOLOGY_AUTH_JWKS_URL").is_some() {
             "HFS_TERMINOLOGY_AUTH"
@@ -192,7 +216,7 @@ async fn start_embedded(
     let audit = audit.map(|state| embedded_audit(state, settings.public_url.as_deref()));
     let started = Instant::now();
     let hts = helios_hts::embedded::start(EmbeddedOptions {
-        config,
+        config: hts,
         pool: PoolSettings {
             size: embedded.pg_pool_size,
             wait_timeout_secs: Some(embedded.pg_pool_wait_timeout.as_secs()),
@@ -228,15 +252,16 @@ async fn start_embedded(
         admin: hts.admin.clone(),
         rate_limit,
     });
-    Ok(hts.service)
+    Ok(Some(hts.service))
 }
 
 #[cfg(not(feature = "terminology"))]
 async fn start_embedded(
+    _config: &ServerConfig,
     _resolved: &Resolved,
     _audit: Option<&Arc<helios_audit::AuditMiddlewareState>>,
     _admin_gate: helios_admin_auth::AdminGate,
-) -> anyhow::Result<Arc<dyn TerminologyService>> {
+) -> anyhow::Result<Option<Arc<dyn TerminologyService>>> {
     Err(ConfigError::EmbeddedNotBuilt.into())
 }
 
@@ -641,6 +666,22 @@ mod tests {
         for d in &r.view.deprecations {
             assert!(!d.message().contains("secret"));
         }
+    }
+
+    #[test]
+    fn store_is_derived_from_the_fhir_store() {
+        let mut c = config();
+        c.database_url = None;
+        assert_eq!(derived_store(&c, "terminology").as_deref(), Some("terminology.db"));
+        c.database_url = Some("./data/fhir.db".into());
+        assert_eq!(
+            derived_store(&c, "terminology").as_deref(),
+            Some("./data/terminology.db")
+        );
+        c.database_url = Some(":memory:".into());
+        assert!(derived_store(&c, "terminology").is_none());
+        c.database_url = Some("postgres://hfs@db/hfs".into());
+        assert!(derived_store(&c, "terminology").unwrap().contains("search_path"));
     }
 
     #[test]

@@ -2892,6 +2892,11 @@ impl ServerConfig {
         config.validation = ValidationConfig::from_env();
         config.packages = PackageConfig::from_env();
         config.search_terminology = SearchTerminologyConfig::from_env();
+        // An explicit `HFS_TERMINOLOGY=embedded` satisfies the terminology
+        // requirements below; the `hfs` binary resolves the full mode
+        // (defaults, legacy `HTS_*`) afterwards.
+        config.terminology_embedded = std::env::var("HFS_TERMINOLOGY")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("embedded"));
         config.normalize_public_base_url().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
