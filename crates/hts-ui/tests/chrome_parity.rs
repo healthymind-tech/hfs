@@ -256,7 +256,10 @@ fn assert_back_link(source: &str, page: &str, href: &str, key: &str) {
         "{page} must wrap its header in `<header class=\"page-head page-head--back-link\">` (#801)",
     );
 
-    let marker = format!("<a class=\"back-link\" href=\"{href}\">");
+    // Templates spell the console prefix through `TerminologyPaths`
+    // (`/ui/hts` stand-alone, `/ui/terminology` embedded).
+    let templated = href.replacen("/ui/hts", "{{ crate::paths::ui() }}", 1);
+    let marker = format!("<a class=\"back-link\" href=\"{templated}\">");
     let start = source
         .find(&marker)
         .unwrap_or_else(|| panic!("{page} must contain the shared back link `{marker}` (#801)"));

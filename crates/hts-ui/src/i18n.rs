@@ -442,7 +442,7 @@ mod tests {
         assert!(explicit);
         let zh = I18n { locale: &ZH_HANT };
         assert_eq!(zh.lang(), "zh-Hant");
-        assert_eq!(zh.t("hts-nav-home"), "首頁");
+        assert_eq!(zh.t("hts-nav-home"), "術語總覽");
         assert_eq!(zh.t("no-such-key"), "no-such-key");
     }
 

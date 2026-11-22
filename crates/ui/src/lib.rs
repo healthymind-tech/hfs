@@ -10920,7 +10920,7 @@ mod tests {
         assert!(html.contains(
             r#"<link rel="icon" type="image/svg+xml" href="/ui/assets/brand/favicon.svg">"#
         ));
-        assert!(html.contains("/ui/assets/htmx.min.js"));
+        assert!(html.contains(&format!("{}/htmx.min.js", shell::asset_base())));
         // No runtime CDN dependency.
         assert!(!html.contains("unpkg.com"));
     }
@@ -11424,7 +11424,7 @@ mod tests {
             .find("hfs_theme=(system|light|dark)")
             .expect("inline boot");
         let script = head
-            .find(r#"<script src="/ui/assets/theme.js" defer></script>"#)
+            .find(r#"/theme.js" defer></script>"#)
             .expect("deferred theme.js");
         assert!(boot < script);
         assert!(html.contains("<svg"));

@@ -237,15 +237,23 @@ async fn saving_a_section_validates_then_persists() {
     assert!(html.contains(r#"aria-invalid="true""#));
     assert_eq!(f.store.get("twcore").await.unwrap().unwrap().revision, 1);
 
+    // The IdP does not exist: verification fails, so Save is stopped with
+    // the checklist and an explicit "Save anyway" (UX-06).
+    let body = "revision=1&auth_mode=write-protect&auth_issuer=https%3A%2F%2Fidp.example%2Fr\
+         &auth_jwks_url=https%3A%2F%2Fidp.example%2Fc&auth_audience=tw&scopes_allow_user=on\
+         &cors_inherit=on&rl_inherit=on";
+    let (status, _, html) = post(&f.app, "/ui/e/twcore/security", body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "failing verification blocks");
+    assert!(html.contains("verify-block"), "the block explains why");
+    assert!(html.contains(r#"name="verify_override" value="1""#));
+    assert_eq!(f.store.get("twcore").await.unwrap().unwrap().revision, 1);
     let (status, headers, _) = post(
         &f.app,
         "/ui/e/twcore/security",
-        "revision=1&auth_mode=write-protect&auth_issuer=https%3A%2F%2Fidp.example%2Fr\
-         &auth_jwks_url=https%3A%2F%2Fidp.example%2Fc&auth_audience=tw&scopes_allow_user=on\
-         &cors_inherit=on&rl_inherit=on",
+        &format!("{body}&verify_override=1"),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "save redirects");
+    assert_eq!(status, StatusCode::SEE_OTHER, "save anyway redirects");
     assert_eq!(headers[header::LOCATION], "/ui/e/twcore/security?saved=1");
     let stored = f.store.get("twcore").await.unwrap().unwrap();
     assert_eq!(
@@ -395,7 +403,7 @@ async fn disabling_and_deleting_with_typed_confirmation() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(headers[header::LOCATION], "/ui?changed=twcore");
+    assert_eq!(headers[header::LOCATION], "/ui?deleted=twcore&tenant=twcore");
     assert!(f.store.get("twcore").await.unwrap().is_none());
     // The default endpoint can never be disabled from the console.
     let (status, _, _) = post(&f.app, "/ui/e/default/status", "action=disable").await;
@@ -549,7 +557,7 @@ async fn brand_block_is_the_heart_mark_and_an_english_wordmark_in_every_language
 async fn layout_loads_the_request_busy_indicator() {
     let f = fixture().await;
     let (_, html) = get(&f.app, "/ui").await;
-    assert!(html.contains(r#"<script src="/ui/assets/request-busy.js" defer></script>"#));
+    assert!(html.contains(r#"/request-busy.js" defer></script>"#));
     let css = include_str!("../assets/app.css");
     for needle in [
         ".is-loading {",

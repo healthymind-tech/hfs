@@ -65,7 +65,7 @@ const ROUTES: &[Route] = &[
         // shell). The Fluent stub for `hts-nav-home` in en is exactly
         // "Home" — the same key backs both the sidebar label and the h1,
         // mirroring HFS's `nav-home` collapse.
-        expect: ">Home<",
+        expect: ">Terminology overview<",
     },
     Route {
         // Slice A refresh fragment endpoint. Not a "page", but registered
@@ -157,14 +157,14 @@ const ROUTES: &[Route] = &[
     // walk; the POST arm is exercised by `tests/import.rs`.
     Route {
         path: "/ui/hts/import",
-        // Fluent en value for `hts-import-heading` is "Import Terminology".
-        expect: ">Import Terminology<",
+        // Fluent en value for `hts-import-heading` is "Import terminology".
+        expect: ">Import terminology<",
     },
     // Terminology management (HTS_ADMIN_UI). With the closed upstream the
     // pages render their shell plus the degraded notice.
     Route {
         path: "/ui/hts/terminology",
-        expect: ">Terminology inventory<",
+        expect: ">Loaded terminologies<",
     },
     Route {
         path: "/ui/hts/terminology/delete?url=http%3A%2F%2Fx&version=1",

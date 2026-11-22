@@ -1235,11 +1235,19 @@ pub(crate) async fn save_section(
     // Configure-then-verify on Save (UX-06): a token configuration that
     // fails verification is not saved silently; the JWKS URL left empty is
     // the one the issuer publishes (UX-03).
-    if section == Section::Security
-        && let Some(blocked) =
-            verify_before_save(&c, Some(&ep), spec.auth.as_mut(), form.checked("verify_override"))
-                .await
-    {
+    let blocked = if section == Section::Security {
+        verify_before_save(&c, Some(&ep), spec.auth.as_mut(), form.checked("verify_override")).await
+    } else {
+        None
+    };
+    // Field errors come first: they say exactly what to fill in.
+    if let Err(v) = spec.validate() {
+        for fe in v.0 {
+            errors.entry(fe.field).or_insert(fe.message);
+        }
+        return section_response(c, section, &e, &spec, errors, false, None, &others);
+    }
+    if let Some(blocked) = blocked {
         return section_response_full(
             c,
             section,
@@ -1826,6 +1834,9 @@ pub(crate) async fn create(
         }
         if let Some(block) = blocked {
             let nv = NewValues::from_form(&form, default_version_label(&state));
+            if let Err(errors) = forms::parse_new(&form) {
+                return new_response(&state, c, nv, errors).await;
+            }
             return new_response_full(&state, c, nv, FieldErrors::new(), Some(block)).await;
         }
     }
@@ -2009,7 +2020,7 @@ fn review_rows(i18n: &I18n, spec: &EndpointSpec) -> Vec<ReviewRow> {
     let inherited = i18n.t("mgr-inherit-label");
     let mut rows = vec![
         row(0, "mgr-field-display-name", spec.display_name.clone()),
-        row(0, "mgr-field-name", spec.name.clone()),
+        row(0, "mgr-field-name", spec.name.to_string()),
         row(
             0,
             "mgr-field-path",

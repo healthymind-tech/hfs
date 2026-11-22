@@ -936,7 +936,7 @@ async fn page_wires_the_hover_rail_nav() {
     // toggle for it. The one script the chrome carries is the responsive
     // drawer below the tablet breakpoint, where there is no hover at all.
     assert!(!html.contains("data-toggle-nav"));
-    assert!(html.contains("/ui/assets/nav.js"));
+    assert!(html.contains("/nav.js\" defer"));
     assert!(html.contains(
         r#"class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false""#
     ));
@@ -1044,13 +1044,13 @@ async fn layout_carries_the_unsaved_changes_helper() {
     ));
 
     let busy = html
-        .find(r#"src="/ui/assets/busy.js""#)
+        .find(r#"/busy.js" defer"#)
         .expect("busy.js in the layout");
     let unsaved = html
-        .find(r#"src="/ui/assets/unsaved.js""#)
+        .find(r#"/unsaved.js" defer"#)
         .expect("unsaved.js in the layout");
     let addbox = html
-        .find(r#"src="/ui/assets/addbox.js""#)
+        .find(r#"/addbox.js" defer"#)
         .expect("addbox.js in the layout");
     assert!(busy < unsaved, "unsaved.js must load after busy.js");
     assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
@@ -1088,10 +1088,10 @@ async fn layout_carries_the_shared_confirmation() {
     assert!(html.contains(r#"data-msg-confirm-cancel="Cancel""#));
 
     let confirm = html
-        .find(r#"src="/ui/assets/confirm.js""#)
+        .find(r#"/confirm.js" defer"#)
         .expect("confirm.js in the layout");
     let unsaved = html
-        .find(r#"src="/ui/assets/unsaved.js""#)
+        .find(r#"/unsaved.js" defer"#)
         .expect("unsaved.js in the layout");
     assert!(confirm < unsaved, "confirm.js must load before unsaved.js");
 }
@@ -3727,7 +3727,7 @@ async fn batch_page_serves_the_workspace_shell() {
     // The semantics copy rides in as data for batch.js.
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
-    assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
+    assert!(html.contains(r#"/json-view.js" defer"#));
 }
 
 /// #1662: the shell stamps the server's body limit and the "too large" copy,
@@ -3816,7 +3816,7 @@ async fn batch_page_carries_the_shared_busy_affordances() {
     // The helper loads from the shared layout, before the page script (both
     // defer, so document order is execution order).
     let busy = html
-        .find(r#"src="/ui/assets/busy.js""#)
+        .find(r#"/busy.js" defer"#)
         .expect("busy.js in the layout");
     let batch = html
         .find(r#"src="/ui/assets/batch.js""#)
