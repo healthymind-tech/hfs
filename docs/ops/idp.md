@@ -63,7 +63,7 @@ Security properties (tests in `crates/idp-pages/tests/flows.rs`):
 * Clickjacking: `frame-ancestors 'none'` + `X-Frame-Options: DENY`; a realm may
   allow EHR embedding with `branding.frameAncestors: ["https://ehr.example"]`
   (https origins only; anything else is ignored).
-* Strict CSP (`script-src 'self' 'nonce-…'`), `Referrer-Policy: no-referrer`,
+* Strict CSP (`script-src 'self' 'nonce-…'`), `Referrer-Policy: same-origin` (no referrer to other origins; same-origin posts keep a real `Origin`),
   `Cache-Control: no-store`.
 * No open redirect: redirects only go to the redirect URI validated at
   `/authorize` or to a registered post-logout URI.

@@ -25,6 +25,9 @@
 //! * errors before the client is trusted (unknown or expired interaction)
 //!   render an error page and never redirect.
 
+// Handlers short-circuit with a finished `Response` as the error value.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1411,8 +1414,7 @@ async fn picker_submit(
         ),
         _ => user
             .selectable_patients(&step.pending.endpoint)
-            .iter()
-            .any(|p| *p == id),
+            .contains(&id),
     };
     if !allowed {
         tracing::warn!(realm = %realm, user = %user.id, "idp: patient outside the selectable set refused");
@@ -1916,6 +1918,7 @@ pub struct AppsQuery {
 
 const ACCOUNT_IX: &str = "account";
 
+#[allow(clippy::too_many_arguments)]
 async fn render_account_login(
     pages: &Pages,
     realm: &RealmRuntime,

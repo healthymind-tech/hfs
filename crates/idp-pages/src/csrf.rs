@@ -92,10 +92,10 @@ pub fn same_origin(headers: &HeaderMap, public_origin: &str) -> bool {
             _ => return false,
         }
     }
-    if let Some(site) = headers.get("sec-fetch-site") {
-        if site.to_str().map(|s| s != "same-origin").unwrap_or(true) {
-            return false;
-        }
+    if let Some(site) = headers.get("sec-fetch-site")
+        && site.to_str().map(|s| s != "same-origin").unwrap_or(true)
+    {
+        return false;
     }
     true
 }

@@ -162,8 +162,7 @@ pub fn forwarded_ip(h: &axum::http::HeaderMap) -> Option<String> {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .last()
+        .rfind(|v| !v.is_empty())
         .and_then(valid)
 }
 

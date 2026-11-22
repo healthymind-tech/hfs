@@ -145,18 +145,29 @@ def authorize_url(realm, aud, scope, challenge, extra=None, redirect=CB):
 
 
 class App:
-    """Captures the redirect to the app (the browser never leaves)."""
+    """Records navigations to the app's redirect URI. Playwright does not
+    route redirect hops, so the requests are observed (`request` event) and
+    the browser's own navigation to the fake host is allowed to fail."""
 
     def __init__(self, ctx):
         self.hits = []
-        ctx.route("https://app.example/**", self.handle)
+        ctx.on("request", self.seen)
 
-    def handle(self, route):
-        self.hits.append(route.request.url)
-        route.fulfill(status=200, content_type="text/html", body="<h1>app</h1>")
+    def seen(self, request):
+        if request.url.startswith("https://app.example/"):
+            self.hits.append(request.url)
 
     def last(self):
         return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.hits[-1]).query)) if self.hits else {}
+
+
+def goto(page, url):
+    """Navigates; a navigation that ends at the (unresolvable) app is fine."""
+    try:
+        page.goto(url)
+    except Exception as e:  # noqa: BLE001
+        if "ERR_NAME_NOT_RESOLVED" not in str(e) and "ERR_ABORTED" not in str(e):
+            raise
 
 
 def token(realm, code, verifier):
@@ -197,9 +208,8 @@ def run(shots):
         v, c = pkce()
         url, state = authorize_url("clinic", LAB, "openid fhirUser launch/patient patient/*.rs offline_access",
                                    c, {"nonce": "n-e2e"})
-        page.goto(url)
+        resp = page.goto(url)
         check("authorize -> hosted sign-in", "/idp/clinic/login?ix=hmix_" in page.url, page.url)
-        resp = page.request.get(page.url)
         h = resp.headers
         check("login: CSP frame-ancestors 'none'", "frame-ancestors 'none'" in h.get("content-security-policy", ""), h)
         check("login: X-Frame-Options DENY", h.get("x-frame-options") == "DENY", h)
@@ -248,7 +258,7 @@ def run(shots):
         v, c = pkce()
         url, _ = authorize_url("clinic", LAB, "openid fhirUser launch/patient patient/*.rs offline_access", c)
         n = len(app.hits)
-        page.goto(url)
+        goto(page, url)
         page.wait_for_timeout(300)
         check("SSO + remembered consent: no page shown", len(app.hits) == n + 1 and app.last().get("code"), page.url)
         # Connected apps: remove access.
@@ -258,7 +268,7 @@ def run(shots):
         page.click(f"button[data-app='{CLIENT}']")
         page.wait_for_load_state()
         check("access removed", page.is_visible("text=Access for Growth Chart was removed."), page.content()[:300])
-        page.goto(url.replace("st-", "st2-"))
+        goto(page, url.replace("st-", "st2-"))
         check("consent asked again after removal", "/consent?ix=" in page.url, page.url)
         # Deny → access_denied.
         page.click("#idp-consent-deny")
@@ -287,7 +297,7 @@ def run(shots):
         page = ctx.new_page()
         v, c = pkce()
         url, _ = authorize_url("clinic", LAB, "openid fhirUser launch/patient patient/*.rs", c)
-        page.goto(url)
+        goto(page, url)
         shot(page, shots, "11-login-light")
         sign_in(page, "carol", "carol-password-1")
         check("caregiver gets the picker", "/select-patient?ix=" in page.url, page.url)
@@ -315,7 +325,7 @@ def run(shots):
         page = ctx.new_page()
         v, c = pkce()
         url, _ = authorize_url("clinic", LAB, "openid fhirUser launch/patient user/*.rs", c)
-        page.goto(url)
+        goto(page, url)
         sign_in(page, "drbob", "drbob-password-1")
         page.fill("#idp-q", "Ortiz")
         page.click("#idp-picker-search button")
@@ -342,7 +352,7 @@ def run(shots):
         page = ctx.new_page()
         v, c = pkce()
         url, _ = authorize_url("clinic", LAB, "openid launch/patient patient/*.rs", c)
-        page.goto(url)
+        goto(page, url)
         for i in range(3):
             sign_in(page, "lockme", "wrong-password-x")
         check("generic error, then lockout after 3 failures", page.is_visible("text=Too many failed attempts"), page.content()[:400])
@@ -350,7 +360,7 @@ def run(shots):
         sign_in(page, "lockme", "lockme-password-1")
         check("locked account refuses the right password", page.is_visible("text=Too many failed attempts"), page.url)
         # CSRF: corrupt the token.
-        page.goto(url)
+        goto(page, url)
         page.eval_on_selector("input[name=csrf]", "e => e.value = 'forged'")
         sign_in(page, "alice", "alice-password-1")
         check("forged CSRF token refused", page.is_visible("text=This form has expired."), page.content()[:300])
@@ -368,11 +378,11 @@ def run(shots):
         # Open redirect: unregistered redirect_uri.
         n = len(app.hits)
         bad, _ = authorize_url("clinic", LAB, "openid", c, redirect="https://evil.example/cb")
-        evil.goto(bad)
+        goto(evil, bad)
         check("unregistered redirect_uri: no redirect", evil.url.startswith(BASE) and len(app.hits) == n, evil.url)
         shot(evil, shots, "09-bad-redirect-dark")
         # Clickjacking: frame the login page from another origin.
-        page.goto(url)
+        goto(page, url)
         login_url = page.url
         frame_page = ctx.new_page()
         frame_page.route("https://evil.example/**", lambda r: r.fulfill(
@@ -400,7 +410,7 @@ def run(shots):
         page = ctx.new_page()
         v, c = pkce()
         url, _ = authorize_url("clinic", LAB, "openid fhirUser launch/patient patient/*.rs offline_access", c)
-        page.goto(url + "&ui_locales=zh-Hant")
+        goto(page, url + "&ui_locales=zh-Hant")
         check("ui_locales=zh-Hant renders Chinese", page.is_visible("text=登入 Riverside Clinic 以繼續使用 Growth Chart。"), page.content()[:300])
         check("brand stays English", "HealthyMind" in page.inner_text(".auth-foot") and "療心" not in page.content())
         no_scroll = page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")

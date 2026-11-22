@@ -10,7 +10,10 @@
 //!   by default. A realm may allow EHR embedding for listed `https` origins
 //!   (`branding.frameAncestors`); then `frame-ancestors` names exactly those
 //!   origins and `X-Frame-Options` is omitted (it cannot express a list).
-//! * `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
+//! * `Referrer-Policy: same-origin` (nothing — not even the `ix` handle in
+//!   the URL — leaves for another origin; same-origin form posts keep a real
+//!   `Origin` header, which `no-referrer` would turn into `Origin: null`),
+//!   `Cache-Control: no-store`,
 //!   `X-Content-Type-Options: nosniff`, `Cross-Origin-Opener-Policy:
 //!   same-origin`, a closed `Permissions-Policy`.
 
@@ -99,7 +102,7 @@ pub fn apply(
     }
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
@@ -138,7 +141,7 @@ mod tests {
         let mut h = HeaderMap::new();
         apply(&mut h, "abc", &[], None);
         assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
-        assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(h[header::REFERRER_POLICY], "same-origin");
         assert_eq!(h[header::CACHE_CONTROL], "no-store");
     }
 

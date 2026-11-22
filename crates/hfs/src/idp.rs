@@ -226,6 +226,26 @@ pub async fn attach(
         seed(&rt, path.trim()).await?;
     }
     let _watcher = rt.spawn_watcher(Duration::from_secs(1));
+    // Endpoint changes (created, renamed path) change the realms' audience
+    // URLs: reload the realms when the endpoint registry moves on.
+    {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            let mut seen = None;
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let Some(reg) = REGISTRY.get() else { continue };
+                let epoch = reg.snapshot().epoch();
+                if seen.is_some_and(|s| s != epoch)
+                    && let Err(e) = rt.reload().await
+                {
+                    warn!(error = %e, "idp: reload after an endpoint change failed");
+                }
+                seen = Some(epoch);
+            }
+        });
+    }
     if let Some((sink, observer)) = audit {
         rt.set_event_sink(Arc::new(helios_idp_pages::audit::BalpEventSink::new(
             sink,

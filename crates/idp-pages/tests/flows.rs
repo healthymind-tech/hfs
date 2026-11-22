@@ -866,7 +866,7 @@ async fn hosted_pages_refuse_framing_and_inline_script() {
     assert!(!csp.contains("unsafe-inline"));
     assert_eq!(r.header(header::X_FRAME_OPTIONS), "DENY");
     assert_eq!(r.header(header::CACHE_CONTROL), "no-store");
-    assert_eq!(r.header(header::REFERRER_POLICY), "no-referrer");
+    assert_eq!(r.header(header::REFERRER_POLICY), "same-origin");
     let html = r.text();
     // Every inline script carries this response's nonce.
     let nonce = csp
