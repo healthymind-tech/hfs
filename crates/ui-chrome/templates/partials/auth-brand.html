@@ -1,11 +1,13 @@
 {#
   SHARED CHROME -- the brand header at the top of the sign-in card of both
-  consoles (`helios_ui_chrome::auth_brand()`): the official horizontal logo,
-  modest and centred, and the product name as a small title in the request's
-  language. The logo's wordmark is decorative; the name is real text.
+  consoles (`helios_ui_chrome::auth_brand()`): the official square English
+  logo (heart mark over the "HealthyMind" wordmark, transparent, 1x/2x/3x;
+  no Chinese characters, the same mark as the sidebar brand), modest and
+  centred, and the product name as a small title in the request's language.
+  The logo's wordmark is decorative; the name is real text.
 #}<div class="auth-logo">
             <a class="auth-logo__link" href="{{ brand.home }}" aria-label="{{ i18n.t(brand.product_key) }}">
-              <img class="auth-logo__img" src="{{ brand.assets }}/brand/healthymind-logo-horizontal@2x.png" alt="" width="181" height="40">
+              <img class="auth-logo__img" src="{{ brand.assets }}/brand/healthymind-logo-en.png" srcset="{{ brand.assets }}/brand/healthymind-logo-en@2x.png 2x, {{ brand.assets }}/brand/healthymind-logo-en@3x.png 3x" alt="" width="101" height="80">
             </a>
             <p class="auth-logo__name">{{ i18n.t(brand.product_key) }}</p>
           </div>

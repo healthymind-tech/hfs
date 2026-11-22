@@ -12,6 +12,9 @@
   <script src="/ui/hts/assets/theme.js" defer></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/hts/assets/htmx.min.js" defer></script>
+  <!-- Loading feedback for htmx requests slower than 300ms (aria-busy, a
+       dimmed target with a ring), shared with HFS. -->
+  <script src="/ui/hts/assets/request-busy.js" defer></script>
   <!-- The responsive navigation drawer (phones and tablets), shared with HFS. -->
   <script src="/ui/hts/assets/nav.js" defer></script>
   <!-- Load more: moves focus to the first appended row (list-paging.js). -->
@@ -113,10 +116,7 @@
       <button type="button" class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false" aria-label="{{ chrome.i18n.t("nav-menu-open") }}">
         {% include "icons/menu.svg" %}
       </button>
-      <a class="topbar__brand" href="/ui/hts" aria-label="{{ chrome.i18n.t("hts-app-title") }} — {{ chrome.i18n.t("hts-nav-home") }}">
-        <img src="/ui/hts/assets/brand/mark-64.png" alt="" width="32" height="32">
-        <span class="topbar__brand-name">{{ chrome.i18n.t("hts-app-short-name") }}</span>
-      </a>
+{{ chrome.topbar_brand()?|safe }}{# markup: crates/ui-chrome/templates/partials/brand.html #}
       {#- FHIR Server | Terminology (UI/UX review §4.2), the same switcher HFS
           renders; present only when an HFS console shares this origin. -#}
 {{ chrome.product_switcher()?|safe }}{# markup: crates/ui-chrome/templates/partials/product-switcher.html #}

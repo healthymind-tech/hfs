@@ -747,8 +747,7 @@ impl Status {
         helios_ui_chrome::BrandLinks {
             home: helios_ui_chrome::HFS_CONSOLE_PATH,
             assets: "/ui/assets",
-            title_key: "app-title",
-            product_line_key: "app-product-line",
+            product_line: "FHIR Server Manager",
             version,
             home_key: "nav-home",
         }
@@ -758,6 +757,12 @@ impl Status {
     pub(crate) fn brand(&self, i18n: &I18n) -> Result<String, askama::Error> {
         let version = format!("v{}", self.version);
         helios_ui_chrome::brand(i18n, self.brand_links(&version))
+    }
+
+    /// The same brand link for the phone / tablet topbar, shared with HTS.
+    pub(crate) fn topbar_brand(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        let version = format!("v{}", self.version);
+        helios_ui_chrome::topbar_brand(i18n, self.brand_links(&version))
     }
 
     /// Favicon / app-icon links for `<head>`, shared with HTS.
