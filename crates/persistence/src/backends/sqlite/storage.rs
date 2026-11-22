@@ -9033,6 +9033,12 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             let conn = pool.get().expect("holder acquires a connection");
+            // Pooled in-memory connections read uncommitted and take no table
+            // read locks; this holder stands for a reader that does (another
+            // process's connection, an older build), so the writers' retry
+            // still meets a real lock.
+            conn.execute_batch("PRAGMA read_uncommitted = false")
+                .unwrap();
             conn.execute_batch("BEGIN").unwrap();
             let _: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -9040,6 +9046,8 @@ mod tests {
             held_tx.send(()).unwrap();
             let _ = release_rx.recv();
             conn.execute_batch("COMMIT").unwrap();
+            conn.execute_batch("PRAGMA read_uncommitted = true")
+                .unwrap();
         });
         held_rx
             .recv()

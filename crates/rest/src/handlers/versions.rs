@@ -52,7 +52,11 @@ where
 
     // Get all enabled versions
     let enabled_versions = FhirVersion::enabled_versions();
-    let default_version = state.config().default_fhir_version;
+    // The request's endpoint release (FHIR server manager) is its default.
+    let default_version = crate::endpoint::with_current(|r| {
+        crate::endpoint::effective_fhir_version(Some(r), state.config().default_fhir_version)
+    })
+    .unwrap_or(state.config().default_fhir_version);
 
     // Build version parameters
     let mut parameters: Vec<serde_json::Value> = enabled_versions

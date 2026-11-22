@@ -40,6 +40,9 @@ pub struct FhirVersionExtractor {
     content_version: Option<FhirVersion>,
     /// Version from Accept header (for reads)
     accept_version: Option<FhirVersion>,
+    /// The release of the request's endpoint (FHIR server manager), which
+    /// replaces the server default a caller passes in.
+    endpoint_default: Option<FhirVersion>,
 }
 
 impl FhirVersionExtractor {
@@ -64,8 +67,13 @@ impl FhirVersionExtractor {
     /// Uses the Content-Type version if specified, otherwise falls back to
     /// the supplied default — callers pass the server's configured default
     /// (`ServerConfig::default_fhir_version`), not the compile-time one.
+    ///
+    /// With the FHIR server manager, the request's endpoint release takes the
+    /// place of `default`.
     pub fn storage_version_or(&self, default: FhirVersion) -> FhirVersion {
-        self.content_version.unwrap_or(default)
+        self.content_version
+            .or(self.endpoint_default)
+            .unwrap_or(default)
     }
 
     /// Returns the FHIR version a read should be rendered as.
@@ -73,7 +81,14 @@ impl FhirVersionExtractor {
     /// Uses the Accept version if specified, otherwise falls back to the
     /// supplied default — same contract as [`Self::storage_version_or`].
     pub fn accept_version_or(&self, default: FhirVersion) -> FhirVersion {
-        self.accept_version.unwrap_or(default)
+        self.accept_version
+            .or(self.endpoint_default)
+            .unwrap_or(default)
+    }
+
+    /// The endpoint release that replaces the server default, if any.
+    pub fn endpoint_default(&self) -> Option<FhirVersion> {
+        self.endpoint_default
     }
 }
 
@@ -86,10 +101,15 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let content_version = get_content_type_fhir_version(&parts.headers);
         let accept_version = get_accept_fhir_version(&parts.headers);
+        let endpoint_default = parts
+            .extensions
+            .get::<helios_endpoints::ResolvedEndpoint>()
+            .and_then(|r| crate::endpoint::fhir_version_of(r.endpoint.spec.fhir_version));
 
         Ok(FhirVersionExtractor {
             content_version,
             accept_version,
+            endpoint_default,
         })
     }
 }
@@ -136,6 +156,7 @@ mod tests {
         let extractor = FhirVersionExtractor {
             content_version: None,
             accept_version: None,
+            endpoint_default: None,
         };
         assert_eq!(
             extractor.storage_version_or(FhirVersion::default()),

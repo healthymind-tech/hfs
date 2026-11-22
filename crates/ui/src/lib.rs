@@ -38,17 +38,22 @@
 //! picker's option list widens from the tenant's stored types to every
 //! resource type of the active FHIR version, offering the untouched ones at 0.
 
+mod account;
 mod admin_login;
 mod bulk_export;
 mod bulk_import;
 mod capability;
 mod compartments;
 mod conformance;
+mod console_settings;
+mod console_users;
+mod csrf;
 mod editor;
 mod history;
 mod i18n;
 mod login;
 mod lookup;
+pub mod manager;
 mod navigation;
 mod rail_state;
 mod search_params;
@@ -65,6 +70,7 @@ pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
+mod sync_pages;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
 #[doc(hidden)]
@@ -231,6 +237,9 @@ struct WebState {
     /// The administrator sign-in (`HFS_ADMIN_PASSWORD`) guarding the admin
     /// pages, as installed with [`set_admin_gate`]; `Open` when none was.
     admin_gate: helios_admin_auth::AdminGate,
+    /// The FHIR server manager console (`HFS_MANAGER=on`), as installed with
+    /// [`manager::set_manager`]. `None` renders the single-server console.
+    manager: Option<Arc<manager::ManagerRuntime>>,
 }
 
 impl WebState {
@@ -320,6 +329,14 @@ pub(crate) struct RequestTenant {
     /// The administrator signed in with `HFS_ADMIN_PASSWORD`, when this
     /// request carries a live admin session (stamped by the admin guard).
     pub(crate) admin_user: Option<String>,
+    /// The endpoint this request is scoped to (manager console,
+    /// `/ui/e/{endpoint}/…`), stamped by `manager::scope::dispatch`.
+    pub(crate) scope: Option<Arc<manager::EndpointScope>>,
+    /// The console role of the requester (`manager::role_of`).
+    pub(crate) role: helios_endpoints::ConsoleRole,
+    /// The CSRF synchronizer token of the console session, when the console
+    /// guard (package P3) stamped one ([`manager::CsrfToken`]).
+    pub(crate) csrf: Option<String>,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -342,6 +359,9 @@ where
                 multi: false,
                 signed_in: None,
                 admin_user: None,
+                scope: None,
+                role: helios_endpoints::ConsoleRole::Viewer,
+                csrf: None,
             }))
     }
 }
@@ -375,12 +395,30 @@ async fn resolve_prefs(
         .get::<helios_admin_auth::AdminUser>()
         .map(|u| u.0.clone());
     let mut version = state.fhir_version;
+    let scope = request
+        .extensions()
+        .get::<manager::EndpointScope>()
+        .cloned()
+        .map(Arc::new);
+    let role = manager::role_of(
+        request.extensions(),
+        matches!(state.admin_gate, helios_admin_auth::AdminGate::Open),
+        admin_user.is_some(),
+        scope.as_deref().map(|s| s.endpoint.as_ref()),
+    );
+    let csrf = request
+        .extensions()
+        .get::<manager::CsrfToken>()
+        .map(|t| t.0.clone());
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
         multi: false,
         signed_in: signed_in.clone(),
         admin_user: admin_user.clone(),
+        scope: None,
+        role,
+        csrf: csrf.clone(),
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -409,6 +447,9 @@ async fn resolve_prefs(
                 multi: false,
                 signed_in: signed_in.clone(),
                 admin_user: admin_user.clone(),
+                scope: None,
+                role,
+                csrf: csrf.clone(),
             };
         }
     }
@@ -425,6 +466,22 @@ async fn resolve_prefs(
                 .unwrap_or(false),
             None => false,
         };
+    // The manager console: the endpoint in the URL decides the tenant and
+    // the FHIR release, never the stored browser preference (design D-16),
+    // and there is no tenant picker.
+    if state.manager.is_some() {
+        tenant.multi = false;
+        if let Some(scope) = scope {
+            tenant.id = scope.endpoint.tenant_id().to_string();
+            tenant.display = Some(scope.endpoint.spec.display_name.clone());
+            if let Some(v) = search_params::version_from_str(manager::forms::release_label(
+                scope.endpoint.spec.fhir_version,
+            )) {
+                version = v;
+            }
+            tenant.scope = Some(scope);
+        }
+    }
     request.extensions_mut().insert(RequestVersion(version));
     request.extensions_mut().insert(tenant);
     request
@@ -472,6 +529,11 @@ pub(crate) struct Status {
     /// built on it; before that, page scripts assumed the root and broke
     /// behind any prefix.
     fhir_base: String,
+    /// The manager console's chrome (endpoint switcher, sectioned sidebar),
+    /// when the manager is installed.
+    manager: Option<manager::ManagerChrome>,
+    /// The console session's CSRF token, when one is in force.
+    csrf: Option<String>,
 }
 
 /// The browser-facing FHIR API path prefix for `public_base_url`
@@ -629,7 +691,74 @@ impl TerminologyNavigation {
 }
 
 impl Status {
-    /// Whether FHIR package administration is enabled (`HFS_ADMIN_UI`), so
+    /// Whether the FHIR server manager console is active.
+    pub(crate) fn manager_on(&self) -> bool {
+        self.manager.is_some()
+    }
+
+    /// The manager's sidebar sections (empty without the manager).
+    pub(crate) fn nav_groups(&self) -> &[manager::nav::NavGroup] {
+        self.manager
+            .as_ref()
+            .map(|m| m.nav.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The endpoint in scope, for the switcher label.
+    pub(crate) fn current_endpoint(&self) -> Option<&manager::EndpointChip> {
+        self.manager.as_ref().and_then(|m| m.endpoint.as_ref())
+    }
+
+    /// Every endpoint, for the switcher.
+    pub(crate) fn endpoint_options(&self) -> &[manager::EndpointChip] {
+        self.manager
+            .as_ref()
+            .map(|m| m.endpoints.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Whether the nav entry `id` is the current page `active` — data pages
+    /// opened from Resources (editor, history, queries, search) mark it too.
+    pub(crate) fn nav_current(&self, id: &str, active: &str) -> bool {
+        id == active
+            || (id == "resources" && matches!(active, "editor" | "history" | "queries" | "search"))
+            || (id == "ep-home" && active == "home")
+    }
+
+    fn brand_links<'a>(&self, version: &'a str) -> helios_ui_chrome::BrandLinks<'a> {
+        helios_ui_chrome::BrandLinks {
+            home: helios_ui_chrome::HFS_CONSOLE_PATH,
+            assets: "/ui/assets",
+            title_key: "app-title",
+            product_line_key: "app-product-line",
+            version,
+            home_key: "nav-home",
+        }
+    }
+
+    /// The HealthyMind sidebar brand, shared with HTS (design §10.2).
+    pub(crate) fn brand(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        let version = format!("v{}", self.version);
+        helios_ui_chrome::brand(i18n, self.brand_links(&version))
+    }
+
+    /// Favicon / app-icon links for `<head>`, shared with HTS.
+    pub(crate) fn brand_head(&self) -> Result<String, askama::Error> {
+        helios_ui_chrome::brand_head("/ui/assets")
+    }
+
+    /// The attribution footer, shared with HTS.
+    pub(crate) fn site_footer(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        let version = format!("v{}", self.version);
+        helios_ui_chrome::site_footer(i18n, self.brand_links(&version), "/ui/about")
+    }
+
+    /// The CSRF token for `<meta name="csrf-token">` and hidden fields.
+    pub(crate) fn csrf_token(&self) -> Option<&str> {
+        self.csrf.as_deref()
+    }
+
+    /// Whether the FHIR package administration is enabled (`HFS_ADMIN_UI`), so
     /// the nav links the IG Packages page.
     pub(crate) fn package_admin(&self) -> bool {
         package_admin()
@@ -1947,7 +2076,9 @@ pub fn mount_with_conformance_source_and_runtime(
         .layer(middleware::from_fn(revalidate_assets));
 
     let mut router = Router::new()
-        .route("/ui", get(index))
+        // The per-endpoint dashboard's own address under the manager (where
+        // `/ui` is the overview); without the manager it is `/ui` as well.
+        .route("/ui/dashboard", get(index))
         // Resources workspace (#282): the type filter + search + edit modal.
         .route("/ui/resources", get(resources))
         .route("/ui/resources/params", get(resources_params_catalog))
@@ -2190,6 +2321,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
+        .merge(sync_pages::routes())
         // Persists the sidebar's FHIR-version choice (#343) and redirects back.
         .route("/ui/version", axum::routing::post(set_version))
         // The tenant selector (#344): lazily-loaded options and the persisted
@@ -2216,6 +2348,14 @@ pub fn mount_with_conformance_source_and_runtime(
     if nl_enabled {
         router = router.route("/ui/search", get(search));
     }
+    let manager_runtime = manager::installed();
+    router = match &manager_runtime {
+        // The manager console: overview at `/ui`, endpoint pages, About.
+        Some(_) => router.merge(manager::pages::routes()),
+        None => router
+            .route("/ui", get(index))
+            .route("/ui/about", get(manager::pages::about)),
+    };
 
     // One inventory per mounted app, never process-global (#1850). It also
     // follows purges and deregistrations made outside this UI (the
@@ -2259,10 +2399,13 @@ pub fn mount_with_conformance_source_and_runtime(
         tenant_path_routing,
         login: login::installed(),
         admin_gate: installed_admin_gate(),
+        manager: manager_runtime.clone(),
     };
 
-    router
+    let app = router
         .route("/ui/{*rest}", axum::routing::any(ui_not_found))
+        // Console sign-in, account and users/roles settings (P3).
+        .merge(login::console_routes())
         .merge(assets)
         // With authentication on and no browser sign-in installed, nothing a
         // browser sends can be authenticated, so the handlers that reach the
@@ -2335,7 +2478,24 @@ pub fn mount_with_conformance_source_and_runtime(
                     Err(never) => match never {},
                 }
             }
-        })
+        });
+    // The manager console scopes every `/ui` request to an endpoint before
+    // routing (it may rewrite `/ui/e/{ep}/data/…` onto the data pages), so
+    // it wraps the whole router rather than layering inside it.
+    match manager_runtime {
+        Some(runtime) => Router::new().fallback_service(tower::service_fn(
+            move |request: axum::extract::Request| {
+                let runtime = runtime.clone();
+                let app = app.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        manager::scope::dispatch(runtime, app, request).await,
+                    )
+                }
+            },
+        )),
+        None => app,
+    }
 }
 
 /// Any `/ui/…` path no UI route matches (#1673): the not-found page inside
@@ -2386,7 +2546,16 @@ async fn scope_request_authorization(
     let authorization = login::caller_for(&state, request.headers(), "")
         .await
         .authorization;
-    conformance::with_request_authorization(authorization, next.run(request)).await
+    let prefix = request
+        .extensions()
+        .get::<manager::EndpointScope>()
+        .map(|scope| scope.self_call_prefix())
+        .unwrap_or_default();
+    conformance::with_endpoint_prefix(
+        prefix,
+        conformance::with_request_authorization(authorization, next.run(request)),
+    )
+    .await
 }
 
 /// Middleware: tell a HTS console served from the same origin that this
@@ -4419,10 +4588,10 @@ async fn sql_view_definitions_page(
     // definitive 404/410 prunes it from the stored registry.
     let mut live_ids: std::collections::HashSet<String> =
         summaries.iter().map(|s| s.id.clone()).collect();
-    if let Some(s) = &selected {
-        if !s.id.is_empty() {
-            live_ids.insert(s.id.clone());
-        }
+    if let Some(s) = &selected
+        && !s.id.is_empty()
+    {
+        live_ids.insert(s.id.clone());
     }
     let rail = prune_gone_recents(
         &state,
@@ -10316,7 +10485,15 @@ pub(crate) fn current_status(
         user: UserSummary::from_session(tenant.signed_in.as_ref())
             .or_else(|| UserSummary::admin(tenant.admin_user.as_deref())),
         bearer_only_auth: bearer_only_auth(),
-        fhir_base: fhir_base_path(&state.public_base_url),
+        fhir_base: match &tenant.scope {
+            Some(scope) => scope.fhir_base(&fhir_base_path(&state.public_base_url)),
+            None => fhir_base_path(&state.public_base_url),
+        },
+        manager: state
+            .manager
+            .as_deref()
+            .map(|rt| manager::ManagerChrome::new(rt, tenant.scope.as_deref(), tenant.role)),
+        csrf: tenant.csrf.clone(),
     }
 }
 
@@ -10471,6 +10648,8 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                manager: None,
+                csrf: None,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -10602,9 +10781,13 @@ mod tests {
             .render()
             .expect("index renders");
 
-        assert!(html.contains("Helios FHIR Server"));
+        assert!(html.contains("HealthyMind FHIR Server Manager"));
+        // The upstream attribution stays in the footer (design §10.2).
+        assert!(html.contains("Based on Helios FHIR Server"));
         assert!(html.contains("1.2.3"));
-        assert!(html.contains(r#"<link rel="icon" type="image/png" href="/ui/assets/logo.png">"#));
+        assert!(html.contains(
+            r#"<link rel="icon" type="image/svg+xml" href="/ui/assets/brand/favicon.svg">"#
+        ));
         assert!(html.contains("/ui/assets/htmx.min.js"));
         // No runtime CDN dependency.
         assert!(!html.contains("unpkg.com"));
@@ -10660,6 +10843,8 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                manager: None,
+                csrf: None,
             },
             i18n: i18n("en"),
         }
@@ -10869,6 +11054,8 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                manager: None,
+                csrf: None,
             },
             i18n: i18n(lang),
             active_page: "search",
@@ -11983,6 +12170,8 @@ mod user_summary_tests {
             user,
             bearer_only_auth: false,
             fhir_base: String::new(),
+            manager: None,
+            csrf: None,
         }
     }
 

@@ -13,6 +13,7 @@ hospital production environment.
 | [backup-restore.md](backup-restore.md) | logical dumps, WAL archiving + PITR, drill timings, RPO/RTO |
 | [monitoring.md](monitoring.md) | Prometheus / Grafana / alerts / OTLP traces and the alert runbook |
 | [upgrade.md](upgrade.md) | image upgrades, verification, rollback |
+| [ci.md](ci.md) | HealthyMind CI on GitHub-hosted runners, coverage, disabled upstream workflows |
 | [upstream-rebase.md](upstream-rebase.md) | bringing in upstream releases (v0.2.4 → v0.2.8 plan) |
 | [ig-update-sop.md](ig-update-sop.md) | changing installed Implementation Guides |
 | [terminology-release-calendar.md](terminology-release-calendar.md) | yearly terminology calendar and change SOP |

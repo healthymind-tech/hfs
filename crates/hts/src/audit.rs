@@ -268,3 +268,7 @@ async fn read_handler(
         ),
     }
 }
+
+#[cfg(test)]
+#[path = "audit_hm_tests.rs"]
+mod hm_tests;

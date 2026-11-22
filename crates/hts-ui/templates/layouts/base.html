@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ chrome.i18n.t("hts-app-title") }}{% endblock %}</title>
-  <link rel="icon" type="image/png" href="/ui/hts/assets/logo.png">
+{{ chrome.brand_head()?|safe }}{# markup: crates/ui-chrome/templates/partials/brand-head.html #}
   <link rel="stylesheet" href="/ui/hts/assets/app.css">
   <!-- Inline first-paint theme stamp, shared with HFS (see its layout):
        crates/ui-chrome/templates/partials/theme-boot.html. -->
@@ -18,17 +18,12 @@
   <script src="/ui/hts/assets/list-paging.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
+  <a class="skip-link" href="#main">{{ chrome.i18n.t("mgr-skip-to-content") }}</a>
   <aside class="sidebar" id="sidebar">
     <button type="button" class="sidebar__close" data-nav-close aria-label="{{ chrome.i18n.t("nav-menu-close") }}">
       {% include "icons/x.svg" %}
     </button>
-    <a class="brand" href="/ui/hts" aria-label="{{ chrome.i18n.t("hts-app-title") }} hts v{{ chrome.version }} — {{ chrome.i18n.t("hts-nav-home") }}">
-      <img class="brand__logo" src="/ui/hts/assets/logo.png" alt="">
-      <div class="brand__text">
-        <span class="brand__name">{{ chrome.i18n.t("hts-app-title") }}</span>
-        <span class="brand__version">hts v{{ chrome.version }}</span>
-      </div>
-    </a>
+{{ chrome.brand()?|safe }}{# markup: crates/ui-chrome/templates/partials/brand.html #}
 
     <hr class="divider">
 
@@ -118,6 +113,10 @@
       <button type="button" class="nav-toggle" data-nav-toggle aria-controls="sidebar" aria-expanded="false" aria-label="{{ chrome.i18n.t("nav-menu-open") }}">
         {% include "icons/menu.svg" %}
       </button>
+      <a class="topbar__brand" href="/ui/hts" aria-label="{{ chrome.i18n.t("hts-app-title") }} — {{ chrome.i18n.t("hts-nav-home") }}">
+        <img src="/ui/hts/assets/brand/mark-64.png" alt="" width="32" height="32">
+        <span class="topbar__brand-name">{{ chrome.i18n.t("hts-app-short-name") }}</span>
+      </a>
       {#- FHIR Server | Terminology (UI/UX review §4.2), the same switcher HFS
           renders; present only when an HFS console shares this origin. -#}
 {{ chrome.product_switcher()?|safe }}{# markup: crates/ui-chrome/templates/partials/product-switcher.html #}
@@ -158,8 +157,9 @@
 {{ chrome.user_menu()?|safe }}{# markup: crates/ui-chrome/templates/partials/user-menu.html (#799) #}
       </div>
     </header>
-    <main class="content{% block content_class %}{% endblock %}">
+    <main class="content{% block content_class %}{% endblock %}" id="main" tabindex="-1">
       {% block content %}{% endblock %}
+{{ chrome.site_footer()?|safe }}{# markup: crates/ui-chrome/templates/partials/site-footer.html #}
     </main>
   </div>
   {#-

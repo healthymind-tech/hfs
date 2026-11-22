@@ -417,12 +417,46 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             schema.max_value = Some(value.clone());
         } else if key == "maxLength" {
             schema.max_length = value.as_u64().filter(|n| *n > 0);
+        } else if key == "mustHaveValue" {
+            schema.must_have_value = value.as_bool().filter(|b| *b);
+        } else if key == "valueAlternatives" {
+            let urls: Vec<String> = value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if !urls.is_empty() {
+                schema.value_alternatives = Some(urls);
+            }
         } else if key == "extension" {
             for ext in value.as_array().into_iter().flatten() {
                 if ext.get("url").and_then(serde_json::Value::as_str)
                     == Some("http://hl7.org/fhir/StructureDefinition/minLength")
                 {
                     schema.min_length = ext.get("valueInteger").and_then(serde_json::Value::as_u64);
+                }
+                let url = ext.get("url").and_then(serde_json::Value::as_str);
+                if url
+                    == Some(
+                        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.mustHaveValue",
+                    )
+                    && ext.get("valueBoolean").and_then(serde_json::Value::as_bool) == Some(true)
+                {
+                    schema.must_have_value = Some(true);
+                }
+                if url
+                    == Some(
+                        "http://hl7.org/fhir/5.0/StructureDefinition/extension-ElementDefinition.valueAlternatives",
+                    )
+                    && let Some(alt) = ext
+                        .get("valueCanonical")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    schema
+                        .value_alternatives
+                        .get_or_insert_with(Vec::new)
+                        .push(alt.to_string());
                 }
                 if ext.get("url").and_then(serde_json::Value::as_str)
                     == Some("http://hl7.org/fhir/StructureDefinition/maxSize")

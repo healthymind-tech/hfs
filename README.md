@@ -1,695 +1,462 @@
-[![Helios FHIR Server](https://github.com/HeliosSoftware/hfs/blob/main/github-banner.png)](https://heliossoftware.com)
-
-# Helios FHIR Server
-
-The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.org/fhir) standard, built in Rust for high performance and optimized for clinical analytics workloads. It provides modular components that can be run as standalone command-line tools, integrated as microservices, or embedded directly into your data analytics pipeline.
-
-## Why Helios FHIR Server?
-
-- **🚀 Blazing Fast**: Built in Rust for maximum performance and minimal resource usage
-- **📊 Analytics-First**: Optimized for clinical data analytics and research workloads
-- **🔧 Modular Design**: Use only what you need - from FHIRPath expressions to full server capabilities
-- **🌐 Multi-Version Support**: Work with R4, R4B, R5, and R6 data in the same application
-- **🛠️ Developer Friendly**: Excellent error messages, comprehensive documentation, and CLI tools
-
-## What People Build with the Helios FHIR Server
-
-- **Clinical Research Platforms**: Transform FHIR data into research-ready datasets using SQL-on-FHIR
-- **Real-time Analytics Dashboards**: Process streaming FHIR data for operational insights
-- **Data Quality Tools**: Validate and profile FHIR data using FHIRPath expressions
-- **ETL Pipelines**: Extract and transform FHIR data for data warehouses and lakes
-- **Healthcare APIs**: Build high-performance FHIR-compliant REST APIs
-- **Healthcare Analytics**: Analyze patient cohorts at scale
-
-
-# Quick Start
-
-The Helios FHIR Server includes several components:
-
-- **`hfs`** — the main FHIR server
-- **`hts`** — the FHIR Terminology Server
-- **`fhirpath-cli`** and **`fhirpath-server`** — FHIRPath evaluation
-- **`sof-cli`** and **`sof-server`** — SQL-on-FHIR transformation
-- **[`pysof`](https://pypi.org/project/pysof/)** — Python bindings for SQL-on-FHIR
-
-See [Core Components](#core-components) for details on each.
-
-The server supports SQLite, PostgreSQL, Elasticsearch, and S3 in various configurations — see [Storage Backends](#storage-backends) for setup options.
-
-## Using Release Binaries
-
-Pre-built binaries are available on the [GitHub Releases](https://github.com/HeliosSoftware/hfs/releases) page. Download the appropriate archive for your platform and extract it.
-
-> **Windows users:** Add `.exe` to all binary names (e.g., `hfs.exe`, `fhirpath-cli.exe`, `sof-cli.exe`).
-
-The following are independent examples showing how to run each executable — pick whichever ones apply to your use case:
-
-```bash
-# FHIR server (access at http://localhost:8080/metadata)
-./hfs
-
-# FHIR Terminology Server (access at http://localhost:8090/metadata)
-./hts
-
-# Evaluate a FHIRPath expression
-echo '{"resourceType": "Patient", "id": "123"}' | ./fhirpath-cli 'Patient.id'
-
-# Transform FHIR Bundle to CSV using SQL-on-FHIR
-./sof-cli --view examples/patient-view.json --bundle examples/patients.json
-
-# Transform NDJSON file to CSV using SQL-on-FHIR
-./sof-cli --view examples/patient-view.json --bundle examples/patients.ndjson
-
-# SQL-on-FHIR HTTP server (POST to http://localhost:8080/$sql-run)
-./sof-server
-
-# FHIRPath HTTP server (POST expressions to http://localhost:3000/fhirpath)
-./fhirpath-server
-```
-
-## Using Docker Images
-
-Pre-built multi-arch Docker images (amd64/arm64) are available on GitHub Container Registry.
-
-```bash
-# FHIR Server (default: R4, in-memory SQLite, port 8080)
-docker run -p 8080:8080 ghcr.io/heliossoftware/hfs:latest
-
-# With persistent SQLite storage
-docker run -p 8080:8080 -v hfs-data:/data -e HFS_DATABASE_URL=/data/fhir.db ghcr.io/heliossoftware/hfs:latest
-
-# With PostgreSQL
-docker run -p 8080:8080 \
-  -e HFS_STORAGE_BACKEND=postgres \
-  -e HFS_DATABASE_URL="postgresql://user:pass@host:5432/fhir" \
-  ghcr.io/heliossoftware/hfs:latest
-
-# FHIRPath Server (port 3000)
-docker run -p 3000:3000 ghcr.io/heliossoftware/fhirpath-server:latest
-
-# SQL-on-FHIR Server (port 8080)
-docker run -p 8080:8080 ghcr.io/heliossoftware/sof-server:latest
-
-# FHIR Terminology Server (default: SQLite, port 8090)
-docker run -p 8090:8090 ghcr.io/heliossoftware/hts:latest
-
-# HTS with persistent SQLite storage
-docker run -p 8090:8090 -v hts-data:/data -e HTS_DATABASE_URL=/data/hts.db ghcr.io/heliossoftware/hts:latest
-```
-
-See [Environment Variables](#environment-variables) for all available configuration options.
-
-## Building From Source
-
-### Prerequisites
-
-1. **Install [Rust](https://www.rust-lang.org/tools/install)**
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
-
-2. **Install [LLD](https://lld.llvm.org/)**
-
-    Linux (Ubuntu/Debian):
-    ```bash
-    sudo apt install clang lld
-    ```
-
-    Windows:
-
-      Download a pre-build binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
-
-    macOS:
-
-      LLD is not required for macOS.
-
-
-3. **Configure config.toml**
-
-    Create or modify `~/.cargo/config.toml`:
-    ```toml
-    [target.x86_64-unknown-linux-gnu]
-    linker = "clang"
-    rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
-
-    [target.aarch64-apple-darwin]
-    linker = "clang"
-    rustflags = [
-      "-C", "link-arg=-Wl,-dead_strip",
-      "-C", "link-arg=-undefined",
-      "-C", "link-arg=dynamic_lookup"
-    ]
-
-    [target.x86_64-pc-windows-msvc]
-    linker = "lld-link.exe"
-    rustflags = ["-C", "link-arg=/STACK:8388608"]
-    ```
-
-4. **Memory-constrained builds** (optional):
-
-💡 **Tip**: If you run out of memory during compilation on Linux, especially on high CPU core count machines, limit parallel jobs to 4 (or less):
-    ```bash
-    export CARGO_BUILD_JOBS=4
-    ```
-
-### Build and Install
-
-```bash
-# Clone the repository
-git clone https://github.com/HeliosSoftware/hfs.git
-cd hfs
-
-# Build (R4 only by default). Uses workspace default-members and skips the Python bindings crate (pysof).
-cargo build --release
-
-# Or build with all FHIR versions
-cargo build --release --features R4,R4B,R5,R6
-
-# Build all workspace members (including pysof)
-cargo build --workspace --release
-
-```
-
-## Storage Backends
-
-The Helios FHIR Server supports multiple storage backend configurations. Choose a configuration based on your search requirements and deployment scale.
-
-### Available Configurations
-
-| Configuration | Search Capability | Use Case |
-|---|---|---|
-| **SQLite** (default) | Built-in FTS5 full-text search | Development, testing, small deployments |
-| **SQLite + Elasticsearch** | Elasticsearch-powered search with relevance scoring | Production deployments needing robust search |
-| **PostgreSQL** | Built-in full-text search (tsvector/tsquery) | Production OLTP deployments |
-| **PostgreSQL + Elasticsearch** | Elasticsearch-powered search with PostgreSQL CRUD | Production deployments needing RDBMS + robust search |
-| **S3** | Object storage for CRUD, versioning, history, and bulk operations (no search) | Archival, bulk analytics, cost-effective storage |
-| **S3 + Elasticsearch** | Elasticsearch-powered search with S3 CRUD | Large-scale storage with full FHIR search |
-
-### Running the Server
-
-```bash
-# SQLite (default) — no external dependencies
-./hfs
-
-# SQLite + Elasticsearch
-HFS_STORAGE_BACKEND=sqlite-elasticsearch \
-HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
-  ./hfs
-
-# PostgreSQL
-HFS_STORAGE_BACKEND=postgres \
-HFS_DATABASE_URL="postgresql://user:pass@localhost:5432/fhir" \
-  ./hfs
-
-# PostgreSQL + Elasticsearch
-HFS_STORAGE_BACKEND=postgres-elasticsearch \
-HFS_DATABASE_URL="postgresql://user:pass@localhost:5432/fhir" \
-HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
-  ./hfs
-
-# S3 (requires AWS credentials via standard provider chain:
-# https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html)
-HFS_STORAGE_BACKEND=s3 \
-HFS_S3_BUCKET=my-fhir-bucket \
-AWS_PROFILE=your-aws-profile \
-AWS_REGION=us-east-1 \
-  ./hfs
-
-# S3 + Elasticsearch
-HFS_STORAGE_BACKEND=s3-elasticsearch \
-HFS_S3_BUCKET=my-fhir-bucket \
-HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
-AWS_PROFILE=your-aws-profile \
-AWS_REGION=us-east-1 \
-  ./hfs
-```
-
-### Environment Variables
-
-**Server**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_STORAGE_BACKEND` | `sqlite` | Backend mode: `sqlite`, `sqlite-elasticsearch`, `postgres`, `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch` |
-| `HFS_SERVER_PORT` | `8080` | Server port |
-| `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
-| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base used in `Location` headers and Bundle links |
-| `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
-| `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
-| `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | FHIR version (R4, R4B, R5, R6) |
-| `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
-| `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. Set `false` for headless deployments; `/ui` then returns `404` + OperationOutcome. Has no effect on a binary built without the `ui` feature. |
-| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
-| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (approximate, or an import running) (CLI `--dashboard-refresh-secs`). Re-reads in-memory counters only, never storage. Whole seconds, must be `> 0` and `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise a startup error. |
-| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a Home dashboard whose figures are settled (exact, no import running), so an open tab notices an import starting (CLI `--dashboard-idle-refresh-secs`). Whole seconds, must be `> 0` and `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise a startup error. |
-
-Set `HFS_BASE_URL` to the URL clients use, including any reverse-proxy path
-prefix, for example `https://fhir.example.com/fhir`. HFS accepts only absolute
-`http` or `https` URLs without credentials, query strings, or fragments. It
-removes trailing slashes at startup. HFS does not derive this value from
-`Host`, `Forwarded`, or `X-Forwarded-*` request headers.
-
-**Limits & behavior**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size (bytes; applies to the decompressed body for compressed requests). The 128 MiB default covers the largest per-patient Synthea Bundle (#1662); a batch or transaction body is parsed whole in memory, so lower it on small hosts. A bundle that size takes minutes to process (the largest, 27,056 entries, took about 2 minutes on a release build with SQLite), and `HFS_REQUEST_TIMEOUT` can answer 408 before it finishes: raise that too when posting large bundles. |
-| `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
-| `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
-| `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
-| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
-| `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
-| `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
-| `HFS_RETURN_GONE` | `true` | Return `410 Gone` for deleted resources (vs `404`) |
-| `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates |
-
-Request bodies may be sent compressed (`Content-Encoding: gzip`, `deflate`,
-`br`, or `zstd`); unsupported encodings are rejected with `415`. Responses are
-compressed when the client sends `Accept-Encoding`.
-
-**CORS**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_ENABLE_CORS` | `true` | Enable CORS |
-| `HFS_CORS_ORIGINS` | `*` | Allowed origins |
-| `HFS_CORS_METHODS` | `GET,POST,PUT,PATCH,DELETE,OPTIONS` | Allowed methods |
-| `HFS_CORS_HEADERS` | `Content-Type,Authorization,Accept,…` | Allowed headers |
-
-**Multi-tenancy**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_DEFAULT_TENANT` | `default` | Default tenant ID for requests without an `X-Tenant-ID` header |
-| `HFS_TENANT_ROUTING_MODE` | `header_only` | Tenant routing: `header_only`, `url_path`, or `both` |
-| `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
-| `HFS_JWT_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant |
-
-**Terminology**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_TERMINOLOGY_SERVER` | *(none)* | HTS base URL for the `:in`/`:not-in`/token `:above`/`:below` search modifiers and FHIRPath terminology functions (`memberOf`, `subsumes`) |
-| `HFS_SEARCH_TERMINOLOGY_FAIL` | closed | When a search's ValueSet/hierarchy expansion fails: `closed` (OperationOutcome error), `empty` (match nothing) or `open` (drop the parameter, pre-fork behaviour) |
-| `HFS_SEARCH_EXPANSION_PAGE_SIZE` | 1000 | `$expand` page size (`count`) used by search modifiers |
-| `HFS_SEARCH_EXPANSION_MAX_CODES` | 10000 | Largest expansion a search modifier may be rewritten into (else `422 too-costly`) |
-| `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS` | 60 | How long search expansions are cached; `0` disables |
-| `HFS_CORE_TERMINOLOGY` | true | With `HFS_TERMINOLOGY_SERVER`: at startup (and before a package install) send the terminology server the CodeSystems, ValueSets and ConceptMaps of the FHIR core package (`hl7.fhir.r4.core#4.0.1`) it lacks — compared by url and version, so a server that has them gets nothing. The core package comes from the package cache or registry like any other (offline: upload it once). |
-| `HFS_TERMINOLOGY_PUBLIC_URL` | *(none)* | Browser-reachable URL for the web UI's Terminology link (the server-side URL above is often an internal address); defaults to `/ui/hts` on the UI's own origin when `HFS_TERMINOLOGY_SERVER` names an internal host |
-
-**Elasticsearch**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_ELASTICSEARCH_NODES` | `http://localhost:9200` | Comma-separated ES node URLs |
-| `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | ES index name prefix |
-| `HFS_ELASTICSEARCH_USERNAME` | *(none)* | ES basic auth username |
-| `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
-| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
-| `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
-| `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | ES request timeout in milliseconds, including `_bulk`. A `_bulk` request that times out is split in half and resent |
-| `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | Byte cap per `_bulk` request body (10 MiB), applied together with the 500-operation cap |
-| `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `4` | `_bulk` requests of one page in flight at once; the page is cut into that many requests (never more than one request per 250 operations); splitting and back-off stay sequential per request |
-| `HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages on the Elasticsearch writer (the composite rebuild): `0` = cores − 1 (1–16), `1` = none beyond the page's own thread (#1250). |
-| `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild (`0` = count only). Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only |
-| `HFS_REINDEX_PREFETCH` | `true` | Fetch the next `$reindex` page from the primary while the current one is written, for `POST $reindex` and the automatic rebuild alike, wherever the source allows it: standalone SQLite, PostgreSQL and MongoDB, whose page read touches only stored resources that no page write changes; `mongo-es` (id phase); and `sqlite-es`, `postgres-es`, `s3-es`, where search is offloaded so the page read and the Elasticsearch write touch disjoint stores. `false` restores the serial fetch → write loop on every backend (#1250) |
-| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | `refresh` parameter for `$reindex`, deferred-rebuild and index-during-ingest writes: `false`, `wait_for`, or `true`. Unset = no per-request refresh on those bulk writes, whatever `HFS_ELASTICSEARCH_WRITE_REFRESH` says |
-| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize`, capped at 10,000 |
-| `HFS_REINDEX_STREAMS` | `auto` | Page streams per resource type of the automatic search-index rebuild: each type is split into that many id ranges, fetched and written at once. `auto` is half the cores, at most 8; `1` keeps one serial page loop. Every writer caps it: SQLite runs one stream (one writer), standalone PostgreSQL at most `HFS_POSTGRES_REINDEX_WIDTH`, MongoDB at most 8 (and its pool), Elasticsearch 8. Manual `POST $reindex` runs use `auto` |
-| `HFS_POSTGRES_REINDEX_WIDTH` | `auto` | Concurrent write groups of the search-index rebuild on the standalone `postgres` backend. `auto` is a quarter of the connection pool, at most 8 (pools of 32 and more reach 8); an explicit value is capped by the pool. No longer follows `HFS_BULK_SUBMIT_FILE_CONCURRENCY`. Ignored on composites (pg-es), where PostgreSQL is not a rebuild writer |
-
-**PostgreSQL** (used to assemble a connection when `HFS_DATABASE_URL` is not set)
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_PG_HOST` | `localhost` | PostgreSQL host |
-| `HFS_PG_PORT` | `5432` | PostgreSQL port |
-| `HFS_PG_DBNAME` | `helios` | Database name |
-| `HFS_PG_USER` | `helios` | Database user |
-| `HFS_PG_PASSWORD` | *(none)* | Database password |
-| `HFS_PG_MAX_CONNECTIONS` | `cores * 4`, 16 to 64 | Connection pool size. Without this variable (or with a value that does not parse) the pool is also limited at startup to half of the server's `max_connections`, shared with the other pools `hfs` opens against the same host and port, such as the `HFS_AUDIT_BACKEND=database` pool: on a stock server (`max_connections = 100`) the two get at most 25 each. A value you set is used as given, with a warning in the log when the pools add up to more than the server's limit. Raise it when PostgreSQL shares the machine with `hfs` and writes wait on the WAL flush; on a database with its own cores a larger pool did not raise throughput (#2216). |
-| `HFS_PG_CONNECT_TIMEOUT_SECS` | `5` | How long establishing a connection may take before failing (s), covering DNS, TCP, TLS and authentication. Raise it for a server that is slow to answer a fresh connection. |
-| `HFS_PG_STATEMENT_TIMEOUT_MS` | `30000` | Server-side `statement_timeout` applied to every pooled connection. Raise it for migrations or other long-running maintenance work. |
-| `HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` | `25000` | Statement budget for the cross-tenant resource count behind the Tenants UI, `GET /admin/tenants`, the existence check of `DELETE /admin/tenants/{id}` and the console tenant metrics, applied as `SET LOCAL statement_timeout` in the count's own transaction, so no other statement carries it. It only tightens `HFS_PG_STATEMENT_TIMEOUT_MS`: the count runs under the smaller of the two. Past it PostgreSQL stops the count and the call fails with a timeout error, never a zero count. The REST endpoints answer `504` only when this budget is below `HFS_REQUEST_TIMEOUT`, as the defaults are (25 s against 30 s); at or above it the request timeout answers `408` first, and `hfs` logs a startup warning. Like `statement_timeout` it covers lock waits and execution, not waiting for a pooled connection, so the `504` at defaults assumes the pool checkout and the handler's earlier work take less than the 5 s of headroom; a checkout that waits longer on a saturated pool (`HFS_PG_POOL_WAIT_TIMEOUT_SECS`, default 10 s) still ends in `408`. Must be 1 to 2147483647; an out-of-range value fails startup, and one that does not parse is ignored like the other `HFS_PG_*` settings. The 25 s default is policy, not a large-store measurement. Since schema v49 the count is an index-only scan of `idx_resources_live_tenant` (see [PostgreSQL in the persistence crate README](crates/persistence/README.md#postgresql)). |
-| `HFS_PG_POOL_WAIT_TIMEOUT_SECS` | `10` | How long a request waits for a free pooled connection before failing with 503 |
-
-**MongoDB**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_MONGODB_URL` / `HFS_MONGODB_URI` | *(none)* | MongoDB connection string |
-| `HFS_MONGODB_DATABASE` | `helios` | Database name |
-| `HFS_MONGODB_MAX_CONNECTIONS` | *(unset: URI `maxPoolSize`, else `10`)* | Connection pool size. Overrides `?maxPoolSize=` in the connection string when set. See [MongoDB pool and timeout precedence](#mongodb-pool-and-timeout-precedence). |
-| `HFS_MONGODB_SEARCH_TIMEOUT_MS` | *(unset)* | Soft MongoDB search/count budget (ms), 1–2147483647, shared by admission, planning, pages, totals and inline includes. Unset or blank preserves existing behavior. Checks occur before commands and matching batches, never per ID. Completed search results are returned even if late; unfinished planning, retries and additional batches can still time out. Active commands/cursor reads may overrun; detected expiry returns an error without partial results. New commands receive the remaining maxTimeMS; implicit getMore retains its cursor budget. The HTTP timeout is separate. |
-| `HFS_MONGODB_PROBE_TIMEOUT_MS` | `10` | Server execution budget for optional cardinality and ordered-page probes (ms), from 1 through 2147483647. Unset or blank preserves the default. A probe’s own timeout falls back to normal matching; the optional whole-search deadline still applies. |
-| `HFS_MONGODB_ADAPTIVE_OFFSET_PAGING` | `true` | Samples eligible no-total offsets and caches their execution strategy. `false` disables adaptive offset selection; other search plans are unchanged. |
-| `HFS_MONGODB_MISSING_METADATA` | `true` | Records absent search parameters on each resource (`missing_params`) and builds `idx_resources_missing_params` so `:missing=true` can use them. `false` stops recording them (each write removes the field), skips the index build, and answers `:missing=true` from the value indexes instead; results are the same. An existing index is not dropped. |
-| `HFS_MONGODB_CONNECT_TIMEOUT_MS` | *(unset: URI `connectTimeoutMS`, else `5000`)* | TCP handshake timeout (ms). Overrides the URI option when set. |
-| `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` | *(unset: no limit)* | How many potentially broad standard searches run at once per process; others wait for a slot. Reads and narrow searches (`_id`, a reference or uri, a date with `eq`/`ap`, `identifier=system\|code`) bypass this admission limit. A value at or above the pool size is accepted with a startup warning; `0` fails startup. |
-| `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` | `25000` | Server execution budget (`maxTimeMS`) for the cross-tenant resource count behind the Tenants UI, `GET /admin/tenants`, the existence check of `DELETE /admin/tenants/{id}` and the console tenant metrics. No other query carries it. Past it the server stops the count and the call fails with a timeout error, never a zero count. A caller outside the HTTP request timeout, such as the Tenants UI, sees that error directly and shows its error state instead of counts. The REST endpoints answer `504` only when this budget is below `HFS_REQUEST_TIMEOUT`, as the defaults are (25 s against 30 s). The request timeout starts when the request arrives, before the count, so with a budget at or above it the request timeout answers `408` first; the budget still stops the count on the server a moment later. Keep it below `HFS_REQUEST_TIMEOUT` when raising either. It bounds server execution only, not server selection, waiting for a pooled connection or network time. Must be 1 to 2147483647; anything else fails startup. The 25 s default is policy (five seconds under the default request timeout), not a large-store measurement. The count is a covered scan of the `idx_resources_live_tenant` index, which boot creates; for its build cost on an existing store see [`crates/persistence/mongodb/tenant-count-index.md`](crates/persistence/mongodb/tenant-count-index.md). |
-| `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` | `512` | Documents per cursor batch of a SQL-on-FHIR scan (`1` to `100000`; anything else fails startup). Lower = lower first-row latency on selective views (the first row waits for one full batch); higher = fewer round trips against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at `512`, about 7,000 at `256`). Memory is bounded by this many documents per reply. |
-| `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | *(unset: URI `serverSelectionTimeoutMS`, else `15000`)* | Overrides the URI option when set. How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
-| `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` | `4` | How many standard-size transaction Bundles (see `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`) run at once; the rest wait their turn within the request timeout. Each Bundle is one MongoDB transaction held in WiredTiger's cache until commit, so this bounds cache pressure (see [Sizing the WiredTiger cache for transaction Bundles](crates/persistence/README.md#sizing-the-wiredtiger-cache-for-transaction-bundles)). `0` removes the limit. |
-| `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` | `1000` | The entry count of one standard Bundle. Bundles are admitted while their entries fit in limit × this, each counting at least 1 entry and at most the whole room, so small Bundles share a slot and a large one takes several. `0` counts every Bundle as one slot (the #1776 behaviour). The limit counts standard Bundles of this many entries, not Bundles, so with the default weight many small transaction Bundles can be open at once, each with its own session and transaction, bounded by the entry room and the connection pool rather than by the limit. For a hard cap on concurrent Bundles (for example limit `1` to serialise them), set this to `0`. |
-| `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` | `auto` (the admission room, `4000`) | Transaction Bundles with at least this many entries commit their resources and history without their search rows, which are written right after the commit, before the response; other clients may see search lag for those resources. `off` or `0` writes every Bundle's rows inside its transaction. Ignored on mongodb-elasticsearch. See [Deferred search indexing for large MongoDB transaction Bundles](crates/persistence/README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles). |
-| `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` | *(unset: off)* | Refuses a transaction Bundle whose created and updated resources total more than this many bytes (BSON, once per entry; PATCH not counted) before it is admitted, with `500` `too-costly`, so a Bundle too large for the WiredTiger cache fails at once instead of after writing most of its entries. `0` or `off` turns it off. For one Bundle at a time, 20,000,000 per GB of `--wiredTigerCacheSizeGB` up to 5 GB and, above that, the larger of 100,000,000 and 16,000,000 per GB (40,000,000 at 2 GB, 80,000,000 at 4 GB, 100,000,000 at 5 and 6 GB, 128,000,000 at 8 GB; measured at 2, 4, 5, 6, 8 and 12 GB, above 4 GB only with the search rows offloaded, as on `mongodb-elasticsearch`); BSON is about 1.14 x the resources' compact JSON for Synthea data. See [Sizing the WiredTiger cache for transaction Bundles](crates/persistence/README.md#sizing-the-wiredtiger-cache-for-transaction-bundles). |
-| `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` | `60` | Seconds between passes of the task that finishes the search rows a large Bundle left unwritten after its commit (crash, cancelled request, failure); it also runs once at startup. A pass takes only Bundles whose ledger is older than the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s). `0` turns the task off. |
-| `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes and `resources.idx_resources_missing_params` are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see [`crates/persistence/mongodb/search-indexes.md`](crates/persistence/mongodb/search-indexes.md)). |
-| `HFS_MONGODB_REINDEX_OVERLAP` | `true` | Overlap search-parameter extraction with `search_index` inserts inside a `$reindex` page; `false` restores the serial writer. |
-| `HFS_MONGODB_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages: `0` = cores − 1 (1–4), `1` = none beyond the page's own thread. |
-| `HFS_MONGODB_REINDEX_PREFETCH` | `true` | Fetch the next id-order `$reindex` page while the current one is written, on standalone MongoDB and on `mongo-es` (#1250); the MongoDB-specific switch under `HFS_REINDEX_PREFETCH`, which covers every backend. |
-| `HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY` | `4` | `search_index` `insert` commands one `$bulk-submit` batch keeps in flight when it indexes inline (`HFS_BULK_SUBMIT_DEFER_INDEXING=false` on standalone MongoDB). The batch's extraction runs on the rayon pool and its history, index and rollback-log writes overlap. Measured on 71,704 resources: inline ingest 31.4 s on the serial path, 13.3 s at `4`, 21.5 s at `1`, 11.6–12.1 s at `8`; `4` leaves headroom on a shared `mongod`. |
-
-<a id="mongodb-pool-and-timeout-precedence"></a>
-**MongoDB pool and timeout precedence.** For the pool size, connect timeout
-and server selection timeout, the first source that sets a value wins:
-
-1. an explicitly set `HFS_MONGODB_*` variable (`HFS_MONGODB_MAX_CONNECTIONS`,
-   `HFS_MONGODB_CONNECT_TIMEOUT_MS`, `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`);
-2. the matching option in the connection string (`maxPoolSize`, `connectTimeoutMS`,
-   `serverSelectionTimeoutMS`);
-3. the HFS default (pool `10`, connect `5000` ms, server selection `15000` ms).
-
-`appName` and `maxIdleTimeMS` have no variable: the URI value is used, otherwise
-the default (`helios-persistence` and 60 s).
-
-- A numeric variable that does not parse is treated as unset, so the URI value (or the default) applies.
-- `waitQueueTimeoutMS` is read from the URI but has no effect: the MongoDB Rust driver has no timeout for waiting on a pooled connection, so that wait is bounded only by server selection and the request timeout. Use the pool metrics below to see it.
-- **Behavior change:** earlier versions overwrote these URI options. A URI with `?maxPoolSize=200` now gets a pool of 200 (it used to get 10), and `?maxPoolSize=5` now gets 5.
-- At startup HFS logs a warning when the pool leaves fewer than 4 connections beyond the 8 concurrent bulk writers, which is the case with the default pool of 10.
-- The pool is exposed on `/metrics` as `mongodb_pool_*` series; see [`crates/rest/docs/console-metrics.md`](crates/rest/docs/console-metrics.md).
-
-**S3**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_S3_TENANCY` | `prefix-per-tenant` | Where tenants live: `prefix-per-tenant` (one shared bucket, tenant-scoped key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant; #1598) |
-| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only; refused under bucket-per-tenant) |
-| `HFS_S3_TENANT_BUCKETS` | *(none)* | Bucket-per-tenant only, required: `tenant=bucket,tenant=bucket,…`. `HFS_DEFAULT_TENANT` must be among them; each tenant needs its own bucket, and the buckets must already exist |
-| `HFS_S3_SYSTEM_BUCKET` | *(none)* | Bucket-per-tenant only, optional: the tenant-independent bucket that holds the tenant registry (`/admin/tenants`), `/_user/settings`, web login sessions, the `$bulk-submit` worker index and the `__system__` tenant (AuditEvents). Without it those answer `501`, login sessions stay in process, and `HFS_AUDIT_BACKEND=database` needs `HFS_AUDIT_S3_BUCKET` |
-| `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
-| `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
-| `HFS_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO `http://localhost:9000`) |
-| `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
-| `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
-| `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
-| `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY` | `64` | `$bulk-submit` entries one batch writes at once on S3 (when no per-entry error cap is set and no two entries of the batch share an id). Each entry is a few round trips, so throughput scales with it until the store saturates: 71,704 resources against single-node MinIO took 87–91 s at the former default `8` and 36–40 s at `64`. Raise it further against AWS S3, where every round trip costs 20–50 ms. |
-| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
-| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
-
-**S3 keyspace layout (`HFS_S3_KEYSPACE_LAYOUT`).** Each tenant has one layout, `v1` or `v2`, recorded in a marker object `history/_keyspace.json` (`{"layout":2}`). The variable only decides the layout of a tenant that has no marker and no data yet; a tenant that already holds objects without a marker is always `v1`, and a stamped marker always wins, so changing the variable never moves existing data. `v2` stores `resources/{type}/{h2}/{id}/…` and `history/type/{type}/{h2}/…` with `h2 = hex(sha256(id))[0..2]` (256 sub-prefixes) and drops the tenant-wide `history/system/` index (system history is served from `history/type/`), so each write does 3 PUTs instead of 4. The layout of a tenant is immutable: there is no migration, and `purge_tenant_data` keeps the marker. To change it, stop every instance and delete the tenant's prefix by hand. `v2` requires every instance that writes the bucket to run a build that reads the marker and to use the same setting; an older binary ignores the marker and would write `v1` keys into a `v2` tenant, leaving them unreachable. Opt-in: the default is `v1`.
-
-**SQL-on-FHIR async export**
-
-The `$sql-export` operation writes tabular output
-asynchronously to an export sink. See the [rest crate README](crates/rest/README.md#sql-on-fhir-async-export)
-for the full `HFS_EXPORT_*` table.
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`); requires a `sqlite`/`postgres` backend |
-| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
-| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
-| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
-| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup; `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false` |
-| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket for the `s3` sink; required when `HFS_EXPORT_SINK=s3` |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | Region override for the `s3` sink; defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set |
-| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO); forces path-style addressing |
-| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for the `s3` sink; forced on when `HFS_EXPORT_S3_ENDPOINT` is set |
-| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output and bookkeeping; the cleanup reaper deletes shards and drops the job afterward |
-| `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval (seconds; clamped to ≥ 1) |
-
-**Authentication & SMART-on-FHIR**
-
-JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HFS_AUTH_ISSUER`, `HFS_AUTH_AUDIENCE`) and SMART configuration endpoints (`HFS_SMART_*`) plus `HFS_OUTBOUND_BEARER_TOKEN` are documented in the [helios-auth README](crates/auth/README.md).
-
-**Audit, subscriptions & bulk export**
-
-| Variable | Default | Description |
-|---|---|---|
-| `HFS_AUDIT_BACKEND` | `none` | [Audit backend](crates/audit/README.md#audit-sinks): `none`, `file`, `database`, or `cloudwatch` |
-| `HFS_AUDIT_FILE_PATH` | *(none)* | Required when `HFS_AUDIT_BACKEND=file`; NDJSON file path for persisted `AuditEvent` logs |
-| `HFS_AUDIT_DATABASE_URL` | *(none)* | Optional dedicated audit database URL/path (SQLite/PostgreSQL/MongoDB families) |
-| `HFS_AUDIT_MONGODB_DATABASE` | *(none)* | Optional dedicated MongoDB database name for audit events |
-| `HFS_AUDIT_S3_BUCKET` | *(none)* | Optional dedicated S3 bucket for audit events |
-| `HFS_AUDIT_S3_PREFIX` | *(none)* | Optional dedicated S3 prefix for audit events |
-| `HFS_AUDIT_S3_REGION` | *(none)* | Optional dedicated S3 region for audit events |
-| `HFS_AUDIT_S3_VALIDATE_BUCKETS` | *(none)* | Optional dedicated S3 bucket validation toggle for audit events |
-| `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | Sets `AuditEvent.source.observer` |
-| `HFS_AUDIT_EXCLUDE_PATHS` | *(none)* | Comma-separated paths to exclude from audit middleware |
-| `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | Audit write-queue capacity |
-| `HFS_AUDIT_WRITERS` | 4 × cores (4–64) | Writer tasks draining the audit queue (bounds concurrent audit writes) |
-| `HFS_AUDIT_OVERFLOW` | `block` | Full audit queue: `block` the response until queued, or `drop` the event (counted in `audit_events_dropped_total`) |
-| `HFS_AUDIT_WRITE_RETRIES` | `5` | Retries of a transient database-sink write before the event is dropped and counted |
-| `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` | *(none)* | Required when `HFS_AUDIT_BACKEND=cloudwatch`; CloudWatch Logs log group name |
-| `HFS_AUDIT_CLOUDWATCH_LOG_STREAM` | `hfs-audit` | CloudWatch Logs log stream name |
-| `HFS_AUDIT_CLOUDWATCH_REGION` | *(AWS chain)* | AWS region override for CloudWatch Logs |
-| `HFS_SUBSCRIPTIONS_ENABLED` | `false` | Enable the subscription engine when HFS is built with the `subscriptions` feature |
-| `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
-| `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
-| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
-| `HFS_SUBSCRIPTION_REHYDRATE` | `true` | Reload stored `Subscription`/`SubscriptionTopic` resources into the engine at startup, so subscriptions keep delivering across a restart |
-| `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | `true` | Re-run the activation handshake for stored `requested` subscriptions during rehydration |
-| `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | `100` | Events remembered per subscription for `GET Subscription/{id}/$events` (in memory, lost on restart); `0` disables the history |
-| `HFS_BULK_EXPORT_ENABLED` | `true` | Enable the [Bulk Data Export](crates/rest/README.md#bulk-data-export) `$export` operation; when `false`, all `$export` endpoints return `501` |
-| `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Bulk export output store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-export) for the full `HFS_BULK_EXPORT_*` table |
-| `HFS_BULK_SUBMIT_ENABLED` | `true` | Enable the [Bulk Data Submit](crates/rest/README.md#bulk-data-submit) `$bulk-submit` operation (HFS as Data Consumer — fetches a provider manifest and ingests it); when `false`, all `$bulk-submit` endpoints return `501`. Available on `sqlite`, `postgres` and `mongodb` (+ `-elasticsearch` composites) |
-| `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Bulk submit status-artifact store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-submit) for the full `HFS_BULK_SUBMIT_*` table |
-
-The SMTP delivery channel (`HFS_SUBSCRIPTION_SMTP_*`), delivery-retry tuning (`HFS_SUBSCRIPTION_HANDSHAKE_*`), and the remaining startup-rehydration knobs (`HFS_SUBSCRIPTION_REHYDRATE_*`) are documented in the [helios-subscriptions README](crates/subscriptions/README.md).
-
-For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
-
-# Architecture Overview
-
-The Helios FHIR Server is organized as a Rust workspace with modular components that can be used independently or together. Each component is designed for high performance and can be embedded directly into your data analytics pipeline.
-
-## Core Components
-
-### 1. [`helios-hfs`](crates/hfs) - Main Server Application
-- **Executable:**
-  - `hfs` - The main Helios FHIR Server application.
-
-### 2. [`helios-hts`](crates/hts) - FHIR Terminology Server
-- **Executable:**
-  - `hts` - The Helios Terminology Server (default port 8090)
-
-### 3. [`helios-fhir`](crates/fhir) - FHIR Data Models
-Generated from FHIR StructureDefinitions, type-safe Rust representations of all FHIR resources and data types.
-- Supports FHIR R4, R4B, R5, and R6 via feature flags
-- JSON serialization/deserialization with full FHIR compliance
-- Precision decimal handling for clinical accuracy
-- Default: R4 (use `--all-features` for all versions)
-
-### 4. [`helios-fhir-gen`](crates/fhir-gen) - Code Generator
-Generates the FHIR data models from official HL7 specifications.
-- Transforms FHIR StructureDefinitions into Rust types
-- Automatically downloads the latest R6 specs from the HL7 build server
-- See [Code Generation](#code-generation) section and [helios-fhir-gen README](crates/fhir-gen/README.md) for usage details
-
-### 5. [`helios-fhirpath`](crates/fhirpath) - FHIRPath Expression Engine
-Complete implementation of the [FHIRPath 3.0.0-ballot specification](https://hl7.org/fhirpath/2025Jan/).
-- **Executables:**
-  - `fhirpath-cli` - Evaluate FHIRPath expressions from the command line
-  - `fhirpath-server` - HTTP server for FHIRPath evaluation
-- Parser built with chumsky for excellent error messages
-- Comprehensive function library with version-aware type checking
-- Auto-detects FHIR version from input data
-
-### 6. [`helios-sof`](crates/sof) - SQL-on-FHIR Implementation
-Transform FHIR resources into tabular data using [ViewDefinitions](http://hl7.org/fhir/uv/sql-on-fhir/index.html).
-- **Executables:**
-  - `sof-cli` - Command-line tool for batch transformations
-  - `sof-server` - HTTP server with `$sql-run` operation
-- Supports multiple input formats: JSON, NDJSON, and FHIR Bundles from local/cloud storage
-- Supports multiple output formats: CSV, JSON, NDJSON, and Parquet
-
-### 7. [`pysof`](crates/pysof) - Python Bindings
-Python bindings for SQL-on-FHIR using PyO3, bringing high-performance FHIR data transformation to Python.
-
-**Key Capabilities:**
-- **ViewDefinition Processing**: Transform FHIR resources into tabular formats using ViewDefinitions
-- **Multiple Output Formats**: Export to CSV, JSON, NDJSON, and Parquet formats
-- **Streaming Support**: Efficiently process large FHIR bundles without loading everything into memory
-- **Auto Version Detection**: Automatically detects and handles R4, R4B, R5, and R6 FHIR versions
-- **Type-Safe Interface**: Leverages Rust's type safety while providing a Pythonic API
-- **High Performance**: Native Rust performance with minimal Python overhead
-
-**Python API Example:**
-```python
-import pysof
-
-# Transform FHIR bundle to CSV using a ViewDefinition
-result = pysof.run_view_definition(
-    view_definition=view_def_json,
-    bundle=fhir_bundle_json,
-    format="csv"
-)
-
-# Process individual resources
-result = pysof.run_view_definition(
-    view_definition=view_def_json,
-    resources=[patient1, patient2],
-    format="parquet"
-)
-```
-
-**Distribution:**
-- Cross-platform wheel distribution for Linux, Windows, and macOS available on [PyPi](https://pypi.org/project/pysof/)
-
-### 8. [`helios-cds-hooks`](crates/cds-hooks) - CDS Hooks Protocol Types
-Rust types and traits for building [CDS Hooks](https://cds-hooks.hl7.org/) clinical decision support services.
-- Complete protocol types for discovery, requests, responses, cards, suggestions, and feedback
-- Strongly-typed context structs for all 10 hooks in the CDS Hooks Library
-- Async `CdsHooksService` trait compatible with any Rust web framework
-
-### 9. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
-Helper macros for code generation used by other components.
-
-### 10. [`helios-fhirpath-support`](crates/fhirpath-support) - Shared Utilities
-Common types and traits for FHIRPath evaluation.
-
-### 11. [`helios-persistence`](crates/persistence) - Polyglot Persistence Layer
-Storage backend abstraction supporting multiple database technologies optimized for different FHIR workloads. Also hosts the [Bulk Data Export](crates/persistence/README.md) job-state stores, worker runtime, and output stores backing the server's `$export` operation (REST endpoints and `HFS_BULK_EXPORT_*` configuration live in [`helios-rest`](crates/rest/README.md#bulk-data-export)).
-
-### 12. [`helios-audit`](crates/audit) - BALP Audit Logging
-[IHE BALP](https://profiles.ihe.net/ITI/BALP/)-compliant `AuditEvent` logging for REST, auth, persistence, and lifecycle events. Supports file, database, and AWS CloudWatch Logs sinks. See the [helios-audit README](crates/audit/README.md) for full configuration details.
-
-## Design Principles
-
-- **Version Agnostic**: All components use enum wrappers to seamlessly handle multiple FHIR versions
-- **Modular Architecture**: Each component can be used standalone or integrated
-- **Type Safety**: Leverages Rust's type system for compile-time correctness
-- **Performance**: Built for high-throughput clinical analytics workloads
-
-# Features
-
-## FHIR Version Support
-- ✅ **FHIR R4** (4.0.1) - Default
-- ✅ **FHIR R4B** (4.3.0)
-- ✅ **FHIR R5** (5.0.0)
-- ✅ **FHIR R6** (6.0.0-snapshot1)
-
-## FHIRPath Expression Language
-- Complete implementation of [FHIRPath 3.0.0-ballot specification](https://hl7.org/fhirpath/2025Jan/)
-- 100+ built-in functions across all categories
-- HTTP server for integration with FHIRPath Lab
-- Command-line tool for testing and development
-
-## SQL-on-FHIR
-- ViewDefinition-based transformation to tabular formats
-- Multiple input formats: JSON, NDJSON (newline-delimited), and FHIR Bundles
-- Multiple output formats: CSV, JSON, NDJSON, Parquet
-- Streaming support for large datasets
-- HTTP API with `$sql-run` operation
-- Cloud storage support: S3, GCS, Azure Blob Storage
-
-## FHIR REST API
-- Full CRUD operations
-- Search with chained parameters
-- History and versioning
-- Batch/transaction support
-- Asynchronous [Bulk Data Export](crates/rest/README.md#bulk-data-export) (`$export`) at system, Patient, and Group level
-- [Administrative operations](crates/rest/README.md#administrative-operations): `$purge` (permanent, irreversible erasure of a resource and its history) and `$reindex` (rebuild the search index), each gated on its own scope
-- Optional BALP-compliant `AuditEvent` logging for REST and auth interactions, including the `$export`, `$purge`, and `$reindex` operations
-
-# Development
-
-## Building from Source
-```bash
-# Build with default features (R4 only)
-# Note: pysof (Python bindings) is excluded by workspace default-members
-cargo build
-
-# Build with all FHIR versions
-cargo build --all-features
-
-# Build specific component
-cargo build -p helios-fhirpath
-
-# Build Python bindings (requires Python 3.11)
-# Option A: Rust-only build of the crate
-cargo build -p pysof
-
-# Option B (recommended): build via maturin into a virtual env
-cd crates/pysof
-uv venv --python 3.11
-uv sync
-uv run maturin develop --release
-# Build distributable artifacts for pysof
-uv run maturin build --release -o dist   # wheels
-uv run maturin sdist -o dist             # source distribution
-# Build everything except Python bindings (alternative)
-cargo build --workspace --exclude pysof
-```
-
-## Running Tests
-
-**Docker Required:** PostgreSQL and Elasticsearch integration tests use [testcontainers](https://testcontainers.com/) to spin up real database instances in Docker. Make sure Docker is installed and running to execute the full test suite. To skip these tests (e.g., if Docker is unavailable), add `-- --skip postgres_integration --skip es_integration` to your test command.
-
-```bash
-# Run all tests (R4 only by default)
-cargo test
-
-# Run tests for all FHIR versions
-cargo test --all-features
-
-# Run tests without Docker (skips PostgreSQL and Elasticsearch integration tests)
-cargo test --all-features -- --skip postgres_integration --skip es_integration
-
-# Run specific test
-cargo test test_name_pattern
-
-# Run with output
-cargo test -- --nocapture
-```
-
-## Code Generation
-To regenerate FHIR models from HL7 specifications:
-```bash
-# This will download the latest R6 (build) specifications from https://build.fhir.org/
-# Note the lack of use of --all-features and the lack of skip-r6-download here.
-cargo build -p helios-fhir-gen --features R4,R4B,R5,R6
-# This will generate all FHIR code models (r4.rs, r4b.rs, r5, and r6) 
-./target/debug/helios-fhir-gen --all
-# Format the generated files accordingly
-cargo fmt --all
-```
-
-## Code Documentation
-
-Published crate documentation is available on [crates.io](https://crates.io/keywords/helios-fhir-server). To generate and view documentation locally:
-
-```bash
-cargo doc --no-deps --open
-```
-
-# Roadmap
-
-See our [Roadmap](ROADMAP.md) for current development priorities and planned features.
-
-# Contributing
-
-Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
-# License
-
-The Helios FHIR Server is licensed under the [MIT License](LICENSE.md).
-
-# Community
-
-We welcome contributors and feedback at every level — from opening issues to joining design discussions.
-
-- **📋 GitHub Discussions:** [github.com/HeliosSoftware/hfs/discussions](https://github.com/HeliosSoftware/hfs/discussions)
-- **🐛 Issues:** [github.com/HeliosSoftware/hfs/issues](https://github.com/HeliosSoftware/hfs/issues)
-- **🗓️ Weekly Developer Meeting:** Open to all. We review roadmap progress, discuss design decisions, and plan upcoming work. Details and updates are posted to [this GitHub Discussion](https://github.com/HeliosSoftware/hfs/discussions/40).
-- **💼 LinkedIn Group:** [linkedin.com/groups/8618077](https://www.linkedin.com/groups/8618077/) — Over 2,500 members
-- **🌐 Website:** [heliossoftware.com](https://heliossoftware.com)
+<p align="center">
+  <img src="docs/images/brand/healthymind-logo-horizontal.png" alt="療心智能 HealthyMind.Tech" width="520">
+</p>
+
+<h1 align="center">HealthyMind FHIR Server</h1>
+
+<p align="center">
+  <b>A production-grade FHIR R4 server, terminology server and validator for hospitals, written in Rust.</b><br>
+  Built and operated by HealthyMind Tech, based on the open-source
+  <a href="https://github.com/HeliosSoftware/hfs">Helios FHIR Server</a>.
+</p>
+
+<p align="center">
+  <img alt="FHIR R4" src="https://img.shields.io/badge/FHIR-R4%204.0.1-0ea5e9">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024%20edition-7c3aed">
+  <img alt="PostgreSQL 16" src="https://img.shields.io/badge/PostgreSQL-16-3b82f6">
+  <img alt="tx-ecosystem 697/697" src="https://img.shields.io/badge/HL7%20tx--ecosystem-697%2F697-22c55e">
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-64748b">
+</p>
+
+<p align="center">
+  <img src="docs/images/screenshots/fhir-resource-editor.png" alt="The FHIR console's resource editor showing a TW Core blood-pressure Observation as JSON next to a schema-driven guided form" width="900">
+</p>
 
 ---
 
-HL7® and FHIR® are registered trademarks of Health Level Seven International.
+## Contents
+
+- [What it is](#what-it-is)
+- [Who it is for](#who-it-is-for)
+- [Key capabilities](#key-capabilities)
+- [Screenshots](#screenshots)
+- [Architecture](#architecture)
+- [Quality, measured](#quality-measured)
+- [Quick start](#quick-start)
+- [Configuration highlights](#configuration-highlights)
+- [Deployment and operations](#deployment-and-operations)
+- [Roadmap](#roadmap)
+- [Support and contact](#support-and-contact)
+- [Acknowledgements and license](#acknowledgements-and-license)
+
+## What it is
+
+HealthyMind FHIR Server is a complete FHIR platform for a hospital's
+production environment. One deployment gives you three things that usually
+come from three different products:
+
+- **A FHIR R4 server (`hfs`)**: REST API, search, transactions, history,
+  Bulk Data, Subscriptions, SMART on FHIR authorization and an IHE BALP audit
+  trail, on PostgreSQL.
+- **A FHIR terminology server (`hts`)**: CodeSystem, ValueSet and ConceptMap
+  operations (`$lookup`, `$validate-code`, `$expand`, `$subsumes`,
+  `$translate`, `$closure`), with importers for SNOMED CT, LOINC, ICD-10-CM/PCS,
+  the Taiwan ICD tables, NDC and more.
+- **A FHIR validator**: `$validate` and optional validate-on-write against the
+  profiles of the Implementation Guides you install, with terminology checks
+  answered by the terminology server.
+
+Both servers come with a web console for browsing, editing, validating,
+installing IG packages and managing terminology.
+
+The goal is to **replace HAPI FHIR** in hospital deployments with a single,
+memory-efficient Rust service. It is tuned for **Taiwan**: TW Core and the
+other Ministry of Health and Welfare (MOHW) / NHI Implementation Guides,
+Traditional Chinese (zh-Hant) terminology displays and a fully translated
+console. Nothing in it is Taiwan-only; US Core, IPS, mCODE, Da Vinci and other
+international IGs run on the same server.
+
+## Who it is for
+
+- **Hospitals and health systems** that need a FHIR server for national
+  exchange (TW Core, EMR exchange, NHI pre-authorization, e-prescription,
+  reportable disease) or for internal integration.
+- **Health-IT vendors and integrators** that want a FHIR backend with
+  validation and terminology included, rather than three separate products.
+- **Teams running HAPI FHIR today** that want lower memory use, a built-in
+  terminology server and an operations story (backups, PITR, monitoring,
+  upgrades) written down and rehearsed.
+
+## Key capabilities
+
+| Area | What you get |
+|---|---|
+| **FHIR REST** | R4 (4.0.1) create / read / vread / update / patch / delete, history, batch and transaction Bundles, conditional operations, `$meta`, JSON and XML with correct FHIR media types, multi-tenancy. |
+| **Search** | Spec search parameters plus those from installed IGs; chains, `_has`, `_include` / `_revinclude`, `_sort`, `_summary`, `_elements`, token modifiers including `:in`, `:not-in` and `:below` answered by the terminology server. Indexes reviewed on 2.6M resources (see [index strategy](docs/ops/index-strategy.md)). |
+| **Validation** | `$validate` against core FHIR and installed IG profiles: slicing, extensions, invariants (FHIRPath), reference targets, Bundle rules, required / extensible bindings. Terminology can be checked by the remote terminology server (`HFS_VALIDATION_TERMINOLOGY=remote`). Validate-on-write in three modes: `off`, `log`, `enforce`. |
+| **Terminology server** | Full HL7 tx-ecosystem conformance (see [numbers](#quality-measured)), full ECL 2 and SNOMED CT post-coordinated expressions, implicit ValueSets, CodeSystem supplements, versioned canonicals, `displayLanguage` (for example zh-Hant), expansion caching. |
+| **Terminology importers** | SNOMED CT RF2, LOINC (with parts, answer lists, linguistic variants), ICD-10-CM, ICD-10-PCS, ICD-9-CM, Taiwan NHI ICD-10-CM/PCS (zh-Hant), RxNorm RRF, FDA NDC, NUCC, MeSH, NCI Thesaurus, UCUM, DICOM, HL7 v2 tables, and any FHIR CodeSystem/ValueSet Bundle or IG package. |
+| **IG package manager** | Browse packages.fhir.org from the console, upload `.tgz`, resolve dependencies, dry-run, install, upgrade, side-by-side major versions, uninstall. Conformance resources go to the FHIR server, terminology to the terminology server. |
+| **SMART on FHIR / OIDC** | JWT bearer validation against your IdP (tested with Keycloak), SMART v1 and v2 granular scopes, patient-compartment enforcement, backend services with `private_key_jwt`, per-client rate limits. `HFS_AUTH_MODE=write-protect` (anonymous read, authenticated write) or `full`. See [auth.md](docs/ops/auth.md). |
+| **Audit trail** | Every REST interaction recorded as an IHE BALP `AuditEvent`, searchable through `/AuditEvent`, immutable through the API, queued writes that never drop events, retention with an archive written before each purge. The terminology server writes into the same trail. See [audit.md](docs/ops/audit.md). |
+| **Bulk Data** | `$export` (system, Patient, Group, `_typeFilter`) and `$bulk-submit` ingestion. Patient/`$everything`. Tested with 3.1M Synthea resources (see [numbers](#quality-measured)). |
+| **Clinical quality (CQL)** | Works as the data source and terminology source for an external CQL engine: eCQM retrieves with `code:in`, expansion-only VSAC ValueSets, Measure evaluation through the engine. See [cql.md](docs/ops/cql.md). |
+| **Cluster** | Several HFS and HTS instances on one PostgreSQL: shared job queues, Subscription delivery, profile and SearchParameter propagation, terminology cache invalidation, admin sessions in the database. Rolling restarts tested without failed requests. See [cluster.md](docs/ops/cluster.md). |
+| **PostgreSQL in production** | Versioned schema migrations, pool and timeout settings, a non-superuser runtime role, logical dumps, WAL archiving and point-in-time recovery with rehearsed restore times, Prometheus metrics and OTLP traces. See [docs/ops](docs/ops/README.md). |
+| **Web console** | `/ui` (FHIR) and `/ui/hts` (terminology): dashboards, resource browser with a query builder, schema-driven resource editor, validator, capability statement, IG packages, terminology inventory and import jobs, light and dark themes, mobile layout, English / 繁體中文 / Deutsch / Español. Admin pages need administrator sign-in. |
+| **Also included** | FHIRPath engine (CLI and HTTP), SQL on FHIR (ViewDefinitions, CLI, HTTP, Python bindings), topic-based Subscriptions, CDS Hooks types; inherited from the upstream project. |
+
+## Screenshots
+
+All screenshots are from our reference deployment, which holds test data only.
+The console still shows the upstream "Helios" product name in a few places.
+
+| | |
+|---|---|
+| ![FHIR console home with stored-resource counts and a 24-hour chart of resources over time](docs/images/screenshots/fhir-console-home.png) | ![Resource browser listing Observations, with the resource type list, query builder and results table](docs/images/screenshots/fhir-resource-browser.png) |
+| **FHIR console**: resource counts, jobs, uptime and growth over time. | **Resource browser**: pick a type, build a query by hand or in plain language, open any result. |
+| ![Validation result for an Observation against the TW Core blood-pressure profile, listing three errors and one warning](docs/images/screenshots/fhir-validate-result.png) | ![Capability statement page showing server summary, system interactions and supported operations](docs/images/screenshots/fhir-capability-statement.png) |
+| **`$validate`**: a broken TW Core blood-pressure Observation, with errors located by path. | **Capability statement**, composed live from `/metadata`. |
+| ![IG Packages page listing installed packages with version, FHIR version, resource count, dependencies and status](docs/images/screenshots/fhir-ig-packages.png) | ![Terminology inventory listing code systems by size, with SNOMED CT, LOINC and NDC concept counts and database size](docs/images/screenshots/hts-terminology-inventory.png) |
+| **IG package manager**: installed packages with their dependency graph; browse the registry or upload a `.tgz`. | **Terminology inventory**: 3.8M concepts in 9.5 GB, by code system and version. |
+| ![Terminology lookup of ICD-10-CM code E11.9 in the Taiwan NHI 2023 Chinese edition, returning the zh-Hant display with the English designation](docs/images/screenshots/hts-lookup-tw-icd10cm.png) | ![Terminology server home with status, uptime, loaded code systems and requests per minute](docs/images/screenshots/hts-console-home.png) |
+| **`$lookup`** in the Taiwan NHI ICD-10-CM (zh-Hant): E11.9 with its Chinese display and English designation. | **Terminology console**: health, catalog size and traffic. |
+| ![The resource editor in dark mode](docs/images/screenshots/dark-mode-resource-editor.png) | ![The terminology server home in dark mode](docs/images/screenshots/dark-mode-hts-home.png) |
+| **Dark mode** (follows the system, or set per browser). | |
+
+<p align="center">
+  <img src="docs/images/screenshots/mobile-console-home.png" alt="FHIR console home on a phone-width screen with stacked summary cards" width="240">
+  &nbsp;&nbsp;
+  <img src="docs/images/screenshots/mobile-resource-editor.png" alt="Resource editor on a phone-width screen" width="240">
+  <br><b>Phone layout</b>: the console works at mobile widths.
+</p>
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        EHR["HIS / EHR systems"]
+        APPS["SMART apps"]
+        BULK["Bulk Data clients"]
+        CQL["CQL engine"]
+        OPS["Administrators<br/>(web console)"]
+    end
+
+    IDP["OIDC identity provider<br/>(e.g. Keycloak)"]
+
+    subgraph Edge["Reverse proxy (TLS, nginx)"]
+        NGINX["/fhir → HFS<br/>/tx → HTS<br/>/ui, /ui/hts → consoles"]
+    end
+
+    subgraph HealthyMind["HealthyMind FHIR Server"]
+        HFS["hfs: FHIR R4 server<br/>REST · search · $validate<br/>Bulk Data · Subscriptions<br/>SMART · BALP audit<br/>IG package manager · /ui"]
+        HTS["hts: terminology server<br/>$lookup · $validate-code · $expand<br/>$subsumes · $translate · ECL<br/>importers · /ui/hts"]
+    end
+
+    PG[("PostgreSQL 16<br/>hfs DB · hts DB<br/>WAL archive / PITR")]
+    REG["packages.fhir.org"]
+    MON["Prometheus · Grafana<br/>OTLP traces"]
+
+    EHR & APPS & BULK & CQL & OPS --> NGINX
+    APPS -. tokens .-> IDP
+    NGINX --> HFS
+    NGINX --> HTS
+    HFS -- "terminology checks,<br/>code:in, IG terminology" --> HTS
+    HFS -. JWKS .-> IDP
+    HTS -. JWKS .-> IDP
+    HFS --> PG
+    HTS --> PG
+    HTS -- "audit events" --> PG
+    HFS -- "IG packages" --> REG
+    HFS & HTS -. "/metrics" .-> MON
+```
+
+- **One PostgreSQL**, two databases. SQLite is supported for development and
+  tests only.
+- **HFS asks HTS** for every terminology question: binding checks during
+  validation, `code:in` searches and the terminology part of IG packages.
+- **Horizontal scale**: run 2–3 HFS and 2 HTS instances behind the proxy with
+  `HFS_CLUSTER=true` ([cluster.md](docs/ops/cluster.md)).
+
+## Quality, measured
+
+Every number below names its test suite and what it counts. Where a target was
+missed, we say so. Full reports are kept with the project's evaluation records.
+
+### Terminology server: HL7 tx-ecosystem test suite
+
+Official HL7 `fhir-tx-ecosystem-ig` tests, run with the HL7 `validator_cli`
+test runner, on PostgreSQL and SQLite (identical results):
+
+| Suite | Result |
+|---|---|
+| General | **697 / 697** |
+| SNOMED CT | 72 / 72 |
+| SNOMED CT ECL | 103 / 103 |
+| UCUM | 19 / 19 (1 skipped) |
+| closure | 10 / 10 |
+| mimetypes | 39 / 39 |
+| Runner total | **872 / 872** (5 skipped) |
+
+Suites that need data we do not hold (OMOP, ICD-11) and tx.fhir.org-only
+suites were not run.
+
+### Validator: HL7 `fhir-test-cases` (R4-applicable, 457 sub-tests)
+
+The four classes of the old harness are split so that a "deviation" with the
+wrong verdict counts as a failure:
+
+| Class | Count |
+|---|---|
+| Strict pass (same error count and locations) | 325 |
+| Pass on error count only (locations differ) | 55 |
+| Deviation, right verdict, different count | 22 |
+| **Deviation, wrong verdict (real failure)** | **32** (23 missed errors, 9 false positives) |
+| Data unavailable (licensed or unavailable content: SNOMED national editions, HCPCS, X12, EDQM, NUCC, HGVS, VSAC) | 23 |
+
+Reported the old way this is 380 pass / 54 deviation / 23 data-unavailable.
+The 23 missed errors are features not implemented yet: terminology authoring
+rules, R5 xhtml controls, Bundle signatures, `htmlChecks()` and a few smaller
+rules.
+
+### Validator: difference test against the HL7 Java validator
+
+The same IG examples validated by our server and by the HL7 Java validator
+(with tx.fhir.org). Set 9 = 590 examples (Taiwan IGs, US Core, IPS); set new =
+729 examples from the other installed packages.
+
+| Set | Agree on "has an error" | Precision | Recall | Same, excluding Java-side / licensed-terminology differences |
+|---|---|---|---|---|
+| 9 | 94.4 % | 98.1 % | 82.6 % | 100 % / 100 % / 96.5 % |
+| new | 91.1 % | 89.2 % | 68.7 % | 98.5 % / 92.2 % / 86.9 % |
+
+Precision = matched errors / errors we report; recall = matched errors / errors
+the Java validator reports. Our targets were ≥ 97 % agreement and ≥ 85 %
+recall on the raw numbers; **those raw targets are not met yet**. Most of the
+gap is content we cannot load (SNOMED CT US Edition, CPT/HCPCS/X12, the HGVS
+service), which is why the right-hand column is shown separately.
+
+In `enforce` mode, 1,503 published examples from 37 packages (including all
+seven Taiwan IGs) produced 143 rejections; every one was traced to the example
+itself, a missing dependency, a version mismatch or a deliberate stricter
+rule; **0 were validator bugs**. TW Core 1.0.0 and TW PAS examples: 0
+rejections.
+
+### Scale and performance (PostgreSQL on NVMe)
+
+| Measurement | Result |
+|---|---|
+| 23 common search shapes on 2.64M resources (warm) | patient-scoped searches p95 4–21 ms; slowest shapes (code + date across all patients, chains over 2,000 targets, `$everything`) p95 119–224 ms |
+| Load, Synthea transaction Bundles, 16 clients | 3.17M resources at 4,406 resources/s, 0 failed Bundles |
+| Group `$export`, 14,000 patients (3.1M resources) | 243 s |
+| `Patient/$everything`, 50 patients | p50 125 ms / p95 235 ms, complete, no duplicates |
+| Restore drill (production-sized dump) | RTO about 1.5 min logical, about 1 min PITR; RPO ≤ 5 min with WAL archiving |
+| Cluster: 3 HFS + 2 HTS, rolling restarts under load | 57 / 57 checks, 0 failed requests |
+| CQL: 15 eCQMs, 273 test patients | 264 / 273 patients agree with the engine's reference run (HAPI FHIR 8.12 on the same data: 242 / 273) |
+
+Rotating disks are not supported for the database: on an HDD, loads failed
+with statement timeouts once the database passed about 9 GB.
+
+### Test suites
+
+At the current `hm/main`: Rust workspace (default features) **10,666 passed,
+0 failed**; PostgreSQL persistence suite 3,821 / 0; terminology server on
+PostgreSQL 2,000 / 0; `--all-features` (the CI selection) 12,127 / 0. Each
+production deployment is gated by a 94-case validator regression (94 / 94),
+112 terminology API checks, 184 FHIR API checks and 42 authentication checks
+against the public URL.
+
+## Quick start
+
+### Run locally from source (SQLite, for evaluation)
+
+Requires [Rust](https://www.rust-lang.org/tools/install) (1.95 or newer; the
+toolchain is pinned in `rust-toolchain.toml`) and, on Linux, `clang` + `lld`
+(see [Building from source](#building-from-source)).
+
+```bash
+git clone https://github.com/healthymind-tech/hfs.git
+cd hfs
+cargo build --release --locked -p helios-hfs -p helios-hts
+
+# 1. Terminology server on :8090, seeded with the bundled terminology set
+HTS_BOOTSTRAP_DIR=./crates/hts/terminology-data ./target/release/hts &
+
+# 2. FHIR server on :8080, wired to the terminology server, console enabled
+HFS_TERMINOLOGY_SERVER=http://127.0.0.1:8090 \
+HFS_ADMIN_UI=true HFS_ADMIN_PASSWORD="$(openssl rand -base64 24)" \
+./target/release/hfs
+```
+
+Then open:
+
+| URL | What |
+|---|---|
+| http://localhost:8080/ui | FHIR console |
+| http://localhost:8080/metadata | CapabilityStatement |
+| http://localhost:8090/ui/hts | Terminology console |
+| http://localhost:8090/metadata | Terminology server CapabilityStatement |
+
+```bash
+# Create and search a resource
+curl -s -X POST http://localhost:8080/Patient \
+  -H 'Content-Type: application/fhir+json' \
+  -d '{"resourceType":"Patient","name":[{"family":"Chen","given":["Ming"]}]}'
+curl -s 'http://localhost:8080/Patient?family=Chen'
+
+# Validate without storing
+curl -s -X POST http://localhost:8080/Patient/\$validate \
+  -H 'Content-Type: application/fhir+json' \
+  -d '{"resourceType":"Patient","gender":"unknown-value"}'
+```
+
+### Production: Docker Compose with PostgreSQL
+
+`docker/production/` contains the production stack: PostgreSQL 16 with WAL
+archiving, HTS, HFS, nginx, and an optional monitoring profile (Prometheus,
+Grafana, postgres-exporter, OTLP collector, Jaeger).
+
+```bash
+cd docker/production
+cp .env.example .env && chmod 600 .env && $EDITOR .env   # image tags, secrets, public URL, storage paths
+docker compose up -d db
+docker compose up -d hts        # first boot imports the bundled terminology (~4 min)
+docker compose up -d hfs nginx
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8082/fhir/metadata   # 200
+```
+
+Images are built from this repository (release binaries with the production
+feature set, packaged by the root `Dockerfile`) and pinned by tag; never deploy
+`:latest`. The full procedure, sizing and TLS setup are in
+[deployment.md](docs/ops/deployment.md); after first start, import SNOMED CT /
+LOINC / ICD-10 ([terminology-updates.md](docs/ops/terminology-updates.md)),
+install your IGs ([ig-update-sop.md](docs/ops/ig-update-sop.md)) and go
+through the [go-live checklist](docs/ops/go-live-checklist.md).
+Kubernetes manifests are in `docker/kubernetes/`.
+
+### Building from source
+
+1. Install Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+2. Linux: `sudo apt install clang lld`, then in `~/.cargo/config.toml`:
+   ```toml
+   [target.x86_64-unknown-linux-gnu]
+   linker = "clang"
+   rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
+   ```
+   macOS needs no extra linker; on Windows use `lld-link.exe` with
+   `rustflags = ["-C", "link-arg=/STACK:8388608"]`.
+3. Build with the production feature set:
+   ```bash
+   cargo build --release --locked -p helios-hfs -p helios-hts --features \
+     helios-hfs/R4,helios-hfs/sqlite,helios-hfs/postgres,helios-hfs/ui,helios-hfs/xml,helios-hfs/subscriptions,helios-hfs/bulk-submit-jwe,helios-hfs/mimalloc,helios-hfs/otel,helios-hts/postgres,helios-hts/otel
+   ```
+   If the build runs out of memory, limit parallel jobs: `export CARGO_BUILD_JOBS=4`.
+4. Run the tests: `cargo test --workspace` (add `--all-features` for the CI
+   selection; PostgreSQL integration tests use Docker testcontainers).
+
+## Configuration highlights
+
+Both servers are configured with environment variables. The most important
+ones for a hospital deployment:
+
+| Variable | Typical value | Purpose |
+|---|---|---|
+| `HFS_STORAGE_BACKEND` / `HFS_DATABASE_URL` | `postgres` / `postgres://hfs:…@db:5432/hfs` | FHIR data store |
+| `HTS_STORAGE_BACKEND` / `HTS_DATABASE_URL` | `postgres` / `postgresql://hts:…@db:5432/hts` | Terminology store |
+| `HFS_BASE_URL` | `https://fhir.hospital.example/fhir` | Public base URL written into Bundle links |
+| `HFS_TERMINOLOGY_SERVER` | `http://hts:8090` | Terminology server used by HFS |
+| `HFS_TERMINOLOGY_SERVER_TOKEN` | HTS admin credential | Lets the package manager write IG terminology to HTS |
+| `HFS_VALIDATION_MODE` | `off` → `log` → `enforce` | Validate on write; start with `log` and review |
+| `HFS_VALIDATION_TERMINOLOGY` | `remote` | Answer binding checks with HTS |
+| `HFS_ADMIN_UI` / `HFS_ADMIN_PASSWORD(_FILE)` | `true` / secret | Console admin pages (fail closed without a password); same for `HTS_*` |
+| `HFS_AUTH_MODE` | `write-protect` or `full` | SMART on FHIR / OIDC enforcement |
+| `HFS_AUTH_ISSUER` / `HFS_AUTH_JWKS_URL` / `HFS_AUTH_AUDIENCE` | your IdP | Token validation; `HTS_AUTH_*` for the terminology server |
+| `HFS_RATE_LIMIT_ANONYMOUS` / `HFS_RATE_LIMIT_AUTHENTICATED` | `600` / `6000` per minute | Per-client rate limits |
+| `HFS_AUDIT_BACKEND` | `database` | IHE BALP audit trail |
+| `HFS_AUDIT_RETENTION_DAYS` | e.g. `2557` (7 years) | Audit retention, with archive before purge |
+| `HFS_PG_MAX_CONNECTIONS` / `HFS_PG_STATEMENT_TIMEOUT_MS` | `64` / `60000` | Pool and statement timeout |
+| `HFS_BULK_EXPORT_BATCH_SIZE` | `5000` | Bulk export throughput |
+| `HFS_CLUSTER` | `true` | Several HFS instances on one database |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4317` | Traces (image built with `otel`) |
+
+Detailed references: [postgresql.md](docs/ops/postgresql.md),
+[auth.md](docs/ops/auth.md), [audit.md](docs/ops/audit.md),
+[admin-sign-in.md](docs/ops/admin-sign-in.md),
+[cluster.md](docs/ops/cluster.md), [monitoring.md](docs/ops/monitoring.md).
+The upstream documentation book in `book/` covers the remaining variables.
+
+## Deployment and operations
+
+The [operations manual](docs/ops/README.md) is written for hospital IT and has
+been rehearsed on production-sized data:
+
+| Page | For |
+|---|---|
+| [go-live-checklist.md](docs/ops/go-live-checklist.md) | everything that must be true before cut-over |
+| [deployment.md](docs/ops/deployment.md) | Docker Compose and Kubernetes, sizing, TLS |
+| [postgresql.md](docs/ops/postgresql.md) | server parameters, pools, timeouts, roles, maintenance |
+| [database-migrations.md](docs/ops/database-migrations.md) | schema versions and how migrations are applied |
+| [backup-restore.md](docs/ops/backup-restore.md) | logical dumps, WAL archiving, PITR, drill timings, RPO/RTO |
+| [monitoring.md](docs/ops/monitoring.md) | Prometheus, Grafana, alerts, OTLP traces, alert runbook |
+| [upgrade.md](docs/ops/upgrade.md) | image upgrades, verification, rollback |
+| [index-strategy.md](docs/ops/index-strategy.md) | search index review and EXPLAIN results |
+| [auth.md](docs/ops/auth.md) / [admin-sign-in.md](docs/ops/admin-sign-in.md) | SMART on FHIR / OIDC rollout, administrator sign-in |
+| [audit.md](docs/ops/audit.md) | audit trail, retention, archive |
+| [cluster.md](docs/ops/cluster.md) | multi-instance topology and rolling restarts |
+| [cql.md](docs/ops/cql.md) | connecting a CQL engine |
+| [ig-packages.md](docs/ops/ig-packages.md) / [ig-update-sop.md](docs/ops/ig-update-sop.md) | the package installer and the IG change procedure |
+| [terminology-updates.md](docs/ops/terminology-updates.md) / [terminology-release-calendar.md](docs/ops/terminology-release-calendar.md) | terminology imports and the yearly update calendar |
+| [upstream-rebase.md](docs/ops/upstream-rebase.md) | bringing in upstream Helios releases |
+
+Operational scripts (backup, restore, base backup, PITR restore, WAL pruning,
+search benchmark, ValueSet warm-up) are in `scripts/ops/`.
+
+## Roadmap
+
+- **FHIR servers manager** *(in development)*: run several FHIR endpoints from
+  one installation, each under its own base path and configured from the web
+  console; per-endpoint authentication (none or SMART on FHIR); sync and
+  duplicate between endpoints; console sign-in with no login, OIDC or
+  site-wide username and password.
+- **Validator**: Bundle signature verification, HL7-namespace URI resolution,
+  `htmlChecks()`, faster stored document Bundles under `enforce`, and higher
+  recall against the HL7 Java validator.
+- **Upstream**: continue merging Helios FHIR Server releases (currently
+  merged through v0.2.9).
+
+## Support and contact
+
+HealthyMind FHIR Server is developed and supported by **療心智能
+HealthyMind.Tech**. For deployment, support or partnership enquiries, contact
+HealthyMind Tech through the
+[healthymind-tech GitHub organization](https://github.com/healthymind-tech).
+Bug reports and feature requests are welcome as
+[GitHub issues](https://github.com/healthymind-tech/hfs/issues).
+
+Please do not post patient data, credentials or other confidential
+information in issues.
+
+## Acknowledgements and license
+
+HealthyMind FHIR Server is a fork of, and is built on, the open-source
+**[Helios FHIR Server](https://github.com/HeliosSoftware/hfs)** by
+**Helios Software**, released under the MIT License. The FHIR data models,
+FHIRPath engine, SQL on FHIR, persistence layer, REST layer, terminology
+server foundations and much more come from that project and its contributors;
+we are grateful for their work. HealthyMind Tech's changes are focused on
+hospital production use: validation and terminology completeness, Taiwan IG
+support, SMART on FHIR enforcement, audit, PostgreSQL operations, clustering,
+Bulk Data performance and the console. We contribute fixes upstream where they
+apply.
+
+HealthyMind FHIR Server is an independent product of HealthyMind Tech. It is
+not affiliated with or endorsed by Helios Software. "Helios" and related names
+and logos belong to their respective owners.
+
+This project is distributed under the **MIT License**; see
+[LICENSE.md](LICENSE.md). The original copyright notice
+("Copyright 2025-2026 Helios Software") and permission notice are retained, as
+the license requires. Upstream contribution guidelines are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Third-party terminologies are licensed separately. The bundled seed set in
+`crates/hts/terminology-data` contains only freely distributable content (HL7
+terminology and core packages, ICD-10-CM, ICD-9-CM, NDC, NUCC, MeSH, NCI
+Thesaurus, UCUM; see its README). SNOMED CT, LOINC and the Taiwan MOHW/NHI
+code tables are **not** distributed with this software; obtain them from their
+publishers under their own terms (for example, SNOMED CT requires an Affiliate
+Licence or national membership).
+
+FHIR® is the registered trademark of Health Level Seven International (HL7);
+its use here does not constitute endorsement by HL7.

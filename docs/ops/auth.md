@@ -354,7 +354,60 @@ access tokens ≤ 15 min, backend integrations on `private_key_jwt` with the
 narrowest `system/` scopes, audit on (`HFS_AUDIT_*`), TLS everywhere, admin
 password kept as break-glass in a secrets file (`HFS_ADMIN_PASSWORD_FILE`).
 
-## 8. Limitations
+## 8. Per-endpoint auth (FHIR server manager)
+
+With the FHIR server manager on (`HFS_MANAGER=on`, see
+`docs/design/fhir-server-manager.md` §6) every FHIR endpoint
+(`/fhir/{path}/…`) has an `auth` section in its configuration (admin API
+`/admin/endpoints`, the console's Security page, or `HFS_ENDPOINTS_FILE`):
+
+| `auth` | Behaviour |
+|---|---|
+| `null` (default, and the default endpoint after the upgrade) | the environment's `HFS_AUTH_*` exactly as described above |
+| `{"mode": "off"}` | no credential needed, tokens ignored, no SMART discovery (`404`) |
+| `{"mode": "write-protect" \| "full", "issuer", "jwksUrl", "audience", …}` | the endpoint's own IdP |
+
+Fields: `issuer` (exact `iss`), `jwksUrl` (fetched by HFS), `audience`
+(required `aud`; give every endpoint its own), `algorithms` (default
+`RS256,RS384,ES256,ES384`), `clockSkewSecs` (60), `jwksMaxAgeSecs` (300),
+`scopes` (`acceptV1`, `allowPatient`, `allowUser`, `allowSystem`,
+`patientNonCompartment`, `patientSharedTypes`), `smart` (discovery fields;
+unset ones are discovered from `{issuer}/.well-known/openid-configuration`
+when `discoverFromIssuer`, the default), `acceptAdminCredential` (default
+true). Claim names (`HFS_AUTH_*_CLAIM`), the JWKS refresh interval and the
+advertised grant types / token auth methods stay server-wide.
+
+* **Shared verifiers.** Endpoints naming the same issuer and JWKS URL share
+  one JWKS fetcher (one key download per IdP); each endpoint still checks its
+  own audience, so a token minted for one endpoint is refused (`401
+  invalid_token`) by another. The console warns when two endpoints share an
+  issuer and their audiences do not tell them apart, and when auth is on
+  without an audience.
+* **Scope policy.** Scopes of a context the endpoint does not allow
+  (`allowPatient=false`, …) and, with `acceptV1=false`, SMART v1 scopes are
+  ignored; a token left with no usable scope is refused `403`.
+* **Console sessions** act on an endpoint's API as the console principal
+  (`iss=urn:helios:console`) with the scopes of the user's role and the
+  endpoint's `consoleAccess` (`off` / `read-only` / `role-based`); writes need
+  a same-origin `Origin`/`Referer`. A bearer token always wins over the
+  cookie.
+* **Rate limits** (`rateLimit` section, else `HFS_RATE_LIMIT_*`) are per
+  endpoint and client.
+* **Outbound policy.** The issuer discovery and JWKS of an endpoint edited in
+  the console are fetched only from public addresses (HTTPS) unless the host
+  is in `HFS_OUTBOUND_ALLOW` (e.g. `keycloak` for the in-network Keycloak);
+  a refused URL makes the endpoint answer tokens `503`. Endpoints from
+  `HFS_ENDPOINTS_FILE` are operator-configured and trusted like
+  `HFS_AUTH_JWKS_URL`. `POST /admin/endpoints/{name}/$test-auth` probes the
+  issuer and the JWKS through the same policy.
+* **Hot reload.** A configuration change applies to the next request on every
+  instance (≤ `HFS_CLUSTER_SYNC_INTERVAL_MS`); fetchers, rate-limit buckets and
+  discovery entries of removed endpoints are dropped.
+* **Admin APIs** of the manager (endpoints, sync, console users) require the
+  JWT scope `HFS_ADMIN_TOKEN_SCOPE` (default `system/*.cruds`);
+  `/admin/packages` and `/admin/tenants` keep `system/*.r`.
+
+## 9. Limitations
 
 * No token introspection: revocation of an access token takes effect when it
   expires (keep lifetimes short). DPoP/mTLS sender-constrained tokens are not

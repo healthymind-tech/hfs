@@ -1,0 +1,10 @@
+{# "Test" of an auth section: issuer discovery + JWKS reachability (P4 $test-auth). #}
+{% if unavailable %}
+<p class="muted">{{ i18n.t("mgr-test-auth-unavailable") }}</p>
+{% else if !error.is_empty() %}
+<p class="mfield__error">{{ error }}</p>
+{% else %}
+<ul class="probe__lines">
+  {% for line in lines %}<li class="probe__line probe__line--{% if line.ok %}ok{% else %}fail{% endif %}"><span class="visually-hidden">{% if line.ok %}{{ i18n.t("mgr-outcome-ok") }}{% else %}{{ i18n.t("mgr-outcome-failed") }}{% endif %}</span>{{ line.message }}</li>{% endfor %}
+</ul>
+{% endif %}

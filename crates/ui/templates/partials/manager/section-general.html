@@ -1,0 +1,59 @@
+{% call ui::form_section("sec-identity", i18n.t("mgr-sec-identity"), i18n.t("mgr-sec-identity-desc")) %}
+  <div class="form-grid">
+    {% call ui::field_text(i18n.t("mgr-field-display-name"), "display_name", v.display_name, self.err("displayName"), "", "text", true) %}{% endcall %}
+    <div class="mfield">
+      <span class="mfield__label">{{ i18n.t("mgr-field-name") }}</span>
+      <p class="mfield__static"><code>{{ head.name }}</code> <span class="mfield__hint">{{ i18n.t("mgr-field-name-hint") }}</span></p>
+    </div>
+  </div>
+  {% call ui::field_area(i18n.t("mgr-field-description"), "description", v.description, self.err("description"), "", 2, "", false, false) %}{% endcall %}
+  {% call ui::field_area(i18n.t("mgr-field-labels"), "labels", v.labels, self.err("labels"), i18n.t("mgr-field-labels-hint"), 3, "env=test") %}{% endcall %}
+{% endcall %}
+
+{% call ui::form_section("sec-address", i18n.t("mgr-sec-address"), i18n.t("mgr-sec-address-desc")) %}
+  <div class="form-grid">
+    {% if head.is_default %}
+    <div class="mfield">
+      <span class="mfield__label">{{ i18n.t("mgr-field-path") }}</span>
+      <p class="mfield__static">{{ i18n.t("mgr-field-path-root") }}</p>
+    </div>
+    {% else %}
+    {% call ui::field_text(i18n.t("mgr-field-path"), "path", v.path, self.err("path"), i18n.t("mgr-field-path-change-hint"), "text", true, "", false, true) %}{% endcall %}
+    {% endif %}
+    <div class="mfield{% if self.bad("fhirVersion") %} mfield--error{% endif %}">
+      <label class="mfield__label" for="f-fhir_version">{{ i18n.t("mgr-field-fhir-version") }}</label>
+      <select class="mfield__input" id="f-fhir_version" name="fhir_version">
+        {% for ver in versions %}<option value="{{ ver }}"{% if *ver == v.fhir_version %} selected{% endif %}>FHIR {{ ver }}</option>{% endfor %}
+      </select>
+      <p class="mfield__hint">{{ i18n.t("mgr-field-fhir-version-hint") }}</p>
+    </div>
+  </div>
+  <div class="mfield">
+    <span class="mfield__label">{{ i18n.t("mgr-field-storage") }}</span>
+    <p class="mfield__static">{{ i18n.t("mgr-field-storage-tenant") }} <code>{{ head.tenant }}</code> <span class="mfield__hint">{{ i18n.t("mgr-field-storage-hint") }}</span></p>
+  </div>
+{% endcall %}
+
+{% call ui::form_section("sec-console", i18n.t("mgr-sec-console"), i18n.t("mgr-sec-console-desc")) %}
+  <fieldset class="radio-cards">
+    <legend class="mfield__label">{{ i18n.t("mgr-field-console-access") }}</legend>
+    <label class="radio-card">
+      <input type="radio" name="console_access" value="role-based"{% if v.console_access == "role-based" %} checked{% endif %}>
+      <span class="radio-card__title">{{ i18n.t("mgr-console-access-role-based") }}</span>
+      <span class="radio-card__desc">{{ i18n.t("mgr-console-access-role-based-desc") }}</span>
+    </label>
+    <label class="radio-card">
+      <input type="radio" name="console_access" value="read-only"{% if v.console_access == "read-only" %} checked{% endif %}>
+      <span class="radio-card__title">{{ i18n.t("mgr-console-access-read-only") }}</span>
+      <span class="radio-card__desc">{{ i18n.t("mgr-console-access-read-only-desc") }}</span>
+    </label>
+    <label class="radio-card">
+      <input type="radio" name="console_access" value="off"{% if v.console_access == "off" %} checked{% endif %}>
+      <span class="radio-card__title">{{ i18n.t("mgr-console-access-off") }}</span>
+      <span class="radio-card__desc">{{ i18n.t("mgr-console-access-off-desc") }}</span>
+    </label>
+  </fieldset>
+  {% if head.is_default %}
+  {% call ui::checkbox(i18n.t("mgr-field-legacy-header"), "legacy_tenant_header", v.legacy_tenant_header, i18n.t("mgr-field-legacy-header-hint")) %}{% endcall %}
+  {% endif %}
+{% endcall %}

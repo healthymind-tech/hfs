@@ -1,0 +1,260 @@
+{#
+  The manager console's component macros (design §15 P5 "Provides"): the
+  building blocks every manager, sign-in (P3) and sync (P6) page composes, so
+  forms, pills and empty states look and behave the same everywhere.
+
+    {% import "partials/components.html" as ui %}
+
+  | Macro | Renders |
+  |---|---|
+  | icon(name) | an inline icon by name (`partials/shell/icon.html` set) |
+  | page_header(title, lede) + caller | `<header class="page-head">` with an actions slot |
+  | pill(badge) | status / mode pill from a `manager::view::Badge` (icon + text) |
+  | pill_raw(tone, icon, text) | the same from loose values |
+  | form_section(id, title, desc) + caller | a titled card of form fields |
+  | field_text(label, name, value, error, ...) | label + input + hint + error, ARIA wired |
+  | field_area(label, name, value, error, ...) | the same with a textarea |
+  | checkbox(label, name, checked, hint, disabled) | a labelled checkbox row |
+  | secret_field(label, name, is_set, hint, disabled) | write-only secret: set/not set, Replace, Clear |
+  | inherit_toggle(name, checked, target, summary, disabled) | "Inherit from server" switch for a fieldset |
+  | empty_state(icon, title, text) + caller | a friendly empty list with an action slot |
+  | job_progress(percent, label) | a progress bar (indeterminate when percent is None), aria-live |
+  | copy_field(value, label) | read-only value with a copy button |
+
+  Tables use the existing `.table-wrap` (tabindex="0") > `.data-table`
+  vocabulary; stacked lists on phones come from `.data-table--stack` with
+  `data-label` on each `<td>`.
+
+  Every macro takes already-localized text; `i18n` is read from the page.
+#}
+
+{% macro icon(name) -%}
+{%- if name == "home" %}{% include "icons/home.svg" %}
+{%- else if name == "grid" %}{% include "icons/grid.svg" %}
+{%- else if name == "layers" %}{% include "icons/layers.svg" %}
+{%- else if name == "layers-platforms" %}{% include "icons/layers-platforms.svg" %}
+{%- else if name == "code" %}{% include "icons/code.svg" %}
+{%- else if name == "compartments" %}{% include "icons/compartments.svg" %}
+{%- else if name == "building" %}{% include "icons/building.svg" %}
+{%- else if name == "send" %}{% include "icons/send.svg" %}
+{%- else if name == "check-circle" %}{% include "icons/check-circle.svg" %}
+{%- else if name == "check" %}{% include "icons/check.svg" %}
+{%- else if name == "import" %}{% include "icons/import.svg" %}
+{%- else if name == "export" %}{% include "icons/export.svg" %}
+{%- else if name == "shield" %}{% include "icons/shield.svg" %}
+{%- else if name == "search" %}{% include "icons/search.svg" %}
+{%- else if name == "sync" %}{% include "icons/sync.svg" %}
+{%- else if name == "sliders" %}{% include "icons/sliders.svg" %}
+{%- else if name == "book" %}{% include "icons/book.svg" %}
+{%- else if name == "history" %}{% include "icons/history.svg" %}
+{%- else if name == "pencil" %}{% include "icons/pencil.svg" %}
+{%- else if name == "package" %}{% include "icons/package.svg" %}
+{%- else if name == "info" %}{% include "icons/info.svg" %}
+{%- else if name == "users" %}{% include "icons/users.svg" %}
+{%- else if name == "lock" %}{% include "icons/lock.svg" %}
+{%- else if name == "unlock" %}{% include "icons/unlock.svg" %}
+{%- else if name == "eye" %}{% include "icons/eye.svg" %}
+{%- else if name == "x" %}{% include "icons/x.svg" %}
+{%- else if name == "stop-circle" %}{% include "icons/stop-circle.svg" %}
+{%- else if name == "trash" %}{% include "icons/trash.svg" %}
+{%- else if name == "alert" %}{% include "icons/alert.svg" %}
+{%- else if name == "database" %}{% include "icons/database.svg" %}
+{%- else if name == "server" %}{% include "icons/server.svg" %}
+{%- else if name == "key" %}{% include "icons/key.svg" %}
+{%- else if name == "globe" %}{% include "icons/globe.svg" %}
+{%- else if name == "activity" %}{% include "icons/activity.svg" %}
+{%- else if name == "external" %}{% include "icons/external.svg" %}
+{%- else if name == "copy" %}{% include "icons/copy2.svg" %}
+{%- else if name == "power" %}{% include "icons/power.svg" %}
+{%- else if name == "duplicate" %}{% include "icons/duplicate.svg" %}
+{%- else if name == "plus" %}{% include "icons/plus.svg" %}
+{%- else if name == "arrow-right" %}{% include "icons/arrow-right.svg" %}
+{%- else %}{% include "icons/info.svg" %}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro page_header(title, lede="") %}
+<header class="page-head page-head--row">
+  <div class="page-head__text">
+    <h1 class="page-head__title">{{ title }}</h1>
+    {% if !lede.is_empty() %}<p class="page-head__lede">{{ lede }}</p>{% endif %}
+  </div>
+  <div class="page-head__actions">{{ caller() }}</div>
+</header>
+{% endmacro %}
+
+{% macro pill(b) %}
+<span class="status-pill status-pill--{{ b.tone }}">{% call icon(b.icon) %}{% endcall %}<span>{{ i18n.t(b.key) }}</span>{% if b.inherited %}<span class="status-pill__note">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
+{%- endmacro %}
+
+{% macro pill_raw(tone, icon_name, text) %}
+<span class="status-pill status-pill--{{ tone }}">{% call icon(icon_name) %}{% endcall %}<span>{{ text }}</span></span>
+{%- endmacro %}
+
+{% macro form_section(id, title, desc="") %}
+<section class="card form-section" aria-labelledby="{{ id }}-title" id="{{ id }}">
+  <header class="form-section__head">
+    <h2 class="form-section__title" id="{{ id }}-title">{{ title }}</h2>
+    {% if !desc.is_empty() %}<p class="form-section__desc">{{ desc }}</p>{% endif %}
+  </header>
+  <div class="form-section__body">
+    {{ caller() }}
+  </div>
+</section>
+{% endmacro %}
+
+{% macro field_text(label, name, value, error="", hint="", kind="text", required=false, placeholder="", disabled=false, mono=false, autocomplete="off") %}
+<div class="mfield{% if !error.is_empty() %} mfield--error{% endif %}">
+  <label class="mfield__label" for="f-{{ name }}">{{ label }}{% if required %} <span class="mfield__req" aria-hidden="true">*</span>{% endif %}</label>
+  <input class="mfield__input{% if mono %} mfield__input--mono{% endif %}" id="f-{{ name }}" name="{{ name }}" type="{{ kind }}" value="{{ value }}"
+         autocomplete="{{ autocomplete }}"
+         {%- if required %} required aria-required="true"{% endif %}
+         {%- if !placeholder.is_empty() %} placeholder="{{ placeholder }}"{% endif %}
+         {%- if disabled %} disabled{% endif %}
+         {%- if !error.is_empty() %} aria-invalid="true"{% endif %}
+         {%- if !error.is_empty() || !hint.is_empty() %} aria-describedby="{% if !hint.is_empty() %}f-{{ name }}-hint {% endif %}{% if !error.is_empty() %}f-{{ name }}-err{% endif %}"{% endif %}>
+  {% if !hint.is_empty() %}<p class="mfield__hint" id="f-{{ name }}-hint">{{ hint }}</p>{% endif %}
+  {% if !error.is_empty() %}<p class="mfield__error" id="f-{{ name }}-err">{% call icon("alert") %}{% endcall %}<span>{{ error }}</span></p>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro field_area(label, name, value, error="", hint="", rows=4, placeholder="", disabled=false, mono=true) %}
+<div class="mfield{% if !error.is_empty() %} mfield--error{% endif %}">
+  <label class="mfield__label" for="f-{{ name }}">{{ label }}</label>
+  <textarea class="mfield__input mfield__area{% if mono %} mfield__input--mono{% endif %}" id="f-{{ name }}" name="{{ name }}" rows="{{ rows }}"
+            {%- if !placeholder.is_empty() %} placeholder="{{ placeholder }}"{% endif %}
+            {%- if disabled %} disabled{% endif %}
+            {%- if !error.is_empty() %} aria-invalid="true"{% endif %}
+            {%- if !error.is_empty() || !hint.is_empty() %} aria-describedby="{% if !hint.is_empty() %}f-{{ name }}-hint {% endif %}{% if !error.is_empty() %}f-{{ name }}-err{% endif %}"{% endif %}>{{ value }}</textarea>
+  {% if !hint.is_empty() %}<p class="mfield__hint" id="f-{{ name }}-hint">{{ hint }}</p>{% endif %}
+  {% if !error.is_empty() %}<p class="mfield__error" id="f-{{ name }}-err">{% call icon("alert") %}{% endcall %}<span>{{ error }}</span></p>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro checkbox(label, name, checked, hint="", disabled=false) %}
+<div class="mcheck">
+  <input type="checkbox" class="mcheck__input" id="f-{{ name }}" name="{{ name }}" value="on"{% if checked %} checked{% endif %}{% if disabled %} disabled{% endif %}{% if !hint.is_empty() %} aria-describedby="f-{{ name }}-hint"{% endif %}>
+  <label class="mcheck__label" for="f-{{ name }}">{{ label }}</label>
+  {% if !hint.is_empty() %}<p class="mcheck__hint" id="f-{{ name }}-hint">{{ hint }}</p>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro secret_field(label, name, is_set, hint="", disabled=false) %}
+<div class="mfield secret-field">
+  <span class="mfield__label" id="f-{{ name }}-label">{{ label }}</span>
+  <div class="secret-field__state">
+    {% if is_set %}
+    {% call pill_raw("ok", "key", i18n.t("mgr-secret-set")) %}{% endcall %}
+    {% else %}
+    {% call pill_raw("muted", "key", i18n.t("mgr-secret-unset")) %}{% endcall %}
+    {% endif %}
+  </div>
+  <label class="mfield__label mfield__label--sub" for="f-{{ name }}">{% if is_set %}{{ i18n.t("mgr-secret-replace") }}{% else %}{{ i18n.t("mgr-secret-enter") }}{% endif %}</label>
+  <input class="mfield__input mfield__input--mono" id="f-{{ name }}" name="{{ name }}" type="password" value="" autocomplete="new-password"{% if disabled %} disabled{% endif %} aria-describedby="f-{{ name }}-hint">
+  <p class="mfield__hint" id="f-{{ name }}-hint">{{ hint }} {{ i18n.t("mgr-secret-hint") }}</p>
+  {% if is_set %}
+  <div class="mcheck">
+    <input type="checkbox" class="mcheck__input" id="f-{{ name }}_clear" name="{{ name }}_clear" value="on"{% if disabled %} disabled{% endif %}>
+    <label class="mcheck__label" for="f-{{ name }}_clear">{{ i18n.t("mgr-secret-clear") }}</label>
+  </div>
+  {% endif %}
+</div>
+{% endmacro %}
+
+{% macro inherit_toggle(name, checked, target, summary, disabled=false) %}
+<div class="inherit">
+  <input type="checkbox" class="inherit__input" role="switch" id="f-{{ name }}" name="{{ name }}" value="on"
+         data-inherit-target="{{ target }}"{% if checked %} checked{% endif %}{% if disabled %} disabled{% endif %}
+         aria-describedby="f-{{ name }}-summary">
+  <label class="inherit__label" for="f-{{ name }}">{{ i18n.t("mgr-inherit-label") }}</label>
+  <p class="inherit__summary" id="f-{{ name }}-summary">{% call icon("server") %}{% endcall %}<span>{{ summary }}</span></p>
+</div>
+{% endmacro %}
+
+{% macro empty_state(icon_name, title, text) %}
+<div class="empty-state">
+  <span class="empty-state__icon" aria-hidden="true">{% call icon(icon_name) %}{% endcall %}</span>
+  <h2 class="empty-state__title">{{ title }}</h2>
+  <p class="empty-state__text">{{ text }}</p>
+  <div class="empty-state__actions">{{ caller() }}</div>
+</div>
+{% endmacro %}
+
+{% macro job_progress(percent, label) %}
+<div class="job-progress" aria-live="polite">
+  <div class="job-progress__label">{{ label }}</div>
+  {% if let Some(p) = percent %}
+  <div class="job-progress__track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ p }}" aria-label="{{ label }}">
+    <div class="job-progress__bar" style="width: {{ p }}%"></div>
+  </div>
+  {% else %}
+  <div class="job-progress__track job-progress__track--busy" role="progressbar" aria-label="{{ label }}">
+    <div class="job-progress__bar"></div>
+  </div>
+  {% endif %}
+</div>
+{% endmacro %}
+
+{% macro copy_field(value, label) %}
+<div class="copy-field">
+  <code class="copy-field__value" title="{{ value }}">{{ value }}</code>
+  <button type="button" class="icon-button copy-field__btn" data-copy="{{ value }}" aria-label="{{ label }}" title="{{ label }}">{% call icon("copy") %}{% endcall %}</button>
+</div>
+{% endmacro %}
+
+{#
+  The identity header of every /ui/e/{endpoint} page: breadcrumb, the page
+  title, the endpoint's status / auth / validation pills, its public base URL
+  with a copy button, and (admins) quick actions.
+#}
+{% macro ep_head(head, title, is_home=false, can_admin=false, actions=true) %}
+<header class="ep-head">
+  <nav class="crumbs" aria-label="{{ i18n.t("mgr-breadcrumb") }}">
+    <a href="/ui">{{ i18n.t("mgr-all-endpoints") }}</a>
+    <span class="crumbs__sep" aria-hidden="true">/</span>
+    {% if is_home %}
+    <span aria-current="page">{{ head.display_name }}</span>
+    {% else %}
+    <a href="/ui/e/{{ head.name }}">{{ head.display_name }}</a>
+    <span class="crumbs__sep" aria-hidden="true">/</span>
+    <span aria-current="page">{{ title }}</span>
+    {% endif %}
+  </nav>
+  <div class="ep-head__row">
+    <div class="ep-head__main">
+      <h1 class="page-head__title">{{ title }}</h1>
+      <div class="ep-head__meta">
+        {% call pill(head.status) %}{% endcall %}
+        <span class="chip chip--version" title="{{ i18n.t("mgr-field-fhir-version") }}">FHIR {{ head.fhir_version }}</span>
+        {% call pill(head.auth) %}{% endcall %}
+        {% call pill(head.validation) %}{% endcall %}
+        {% if head.env_managed %}{% call pill_raw("warn", "lock", i18n.t("mgr-env-managed")) %}{% endcall %}{% endif %}
+      </div>
+      {% call copy_field(head.base_url, i18n.t("mgr-copy-base-url")) %}{% endcall %}
+      {% if is_home && !head.description.is_empty() %}<p class="ep-head__desc">{{ head.description }}</p>{% endif %}
+      <p class="ep-head__updated">{{ i18n.t_arg("mgr-updated-at", "at", head.updated.clone()) }}{% if !head.updated_by.is_empty() %} · {{ head.updated_by }}{% endif %} · r{{ head.revision }}</p>
+    </div>
+    {% if actions %}
+    <div class="ep-head__actions">
+      <a class="btn" href="/ui/e/{{ head.name }}/data/resources">{% call icon("layers") %}{% endcall %}{{ i18n.t("mgr-action-browse-data") }}</a>
+      {% if can_admin %}
+      <a class="btn" href="/ui/e/{{ head.name }}/duplicate">{% call icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
+      {% if !head.is_default && !head.env_managed %}
+      <form method="post" action="/ui/e/{{ head.name }}/status" class="inline-form">
+        {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+        <input type="hidden" name="revision" value="{{ head.revision }}">
+        {% if head.enabled %}
+        <input type="hidden" name="action" value="disable">
+        <button type="submit" class="btn" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", head.name.clone()) }}">{% call icon("power") %}{% endcall %}{{ i18n.t("mgr-action-disable") }}</button>
+        {% else %}
+        <input type="hidden" name="action" value="enable">
+        <button type="submit" class="btn btn--primary">{% call icon("power") %}{% endcall %}{{ i18n.t("mgr-action-enable") }}</button>
+        {% endif %}
+      </form>
+      {% endif %}
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</header>
+{% endmacro %}

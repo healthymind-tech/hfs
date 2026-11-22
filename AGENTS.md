@@ -6,7 +6,7 @@ This file provides guidance to Codex when working with code in this repository.
 
 ### Workspace Structure
 
-The project is a Rust workspace with 22 crates (21 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table had drifted from the workspace (missing `helios-fhir-validator`, `helios-observability`, `helios-ui`, `helios-ui-chrome`, `helios-hts-ui`, and the `validator-cli` binary); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
+The project is a Rust workspace with 24 crates (23 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table had drifted from the workspace (missing `helios-fhir-validator`, `helios-observability`, `helios-ui`, `helios-ui-chrome`, `helios-hts-ui`, and the `validator-cli` binary); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -31,6 +31,7 @@ The project is a Rust workspace with 22 crates (21 default-members; `pysof` excl
 | **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS - Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
 | **`helios-ui-chrome`** (`crates/ui-chrome`) | Shared Askama chrome partials for the HFS and HTS web UIs - the topbar account menu and Capability Statement projection, so `helios-ui` and `helios-hts-ui` link the same markup instead of each keeping a copy. |
 | **`helios-hts-ui`** (`crates/hts-ui`) | Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS), built on `helios-ui-chrome`. |
+| **`helios-endpoints`** (`crates/endpoints`) | FHIR server manager foundation - endpoint model, routing snapshot and hot-swappable registry, endpoint/console/sync store contracts, sealed secrets (`HFS_SECRET_KEYS`), outbound SSRF policy. See `docs/design/fhir-server-manager.md`. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
 ### Binaries

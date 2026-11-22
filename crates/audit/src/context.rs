@@ -37,7 +37,20 @@ pub struct Captured {
     /// Patients the handler found the request to involve, beyond those the
     /// request path and parameters name.
     pub patients: Vec<String>,
+    /// The FHIR server manager endpoint that served the request (its name),
+    /// reported by the endpoint dispatcher. Recorded on every event as the
+    /// [`ENDPOINT_EXTENSION_URL`] extension.
+    pub endpoint: Option<String>,
+    /// The URL prefix the dispatcher stripped (`/{path}` of a named
+    /// endpoint), which the middleware strips too before classifying the
+    /// path.
+    pub endpoint_prefix: Option<String>,
 }
+
+/// Extension carrying the name of the FHIR endpoint (FHIR server manager)
+/// an `AuditEvent` was recorded for.
+pub const ENDPOINT_EXTENSION_URL: &str =
+    "https://healthymind.tech/fhir/StructureDefinition/hfs-endpoint";
 
 /// Handle on the audit context of the request being processed.
 #[derive(Debug, Default, Clone)]
@@ -90,6 +103,15 @@ pub fn set_tenant(tenant: &str, from_url: bool) {
     update(|c| {
         c.tenant = Some(tenant.to_string());
         c.tenant_from_url = from_url;
+    });
+}
+
+/// Reports the FHIR server manager endpoint serving the request and the URL
+/// prefix stripped for it (`""` for the default endpoint).
+pub fn set_endpoint(name: &str, prefix: &str) {
+    update(|c| {
+        c.endpoint = Some(name.to_string());
+        c.endpoint_prefix = Some(prefix.to_string()).filter(|p| !p.is_empty());
     });
 }
 

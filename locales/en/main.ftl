@@ -1,4 +1,4 @@
-# Helios FHIR Server — UI message catalog
+# HealthyMind FHIR Server Manager (based on Helios FHIR Server) — UI message catalog
 # Locale: English (en) — SOURCE LOCALE. Every key defined here is the
 # canonical set; other locales are expected to provide the same keys.
 #
@@ -9,13 +9,15 @@
 
 ## Brand / shared terms
 
--app-name = Helios FHIR Server
--org-name = Helios Software
+-app-name = HealthyMind FHIR Server Manager
+-org-name = HealthyMind Tech
 
 ## Page chrome
 
 app-title = { -app-name }
-app-tagline = A fast, multi-version FHIR server
+app-short-name = HealthyMind FHIR
+app-product-line = FHIR Server Manager
+app-tagline = Many FHIR endpoints, one manager — based on Helios FHIR Server
 
 nav-dashboard = Dashboard
 nav-terminology = Terminology
@@ -1409,8 +1411,10 @@ sql-param-default = default
 ## nav, and the dashboard scaffold placeholder rendered by the Phase 1 blocker
 ## slice. They must be kept in parity with es/de/main.ftl.
 
--hts-app-name = Helios Terminology Server
+-hts-app-name = HealthyMind Terminology Server
 hts-app-title = { -hts-app-name }
+hts-app-short-name = HealthyMind Terminology
+hts-app-product-line = Terminology Server
 
 hts-nav-section-work = Terminology
 hts-nav-section-tools = Tools

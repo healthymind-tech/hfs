@@ -139,6 +139,15 @@ pub struct FhirSchema {
     /// Attachment's data may hold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_size: Option<u64>,
+    /// `ElementDefinition.mustHaveValue` (R5; in R4 the 5.0 cross-version
+    /// extension): a primitive must carry a value, extensions alone (a
+    /// data-absent-reason) do not do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub must_have_value: Option<bool>,
+    /// `ElementDefinition.valueAlternatives` (R5 / 5.0 cross-version
+    /// extension): the extensions that may stand in for a missing value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_alternatives: Option<Vec<String>>,
     /// Terminology binding. Only `required`-strength bindings are enforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,

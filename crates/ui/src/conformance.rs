@@ -26,6 +26,22 @@ use serde_json::Value;
 
 tokio::task_local! {
     static REQUEST_AUTHORIZATION: Option<String>;
+    static REQUEST_ENDPOINT_PREFIX: String;
+}
+
+/// Runs `fut` with every self-call addressed to the endpoint prefix
+/// `prefix` (`/twcore`; `""` for the server root) — the manager console's
+/// endpoint scope (`/ui/e/{endpoint}/data/…`). A tenant bound to a named
+/// endpoint is refused at the root door (design D-7), so its pages must call
+/// the endpoint's own base.
+pub async fn with_endpoint_prefix<F: std::future::Future>(prefix: String, fut: F) -> F::Output {
+    REQUEST_ENDPOINT_PREFIX.scope(prefix, fut).await
+}
+
+fn endpoint_prefix() -> String {
+    REQUEST_ENDPOINT_PREFIX
+        .try_with(Clone::clone)
+        .unwrap_or_default()
 }
 
 /// Runs `fut` with `authorization` as the credential of every self-call it
@@ -41,6 +57,13 @@ pub async fn with_request_authorization<F: std::future::Future>(
 
 fn request_authorization() -> Option<String> {
     REQUEST_AUTHORIZATION.try_with(Clone::clone).ok().flatten()
+}
+
+/// The credential of the request being served, when one is in scope
+/// ([`with_request_authorization`]) — for self-calls made outside this module
+/// (the manager's audit reads).
+pub(crate) fn current_request_authorization() -> Option<String> {
+    request_authorization()
 }
 
 /// Who is asking on the loopback self-call that backs `$sql-export` (#833):
@@ -548,6 +571,12 @@ impl HttpConformanceSource {
         }
     }
 
+    /// The FHIR base of self-calls: the loopback base plus the request's
+    /// endpoint prefix ([`with_endpoint_prefix`]).
+    fn base(&self) -> String {
+        format!("{}{}", self.base_url, endpoint_prefix())
+    }
+
     /// The request's own credential when one is in scope
     /// ([`with_request_authorization`]), else the outbound service
     /// credential.
@@ -655,7 +684,7 @@ impl ConformanceSource for HttpConformanceSource {
     /// sidebar's selection rides the request — no spec-bundle fallback here,
     /// the endpoint itself is version-aware.
     async fn metadata(&self, version: FhirVersion, tenant: &str) -> Result<Value, String> {
-        let url = format!("{}/metadata", self.base_url);
+        let url = format!("{}/metadata", self.base());
         let mut request = self.client.get(&url).header(
             "Accept",
             format!(
@@ -696,7 +725,7 @@ impl ConformanceSource for HttpConformanceSource {
         // 10000, but a server capping at 1000 used to silently truncate the
         // registry (1377 R4 SearchParameters served as 1000). The UI needs
         // the full list for its facets and rail, and paginates in-memory.
-        let mut url = format!("{}/{}?_count=10000", self.base_url, resource_type);
+        let mut url = format!("{}/{}?_count=10000", self.base(), resource_type);
         let mut resources = Vec::new();
         // Generous page bound — only a runaway self-linking server hits it.
         for _ in 0..100 {
@@ -731,7 +760,7 @@ impl ConformanceSource for HttpConformanceSource {
                 // The advertised link carries the server's own idea of its base
                 // URL, which need not be the loopback this client targets —
                 // keep the path + query, swap in our base.
-                Some(next) => url = rebase_link(&next, &self.base_url, resource_type),
+                Some(next) => url = rebase_link(&next, &self.base(), resource_type),
                 None => break,
             }
         }
@@ -755,7 +784,7 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
-        let url = format!("{}/$sql-run?_format=json&_limit={limit}", self.base_url);
+        let url = format!("{}/$sql-run?_format=json&_limit={limit}", self.base());
         // The Parameters envelope, not the raw-resource shorthand: the
         // shorthand is ViewDefinition-only, while `subjectResource` carries
         // Library subjects (SQL Queries / SQL Views) just the same.
@@ -829,7 +858,7 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<SearchPage, String> {
-        let url = format!("{}/{resource_type}", self.base_url);
+        let url = format!("{}/{resource_type}", self.base());
         let mut query: Vec<(String, String)> = params.to_vec();
         // One more than the page: whether a further page exists is read off
         // the overflow row, not only the Bundle's `next` link — MongoDB
@@ -884,7 +913,7 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Value, String> {
-        let url = format!("{}/{resource_type}/{id}", self.base_url);
+        let url = format!("{}/{resource_type}/{id}", self.base());
         let request = self.client.get(&url).header(
             "Accept",
             format!(
@@ -919,7 +948,7 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<bool, String> {
-        let url = format!("{}/{resource_type}/{id}", self.base_url);
+        let url = format!("{}/{resource_type}/{id}", self.base());
         let request = self.client.get(&url).header(
             "Accept",
             format!(
@@ -951,8 +980,8 @@ impl ConformanceSource for HttpConformanceSource {
         tenant: &str,
     ) -> Result<Value, String> {
         let url = match id {
-            Some(id) => format!("{}/{resource_type}/{id}", self.base_url),
-            None => format!("{}/{resource_type}", self.base_url),
+            Some(id) => format!("{}/{resource_type}/{id}", self.base()),
+            None => format!("{}/{resource_type}", self.base()),
         };
         let accept = format!(
             "application/fhir+json; fhirVersion={}",
@@ -1026,7 +1055,7 @@ impl HttpConformanceSource {
         caller: &Caller,
     ) -> Result<String, String> {
         let body = sql_export_parameters_body(request);
-        let url = format!("{}/$sql-export", self.base_url);
+        let url = format!("{}/$sql-export", self.base());
         let http_request = self
             .client
             .post(&url)
@@ -1080,7 +1109,7 @@ impl HttpConformanceSource {
     /// alone is still a perfectly good answer from a server that predates
     /// this extension.
     async fn export_status(&self, job_id: &str, caller: &Caller) -> SqlExportStatus {
-        let url = format!("{}/export/{job_id}/status", self.base_url);
+        let url = format!("{}/export/{job_id}/status", self.base());
         let request = match self.authorized_for(self.client.get(&url), caller).await {
             Ok(r) => r,
             Err(e) => return SqlExportStatus::Unavailable(e),
@@ -1120,7 +1149,7 @@ impl HttpConformanceSource {
     }
 
     async fn export_cancel(&self, job_id: &str, caller: &Caller) -> Result<(), String> {
-        let url = format!("{}/export/{job_id}/status", self.base_url);
+        let url = format!("{}/export/{job_id}/status", self.base());
         let response = self
             .authorized_for(self.client.delete(&url), caller)
             .await?
@@ -1139,7 +1168,7 @@ impl HttpConformanceSource {
         job_id: &str,
         caller: &Caller,
     ) -> Result<Value, SqlExportFailure> {
-        let url = format!("{}/export/{job_id}/result", self.base_url);
+        let url = format!("{}/export/{job_id}/result", self.base());
         let response = self
             .authorized_for(self.client.get(&url), caller)
             .await?

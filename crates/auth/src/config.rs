@@ -408,6 +408,89 @@ impl AuthConfig {
         }
     }
 
+    /// The configuration of one FHIR endpoint whose auth section is set in
+    /// the FHIR server manager (`docs/design/fhir-server-manager.md` §6).
+    ///
+    /// Everything that describes the endpoint's IdP comes from `endpoint`:
+    /// mode, issuer, JWKS URL, audience, algorithms (empty =
+    /// `RS256,RS384,ES256,ES384`), clock skew (default 60 s), JWKS max age
+    /// (default 300 s), the patient non-compartment policy and the SMART
+    /// discovery fields (left unset ones are discovered from the issuer at
+    /// request time, never copied from `HFS_SMART_*`, which describe the
+    /// environment's IdP). Server-wide conventions come from `env`: claim
+    /// names (`HFS_AUTH_*_CLAIM`), the JWKS refresh interval, the advertised
+    /// grant types and token auth methods, and the shared reference types
+    /// when the endpoint does not list its own. The web UI's interactive
+    /// login (#1449) belongs to the environment's IdP and is not carried.
+    pub fn from_endpoint(endpoint: &helios_endpoints::EndpointAuth, env: &AuthConfig) -> Self {
+        use helios_endpoints::model::{AuthMode as EpMode, NonCompartmentPolicy as EpPolicy};
+        let mode = match endpoint.mode {
+            EpMode::Off => AuthMode::Off,
+            EpMode::WriteProtect => AuthMode::WriteProtect,
+            EpMode::Full => AuthMode::Full,
+        };
+        let trimmed = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let smart = &endpoint.smart;
+        Self {
+            enabled: mode != AuthMode::Off,
+            mode: if mode == AuthMode::Off {
+                AuthMode::Full
+            } else {
+                mode
+            },
+            clock_skew_secs: endpoint.clock_skew_secs.map(u64::from).unwrap_or(60),
+            patient_non_compartment: match endpoint.scopes.patient_non_compartment {
+                EpPolicy::Allow => NonCompartmentPolicy::Allow,
+                EpPolicy::Deny => NonCompartmentPolicy::Deny,
+            },
+            patient_shared_types: endpoint
+                .scopes
+                .patient_shared_types
+                .clone()
+                .unwrap_or_else(|| env.patient_shared_types.clone()),
+            smart_capabilities: smart.capabilities.clone(),
+            smart_scopes_supported: smart.scopes_supported.clone(),
+            smart_token_auth_methods: env.smart_token_auth_methods.clone(),
+            smart_grant_types: env.smart_grant_types.clone(),
+            jwks_url: trimmed(&endpoint.jwks_url),
+            expected_issuer: trimmed(&endpoint.issuer),
+            expected_audience: trimmed(&endpoint.audience),
+            tenant_claim: env.tenant_claim.clone(),
+            patient_claim: env.patient_claim.clone(),
+            encounter_claim: env.encounter_claim.clone(),
+            fhir_user_claim: env.fhir_user_claim.clone(),
+            allowed_algorithms: if endpoint.algorithms.is_empty() {
+                ["RS256", "RS384", "ES256", "ES384"]
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect()
+            } else {
+                endpoint.algorithms.clone()
+            },
+            jwks_min_refresh_interval: env.jwks_min_refresh_interval,
+            jwks_max_age_secs: endpoint.jwks_max_age_secs.map(u64::from).unwrap_or(300),
+            smart_token_endpoint: trimmed(&smart.token_endpoint),
+            smart_authorize_endpoint: trimmed(&smart.authorization_endpoint),
+            smart_jwks_url: trimmed(&smart.jwks_uri),
+            smart_introspection_endpoint: trimmed(&smart.introspection_endpoint),
+            smart_management_endpoint: trimmed(&smart.management_endpoint),
+            smart_registration_endpoint: trimmed(&smart.registration_endpoint),
+            smart_revocation_endpoint: trimmed(&smart.revocation_endpoint),
+            outbound_bearer_token: env.outbound_bearer_token.clone(),
+            web_client_id: None,
+            web_client_secret: None,
+            web_redirect_uri: None,
+            web_scopes: env.web_scopes.clone(),
+            web_cookie_secure: env.web_cookie_secure,
+            smart_end_session_endpoint: trimmed(&smart.end_session_endpoint),
+        }
+    }
+
     /// The types a `patient/` scope may read outside the Patient compartment:
     /// [`patient_shared_types`](Self::patient_shared_types) under
     /// [`NonCompartmentPolicy::Allow`], none under `Deny`.
@@ -563,6 +646,79 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn from_endpoint_takes_the_idp_from_the_endpoint_and_conventions_from_env() {
+        use helios_endpoints::model::{
+            AuthMode as EpMode, EndpointAuth, NonCompartmentPolicy as EpPolicy,
+        };
+        let env = AuthConfig {
+            enabled: true,
+            mode: AuthMode::WriteProtect,
+            expected_issuer: Some("https://env-idp".into()),
+            expected_audience: Some("env-aud".into()),
+            jwks_url: Some("http://keycloak:8080/certs".into()),
+            smart_token_endpoint: Some("https://env-idp/token".into()),
+            patient_claim: "launch_patient".into(),
+            web_client_id: Some("hfs-web".into()),
+            smart_grant_types: Some(vec!["client_credentials".into()]),
+            patient_shared_types: vec!["Medication".into()],
+            ..AuthConfig::default()
+        };
+        let mut ep = EndpointAuth {
+            mode: EpMode::Full,
+            issuer: Some(" https://ep-idp/realms/x ".into()),
+            jwks_url: Some("https://ep-idp/realms/x/certs".into()),
+            audience: Some("ep-aud".into()),
+            ..EndpointAuth::default()
+        };
+        ep.smart.authorization_endpoint = Some("https://ep-idp/auth".into());
+        let c = AuthConfig::from_endpoint(&ep, &env);
+        assert!(c.enabled);
+        assert_eq!(c.effective_mode(), AuthMode::Full);
+        assert_eq!(
+            c.expected_issuer.as_deref(),
+            Some("https://ep-idp/realms/x")
+        );
+        assert_eq!(c.expected_audience.as_deref(), Some("ep-aud"));
+        assert_eq!(c.jwks_url.as_deref(), Some("https://ep-idp/realms/x/certs"));
+        assert_eq!(
+            c.allowed_algorithms,
+            vec!["RS256", "RS384", "ES256", "ES384"]
+        );
+        assert_eq!((c.clock_skew_secs, c.jwks_max_age_secs), (60, 300));
+        // The environment's IdP endpoints are not carried over...
+        assert_eq!(c.smart_token_endpoint, None);
+        assert_eq!(
+            c.smart_authorize_endpoint.as_deref(),
+            Some("https://ep-idp/auth")
+        );
+        assert_eq!(c.web_client_id, None);
+        // ...its conventions are.
+        assert_eq!(c.patient_claim, "launch_patient");
+        assert_eq!(c.smart_grant_types, env.smart_grant_types);
+        assert_eq!(c.patient_shared_types, vec!["Medication".to_string()]);
+        assert!(c.validate().is_ok());
+
+        ep.mode = EpMode::Off;
+        ep.algorithms = vec!["ES256".into()];
+        ep.clock_skew_secs = Some(5);
+        ep.jwks_max_age_secs = Some(30);
+        ep.scopes.patient_non_compartment = EpPolicy::Deny;
+        ep.scopes.patient_shared_types = Some(vec!["Location".into()]);
+        let c = AuthConfig::from_endpoint(&ep, &env);
+        assert!(!c.enabled);
+        assert_eq!(c.effective_mode(), AuthMode::Off);
+        assert_eq!(c.allowed_algorithms, vec!["ES256"]);
+        assert_eq!((c.clock_skew_secs, c.jwks_max_age_secs), (5, 30));
+        assert!(c.patient_shared_read_types().is_empty(), "deny");
+        assert_eq!(c.patient_shared_types, vec!["Location".to_string()]);
+        ep.mode = EpMode::WriteProtect;
+        assert_eq!(
+            AuthConfig::from_endpoint(&ep, &env).effective_mode(),
+            AuthMode::WriteProtect
+        );
+    }
 
     #[test]
     fn redact_url_strips_userinfo_query_and_fragment() {

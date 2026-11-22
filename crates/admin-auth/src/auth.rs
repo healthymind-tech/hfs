@@ -399,18 +399,22 @@ impl AdminAuth {
     /// `Host` it was sent to, or one of the configured allowed origins (for a
     /// proxy that rewrites `Host`). A request carrying neither header fails.
     pub fn same_origin(&self, headers: &HeaderMap) -> bool {
-        let Some(origin) = request_origin(headers) else {
-            return false;
-        };
-        if self.allowed_origins.contains(&origin) {
-            return true;
-        }
-        let (scheme, authority) = origin.split_once("://").unwrap_or(("", ""));
-        headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| strip_default_port(&v.trim().to_ascii_lowercase(), scheme))
-            .is_some_and(|host| host == authority)
+        same_origin_with(headers, &self.allowed_origins)
+    }
+
+    /// The configured extra origins (normalized).
+    pub fn allowed_origins(&self) -> &[String] {
+        &self.allowed_origins
+    }
+
+    /// The configured trusted proxies.
+    pub fn trusted_proxies(&self) -> &[IpNet] {
+        &self.trusted_proxies
+    }
+
+    /// The configured cookie `Secure` mode.
+    pub fn cookie_secure(&self) -> CookieSecure {
+        self.cookie_secure
     }
 
     /// Decides whether a request to an admin endpoint may proceed.
@@ -762,8 +766,25 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether a request's `Origin` (else `Referer`) is the `Host` it was sent to
+/// or one of `allowed` (normalized origins). Neither header: `false`.
+pub(crate) fn same_origin_with(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let Some(origin) = request_origin(headers) else {
+        return false;
+    };
+    if allowed.contains(&origin) {
+        return true;
+    }
+    let (scheme, authority) = origin.split_once("://").unwrap_or(("", ""));
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| strip_default_port(&v.trim().to_ascii_lowercase(), scheme))
+        .is_some_and(|host| host == authority)
+}
+
 /// `Origin`, else the origin of `Referer`, normalized.
-fn request_origin(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn request_origin(headers: &HeaderMap) -> Option<String> {
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         return normalize_origin(origin);
     }
@@ -780,7 +801,7 @@ fn foreign_origin(headers: &HeaderMap) -> bool {
 }
 
 /// Whether the browser reached us over HTTPS, as far as the request shows.
-fn request_is_https(headers: &HeaderMap) -> bool {
+pub(crate) fn request_is_https(headers: &HeaderMap) -> bool {
     let forwarded_https = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())

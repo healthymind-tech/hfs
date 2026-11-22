@@ -1,0 +1,223 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+
+{#
+  New endpoint (design §10.3 wizard): 1 Basics (live name/path check),
+  2 Data (empty / adopt tenant / duplicate), 3 Security, 4 Validation,
+  5 Review (JSON preview + warnings) → Create. One form: without
+  JavaScript every step shows at once; manager.js turns it into a stepper.
+#}
+
+{% block title %}{{ i18n.t("mgr-new-title") }} — {{ i18n.t("app-short-name") }}{% endblock %}
+
+{% block content %}
+<nav class="crumbs" aria-label="{{ i18n.t("mgr-breadcrumb") }}">
+  <a href="/ui">{{ i18n.t("mgr-all-endpoints") }}</a><span class="crumbs__sep" aria-hidden="true">/</span><span aria-current="page">{{ i18n.t("mgr-new-title") }}</span>
+</nav>
+{% call ui::page_header(i18n.t("mgr-new-title"), i18n.t("mgr-new-lede")) %}{% endcall %}
+
+{% if errors.len() > 0 %}
+<div class="notice notice--danger" role="alert" tabindex="-1" data-autofocus>
+  {% call ui::icon("alert") %}{% endcall %}
+  <span>{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}{% if self.bad("") %} — {{ self.err("") }}{% endif %}</span>
+</div>
+{% endif %}
+
+<form method="post" action="/ui/endpoints" class="wizard" id="new-endpoint" novalidate data-wizard data-unsaved-form>
+  {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+  <ol class="stepper" role="list" data-wizard-steps hidden>
+    <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="0"><span class="stepper__num">1</span><span class="stepper__label">{{ i18n.t("mgr-new-step-basics") }}</span></button></li>
+    <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="1"><span class="stepper__num">2</span><span class="stepper__label">{{ i18n.t("mgr-new-step-data") }}</span></button></li>
+    <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="2"><span class="stepper__num">3</span><span class="stepper__label">{{ i18n.t("mgr-new-step-security") }}</span></button></li>
+    <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="3"><span class="stepper__num">4</span><span class="stepper__label">{{ i18n.t("mgr-new-step-validation") }}</span></button></li>
+    <li class="stepper__step"><button type="button" class="stepper__btn" data-wizard-go="4"><span class="stepper__num">5</span><span class="stepper__label">{{ i18n.t("mgr-new-step-review") }}</span></button></li>
+  </ol>
+
+  <section class="card form-section wizard__step" data-wizard-step aria-labelledby="step1-title">
+    <header class="form-section__head"><h2 class="form-section__title" id="step1-title"><span class="wizard__num">1</span>{{ i18n.t("mgr-new-step-basics") }}</h2><p class="form-section__desc">{{ i18n.t("mgr-new-step-basics-desc") }}</p></header>
+    <div class="form-section__body">
+      {% call ui::field_text(i18n.t("mgr-field-display-name"), "display_name", nv.display_name, self.err("displayName"), i18n.t("mgr-new-display-hint"), "text", true, "TW Core sandbox") %}{% endcall %}
+      <div class="form-grid">
+        <div class="mfield{% if self.bad("name") %} mfield--error{% endif %}">
+          <label class="mfield__label" for="f-name">{{ i18n.t("mgr-field-name") }} <span class="mfield__req" aria-hidden="true">*</span></label>
+          <input class="mfield__input mfield__input--mono" id="f-name" name="name" value="{{ nv.name }}" required aria-required="true" autocomplete="off"
+                 pattern="[a-z][a-z0-9-]{0,62}" data-slug-from="display_name"
+                 hx-get="/ui/endpoints/check" hx-trigger="input changed delay:300ms, change" hx-include="#f-name, #f-path" hx-target="#name-check"
+                 aria-describedby="f-name-hint name-check{% if self.bad("name") %} f-name-err{% endif %}"{% if self.bad("name") %} aria-invalid="true"{% endif %}>
+          <p class="mfield__hint" id="f-name-hint">{{ i18n.t("mgr-field-name-rules") }}</p>
+          <div id="name-check" aria-live="polite"></div>
+          {% if self.bad("name") %}<p class="mfield__error" id="f-name-err">{% call ui::icon("alert") %}{% endcall %}<span>{{ self.err("name") }}</span></p>{% endif %}
+        </div>
+        <div class="mfield{% if self.bad("path") %} mfield--error{% endif %}">
+          <label class="mfield__label" for="f-path">{{ i18n.t("mgr-field-path") }}</label>
+          <div class="input-prefix"><span class="input-prefix__text">{{ server_base }}/</span>
+          <input class="mfield__input mfield__input--mono" id="f-path" name="path" value="{{ nv.path }}" autocomplete="off" placeholder="{{ i18n.t("mgr-field-path-same") }}"
+                 hx-get="/ui/endpoints/check" hx-trigger="input changed delay:300ms" hx-include="#f-name, #f-path" hx-target="#name-check"
+                 aria-describedby="f-path-hint{% if self.bad("path") %} f-path-err{% endif %}"{% if self.bad("path") %} aria-invalid="true"{% endif %}></div>
+          <p class="mfield__hint" id="f-path-hint">{{ i18n.t("mgr-field-path-hint") }}</p>
+          {% if self.bad("path") %}<p class="mfield__error" id="f-path-err">{% call ui::icon("alert") %}{% endcall %}<span>{{ self.err("path") }}</span></p>{% endif %}
+        </div>
+      </div>
+      <div class="form-grid">
+        <div class="mfield">
+          <label class="mfield__label" for="f-fhir_version">{{ i18n.t("mgr-field-fhir-version") }}</label>
+          <select class="mfield__input" id="f-fhir_version" name="fhir_version">
+            {% for ver in versions %}<option value="{{ ver }}"{% if *ver == nv.fhir_version %} selected{% endif %}>FHIR {{ ver }}</option>{% endfor %}
+          </select>
+        </div>
+        {% call ui::field_area(i18n.t("mgr-field-labels"), "labels", nv.labels, self.err("labels"), i18n.t("mgr-field-labels-hint"), 2, "env=test") %}{% endcall %}
+      </div>
+      {% call ui::field_area(i18n.t("mgr-field-description"), "description", nv.description, "", "", 2, "", false, false) %}{% endcall %}
+    </div>
+  </section>
+
+  <section class="card form-section wizard__step" data-wizard-step aria-labelledby="step2-title">
+    <header class="form-section__head"><h2 class="form-section__title" id="step2-title"><span class="wizard__num">2</span>{{ i18n.t("mgr-new-step-data") }}</h2><p class="form-section__desc">{{ i18n.t("mgr-new-step-data-desc") }}</p></header>
+    <div class="form-section__body">
+      <fieldset class="radio-cards">
+        <legend class="visually-hidden">{{ i18n.t("mgr-new-step-data") }}</legend>
+        <div class="radio-cards__grid">
+          <label class="radio-card"><input type="radio" name="data_source" value="empty"{% if nv.data_source == "empty" %} checked{% endif %} data-reveal="data-empty"><span class="radio-card__title">{{ i18n.t("mgr-data-empty") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-data-empty-desc") }}</span></label>
+          <label class="radio-card"><input type="radio" name="data_source" value="adopt"{% if nv.data_source == "adopt" %} checked{% endif %} data-reveal="data-adopt"><span class="radio-card__title">{{ i18n.t("mgr-data-adopt") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-data-adopt-desc") }}</span></label>
+          <label class="radio-card"><input type="radio" name="data_source" value="duplicate"{% if nv.data_source == "duplicate" %} checked{% endif %} data-reveal="data-duplicate"><span class="radio-card__title">{{ i18n.t("mgr-data-duplicate") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-data-duplicate-desc") }}</span></label>
+        </div>
+      </fieldset>
+      {% if self.bad("dataSource") %}<p class="mfield__error">{% call ui::icon("alert") %}{% endcall %}<span>{{ self.err("dataSource") }}</span></p>{% endif %}
+      <div class="reveal" data-reveal-id="data-adopt">
+        <div class="mfield{% if self.bad("storage.tenantId") %} mfield--error{% endif %}">
+          <label class="mfield__label" for="f-adopt_tenant">{{ i18n.t("mgr-data-adopt-tenant") }}</label>
+          {% if tenants.is_empty() %}
+          <p class="mfield__static muted">{{ i18n.t("mgr-data-adopt-none") }}</p>
+          {% else %}
+          <select class="mfield__input" id="f-adopt_tenant" name="adopt_tenant">
+            <option value="">—</option>
+            {% for t in tenants %}<option value="{{ t }}"{% if *t == nv.adopt_tenant %} selected{% endif %}>{{ t }}</option>{% endfor %}
+          </select>
+          {% endif %}
+          {% if self.bad("storage.tenantId") %}<p class="mfield__error">{{ self.err("storage.tenantId") }}</p>{% endif %}
+        </div>
+      </div>
+      <div class="reveal" data-reveal-id="data-duplicate">
+        <div class="form-grid">
+          <div class="mfield{% if self.bad("duplicateFrom") %} mfield--error{% endif %}">
+            <label class="mfield__label" for="f-duplicate_from">{{ i18n.t("mgr-data-duplicate-from") }}</label>
+            <select class="mfield__input" id="f-duplicate_from" name="duplicate_from">
+              <option value="">—</option>
+              {% for e in endpoints %}<option value="{{ e.value }}"{% if e.value == nv.duplicate_from %} selected{% endif %}>{{ e.label }}</option>{% endfor %}
+            </select>
+            {% if self.bad("duplicateFrom") %}<p class="mfield__error">{{ self.err("duplicateFrom") }}</p>{% endif %}
+          </div>
+          <fieldset class="checks">
+            <legend class="mfield__label">{{ i18n.t("mgr-data-duplicate-what") }}</legend>
+            <div class="mcheck"><input class="mcheck__input" type="radio" id="dd-none" name="duplicate_data" value="none"{% if nv.duplicate_data == "none" %} checked{% endif %}><label class="mcheck__label" for="dd-none">{{ i18n.t("mgr-dup-data-none") }}</label></div>
+            <div class="mcheck"><input class="mcheck__input" type="radio" id="dd-current" name="duplicate_data" value="current"{% if nv.duplicate_data == "current" %} checked{% endif %}><label class="mcheck__label" for="dd-current">{{ i18n.t("mgr-dup-data-current") }}</label></div>
+            <div class="mcheck"><input class="mcheck__input" type="radio" id="dd-history" name="duplicate_data" value="history"{% if nv.duplicate_data == "history" %} checked{% endif %}><label class="mcheck__label" for="dd-history">{{ i18n.t("mgr-dup-data-history") }}</label></div>
+          </fieldset>
+        </div>
+        {% call ui::checkbox(i18n.t("mgr-dup-packages"), "duplicate_packages", true) %}{% endcall %}
+        {% call ui::checkbox(i18n.t("mgr-dup-auth"), "duplicate_auth", true, i18n.t("mgr-dup-auth-hint")) %}{% endcall %}
+        {% call ui::checkbox(i18n.t("mgr-dup-keep-in-sync"), "duplicate_keep_in_sync", false, i18n.t("mgr-dup-keep-in-sync-hint")) %}{% endcall %}
+      </div>
+      <p class="notice notice--info">{% call ui::icon("info") %}{% endcall %}<span>{{ i18n.t("mgr-isolation-note") }}</span></p>
+    </div>
+  </section>
+
+  <section class="card form-section wizard__step" data-wizard-step aria-labelledby="step3-title">
+    <header class="form-section__head"><h2 class="form-section__title" id="step3-title"><span class="wizard__num">3</span>{{ i18n.t("mgr-new-step-security") }}</h2><p class="form-section__desc">{{ i18n.t("mgr-new-step-security-desc") }}</p></header>
+    <div class="form-section__body">
+      <fieldset class="radio-cards">
+        <legend class="visually-hidden">{{ i18n.t("mgr-new-step-security") }}</legend>
+        <div class="radio-cards__grid">
+          <label class="radio-card"><input type="radio" name="auth_choice" value="inherit"{% if nv.auth_choice == "inherit" %} checked{% endif %} data-reveal="auth-inherit"><span class="radio-card__title">{{ i18n.t("mgr-inherit-label") }}</span><span class="radio-card__desc">{{ i18n.t_arg("mgr-inherit-auth", "mode", i18n.t(env.auth_mode_key)) }}</span></label>
+          <label class="radio-card"><input type="radio" name="auth_choice" value="custom"{% if nv.auth_choice == "custom" %} checked{% endif %} data-reveal="auth-custom"><span class="radio-card__title">{{ i18n.t("mgr-own-settings") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-own-auth-desc") }}</span></label>
+        </div>
+      </fieldset>
+      <div class="reveal" data-reveal-id="auth-custom">
+        <fieldset class="radio-cards">
+          <legend class="mfield__label">{{ i18n.t("mgr-field-auth-mode") }}</legend>
+          <div class="radio-cards__grid">
+            <label class="radio-card"><input type="radio" name="auth_mode" value="off"{% if nv.v.auth_mode == "off" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("mgr-auth-mode-off") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-off-desc") }}</span></label>
+            <label class="radio-card"><input type="radio" name="auth_mode" value="write-protect"{% if nv.v.auth_mode == "write-protect" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("mgr-auth-mode-write-protect") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-write-protect-desc") }}</span></label>
+            <label class="radio-card"><input type="radio" name="auth_mode" value="full"{% if nv.v.auth_mode == "full" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("mgr-auth-mode-full") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-full-desc") }}</span></label>
+          </div>
+        </fieldset>
+        <div class="form-grid">
+          {% call ui::field_text(i18n.t("mgr-field-issuer"), "auth_issuer", nv.v.auth_issuer, self.err("auth.issuer"), i18n.t("mgr-field-issuer-hint"), "url", false, "https://idp.example.org/realms/fhir", false, true) %}{% endcall %}
+          {% call ui::field_text(i18n.t("mgr-field-jwks"), "auth_jwks_url", nv.v.auth_jwks_url, self.err("auth.jwksUrl"), i18n.t("mgr-field-jwks-hint"), "url", false, "", false, true) %}{% endcall %}
+          {% call ui::field_text(i18n.t("mgr-field-audience"), "auth_audience", nv.v.auth_audience, self.err("auth.audience"), i18n.t("mgr-field-audience-hint"), "text", false, "", false, true) %}{% endcall %}
+        </div>
+        <fieldset class="checks">
+          <legend class="mfield__label">{{ i18n.t("mgr-field-scopes") }}</legend>
+          {% call ui::checkbox(i18n.t("mgr-scope-patient"), "scopes_allow_patient", nv.v.scopes_allow_patient) %}{% endcall %}
+          {% call ui::checkbox(i18n.t("mgr-scope-user"), "scopes_allow_user", nv.v.scopes_allow_user) %}{% endcall %}
+          {% call ui::checkbox(i18n.t("mgr-scope-system"), "scopes_allow_system", nv.v.scopes_allow_system) %}{% endcall %}
+          {% call ui::checkbox(i18n.t("mgr-scope-v1"), "scopes_accept_v1", nv.v.scopes_accept_v1) %}{% endcall %}
+          {% if self.bad("auth.scopes") %}<p class="mfield__error">{{ self.err("auth.scopes") }}</p>{% endif %}
+        </fieldset>
+        <input type="hidden" name="smart_discover" value="on">
+        {% call ui::checkbox(i18n.t("mgr-accept-admin"), "accept_admin", nv.v.accept_admin, i18n.t("mgr-accept-admin-hint")) %}{% endcall %}
+      </div>
+    </div>
+  </section>
+
+  <section class="card form-section wizard__step" data-wizard-step aria-labelledby="step4-title">
+    <header class="form-section__head"><h2 class="form-section__title" id="step4-title"><span class="wizard__num">4</span>{{ i18n.t("mgr-new-step-validation") }}</h2><p class="form-section__desc">{{ i18n.t("mgr-new-step-validation-desc") }}</p></header>
+    <div class="form-section__body">
+      <fieldset class="radio-cards">
+        <legend class="visually-hidden">{{ i18n.t("mgr-new-step-validation") }}</legend>
+        <div class="radio-cards__grid">
+          <label class="radio-card"><input type="radio" name="val_choice" value="inherit"{% if nv.val_choice == "inherit" %} checked{% endif %} data-reveal="val-inherit"><span class="radio-card__title">{{ i18n.t("mgr-inherit-label") }}</span><span class="radio-card__desc">{{ i18n.t_arg("mgr-inherit-validation", "mode", i18n.t(env.validation_key)) }}</span></label>
+          <label class="radio-card"><input type="radio" name="val_choice" value="custom"{% if nv.val_choice == "custom" %} checked{% endif %} data-reveal="val-custom"><span class="radio-card__title">{{ i18n.t("mgr-own-settings") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-own-validation-desc") }}</span></label>
+        </div>
+      </fieldset>
+      <div class="reveal" data-reveal-id="val-custom">
+        <fieldset class="radio-cards">
+          <legend class="mfield__label">{{ i18n.t("mgr-field-validation-mode") }}</legend>
+          <div class="radio-cards__grid">
+            <label class="radio-card"><input type="radio" name="val_mode" value="off"{% if nv.v.val_mode == "off" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("mgr-validation-mode-off") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-validation-mode-off-desc") }}</span></label>
+            <label class="radio-card"><input type="radio" name="val_mode" value="log"{% if nv.v.val_mode == "log" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("mgr-validation-mode-log") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-validation-mode-log-desc") }}</span></label>
+            <label class="radio-card"><input type="radio" name="val_mode" value="enforce"{% if nv.v.val_mode == "enforce" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("mgr-validation-mode-enforce") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-validation-mode-enforce-desc") }}</span></label>
+          </div>
+        </fieldset>
+        <div class="mfield">
+          <label class="mfield__label" for="f-val_terminology">{{ i18n.t("mgr-field-terminology-check") }}</label>
+          <select class="mfield__input" id="f-val_terminology" name="val_terminology">
+            <option value="embedded"{% if nv.v.val_terminology == "embedded" %} selected{% endif %}>{{ i18n.t("mgr-term-check-embedded") }}</option>
+            <option value="off"{% if nv.v.val_terminology == "off" %} selected{% endif %}>{{ i18n.t("mgr-term-check-off") }}</option>
+            <option value="remote"{% if nv.v.val_terminology == "remote" %} selected{% endif %}>{{ i18n.t("mgr-term-check-remote") }}</option>
+            <option value="remote-only"{% if nv.v.val_terminology == "remote-only" %} selected{% endif %}>{{ i18n.t("mgr-term-check-remote-only") }}</option>
+          </select>
+        </div>
+        <input type="hidden" name="val_stored_profiles" value="on">
+      </div>
+      <fieldset class="radio-cards">
+        <legend class="mfield__label">{{ i18n.t("mgr-sec-terminology") }}</legend>
+        <div class="radio-cards__grid">
+          <label class="radio-card"><input type="radio" name="term_choice" value="inherit"{% if nv.term_choice == "inherit" %} checked{% endif %} data-reveal="term-inherit"><span class="radio-card__title">{{ i18n.t("mgr-inherit-label") }}</span><span class="radio-card__desc">{{ i18n.t_arg("mgr-inherit-terminology", "url", env.terminology_server.clone()) }}</span></label>
+          <label class="radio-card"><input type="radio" name="term_choice" value="custom"{% if nv.term_choice == "custom" %} checked{% endif %} data-reveal="term-custom"><span class="radio-card__title">{{ i18n.t("mgr-own-settings") }}</span><span class="radio-card__desc">{{ i18n.t("mgr-own-terminology-desc") }}</span></label>
+        </div>
+      </fieldset>
+      <div class="reveal" data-reveal-id="term-custom">
+        {% call ui::field_text(i18n.t("mgr-term-server"), "term_server_url", nv.v.term_server_url, self.err("terminology.serverUrl"), i18n.t("mgr-term-server-hint"), "url", false, "http://hts:8090", false, true) %}{% endcall %}
+      </div>
+      <p class="muted">{{ i18n.t("mgr-new-igs-later") }}</p>
+    </div>
+  </section>
+
+  <section class="card form-section wizard__step" data-wizard-step aria-labelledby="step5-title">
+    <header class="form-section__head"><h2 class="form-section__title" id="step5-title"><span class="wizard__num">5</span>{{ i18n.t("mgr-new-step-review") }}</h2><p class="form-section__desc">{{ i18n.t("mgr-new-step-review-desc") }}</p></header>
+    <div class="form-section__body">
+      <button type="button" class="btn" hx-post="/ui/endpoints/preview" hx-include="#new-endpoint" hx-target="#new-preview" hx-trigger="click, wizard:review from:body" data-wizard-preview>{% call ui::icon("eye") %}{% endcall %}{{ i18n.t("mgr-new-preview") }}</button>
+      <div id="new-preview" class="new-preview" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <div class="save-bar wizard__bar">
+    <a class="btn" href="/ui">{{ i18n.t("action-cancel") }}</a>
+    <span class="save-bar__spacer"></span>
+    <button type="button" class="btn" data-wizard-back hidden>{{ i18n.t("mgr-back") }}</button>
+    <button type="button" class="btn btn--primary" data-wizard-next hidden>{{ i18n.t("mgr-next") }}</button>
+    <button type="submit" class="btn btn--primary" data-wizard-submit>{% call ui::icon("check") %}{% endcall %}{{ i18n.t("mgr-action-create") }}</button>
+  </div>
+</form>
+{% endblock %}

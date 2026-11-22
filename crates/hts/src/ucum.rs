@@ -646,6 +646,10 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "ucum_hm_tests.rs"]
+mod hm_tests;
+
 /// The concepts (code, display) of the stored common UCUM units value set.
 pub async fn common_units<B: crate::traits::TerminologyBackend>(
     backend: &B,

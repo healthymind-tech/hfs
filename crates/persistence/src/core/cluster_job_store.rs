@@ -58,6 +58,8 @@ pub enum JobKind {
     SofExport,
     /// Search parameter reindex (A2).
     Reindex,
+    /// One run of an endpoint sync job (FHIR server manager P6).
+    EndpointSync,
 }
 
 impl JobKind {
@@ -66,6 +68,7 @@ impl JobKind {
         match self {
             Self::SofExport => "sof-export",
             Self::Reindex => "reindex",
+            Self::EndpointSync => "endpoint-sync",
         }
     }
 
@@ -74,6 +77,7 @@ impl JobKind {
         match s {
             "sof-export" => Some(Self::SofExport),
             "reindex" => Some(Self::Reindex),
+            "endpoint-sync" => Some(Self::EndpointSync),
             _ => None,
         }
     }
