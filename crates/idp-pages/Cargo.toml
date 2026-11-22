@@ -1,0 +1,54 @@
+[package]
+name = "helios-idp-pages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/idp-pages"
+description = "Hosted pages of the built-in authorization server: sign-in, patient picker, consent, sign-out, connected apps (SMART on FHIR / OIDC)"
+keywords = ["helios-software", "fhir", "smart-on-fhir", "oauth2", "openid-connect"]
+
+# Packages I4 + I8 of docs/design/authorization-server.md: the interactive
+# steps between `/authorize` (crates/idp-server, which never depends on this
+# crate) and the code redirect, plus the cross-cutting controls of those
+# steps — CSRF, CSP / frame-ancestors, SSO cookie, lockout, rate limits and
+# BALP AuditEvents. Both crates meet only through the helios-idp contracts
+# (`interaction`, `store`); the `hfs` binary wires them together.
+[dependencies]
+helios-idp = { path = "../idp", version = "0.2.9" }
+# BALP AuditEvents for authentication / consent / token events (§10.1).
+helios-audit = { path = "../audit", version = "0.2.9" }
+# The console's design system: brand header, language control, theme
+# button, footer and the theme boot script of the standalone pages.
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.9" }
+# Cluster-wide lockout counters (`admin_login_failures`, scope `IDP`).
+helios-admin-auth = { path = "../admin-auth", version = "0.2.9" }
+axum = { version = "0.8", features = ["form", "query"] }
+askama = "0.16"
+fluent-templates = "0.13"
+unic-langid = { version = "0.9", features = ["macros"] }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+url = "2.5"
+form_urlencoded = "1"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[features]
+default = []
+postgres = ["helios-admin-auth/postgres"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum-test = "18.0"
+tower = "0.5"

@@ -1,0 +1,43 @@
+{% extends "idp/layout.html" %}
+{% block title %}{{ shell.i18n.t("idp-picker-title") }}{% endblock %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ shell.i18n.t("idp-picker-title") }}</h1>
+            <p class="auth-lede">{{ lede }}</p>
+          </header>
+          {%- if let Some(b) = error %}
+          {% include "idp/banner.html" %}
+          {%- endif %}
+          {%- if searchable %}
+          <form method="get" action="{{ action }}" class="idp-search" role="search" id="idp-picker-search">
+            <input type="hidden" name="ix" value="{{ ix }}">
+            <label class="auth-label" for="idp-q">{{ shell.i18n.t("idp-picker-search") }}</label>
+            <div class="idp-search__row">
+              <input class="auth-input" id="idp-q" type="search" name="q" value="{{ query }}" maxlength="100" aria-describedby="idp-q-hint" autocomplete="off">
+              <button class="btn" type="submit">{{ shell.i18n.t("idp-picker-search-button") }}</button>
+            </div>
+            <p class="auth-hint" id="idp-q-hint">{{ shell.i18n.t("idp-picker-search-hint") }}</p>
+          </form>
+          {%- endif %}
+          {%- if patients.is_empty() %}
+          <p class="idp-empty" id="idp-picker-empty">{{ empty_text }}</p>
+          {%- else %}
+          <form method="post" action="{{ action }}" class="auth-form" id="idp-picker-form" data-auth-form>
+            <input type="hidden" name="ix" value="{{ ix }}">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <fieldset class="idp-choices">
+              <legend class="visually-hidden">{{ shell.i18n.t("idp-picker-title") }}</legend>
+              {%- for p in patients %}
+              <label class="idp-choice" for="idp-patient-{{ loop.index }}">
+                <input type="radio" name="patient" id="idp-patient-{{ loop.index }}" value="{{ p.id }}"{% if loop.first %} checked{% endif %} required>
+                <span class="idp-choice__body">
+                  <span class="idp-choice__name">{{ p.name }}</span>
+                  <span class="idp-choice__meta">{{ p.meta }}</span>
+                </span>
+              </label>
+              {%- endfor %}
+            </fieldset>
+            <button class="btn btn--primary auth-btn" type="submit" id="idp-picker-submit">{{ shell.i18n.t("idp-picker-continue") }}</button>
+          </form>
+          {%- endif %}
+{% endblock %}
