@@ -12989,6 +12989,11 @@ select.ctl {
     vertical-align: bottom;
   }
   @media (max-width: 640px) {
+    /* Long values (audit request URLs, canonicals) wrap inside stacked
+       phone rows instead of running past the card edge. */
+    .data-table--stack td {
+      overflow-wrap: anywhere;
+    }
     .data-table--stack .url--clip {
       max-width: none;
       white-space: normal;
@@ -13003,8 +13008,13 @@ select.ctl {
   /* Row action buttons on one baseline: the pin form used to be a
      .form-actions block (12px top margin, even when empty) above Delete. */
   .data-table .row-actions {
-    flex-wrap: nowrap;
-    align-items: center;
+    align-items: flex-start;
+    min-width: 7.5rem;
+  }
+  /* The inventory is wide (eight columns): keep the source file short so
+     the actions column stays on screen at 1440 px. */
+  #hts-term-table .url--clip {
+    max-width: 20ch;
   }
   .data-table .row-actions form {
     display: contents;
