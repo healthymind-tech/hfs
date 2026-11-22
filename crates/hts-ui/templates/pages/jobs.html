@@ -13,8 +13,8 @@
     <p class="page-head__lede">{{ chrome.i18n.t("hts-jobs-lede") }}</p>
   </div>
   <div class="page-head__actions">
-    <a class="btn btn--primary" href="/ui/hts/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
-    <a class="btn" href="/ui/hts/terminology">{{ chrome.i18n.t("hts-nav-terminology") }}</a>
+    <a class="btn btn--primary" href="{{ crate::paths::ui() }}/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
+    <a class="btn" href="{{ crate::paths::manage() }}">{{ chrome.i18n.t("hts-nav-terminology") }}</a>
   </div>
 </section>
 {% if let Some(e) = flash.error %}<p class="alert" role="alert">{{ chrome.i18n.t("hts-admin-request-failed") }} {{ e }}</p>{% endif %}

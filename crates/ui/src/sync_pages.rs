@@ -34,15 +34,16 @@ use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
 
 /// The sync pages (merged into the console router).
 pub(crate) fn routes() -> Router<WebState> {
-    crate::manager::nav::register(crate::manager::nav::NavItem {
-        section: crate::manager::nav::NavSection::Server,
-        id: "sync",
-        label_key: "sync-title",
-        href: "/ui/sync",
-        icon: "sync",
-        min_role: helios_endpoints::ConsoleRole::Viewer,
-        order: 10,
-    });
+    crate::manager::nav::register(
+        crate::manager::nav::NavItem::new(
+            crate::manager::nav::NavSection::Server,
+            "sync",
+            "sync-title",
+            "/ui/sync",
+        )
+        .icon("sync")
+        .order(10),
+    );
     Router::new()
         .route("/ui/sync", get(list_page))
         .route("/ui/sync/new", get(new_page).post(create))

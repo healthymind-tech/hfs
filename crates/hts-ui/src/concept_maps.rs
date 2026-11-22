@@ -255,9 +255,9 @@ impl BrowserRowsView {
         }
         let query = ser.finish();
         Some(if query.is_empty() {
-            "/ui/hts/concept-maps".to_owned()
+            crate::paths::link("/ui/hts/concept-maps")
         } else {
-            format!("/ui/hts/concept-maps?{query}")
+            crate::paths::link(&format!("/ui/hts/concept-maps?{query}"))
         })
     }
 
@@ -288,9 +288,9 @@ impl BrowserRowsView {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/concept-maps".to_owned()
+            crate::paths::link("/ui/hts/concept-maps")
         } else {
-            format!("/ui/hts/concept-maps?{query}")
+            crate::paths::link(&format!("/ui/hts/concept-maps?{query}"))
         }
     }
 
@@ -451,7 +451,7 @@ impl<'a> DetailPageTemplate<'a> {
 /// full detail: facts block above the tab strip, Translate input as the
 /// active tab.
 async fn detail_page(Path(id): Path<String>) -> Response {
-    Redirect::permanent(&format!("/ui/hts/concept-maps/{id}/translate")).into_response()
+    Redirect::permanent(&crate::paths::link(&format!("/ui/hts/concept-maps/{id}/translate"))).into_response()
 }
 
 // ── Translate tab input (GET handler) ───────────────────────────────────

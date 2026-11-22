@@ -1,9 +1,19 @@
-<!doctype html>
+{#-
+  Two shells around one set of blocks. Embedded in the HFS console
+  (`/ui/terminology`, unified-server design §9.3) the host renders its own
+  document shell — the very bytes every FHIR page has, so in-place
+  navigation keeps the sidebar — and hands it over cut at the four blocks
+  (`helios_ui_chrome::shell::HostFrame`). Stand-alone (`hts` binary) the
+  console keeps its own chrome below.
+-#}
+{%- if let Some(host) = chrome.host() -%}{{ host.seg(0)|safe }}{%- else -%}<!doctype html>
 <html lang="{{ chrome.i18n.lang() }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}{{ chrome.i18n.t("hts-app-title") }}{% endblock %}</title>
+  <title>{%- endif -%}
+{% block title %}{{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+{%- if let Some(host) = chrome.host() -%}{{ host.seg(1)|safe }}{%- else -%}</title>
 {{ chrome.brand_head()?|safe }}{# markup: crates/ui-chrome/templates/partials/brand-head.html #}
   <link rel="stylesheet" href="/ui/hts/assets/app.css">
   <!-- Inline first-paint theme stamp, shared with HFS (see its layout):
@@ -20,7 +30,9 @@
   <!-- Load more: moves focus to the first appended row (list-paging.js). -->
   <script src="/ui/hts/assets/list-paging.js" defer></script>
 </head>
-<body class="{% block body_class %}{% endblock %}">
+<body class="{%- endif -%}
+{% block body_class %}{% endblock %}
+{%- if let Some(host) = chrome.host() -%}{{ host.seg(2)|safe }}{%- else -%}">
   <a class="skip-link" href="#main">{{ chrome.i18n.t("mgr-skip-to-content") }}</a>
   <aside class="sidebar" id="sidebar">
     <button type="button" class="sidebar__close" data-nav-close aria-label="{{ chrome.i18n.t("nav-menu-close") }}">
@@ -157,8 +169,12 @@
 {{ chrome.user_menu()?|safe }}{# markup: crates/ui-chrome/templates/partials/user-menu.html (#799) #}
       </div>
     </header>
-    <main class="content{% block content_class %}{% endblock %}" id="main" tabindex="-1">
-      {% block content %}{% endblock %}
+    <main class="content{%- endif -%}
+{% block content_class %}{% endblock %}
+{%- if let Some(host) = chrome.host() -%}{{ host.seg(3)|safe }}{%- else -%}" id="main" tabindex="-1">
+      {%- endif -%}
+{% block content %}{% endblock %}
+{%- if let Some(host) = chrome.host() -%}{{ host.seg(4)|safe }}{%- else -%}
 {{ chrome.site_footer()?|safe }}{# markup: crates/ui-chrome/templates/partials/site-footer.html #}
     </main>
   </div>
@@ -177,3 +193,4 @@
   <script src="/ui/hts/assets/capability-json.js" defer></script>
 </body>
 </html>
+{%- endif -%}

@@ -7,6 +7,8 @@ mgr-nav-section-manager = 管理
 mgr-nav-section-data = 資料
 mgr-nav-section-configure = 設定
 mgr-nav-section-operate = 營運
+mgr-nav-section-terminology = 術語
+mgr-nav-section-idp = 授權伺服器
 mgr-nav-section-server = 伺服器
 mgr-nav-section-settings = 系統設定
 mgr-nav-overview = 所有端點
@@ -418,3 +420,56 @@ mgr-updated-at = 最後變更於 { $at }
 mgr-nav-settings-auth = 主控台登入
 mgr-nav-settings-users = 使用者與角色
 mgr-nav-account = 我的帳號
+
+## Persistent shell (in-place navigation, shell.js)
+shell-nav-error = 無法載入此頁面。
+shell-nav-retry = 重試
+shell-nav-offline = 無法連線到伺服器。請檢查網路連線後重試。
+
+## Verify panels (configure-then-verify): the panel chrome. Step messages
+## (`verify-{code}`) live in verify.ftl.
+verify-run = 驗證設定
+verify-run-terminology = 驗證術語伺服器
+verify-run-peer = 測試連線
+verify-running = 驗證中…會實際連線到伺服器，可能需要幾秒鐘。
+verify-intro-auth = 對授權伺服器做完整檢查：網址、對外連線規則、連線、探索文件、簽發者、簽章金鑰、SMART 功能與受眾。
+verify-intro-terminology = 檢查術語伺服器：網址、對外連線規則、連線、能力聲明、LOINC 查詢、值集展開與回應時間。
+verify-intro-peer = 檢查對方伺服器：網址、對外連線規則、連線、FHIR 版本、憑證、資源數量與增量同步支援。
+verify-token-toggle = 同時以 token 測試
+verify-token-label = 存取 token（JWT）
+verify-token-hint = 貼上授權伺服器簽發的 token。系統會用與此端點完全相同的方式檢查，不會儲存或記錄。
+verify-status-pass = 通過
+verify-status-warn = 警告
+verify-status-fail = 失敗
+verify-status-skipped = 略過
+verify-summary-fail = { $count ->
+    [one] 發現 1 個問題。修正後請再驗證一次。
+   *[other] 發現 { $count } 個問題。請先修正第一個，其餘可能因它而起。
+}
+verify-summary-ok-endpoint-auth = 全部通過——此簽發者的 token 將被接受。
+verify-summary-ok-terminology = 全部通過——此術語伺服器回應正常。
+verify-summary-ok-sync-source = 全部通過——可以讀取來源伺服器。
+verify-summary-ok-sync-target = 全部通過——可以寫入目標伺服器。
+verify-summary-warn-endpoint-auth = 通過，但有 { $count } 個警告——token 會被接受，請閱讀警告。
+verify-summary-warn-terminology = 通過，但有 { $count } 個警告。
+verify-summary-warn-sync-source = 通過，但有 { $count } 個警告。
+verify-summary-warn-sync-target = 通過，但有 { $count } 個警告。
+verify-checked-at = 檢查時間 { $time }
+verify-stale = 檢查後設定已變更——請再驗證一次
+verify-how-to-fix = 修正方式：
+verify-contacted = 連線位址
+verify-go-to-field = 前往欄位
+verify-use-value = 改用 { $value }
+verify-elapsed = { $ms } 毫秒
+verify-unavailable = 此伺服器不提供驗證功能。
+verify-failed-to-run = 無法執行檢查：{ $reason }
+
+## Security section (UX-11, UX-23)
+mgr-effective-title = 沿用時，此端點使用伺服器的設定：
+mgr-effective-unset = 未設定
+mgr-effective-from-discovery = 取自簽發者的探索文件
+mgr-effective-customise = 關閉「沿用」即可為此端點自訂；在此之前，「驗證設定」會檢查這些值。
+mgr-field-audience-recommended = 受眾（建議填寫）
+mgr-field-audience-hint-recommended = token 必須帶有的 aud 值。每個端點請各自設定，避免 token 跨端點通用。
+mgr-field-jwks-hint-optional = 留空則使用簽發者公布的位址。只有本伺服器必須從其他（例如內部）位址取得金鑰時才需設定。
+mgr-sec-advanced = 進階

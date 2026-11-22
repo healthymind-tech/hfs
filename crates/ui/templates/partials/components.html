@@ -69,6 +69,9 @@
 {%- else if name == "duplicate" %}{% include "icons/duplicate.svg" %}
 {%- else if name == "plus" %}{% include "icons/plus.svg" %}
 {%- else if name == "arrow-right" %}{% include "icons/arrow-right.svg" %}
+{%- else if name == "bookmark" %}{% include "icons/book-mark.svg" %}
+{%- else if name == "hierarchy" %}{% include "icons/hierarchy.svg" %}
+{%- else if name == "arrows-exchange" %}{% include "icons/arrows-exchange.svg" %}
 {%- else %}{% include "icons/info.svg" %}
 {%- endif -%}
 {%- endmacro %}
@@ -258,3 +261,32 @@
   </div>
 </header>
 {% endmacro %}
+
+{#-
+  A Verify panel (configure-then-verify, UX-02/07/08): the button that runs
+  a full check of the settings above it, an optional token test, and the
+  checklist result (partials/manager/verify-report.html). `watch` lists the
+  form controls whose change marks a shown result stale; `auto` re-runs the
+  check 600 ms after one of them stops changing (the wizard).
+-#}
+{% macro verify_panel(id, action, watch, intro_key, run_key, with_token, auto) %}
+<section class="verify" id="{{ id }}" data-verify data-verify-watch="{{ watch }}"{% if auto %} data-verify-auto{% endif %} aria-labelledby="{{ id }}-run">
+  <div class="verify__head">
+    <button type="button" class="btn btn--primary btn--small verify__run" id="{{ id }}-run" data-verify-run
+            hx-post="{{ action }}" hx-include="closest form{% if with_token %}, #{{ id }}-token{% endif %}"
+            hx-target="#{{ id }}-result" hx-swap="innerHTML" hx-disabled-elt="this" hx-indicator="#{{ id }}"
+            hx-sync="this:replace" data-busy="off">{% call icon("activity") %}{% endcall %}<span>{{ i18n.t(run_key) }}</span></button>
+    <p class="verify__intro">{{ i18n.t(intro_key) }}</p>
+  </div>
+  {%- if with_token %}
+  <details class="verify__token">
+    <summary>{{ i18n.t("verify-token-toggle") }}</summary>
+    <label class="mfield__label" for="{{ id }}-token">{{ i18n.t("verify-token-label") }}</label>
+    <textarea class="mfield__input" id="{{ id }}-token" name="verify_token" form="{{ id }}-detached" rows="3" spellcheck="false" autocomplete="off"></textarea>
+    <p class="mfield__hint">{{ i18n.t("verify-token-hint") }}</p>
+  </details>
+  {%- endif %}
+  <p class="verify__progress htmx-indicator" role="status">{{ i18n.t("verify-running") }}</p>
+  <div class="verify__result" id="{{ id }}-result" data-verify-result aria-live="polite"></div>
+</section>
+{%- endmacro %}

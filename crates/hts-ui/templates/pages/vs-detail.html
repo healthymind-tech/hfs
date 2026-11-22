@@ -45,7 +45,7 @@
 
   {% if let Some(summary) = self.summary() %}
     <header class="page-head page-head--back-link">
-      <a class="back-link" href="/ui/hts/value-sets">
+      <a class="back-link" href="{{ crate::paths::ui() }}/value-sets">
         <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
         <span>{{ chrome.i18n.t("hts-vs-browser-title") }}</span>
       </a>
@@ -163,8 +163,8 @@
          aria-selected="{% if tab == VsTab::Expand %}true{% else %}false{% endif %}"
          {% if tab == VsTab::Expand %}aria-current="true"{% endif %}
          aria-controls="hts-vs-workbench"
-         href="/ui/hts/value-sets/{{ id }}/expand"
-         hx-get="/ui/hts/value-sets/{{ id }}/expand"
+         href="{{ crate::paths::ui() }}/value-sets/{{ id }}/expand"
+         hx-get="{{ crate::paths::ui() }}/value-sets/{{ id }}/expand"
          hx-target="#hts-vs-detail-region"
          hx-select="#hts-vs-detail-region"
          hx-swap="outerHTML"

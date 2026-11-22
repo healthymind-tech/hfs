@@ -113,8 +113,8 @@
       a hard navigation to the standalone panel route renders the full page
       around this panel. With htmx the same URL swaps just the card. -#}
   <form method="get"
-        action="/ui/hts/concepts/relations"
-        hx-get="/ui/hts/concepts/relations"
+        action="{{ crate::paths::ui() }}/concepts/relations"
+        hx-get="{{ crate::paths::ui() }}/concepts/relations"
         hx-target="#hts-concept-relations"
         hx-swap="outerHTML">
     <input type="hidden" name="system" value="{{ view.reference().system }}">

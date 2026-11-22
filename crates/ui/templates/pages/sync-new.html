@@ -15,7 +15,7 @@
   <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
 </section>
 {% endif %}
-<form method="post" action="/ui/sync/new" autocomplete="off" class="stack">
+<form method="post" action="/ui/sync/new" autocomplete="off" class="stack" data-unsaved-form>
   {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   {% call ui::form_section("sync-basics", i18n.t("sync-step-basics")) %}
     {% call ui::field_text(i18n.t("sync-col-name"), "name", v("name"), "", "", "text", true) %}{% endcall %}

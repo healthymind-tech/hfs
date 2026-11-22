@@ -232,9 +232,9 @@ impl BrowserRowsView {
         }
         let query = ser.finish();
         Some(if query.is_empty() {
-            "/ui/hts/value-sets".to_owned()
+            crate::paths::link("/ui/hts/value-sets")
         } else {
-            format!("/ui/hts/value-sets?{query}")
+            crate::paths::link(&format!("/ui/hts/value-sets?{query}"))
         })
     }
 
@@ -263,9 +263,9 @@ impl BrowserRowsView {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/value-sets".to_owned()
+            crate::paths::link("/ui/hts/value-sets")
         } else {
-            format!("/ui/hts/value-sets?{query}")
+            crate::paths::link(&format!("/ui/hts/value-sets?{query}"))
         }
     }
 
@@ -436,7 +436,7 @@ impl<'a> DetailPageTemplate<'a> {
 /// detail: facts block above the tab strip, Expand input as the active
 /// tab.
 async fn detail_page(Path(id): Path<String>) -> Response {
-    Redirect::permanent(&format!("/ui/hts/value-sets/{id}/expand")).into_response()
+    Redirect::permanent(&crate::paths::link(&format!("/ui/hts/value-sets/{id}/expand"))).into_response()
 }
 
 // ── Workbench input (GET Expand tab handler) ────────────────────────────

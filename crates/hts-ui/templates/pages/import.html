@@ -42,7 +42,7 @@
 {#-
   Archive sources (plan F): chunked upload, server import directory and
   package registry, all queued as background import jobs through
-  `POST /ui/hts/import/job`. Present only when the admin API is enabled.
+  `POST {{ crate::paths::ui() }}/import/job`. Present only when the admin API is enabled.
 -#}
 {% if let Some(a) = admin %}
   {% include "partials/hts-import-archive.html" %}
@@ -88,6 +88,6 @@
   the script. `defer` waits for parse; the script binds by id/name so it is
   safe even if included at end of body.
 -#}
-<script src="/ui/hts/assets/import.js" defer></script>
-<script src="/ui/hts/assets/hts-admin.js" defer></script>
+<script src="{{ crate::paths::assets() }}/import.js" defer></script>
+<script src="{{ crate::paths::assets() }}/hts-admin.js" defer></script>
 {% endblock %}

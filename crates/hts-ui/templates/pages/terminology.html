@@ -20,8 +20,8 @@
     <p class="page-head__lede">{{ chrome.i18n.t("hts-term-lede") }}</p>
   </div>
   <div class="page-head__actions">
-    <a class="btn btn--primary" href="/ui/hts/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
-    <a class="btn" href="/ui/hts/jobs">{{ chrome.i18n.t("hts-nav-jobs") }}</a>
+    <a class="btn btn--primary" href="{{ crate::paths::ui() }}/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
+    <a class="btn" href="{{ crate::paths::ui() }}/jobs">{{ chrome.i18n.t("hts-nav-jobs") }}</a>
   </div>
 </section>
 
@@ -75,8 +75,8 @@
   <section class="card table-card">
     {#- Sort and the stub checkbox apply on change (htmx swaps the body and
         pushes the URL); Apply / Enter still submit natively without JS. -#}
-    <form class="toolbar toolbar--filters" method="get" action="/ui/hts/terminology" aria-label="{{ chrome.i18n.t("hts-term-filter") }}"
-          hx-get="/ui/hts/terminology" hx-trigger="change from:select, change from:input[type=checkbox]"
+    <form class="toolbar toolbar--filters" method="get" action="{{ crate::paths::manage() }}" aria-label="{{ chrome.i18n.t("hts-term-filter") }}"
+          hx-get="{{ crate::paths::manage() }}" hx-trigger="change from:select, change from:input[type=checkbox]"
           hx-target="#hts-term-body" hx-select="#hts-term-body" hx-swap="outerHTML" hx-push-url="true">
       <label class="toolbar__search">
         <input type="search" name="q" value="{{ q }}" placeholder="{{ chrome.i18n.t("hts-term-filter-placeholder") }}" aria-label="{{ chrome.i18n.t("hts-term-filter-placeholder") }}" autocomplete="off" spellcheck="false">
@@ -122,7 +122,7 @@
             <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}"><code>{{ r.version }}</code>{% if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}</td>
             <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-concepts") }}">{% if let Some(c) = r.concepts %}{{ c }}{% else %}&mdash;{% endif %}</td>
             <td class="col-num" style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
-            <td style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="/ui/hts/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
+            <td style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="{{ crate::paths::ui() }}/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url url--clip" title="{{ s }}">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
             {#- Current-version controls live with the Current flag; the
                 Actions column holds only Delete, so the eight-column table
@@ -133,14 +133,14 @@
               {% if r.pinned %}<span class="tag tag--config">{{ chrome.i18n.t("hts-term-pinned") }}</span>{% endif %}
               {% if !r.is_supplement %}
                 {% if r.pinned %}
-                <form method="post" action="/ui/hts/terminology/current">
+                <form method="post" action="{{ crate::paths::manage() }}/current">
                   <input type="hidden" name="url" value="{{ r.url }}">
                   <input type="hidden" name="version" value="{{ r.version_param }}">
                   <input type="hidden" name="back" value="{{ back }}">
                   <button class="btn" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
                 </form>
                 {% else if !r.current && r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
-                <form method="post" action="/ui/hts/terminology/current">
+                <form method="post" action="{{ crate::paths::manage() }}/current">
                   <input type="hidden" name="url" value="{{ r.url }}">
                   <input type="hidden" name="version" value="{{ r.version_param }}">
                   <input type="hidden" name="back" value="{{ back }}">
@@ -152,7 +152,7 @@
             </td>
             <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
               <div class="row-actions">
-                <a class="btn btn--danger" href="/ui/hts/terminology/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
+                <a class="btn btn--danger" href="{{ crate::paths::manage() }}/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
               </div>
             </td>
           </tr>
@@ -168,7 +168,7 @@
 
 <section class="card" aria-labelledby="hts-term-other-heading">
   <div class="card-head"><h3 id="hts-term-other-heading">{{ chrome.i18n.t("hts-term-other-heading") }}</h3></div>
-  <form class="panel" method="post" action="/ui/hts/terminology/delete-resource">
+  <form class="panel" method="post" action="{{ crate::paths::manage() }}/delete-resource">
     <p class="field__hint">{{ chrome.i18n.t("hts-term-other-help") }}</p>
     <div class="field-row">
       <label class="field">
@@ -195,7 +195,7 @@
 
 <section class="card" aria-labelledby="hts-term-maint-heading">
   <div class="card-head"><h3 id="hts-term-maint-heading">{{ chrome.i18n.t("hts-term-maint-heading") }}</h3></div>
-  <form class="panel" method="post" action="/ui/hts/terminology/compact">
+  <form class="panel" method="post" action="{{ crate::paths::manage() }}/compact">
     <p class="notice notice--warn">{{ chrome.i18n.t("hts-term-compact-warning") }}</p>
     {% if let Some(r) = db_reclaimable %}<p>{{ chrome.i18n.t_arg("hts-term-stat-reclaimable", "size", r.to_string()) }}</p>{% endif %}
     <div class="form-actions">

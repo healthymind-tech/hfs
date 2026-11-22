@@ -8,6 +8,8 @@ mgr-nav-section-manager = Manager
 mgr-nav-section-data = Data
 mgr-nav-section-configure = Configure
 mgr-nav-section-operate = Operate
+mgr-nav-section-terminology = Terminology
+mgr-nav-section-idp = Authorization servers
 mgr-nav-section-server = Server
 mgr-nav-section-settings = Settings
 mgr-nav-overview = All endpoints
@@ -434,3 +436,68 @@ mgr-updated-at = Last changed { $at }
 mgr-nav-settings-auth = Console sign-in
 mgr-nav-settings-users = Users & roles
 mgr-nav-account = My account
+
+## Persistent shell (in-place navigation, shell.js)
+shell-nav-error = This page could not be loaded.
+shell-nav-retry = Retry
+shell-nav-offline = The server could not be reached. Check your connection and retry.
+
+## Verify panels (configure-then-verify): the panel chrome. Step messages
+## (`verify-{code}`) live in verify.ftl.
+verify-run = Verify configuration
+verify-run-terminology = Verify terminology server
+verify-run-peer = Test connection
+verify-running = Verifying… this contacts the server and can take a few seconds.
+verify-intro-auth = Runs a full check against the authorization server: address, outbound rules, connection, discovery document, issuer, signing keys, SMART capabilities and audience.
+verify-intro-terminology = Checks the terminology server: address, outbound rules, connection, capability statement, a LOINC lookup, a value set expansion and response time.
+verify-intro-peer = Checks the other server: address, outbound rules, connection, FHIR version, credentials, resource counts and incremental support.
+verify-token-toggle = Also test with a token
+verify-token-label = Access token (JWT)
+verify-token-hint = Paste a token issued by the authorization server. It is checked exactly as this endpoint would check it, and never stored or logged.
+verify-status-pass = Passed
+verify-status-warn = Warning
+verify-status-fail = Failed
+verify-status-skipped = Skipped
+verify-summary-fail = { $count ->
+    [one] 1 problem found. Fix it and verify again.
+   *[other] { $count } problems found. Fix the first one; the others may be consequences.
+}
+verify-summary-ok-endpoint-auth = All checks passed — tokens from this issuer will be accepted.
+verify-summary-ok-terminology = All checks passed — this terminology server answers as expected.
+verify-summary-ok-sync-source = All checks passed — the source server can be read.
+verify-summary-ok-sync-target = All checks passed — the target server can be written.
+verify-summary-warn-endpoint-auth = { $count ->
+    [one] Passed with 1 warning — tokens will be accepted, but read the warning.
+   *[other] Passed with { $count } warnings — tokens will be accepted, but read the warnings.
+}
+verify-summary-warn-terminology = { $count ->
+    [one] Passed with 1 warning.
+   *[other] Passed with { $count } warnings.
+}
+verify-summary-warn-sync-source = { $count ->
+    [one] Passed with 1 warning.
+   *[other] Passed with { $count } warnings.
+}
+verify-summary-warn-sync-target = { $count ->
+    [one] Passed with 1 warning.
+   *[other] Passed with { $count } warnings.
+}
+verify-checked-at = Checked at { $time }
+verify-stale = settings changed since this check — verify again
+verify-how-to-fix = How to fix:
+verify-contacted = Contacted
+verify-go-to-field = Go to field
+verify-use-value = Use { $value }
+verify-elapsed = { $ms } ms
+verify-unavailable = Verification is not available on this server.
+verify-failed-to-run = The check could not run: { $reason }
+
+## Security section (UX-11, UX-23)
+mgr-effective-title = While inheriting, this endpoint uses the server's settings:
+mgr-effective-unset = not set
+mgr-effective-from-discovery = from the issuer's discovery document
+mgr-effective-customise = Turn off "Inherit" to customise them for this endpoint; Verify checks these values meanwhile.
+mgr-field-audience-recommended = Audience (recommended)
+mgr-field-audience-hint-recommended = The aud value a token must carry. Give each endpoint its own, so a token for one is refused by the others.
+mgr-field-jwks-hint-optional = Leave empty to use the one the issuer publishes. Set it only when this server must fetch the keys from another (e.g. internal) address.
+mgr-sec-advanced = Advanced

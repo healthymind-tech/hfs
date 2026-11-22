@@ -67,7 +67,7 @@
                 <td class="col-name">
                   {#- ConceptMap ids have no version pipe, but the segment is
                       encoded anyway so any future id shape stays safe. -#}
-                  <a href="/ui/hts/concept-maps/{{ row.id|urlencode_strict }}">
+                  <a href="{{ crate::paths::ui() }}/concept-maps/{{ row.id|urlencode_strict }}">
                     {% if !row.name.is_empty() %}{{ row.name }}
                     {%- else %}{{ row.id }}
                     {%- endif %}
@@ -144,7 +144,7 @@
           </button>
           <a class="btn" href="{{ view.filters.page_url_at(next) }}" rel="next">{{ chrome.i18n.t("hts-browser-page-next") }}</a>
           {% endif %}
-          <form class="table-foot__goto" method="get" action="/ui/hts/concept-maps">
+          <form class="table-foot__goto" method="get" action="{{ crate::paths::ui() }}/concept-maps">
             <input type="hidden" name="url" value="{% if let Some(v) = view.filters.url %}{{ v }}{% endif %}">
             <input type="hidden" name="name" value="{% if let Some(v) = view.filters.name %}{{ v }}{% endif %}">
             <input type="hidden" name="title" value="{% if let Some(v) = view.filters.title %}{{ v }}{% endif %}">

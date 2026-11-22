@@ -1,6 +1,6 @@
 {#- Job detail fragment; polls itself every 2 s while the job is active. -#}
 <div id="hts-job-detail"
-     {% if job.active %}hx-get="/ui/hts/jobs/{{ job.id|urlencode_strict }}?fragment=1" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+     {% if job.active %}hx-get="{{ crate::paths::ui() }}/jobs/{{ job.id|urlencode_strict }}?fragment=1" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
      data-status="{{ job.status }}" data-phase="{{ job.phase }}" data-percent="{{ job.percent }}">
   <section class="card">
     <div class="card-head">
@@ -8,7 +8,7 @@
       <div class="card-head__tools">
         <span class="tag {{ job.tag_class }}" data-job-status>{{ chrome.i18n.t(job.status_key.as_str()) }}</span>
         {% if job.cancellable %}
-        <form method="post" action="/ui/hts/jobs/{{ job.id|urlencode_strict }}/cancel">
+        <form method="post" action="{{ crate::paths::ui() }}/jobs/{{ job.id|urlencode_strict }}/cancel">
           <button class="btn btn--danger" type="submit" id="hts-job-cancel">{{ chrome.i18n.t("hts-job-cancel") }}</button>
         </form>
         {% endif %}

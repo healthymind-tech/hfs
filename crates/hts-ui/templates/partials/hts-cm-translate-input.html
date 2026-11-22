@@ -35,8 +35,8 @@
       class="card"
       style="margin-bottom:16px"
       method="post"
-      action="/ui/hts/concept-maps/{{ id }}/translate"
-      hx-post="/ui/hts/concept-maps/{{ id }}/translate"
+      action="{{ crate::paths::ui() }}/concept-maps/{{ id }}/translate"
+      hx-post="{{ crate::paths::ui() }}/concept-maps/{{ id }}/translate"
       hx-target="#hts-workbench-result"
       hx-swap="outerHTML show:#hts-workbench-result:top"
       hx-disabled-elt="find button[type=submit]"
@@ -103,7 +103,7 @@
         <label class="chip">
           <input type="radio" name="direction" value="forward"
                  {% if direction == TranslateDirection::Forward %} checked{% endif %}
-                 hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=forward"
+                 hx-get="{{ crate::paths::ui() }}/concept-maps/{{ id }}/translate?direction=forward"
                  hx-target="#hts-workbench-input"
                  hx-select="#hts-workbench-input"
                  hx-swap="outerHTML"
@@ -114,7 +114,7 @@
         <label class="chip">
           <input type="radio" name="direction" value="reverse"
                  {% if direction == TranslateDirection::Reverse %} checked{% endif %}
-                 hx-get="/ui/hts/concept-maps/{{ id }}/translate?direction=reverse"
+                 hx-get="{{ crate::paths::ui() }}/concept-maps/{{ id }}/translate?direction=reverse"
                  hx-target="#hts-workbench-input"
                  hx-select="#hts-workbench-input"
                  hx-swap="outerHTML"

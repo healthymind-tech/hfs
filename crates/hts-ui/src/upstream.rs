@@ -655,7 +655,7 @@ impl CsBrowserFilters {
         }
         ser.append_pair("_count", &self.effective_count().to_string());
         ser.append_pair("_offset", &next_offset.to_string());
-        format!("/ui/hts/code-systems/rows?{}", ser.finish())
+        crate::paths::link(&format!("/ui/hts/code-systems/rows?{}", ser.finish()))
     }
 
     /// The browser *page* URL at `offset` with every active filter carried
@@ -687,9 +687,9 @@ impl CsBrowserFilters {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/code-systems".to_owned()
+            crate::paths::link("/ui/hts/code-systems")
         } else {
-            format!("/ui/hts/code-systems?{query}")
+            crate::paths::link(&format!("/ui/hts/code-systems?{query}"))
         }
     }
 }
@@ -1870,7 +1870,7 @@ impl VsBrowserFilters {
         }
         ser.append_pair("_count", &self.effective_count().to_string());
         ser.append_pair("_offset", &next_offset.to_string());
-        format!("/ui/hts/value-sets/rows?{}", ser.finish())
+        crate::paths::link(&format!("/ui/hts/value-sets/rows?{}", ser.finish()))
     }
 
     /// The browser *page* URL at `offset` with every active filter carried
@@ -1902,9 +1902,9 @@ impl VsBrowserFilters {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/value-sets".to_owned()
+            crate::paths::link("/ui/hts/value-sets")
         } else {
-            format!("/ui/hts/value-sets?{query}")
+            crate::paths::link(&format!("/ui/hts/value-sets?{query}"))
         }
     }
 }
@@ -2908,7 +2908,7 @@ impl CmBrowserFilters {
         }
         ser.append_pair("_count", &self.effective_count().to_string());
         ser.append_pair("_offset", &next_offset.to_string());
-        format!("/ui/hts/concept-maps/rows?{}", ser.finish())
+        crate::paths::link(&format!("/ui/hts/concept-maps/rows?{}", ser.finish()))
     }
 
     /// The browser *page* URL at `offset` with every active filter carried
@@ -2941,9 +2941,9 @@ impl CmBrowserFilters {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/concept-maps".to_owned()
+            crate::paths::link("/ui/hts/concept-maps")
         } else {
-            format!("/ui/hts/concept-maps?{query}")
+            crate::paths::link(&format!("/ui/hts/concept-maps?{query}"))
         }
     }
 }
@@ -5181,20 +5181,20 @@ impl ConceptRef {
 
     /// The concept's permalink — the page a `$lookup` result links into.
     pub fn permalink(&self) -> String {
-        format!("/ui/hts/concepts?{}", self.query_string(&[]))
+        crate::paths::link(&format!("/ui/hts/concepts?{}", self.query_string(&[])))
     }
 
     /// Standalone URL for one lazy panel (`identity`, `mappings`,
     /// `relations`). Used both as the htmx `hx-get` target and as the
     /// `<noscript>` `<a href>` so the panel is reachable without JavaScript.
     pub fn panel_url(&self, panel: &str) -> String {
-        format!("/ui/hts/concepts/{panel}?{}", self.query_string(&[]))
+        crate::paths::link(&format!("/ui/hts/concepts/{panel}?{}", self.query_string(&[])))
     }
 
     /// Panel URL with extra query pairs (the mappings direction toggle and
     /// the subsumption comparator field both need one).
     pub fn panel_url_with(&self, panel: &str, extra: &[(&str, &str)]) -> String {
-        format!("/ui/hts/concepts/{panel}?{}", self.query_string(extra))
+        crate::paths::link(&format!("/ui/hts/concepts/{panel}?{}", self.query_string(extra)))
     }
 }
 

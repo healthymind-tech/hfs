@@ -203,11 +203,53 @@ impl EndpointChip {
     }
 }
 
+/// The roles of a request for the sidebar and the terminology section:
+/// global, on one endpoint, and terminology (max of global and the
+/// `terminology` binding, design §7.2).
+pub(crate) fn nav_roles(
+    parts: &axum::http::Extensions,
+    gate_open: bool,
+    admin_signed_in: bool,
+    endpoint: Option<&str>,
+) -> nav::NavRoles {
+    if let Some(principal) = parts.get::<ConsolePrincipal>() {
+        let terminology = principal
+            .endpoint_roles
+            .get(TERMINOLOGY_BINDING)
+            .copied()
+            .map_or(principal.role, |b| b.max(principal.role));
+        return nav::NavRoles {
+            global: principal.role,
+            endpoint: endpoint.map_or(principal.role, |e| principal.role_for(e)),
+            terminology,
+        };
+    }
+    nav::NavRoles::uniform(if gate_open || admin_signed_in {
+        ConsoleRole::Admin
+    } else {
+        ConsoleRole::Viewer
+    })
+}
+
+/// The role-binding scope that raises (or sets) a user's role on the
+/// terminology section only (hm-0012; `terminology` is a reserved endpoint
+/// name, so the binding never collides with an endpoint).
+pub const TERMINOLOGY_BINDING: &str = "terminology";
+
+/// Cookie remembering the endpoint the sidebar shows on pages outside any
+/// endpoint (Overview, Terminology, Server, Settings), so the sidebar does
+/// not change shape when moving between sections.
+pub const NAV_ENDPOINT_COOKIE: &str = "hm_ep";
+
 /// What the layout needs from the manager on every page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagerChrome {
     /// Sidebar sections.
     pub nav: Vec<nav::NavGroup>,
+    /// The sidebar's context key (endpoint, role, sections).
+    pub nav_key: String,
+    /// The endpoint the sidebar shows (in scope, else remembered).
+    pub nav_endpoint: Option<EndpointChip>,
     /// The endpoint in scope.
     pub endpoint: Option<EndpointChip>,
     /// Every endpoint, for the switcher.
@@ -221,10 +263,23 @@ impl ManagerChrome {
         runtime: &ManagerRuntime,
         scope: Option<&EndpointScope>,
         role: ConsoleRole,
+        nav_ctx: &crate::NavCtx,
     ) -> Self {
         let snapshot = runtime.registry.snapshot();
+        let nav_endpoint = match scope {
+            Some(s) => Some(EndpointChip::new(&s.endpoint)),
+            None => nav_ctx
+                .endpoint
+                .as_deref()
+                .and_then(|name| snapshot.endpoints().iter().find(|e| e.name() == name))
+                .map(|e| EndpointChip::new(e)),
+        };
+        let ep_name = nav_endpoint.as_ref().map(|c| c.name.clone());
+        let role_key = nav::nav_role(nav_ctx.roles.global.max(nav_ctx.roles.terminology));
         Self {
-            nav: nav::build(scope.map(|s| s.name()), role),
+            nav: nav::build(ep_name.as_deref(), nav_ctx.roles),
+            nav_key: nav::nav_key(ep_name.as_deref(), role_key, nav_ctx.key_extra),
+            nav_endpoint,
             endpoint: scope.map(|s| EndpointChip::new(&s.endpoint)),
             endpoints: snapshot
                 .endpoints()

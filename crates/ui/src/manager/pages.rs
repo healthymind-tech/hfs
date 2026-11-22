@@ -958,6 +958,9 @@ impl FormValues {
 /// Inherited server values shown next to each "Inherit" toggle.
 pub(crate) struct EnvView {
     pub auth_mode_key: &'static str,
+    pub auth_issuer: String,
+    pub auth_audience: String,
+    pub auth_jwks: String,
     pub validation_key: &'static str,
     pub terminology_server: String,
     pub cors_origins: String,
@@ -968,6 +971,9 @@ impl EnvView {
     fn new(env: &EnvDefaults) -> Self {
         Self {
             auth_mode_key: view::auth_mode_key(env.auth_mode),
+            auth_issuer: env.auth_issuer.clone().unwrap_or_default(),
+            auth_audience: env.auth_audience.clone().unwrap_or_default(),
+            auth_jwks: env.auth_jwks_url.clone().unwrap_or_default(),
             validation_key: view::validation_badge(None, env).key,
             terminology_server: env.terminology_server.clone().unwrap_or_default(),
             cors_origins: env.cors_origins.clone().unwrap_or_else(|| "*".into()),

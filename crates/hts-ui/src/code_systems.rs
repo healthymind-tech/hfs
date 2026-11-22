@@ -257,9 +257,9 @@ impl BrowserRowsView {
         }
         let query = ser.finish();
         Some(if query.is_empty() {
-            "/ui/hts/code-systems".to_owned()
+            crate::paths::link("/ui/hts/code-systems")
         } else {
-            format!("/ui/hts/code-systems?{query}")
+            crate::paths::link(&format!("/ui/hts/code-systems?{query}"))
         })
     }
 
@@ -294,9 +294,9 @@ impl BrowserRowsView {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/code-systems".to_owned()
+            crate::paths::link("/ui/hts/code-systems")
         } else {
-            format!("/ui/hts/code-systems?{query}")
+            crate::paths::link(&format!("/ui/hts/code-systems?{query}"))
         }
     }
 
@@ -460,7 +460,7 @@ impl<'a> DetailPageTemplate<'a> {
 /// tab. Redirecting instead of rendering keeps the browser URL and the
 /// `aria-current` tab always in sync.
 async fn detail_page(Path(id): Path<String>) -> Response {
-    Redirect::permanent(&format!("/ui/hts/code-systems/{id}/lookup")).into_response()
+    Redirect::permanent(&crate::paths::link(&format!("/ui/hts/code-systems/{id}/lookup"))).into_response()
 }
 
 // ── Workbench inputs (GET tab handlers) ─────────────────────────────────

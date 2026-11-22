@@ -27,7 +27,7 @@
 {% if !persistent %}<div class="notice notice--warn">{% call ui::icon("alert") %}{% endcall %}{{ i18n.t("console-settings-not-persistent") }}</div>{% endif %}
 {% if !break_glass_available %}<div class="notice notice--warn">{% call ui::icon("alert") %}{% endcall %}{{ i18n.t("console-settings-no-break-glass") }}</div>{% endif %}
 
-<form method="post" action="/ui/settings/auth" class="card form-section config-form" id="settings-auth-form">
+<form method="post" action="/ui/settings/auth" class="card form-section config-form" id="settings-auth-form" data-unsaved-form>
   <div class="form-section__body form-grid">
   {{ csrf_html|safe }}
   <input type="hidden" name="revision" value="{{ revision }}">

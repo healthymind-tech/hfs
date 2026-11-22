@@ -70,6 +70,8 @@ pub(crate) use helios_ui_chrome::capability_json;
 pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
+/// Persistent-shell plumbing: build id, versioned assets, CSP.
+mod shell;
 mod subscriptions;
 mod sync_pages;
 // Public but hidden: the coordinator's counters and view are what #1849's
@@ -77,6 +79,8 @@ mod sync_pages;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
+/// The Terminology section (`/ui/terminology`): the embedded terminology console.
+pub mod terminology_console;
 mod vd_complete;
 
 pub use admin_login::ADMIN_COOKIE;
@@ -338,6 +342,29 @@ pub(crate) struct RequestTenant {
     /// The CSRF synchronizer token of the console session, when the console
     /// guard (package P3) stamped one ([`manager::CsrfToken`]).
     pub(crate) csrf: Option<String>,
+    /// What the sidebar of this request shows (roles, endpoint).
+    pub(crate) nav: NavCtx,
+}
+
+/// The sidebar context of a request: the roles that filter its entries and
+/// the endpoint its per-endpoint sections are for.
+#[derive(Debug, Clone)]
+pub(crate) struct NavCtx {
+    pub(crate) roles: manager::nav::NavRoles,
+    /// In scope (`/ui/e/{ep}`), else the remembered one, else the default.
+    pub(crate) endpoint: Option<String>,
+    /// Extra component of the nav key (terminology mode).
+    pub(crate) key_extra: &'static str,
+}
+
+impl Default for NavCtx {
+    fn default() -> Self {
+        Self {
+            roles: manager::nav::NavRoles::uniform(helios_endpoints::ConsoleRole::Viewer),
+            endpoint: None,
+            key_extra: "",
+        }
+    }
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -363,6 +390,7 @@ where
                 scope: None,
                 role: helios_endpoints::ConsoleRole::Viewer,
                 csrf: None,
+                nav: NavCtx::default(),
             }))
     }
 }
@@ -411,6 +439,30 @@ async fn resolve_prefs(
         .extensions()
         .get::<manager::CsrfToken>()
         .map(|t| t.0.clone());
+    let nav_endpoint = match (&scope, &state.manager) {
+        (Some(scope), _) => Some(scope.endpoint.name().to_string()),
+        (None, Some(runtime)) => {
+            let snapshot = runtime.registry.snapshot();
+            let remembered = cookie_value(request.headers(), manager::NAV_ENDPOINT_COOKIE);
+            let endpoints = snapshot.endpoints();
+            remembered
+                .and_then(|name| endpoints.iter().find(|e| e.name() == name))
+                .or_else(|| endpoints.iter().find(|e| e.spec.path.is_root()))
+                .or_else(|| endpoints.first())
+                .map(|e| e.name().to_string())
+        }
+        (None, None) => None,
+    };
+    let nav = NavCtx {
+        roles: manager::nav_roles(
+            request.extensions(),
+            matches!(state.admin_gate, helios_admin_auth::AdminGate::Open),
+            admin_user.is_some(),
+            nav_endpoint.as_deref(),
+        ),
+        endpoint: nav_endpoint,
+        key_extra: terminology_console::nav_key_extra(),
+    };
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
@@ -420,6 +472,7 @@ async fn resolve_prefs(
         scope: None,
         role,
         csrf: csrf.clone(),
+        nav: nav.clone(),
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -451,6 +504,7 @@ async fn resolve_prefs(
                 scope: None,
                 role,
                 csrf: csrf.clone(),
+                nav: nav.clone(),
             };
         }
     }
@@ -722,6 +776,30 @@ impl Status {
             .unwrap_or(&[])
     }
 
+    /// The sidebar's context key (persistent shell §9.4 item 3): the shell
+    /// keeps the sidebar DOM across in-place navigations while it is equal.
+    pub(crate) fn nav_key(&self) -> &str {
+        self.manager
+            .as_ref()
+            .map(|m| m.nav_key.as_str())
+            .unwrap_or("legacy")
+    }
+
+    /// The endpoint the sidebar shows (in scope, else remembered).
+    pub(crate) fn nav_endpoint(&self) -> Option<&manager::EndpointChip> {
+        self.manager.as_ref().and_then(|m| m.nav_endpoint.as_ref())
+    }
+
+    /// Prefix of this build's fingerprinted asset URLs.
+    pub(crate) fn assets(&self) -> &'static str {
+        shell::asset_base()
+    }
+
+    /// This build's id (stale-shell refresh, §9.4 item 9).
+    pub(crate) fn build_id(&self) -> &'static str {
+        shell::build_id()
+    }
+
     /// The endpoint in scope, for the switcher label.
     pub(crate) fn current_endpoint(&self) -> Option<&manager::EndpointChip> {
         self.manager.as_ref().and_then(|m| m.endpoint.as_ref())
@@ -879,21 +957,6 @@ impl Status {
         helios_ui_chrome::theme_toggle(i18n)
     }
 
-    /// The topbar product switcher (FHIR Server | Terminology), shared with
-    /// HTS through `helios-ui-chrome` (UI/UX review §4.2). The Terminology
-    /// entry is the same browser-safe destination as the sidebar's
-    /// Terminology link; with none configured the switcher is not rendered.
-    pub(crate) fn product_switcher(&self, i18n: &I18n) -> Result<String, askama::Error> {
-        helios_ui_chrome::product_switcher(
-            i18n,
-            helios_ui_chrome::ProductLinks {
-                current: helios_ui_chrome::Product::Fhir,
-                fhir: Some(helios_ui_chrome::HFS_CONSOLE_PATH),
-                terminology: self.terminology_url(),
-            },
-        )
-    }
-
     /// The inline first-paint theme stamp for `<head>` (shared with HTS).
     pub(crate) fn theme_boot(&self) -> Result<String, askama::Error> {
         helios_ui_chrome::theme_boot()
@@ -902,6 +965,10 @@ impl Status {
     /// A browser-safe terminology destination, when the configured value is a
     /// valid absolute HTTP(S) URL (#611).
     pub(crate) fn terminology_url(&self) -> Option<&str> {
+        // Embedded, the Terminology section is this console's own page.
+        if terminology_console::installed() {
+            return None;
+        }
         match &self.terminology {
             TerminologyNavigation::Valid(url) => Some(url),
             TerminologyNavigation::Unconfigured | TerminologyNavigation::Invalid => None,
@@ -2101,7 +2168,7 @@ pub fn mount_with_conformance_source_and_runtime(
     // change) is always re-fetched instead of served stale from cache.
     let assets = Router::new()
         .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
-        .layer(middleware::from_fn(revalidate_assets));
+        .layer(middleware::from_fn(shell::versioned_assets));
 
     let mut router = Router::new()
         // The per-endpoint dashboard's own address under the manager (where
@@ -2111,7 +2178,6 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/resources", get(resources))
         .route("/ui/resources/params", get(resources_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
-        .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
         // Read-only live CapabilityStatement (#653).
         .route("/ui/capability-statement", get(capability_page))
@@ -2433,6 +2499,14 @@ pub fn mount_with_conformance_source_and_runtime(
         manager: manager_runtime.clone(),
     };
 
+    // The Terminology section: the embedded terminology console when a
+    // terminology service is installed, else the page explaining how to
+    // enable one (design §9.1 off mode). `/ui/hts/**` redirects either way.
+    if !terminology_console::installed() {
+        router = router.route("/ui/terminology", get(terminology_page));
+    }
+    router = router.merge(terminology_console::routes());
+
     let app = router
         .route("/ui/{*rest}", axum::routing::any(ui_not_found))
         // Console sign-in, account and users/roles settings (P3).
@@ -2450,9 +2524,10 @@ pub fn mount_with_conformance_source_and_runtime(
         // One negotiated locale per request, in request extensions; every
         // handler and template reads this same value.
         .layer(middleware::from_fn(i18n::negotiate_locale))
-        // Lets a HTS console on the same origin offer the way back here in
-        // its product switcher (UI/UX review §4.2).
-        .layer(middleware::from_fn(advertise_console))
+        // The sidebar's endpoint outside endpoint pages (persistent shell).
+        .layer(middleware::from_fn(remember_nav_endpoint))
+        // CSP, `Vary: HX-Boosted`, stale-build refresh (persistent shell).
+        .layer(middleware::from_fn(shell::shell_headers))
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
@@ -2529,6 +2604,19 @@ pub fn mount_with_conformance_source_and_runtime(
     }
 }
 
+/// One cookie's value from the request headers.
+pub(crate) fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|pair| {
+            let (k, v) = pair.trim().split_once('=')?;
+            (k == name && !v.is_empty()).then_some(v)
+        })
+}
+
 /// Any `/ui/…` path no UI route matches (#1673): the not-found page inside
 /// the shell, never the FHIR API's answer for an unknown resource type.
 async fn ui_not_found(
@@ -2589,35 +2677,41 @@ async fn scope_request_authorization(
     .await
 }
 
-/// Middleware: tell a HTS console served from the same origin that this
-/// console exists, so its topbar product switcher can link back to `/ui`
-/// (UI/UX review §4.2 — before this, HTS had no way back to HFS at all).
-/// HTS cannot know otherwise: it is configured independently and may well
-/// run on another host. A `Path=/` cookie carrying nothing but "there is
-/// one" is the smallest signal that is only ever true on a shared origin.
-/// Sent on successful `GET`s of HTML pages only (never beside a sign-in
-/// response's own cookies), and only until the browser has it.
-async fn advertise_console(request: axum::extract::Request, next: middleware::Next) -> Response {
-    let is_get = request.method() == axum::http::Method::GET;
-    let known = !is_get
-        || helios_ui_chrome::has_hfs_console_cookie(
+/// Middleware: remember the endpoint of an endpoint page (`/ui/e/{ep}/…`)
+/// in [`manager::NAV_ENDPOINT_COOKIE`], so pages outside any endpoint
+/// (Overview, Terminology, Server, Settings) keep showing that endpoint's
+/// sidebar sections — the sidebar does not change shape between sections
+/// (persistent shell, design §9.4). Successful HTML `GET`s only, and only
+/// when the value changes.
+async fn remember_nav_endpoint(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let endpoint = (request.method() == axum::http::Method::GET)
+        .then(|| {
             request
-                .headers()
-                .get_all(axum::http::header::COOKIE)
-                .iter()
-                .filter_map(|value| value.to_str().ok()),
-        );
+                .extensions()
+                .get::<manager::EndpointScope>()
+                .map(|s| s.endpoint.name().to_string())
+        })
+        .flatten();
+    let known = endpoint.as_deref().is_some_and(|ep| {
+        cookie_value(request.headers(), manager::NAV_ENDPOINT_COOKIE) == Some(ep)
+    });
     let mut response = next.run(request).await;
     let is_html = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/html"));
-    if !known
+    if let Some(ep) = endpoint
+        && !known
         && is_html
         && response.status() == StatusCode::OK
-        && let Ok(value) =
-            axum::http::HeaderValue::from_str(&helios_ui_chrome::hfs_console_set_cookie())
+        && let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+            "{}={ep}; Path=/ui; Max-Age=31536000; SameSite=Lax",
+            manager::NAV_ENDPOINT_COOKIE
+        ))
     {
         response
             .headers_mut()
@@ -2868,18 +2962,6 @@ async fn set_tenant(
 /// The how-to page for natural-language search, linked from the setup state.
 const NL_SEARCH_DOCS: &str =
     "https://heliossoftware.github.io/hfs/components/natural-language-search.html";
-
-/// Adds `Cache-Control: no-cache` to embedded-asset responses so a rebuilt
-/// asset is never served stale from the browser cache (revalidation is cheap:
-/// unchanged content returns `304` via the ETag `ServeEmbed` already sets).
-async fn revalidate_assets(request: axum::extract::Request, next: middleware::Next) -> Response {
-    let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache"),
-    );
-    response
-}
 
 /// Full landing page. `?types=<A,B,â€¦>` selects which resource types the chart
 /// plots (defaults to the tenant's largest stored types); unknown names are
@@ -10533,7 +10615,9 @@ pub(crate) fn current_status(
         manager: state
             .manager
             .as_deref()
-            .map(|rt| manager::ManagerChrome::new(rt, tenant.scope.as_deref(), tenant.role)),
+            .map(|rt| {
+                manager::ManagerChrome::new(rt, tenant.scope.as_deref(), tenant.role, &tenant.nav)
+            }),
         csrf: tenant.csrf.clone(),
     }
 }

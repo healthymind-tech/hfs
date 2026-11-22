@@ -1,6 +1,6 @@
 {#- Jobs list fragment; polls itself while anything is active. -#}
 <div id="hts-jobs-list"
-     {% if any_active %}hx-get="/ui/hts/jobs?fragment=1" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+     {% if any_active %}hx-get="{{ crate::paths::ui() }}/jobs?fragment=1" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
      aria-live="polite" data-active="{{ any_active }}">
   {% if let Some(u) = unavailable %}
     {% include "partials/hts-admin-unavailable.html" %}
@@ -10,7 +10,7 @@
     {% for job in jobs %}
     <article class="card job-card" id="job-{{ job.id }}" data-status="{{ job.status }}">
       <div class="job-card__head">
-        <h2 class="job-card__name"><a href="/ui/hts/jobs/{{ job.id|urlencode_strict }}">{{ job.label }}</a></h2>
+        <h2 class="job-card__name"><a href="{{ crate::paths::ui() }}/jobs/{{ job.id|urlencode_strict }}">{{ job.label }}</a></h2>
         <div class="job-card__actions">
           <span class="tag {{ job.tag_class }}">{{ chrome.i18n.t(job.status_key.as_str()) }}</span>
         </div>

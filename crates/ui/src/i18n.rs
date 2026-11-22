@@ -269,6 +269,13 @@ impl I18n {
             .unwrap_or_else(|| key.to_owned())
     }
 
+    /// [`Self::t_args`], or `None` when no catalog defines `key` (optional
+    /// messages such as a Verify step's "how to fix").
+    pub(crate) fn t_args_opt(&self, key: &str, args: &BTreeMap<String, String>) -> Option<String> {
+        LOCALES.try_lookup(self.locale, key)?;
+        Some(self.t_args(key, args))
+    }
+
     /// Look up a message with one named placeable, e.g.
     /// `t_arg("status-last-checked", "timestamp", status.checked_at)`.
     pub fn t_arg(&self, key: &str, name: &str, value: impl Into<FluentValue<'static>>) -> String {

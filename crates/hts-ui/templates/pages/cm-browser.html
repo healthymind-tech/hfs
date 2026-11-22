@@ -27,8 +27,8 @@
 <div class="filter-center">
   <form id="hts-cm-filters"
         method="get"
-        action="/ui/hts/concept-maps/rows"
-        hx-get="/ui/hts/concept-maps/rows"
+        action="{{ crate::paths::ui() }}/concept-maps/rows"
+        hx-get="{{ crate::paths::ui() }}/concept-maps/rows"
         hx-target="#hts-cm-rows"
         hx-swap="outerHTML"
         hx-trigger="input changed delay:300ms, change, submit"
@@ -67,7 +67,7 @@
             {% endfor %}
           </select>
         </label>
-        <a class="btn" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-cm-browser-filter-reset") }}</a>
+        <a class="btn" href="{{ crate::paths::ui() }}/concept-maps">{{ chrome.i18n.t("hts-cm-browser-filter-reset") }}</a>
       </div>
 
       {#- Counts omitted for the same reason as CS: each one would cost an
