@@ -1272,6 +1272,140 @@ pub async fn test_auth_unavailable(h: &Harness) {
     assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
 }
 
+/// `$verify-auth` (endpoint and wizard) and `$verify-terminology`: admin
+/// guard, body shapes, failures as report steps, `audience-shared`.
+pub async fn verify_routes(h: &Harness) {
+    let idp = mock_idp::start(true, true).await;
+    let auth = json!({"mode": "full", "issuer": idp.issuer, "jwksUrl": idp.jwks_url,
+                      "audience": "lab-api"});
+    // Admin guard.
+    for path in [
+        "/admin/endpoints/default/$verify-auth",
+        "/admin/endpoints/$verify-auth",
+        "/admin/endpoints/$verify-terminology",
+    ] {
+        let r = h.server.post(path).json(&json!({"auth": auth})).await;
+        assert_eq!(r.status_code(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    // Wizard: no endpoint yet.
+    let (s, o) = scan(
+        &h.post("/admin/endpoints/$verify-auth", json!({"auth": auth}))
+            .await,
+    );
+    assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["kind"], "endpoint-auth");
+    assert_eq!(o["ok"], true, "{o}");
+    assert!(o["checkedAt"].is_string());
+    let ids: Vec<&str> = o["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[..4], ["input", "outbound", "connect", "discovery"]);
+    // A bare auth section works as the body too.
+    let (s, o) = scan(&h.post("/admin/endpoints/$verify-auth", auth.clone()).await);
+    assert_eq!((s, o["ok"].clone()), (StatusCode::OK, json!(true)), "{o}");
+    // The wizard needs an auth section.
+    let (s, _) = scan(&h.post_empty("/admin/endpoints/$verify-auth").await);
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let (s, _) = scan(
+        &h.post(
+            "/admin/endpoints/$verify-auth",
+            json!({"auth": auth, "token": 5}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // With a token.
+    let bad = mock_idp::token(&idp.issuer, "other-api", 300);
+    let (s, o) = scan(
+        &h.post(
+            "/admin/endpoints/default/$verify-auth",
+            json!({"auth": auth, "token": bad}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["ok"], false);
+    let token = o["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "token")
+        .unwrap();
+    assert_eq!(token["code"], "token-audience", "{token}");
+    assert_eq!(token["params"]["got"], "other-api");
+
+    // An outbound-policy refusal is a failed step, not a 422.
+    let (s, o) = scan(
+        &h.post(
+            "/admin/endpoints/$verify-auth",
+            json!({"auth": {"mode": "full", "issuer": "https://10.0.0.1/realms/x"}}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::OK, "{o}");
+    let outbound = &o["steps"][1];
+    assert_eq!(outbound["code"], "outbound-blocked", "{o}");
+    assert_eq!(outbound["status"], "fail");
+    assert_eq!(outbound["field"], "issuer");
+
+    // Stored auth of an inheriting endpoint: the effective server settings.
+    let (s, o) = scan(&h.post_empty("/admin/endpoints/default/$verify-auth").await);
+    assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["kind"], "endpoint-auth");
+    let (s, _) = scan(&h.post_empty("/admin/endpoints/nope/$verify-auth").await);
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Another endpoint with the same issuer and audience.
+    let (s, _, _) = h.create(json!({"name": "lab", "auth": auth})).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, o) = scan(
+        &h.post("/admin/endpoints/$verify-auth", json!({"auth": auth}))
+            .await,
+    );
+    assert_eq!(s, StatusCode::OK, "{o}");
+    let shared = o["steps"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(shared["id"], "audience-shared", "{o}");
+    assert_eq!(shared["status"], "warn");
+    assert_eq!(shared["params"]["other"], "lab");
+    // Not against itself.
+    let (s, o) = scan(&h.post_empty("/admin/endpoints/lab/$verify-auth").await);
+    assert_eq!(s, StatusCode::OK, "{o}");
+    assert!(
+        o["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != "audience-shared"),
+        "{o}"
+    );
+
+    // Terminology.
+    let (s, o) = scan(
+        &h.post(
+            "/admin/endpoints/$verify-terminology",
+            json!({"url": "tx.example.org", "timeoutSecs": 3}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::OK, "{o}");
+    assert_eq!(o["kind"], "terminology");
+    assert_eq!(o["steps"][0]["code"], "input-not-url");
+    assert_eq!(o["steps"][0]["field"], "terminologyUrl");
+    let (s, _) = scan(
+        &h.post(
+            "/admin/endpoints/$verify-terminology",
+            json!({"token": "x"}),
+        )
+        .await,
+    );
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 pub async fn test_auth_probe(h: &Harness) {
     // A healthy IdP: discovery and JWKS pass, token checked.
     let idp = mock_idp::start(true, true).await;

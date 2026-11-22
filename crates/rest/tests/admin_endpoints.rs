@@ -184,6 +184,18 @@ async fn test_auth_runs_the_probe() {
 }
 
 #[tokio::test]
+async fn verify_routes_report_steps() {
+    suite::verify_routes(
+        &harness(Options {
+            outbound: OutboundPolicy::parse("127.0.0.1"),
+            ..Options::default()
+        })
+        .await,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn probe_trusts_only_env_managed_endpoints() {
     suite::probe_guards().await;
 }

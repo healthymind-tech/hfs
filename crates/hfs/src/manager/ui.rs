@@ -23,7 +23,8 @@ use helios_rest::handlers::admin_endpoints::error::{ApiError, ErrorKind};
 use helios_rest::handlers::admin_endpoints::spec_input::SecretInputs;
 use helios_ui::manager::{
     BackendError, DuplicateOutcome, EndpointRouting, EndpointStats, ManagerBackend, ManagerRuntime,
-    ProbeLine, SecretChange, SecretChanges, ServerHealth, StoreBackend, set_manager,
+    ProbeLine, SecretChange, SecretChanges, ServerHealth, StoreBackend, SyncPeerVerifyRequest,
+    VerifyReport, set_manager,
 };
 
 use super::ManagerContext;
@@ -220,6 +221,48 @@ impl ManagerBackend for AdminApiBackend {
                 lines
             })
             .map_err(map)
+    }
+
+    async fn verify_auth(
+        &self,
+        endpoint: Option<&str>,
+        auth: &EndpointAuth,
+        token: Option<&str>,
+    ) -> Result<VerifyReport, BackendError> {
+        self.admin()
+            .verify_endpoint_auth(endpoint, Some(auth.clone()), token)
+            .await
+            .map_err(map)
+    }
+
+    async fn verify_effective_auth(
+        &self,
+        endpoint: &str,
+        token: Option<&str>,
+    ) -> Result<VerifyReport, BackendError> {
+        self.admin()
+            .verify_endpoint_auth(Some(endpoint), None, token)
+            .await
+            .map_err(map)
+    }
+
+    async fn verify_terminology(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<VerifyReport, BackendError> {
+        self.admin()
+            .verify_terminology(url, token, timeout_secs)
+            .await
+            .map_err(map)
+    }
+
+    async fn verify_sync_peer(
+        &self,
+        request: SyncPeerVerifyRequest,
+    ) -> Result<VerifyReport, BackendError> {
+        self.admin().verify_sync_peer(&request).await.map_err(map)
     }
 
     async fn stats(&self, name: &str) -> Option<EndpointStats> {

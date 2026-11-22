@@ -1294,6 +1294,31 @@ fn smart_step(m: &OidcMetadata) -> VerifyStep {
     }
 }
 
+/// The server-level (environment, `HFS_AUTH_*`) auth settings as an
+/// endpoint auth section, so an endpoint that inherits them can be verified
+/// against its effective configuration.
+pub fn endpoint_auth_from_config(config: &AuthConfig) -> EndpointAuth {
+    use crate::config::AuthMode;
+    EndpointAuth {
+        mode: if !config.enabled {
+            EndpointAuthMode::Off
+        } else {
+            match config.mode {
+                AuthMode::Off => EndpointAuthMode::Off,
+                AuthMode::WriteProtect => EndpointAuthMode::WriteProtect,
+                AuthMode::Full => EndpointAuthMode::Full,
+            }
+        },
+        issuer: config.expected_issuer.clone(),
+        jwks_url: config.jwks_url.clone(),
+        audience: config.expected_audience.clone(),
+        algorithms: config.allowed_algorithms.clone(),
+        clock_skew_secs: u32::try_from(config.clock_skew_secs).ok(),
+        jwks_max_age_secs: u32::try_from(config.jwks_max_age_secs).ok(),
+        ..EndpointAuth::default()
+    }
+}
+
 // ------------------------------------------------------------ terminology
 
 const LOOKUP_SYSTEM: &str = "http://loinc.org";
@@ -1865,11 +1890,14 @@ async fn client_credentials_token(
             .since(started),
         );
     }
-    let mut form = form_urlencoded::Serializer::new(String::new());
-    form.append_pair("grant_type", "client_credentials");
-    if let Some(s) = scope.map(str::trim).filter(|s| !s.is_empty()) {
-        form.append_pair("scope", s);
-    }
+    let body = {
+        let mut form = form_urlencoded::Serializer::new(String::new());
+        form.append_pair("grant_type", "client_credentials");
+        if let Some(s) = scope.map(str::trim).filter(|s| !s.is_empty()) {
+            form.append_pair("scope", s);
+        }
+        form.finish()
+    };
     let request = guard
         .client(timeout)
         .post(token_url)
@@ -1879,7 +1907,7 @@ async fn client_credentials_token(
             "application/x-www-form-urlencoded",
         )
         .header(reqwest::header::ACCEPT, "application/json")
-        .body(form.finish());
+        .body(body);
     let step = |status, code: &str, detail: String| {
         VerifyStep::new("token", status, code, detail)
             .param("url", display_url(token_url))
@@ -2091,7 +2119,7 @@ pub async fn verify_fhir_peer_with_timeout(
                         VerifyStep::new(
                             "token",
                             Pass,
-                            "token-ok",
+                            "token-issued",
                             "The token endpoint issued an access token.",
                         )
                         .field(f("client_id"))
@@ -3251,7 +3279,7 @@ mod tests {
                 "incremental"
             ]
         );
-        expect(&r, "token", Pass, "token-ok", Some("source_client_id"));
+        expect(&r, "token", Pass, "token-issued", Some("source_client_id"));
         expect(&r, "counts", Pass, "counts-ok", None);
         assert_eq!(
             step(&r, "counts").params["summary"],
@@ -3361,6 +3389,26 @@ mod tests {
             "token-endpoint-unreachable",
             Some("source_token_url"),
         );
+    }
+
+    #[test]
+    fn verify_futures_are_send() {
+        fn send<T: Send>(_: T) {}
+        let guard = OutboundGuard::Trusted;
+        let auth = EndpointAuth::default();
+        let probe = EndpointAuthProbe::new(guard.clone());
+        send(probe.verify(&auth, None));
+        send(verify_terminology_server(
+            "",
+            None,
+            Duration::from_secs(1),
+            &guard,
+        ));
+        let peer = PeerConfig {
+            url: String::new(),
+            auth: PeerAuth::None,
+        };
+        send(verify_fhir_peer(&peer, PeerRole::Source, None, &[], &guard));
     }
 
     #[test]
