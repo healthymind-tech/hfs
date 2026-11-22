@@ -161,7 +161,11 @@ async fn logout(State(p): State<Pages>, h: HeaderMap) -> Response {
 /// Which realm (if any) the endpoint trusts, from its stored auth section.
 async fn trusted_realm(p: &Pages, ep: &str) -> Option<Arc<helios_idp::runtime::RealmRuntime>> {
     let e = p.eps.get(ep).await.ok().flatten()?;
-    let iss = e.spec.auth.as_ref()?.issuer.clone()?;
+    let auth = e.spec.auth.as_ref()?;
+    if let Some(name) = auth.provider.internal_realm() {
+        return p.rt.realm(name);
+    }
+    let iss = auth.issuer.clone()?;
     p.rt.realms().into_iter().find(|r| r.issuer() == iss)
 }
 
@@ -315,7 +319,10 @@ async fn healthy_realm_passes_and_faults_are_pinpointed() {
     // 3. Endpoint not bound (its Security settings point elsewhere).
     let e = s.eps.get("clinic").await.unwrap().unwrap();
     let mut es = e.spec.clone();
-    es.auth.as_mut().unwrap().issuer = Some("https://keycloak.example/realms/other".into());
+    let a = es.auth.as_mut().unwrap();
+    a.provider = helios_endpoints::AuthProviderRef::External;
+    a.issuer = Some("https://keycloak.example/realms/other".into());
+    a.jwks_url = Some("https://keycloak.example/realms/other/certs".into());
     s.eps.update("clinic", e.revision, es, &Actor::bootstrap()).await.unwrap();
     let r = c.diagnose("clinic-apps", DiagnoseOptions::default()).await.unwrap();
     assert_eq!((r.problems()[0].code.as_str(), r.problems()[0].field.as_deref()), ("endpoint-not-bound", Some("endpoints.clinic")));
