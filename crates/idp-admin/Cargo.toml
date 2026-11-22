@@ -44,6 +44,8 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
+# Real protocol endpoints (IdP A) for the end-to-end diagnostic test.
+helios-idp-server = { path = "../idp-server", version = "0.2.9" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
