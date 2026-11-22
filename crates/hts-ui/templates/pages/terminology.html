@@ -124,12 +124,13 @@
             <td class="col-num" style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
             <td style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="/ui/hts/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url url--clip" title="{{ s }}">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
+            {#- Current-version controls live with the Current flag; the
+                Actions column holds only Delete, so the eight-column table
+                fits at 1440 px without pushing Delete off screen. -#}
             <td data-label="{{ chrome.i18n.t("hts-term-col-current") }}">
+              <div class="row-actions row-actions--start">
               {% if r.current %}<span class="tag tag--active">{{ chrome.i18n.t("hts-term-current") }}</span>{% endif %}
               {% if r.pinned %}<span class="tag tag--config">{{ chrome.i18n.t("hts-term-pinned") }}</span>{% endif %}
-            </td>
-            <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
-              <div class="row-actions">
               {% if !r.is_supplement %}
                 {% if r.pinned %}
                 <form method="post" action="/ui/hts/terminology/current">
@@ -147,6 +148,10 @@
                 </form>
                 {% endif %}
               {% endif %}
+              </div>
+            </td>
+            <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
+              <div class="row-actions">
                 <a class="btn btn--danger" href="/ui/hts/terminology/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
               </div>
             </td>

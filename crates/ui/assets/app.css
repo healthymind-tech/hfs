@@ -13008,8 +13008,10 @@ select.ctl {
   /* Row action buttons on one baseline: the pin form used to be a
      .form-actions block (12px top margin, even when empty) above Delete. */
   .data-table .row-actions {
-    align-items: flex-start;
-    min-width: 7.5rem;
+    align-items: center;
+  }
+  .data-table .row-actions--start {
+    justify-content: flex-start;
   }
   /* The inventory is wide (eight columns): keep the source file short so
      the actions column stays on screen at 1440 px. */
