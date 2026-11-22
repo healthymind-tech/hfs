@@ -12707,6 +12707,19 @@ body.auth-page {
   }
 }
 
+/* Tablets: the same panels (and the dashboard's type picker, which ran
+   220px past an 834px screen) stay inside the viewport, right-aligned. */
+@media (min-width: 600px) and (max-width: 900px) {
+  .content .menu__panel--right {
+    position: fixed;
+    top: auto;
+    left: auto;
+    right: 24px;
+    width: min(380px, calc(100vw - 48px));
+    margin-top: 8px;
+  }
+}
+
 /* Progressive disclosure (manager.js `data-show-when`). */
 [data-show-when][hidden] {
   display: none !important;
