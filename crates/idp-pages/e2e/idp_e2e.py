@@ -402,7 +402,7 @@ def run(shots):
         url, _ = authorize_url("clinic", LAB, "openid fhirUser launch/patient patient/*.rs offline_access", c)
         page.goto(url + "&ui_locales=zh-Hant")
         check("ui_locales=zh-Hant renders Chinese", page.is_visible("text=登入 Riverside Clinic 以繼續使用 Growth Chart。"), page.content()[:300])
-        check("brand stays English", page.inner_text(".auth-logo__name").strip() == "HealthyMind")
+        check("brand stays English", "HealthyMind" in page.inner_text(".auth-foot") and "療心" not in page.content())
         no_scroll = page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         check("phone: no horizontal scroll", no_scroll)
         shot(page, shots, "21-login-phone-zh-dark")

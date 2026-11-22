@@ -118,10 +118,19 @@ pub fn router(pages: Pages) -> Router {
             "/idp/{realm}/select-patient",
             get(picker_page).post(picker_submit),
         )
-        .route("/idp/{realm}/consent", get(consent_page).post(consent_submit))
+        .route(
+            "/idp/{realm}/consent",
+            get(consent_page).post(consent_submit),
+        )
         .route("/idp/{realm}/logout", get(logout_page).post(logout_submit))
-        .route("/idp/{realm}/account/apps", get(apps_page).post(apps_revoke))
-        .route("/idp/{realm}/account/login", axum::routing::post(account_login))
+        .route(
+            "/idp/{realm}/account/apps",
+            get(apps_page).post(apps_revoke),
+        )
+        .route(
+            "/idp/{realm}/account/login",
+            axum::routing::post(account_login),
+        )
         .with_state(pages)
 }
 
@@ -177,7 +186,7 @@ impl Shell {
                 helios_ui_chrome::AuthBrand {
                     home: "#auth-main",
                     assets: ASSETS,
-                    product_key: "idp-brand",
+                    product_key: "idp-product",
                 },
             )
             .unwrap_or_default(),
@@ -343,7 +352,13 @@ fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
-fn set_cookie(cfg: &PagesConfig, name: &str, value: &str, same_site: &str, max_age: Option<i64>) -> String {
+fn set_cookie(
+    cfg: &PagesConfig,
+    name: &str,
+    value: &str,
+    same_site: &str,
+    max_age: Option<i64>,
+) -> String {
     let mut c = format!("{name}={value}; Path=/; HttpOnly; SameSite={same_site}");
     if cfg.secure_cookies {
         c.push_str("; Secure");
@@ -429,7 +444,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
         parts: &mut axum::http::request::Parts,
         _: &S,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(crate::limits::CallerIp(ip)) = parts.extensions.get::<crate::limits::CallerIp>() {
+        if let Some(crate::limits::CallerIp(ip)) = parts.extensions.get::<crate::limits::CallerIp>()
+        {
             return Ok(Peer(Some(ip.clone())));
         }
         Ok(Peer(
@@ -445,7 +461,9 @@ fn client_ip(cfg: &PagesConfig, headers: &HeaderMap, peer: Option<String>) -> St
     if let Some(p) = &peer {
         return p.clone();
     }
-    if cfg.trust_forwarded && let Some(ip) = crate::limits::forwarded_ip(headers) {
+    if cfg.trust_forwarded
+        && let Some(ip) = crate::limits::forwarded_ip(headers)
+    {
         return ip;
     }
     "unknown".into()
@@ -521,7 +539,11 @@ impl Step {
         )
     }
     fn path(&self, page: &str) -> String {
-        format!("/idp/{}/{page}?ix={}", self.realm.spec.name.as_str(), self.ix)
+        format!(
+            "/idp/{}/{page}?ix={}",
+            self.realm.spec.name.as_str(),
+            self.ix
+        )
     }
 }
 
@@ -537,7 +559,9 @@ fn error_page(
     status: StatusCode,
     text: String,
 ) -> Response {
-    let display = realm.map(|r| r.spec.display_name.clone()).unwrap_or_default();
+    let display = realm
+        .map(|r| r.spec.display_name.clone())
+        .unwrap_or_default();
     let shell = Shell::new(i18n, headers, &display, "");
     let nonce = shell.nonce.clone();
     let t = MessageTemplate {
@@ -647,7 +671,10 @@ async fn current_session(
     realm: &RealmRuntime,
     headers: &HeaderMap,
 ) -> Option<SsoSession> {
-    let value = read_cookie(headers, &session_cookie_name(&pages.config, realm.spec.name.as_str()))?;
+    let value = read_cookie(
+        headers,
+        &session_cookie_name(&pages.config, realm.spec.name.as_str()),
+    )?;
     let hash = handle_hash(HandleKind::SsoSession, &value)?;
     let s = pages.store().get_session(&realm.id, &hash).await.ok()??;
     let now = Utc::now();
@@ -765,7 +792,14 @@ async fn login_page(
         }
     }
     if p.has_prompt(Prompt::None) {
-        return deny(&pages, &step, &headers, OAuthErrorCode::LoginRequired, "login required").await;
+        return deny(
+            &pages,
+            &step,
+            &headers,
+            OAuthErrorCode::LoginRequired,
+            "login required",
+        )
+        .await;
     }
     let hint = p.login_hint.clone().unwrap_or_default();
     render_login(&pages, &step, &headers, &hint, None, StatusCode::OK)
@@ -837,7 +871,12 @@ async fn authenticate(
             .ok()
             .flatten()
     };
-    let attempt = Attempt::new(&realm.id, user.as_ref().map(|u| u.id.as_str()), username, ip);
+    let attempt = Attempt::new(
+        &realm.id,
+        user.as_ref().map(|u| u.id.as_str()),
+        username,
+        ip,
+    );
     let policy = &realm.spec.security;
     let fail = |reason: &str| IdpEvent::LoginFailed {
         realm: realm_name.clone(),
@@ -874,7 +913,11 @@ async fn authenticate(
     let ok = verify_password(pages, phc, password.chars().take(256).collect()).await
         && password.len() <= helios_idp::password::MAX_LENGTH;
     let Some(user) = user.filter(|u| ok && has_hash && !u.disabled) else {
-        let reason = if !has_hash { "unknown user, disabled or no password" } else { "wrong password" };
+        let reason = if !has_hash {
+            "unknown user, disabled or no password"
+        } else {
+            "wrong password"
+        };
         pages.runtime.emit(fail(reason));
         if let Some(until) = pages.lockout.failed(&attempt, policy).await {
             pages.runtime.emit(locked(until));
@@ -1019,12 +1062,28 @@ async fn advance_as(
             let mut pr = progress.clone();
             pr.patient = Some(selectable[0].clone());
             return match save_progress(pages, &step, pr).await {
-                Ok(step) => Box::pin(advance_as(pages, step, headers, cookies, Some((user, session)))).await,
+                Ok(step) => {
+                    Box::pin(advance_as(
+                        pages,
+                        step,
+                        headers,
+                        cookies,
+                        Some((user, session)),
+                    ))
+                    .await
+                }
                 Err(r) => r,
             };
         }
         if prompt_none {
-            return deny(pages, &step, headers, OAuthErrorCode::InteractionRequired, "patient selection required").await;
+            return deny(
+                pages,
+                &step,
+                headers,
+                OAuthErrorCode::InteractionRequired,
+                "patient selection required",
+            )
+            .await;
         }
         return redirect(&step.path("select-patient"), cookies);
     }
@@ -1053,11 +1112,28 @@ async fn advance_as(
     };
     if needs_consent {
         if prompt_none {
-            return deny(pages, &step, headers, OAuthErrorCode::ConsentRequired, "consent required").await;
+            return deny(
+                pages,
+                &step,
+                headers,
+                OAuthErrorCode::ConsentRequired,
+                "consent required",
+            )
+            .await;
         }
         return redirect(&step.path("consent"), cookies);
     }
-    finish(pages, &step, headers, &user, &session, &progress, p.scopes.clone(), cookies).await
+    finish(
+        pages,
+        &step,
+        headers,
+        &user,
+        &session,
+        &progress,
+        p.scopes.clone(),
+        cookies,
+    )
+    .await
 }
 
 /// Completes the interaction with the granted scopes.
@@ -1091,7 +1167,11 @@ async fn finish(
             .auth_time
             .and_then(|t| DateTime::from_timestamp(t, 0))
             .unwrap_or(session.auth_time),
-        amr: if progress.amr.is_empty() { session.amr.clone() } else { progress.amr.clone() },
+        amr: if progress.amr.is_empty() {
+            session.amr.clone()
+        } else {
+            progress.amr.clone()
+        },
         acr: session.acr.clone(),
         granted_scopes: granted,
         context,
@@ -1116,7 +1196,13 @@ fn complete_error(step: &Step, headers: &HeaderMap, e: CompleteError) -> Respons
         CompleteError::InvalidDecision(m) => format!("{} ({m})", step.i18n.t("idp-error-generic")),
         CompleteError::Internal(_) => step.i18n.t("idp-error-generic"),
     };
-    error_page(headers, Some(&step.realm), step.i18n, StatusCode::BAD_REQUEST, text)
+    error_page(
+        headers,
+        Some(&step.realm),
+        step.i18n,
+        StatusCode::BAD_REQUEST,
+        text,
+    )
 }
 
 /// Sends the authorization response: a 303 for `query`, the auto-submitting
@@ -1408,7 +1494,10 @@ async fn render_consent(
     };
     let shell = step.shell(headers);
     let nonce = shell.nonce.clone();
-    let who = user.display_name.clone().unwrap_or_else(|| user.username.clone());
+    let who = user
+        .display_name
+        .clone()
+        .unwrap_or_else(|| user.username.clone());
     let t = ConsentTemplate {
         title: i.t_arg("idp-consent-title", "app", p.client_name.clone()),
         lede: i.t_args(
@@ -1478,7 +1567,14 @@ async fn consent_submit(
             endpoint: p.endpoint.clone(),
             ip: Some(ip),
         });
-        return deny(&pages, &step, &headers, OAuthErrorCode::AccessDenied, "the user denied the request").await;
+        return deny(
+            &pages,
+            &step,
+            &headers,
+            OAuthErrorCode::AccessDenied,
+            "the user denied the request",
+        )
+        .await;
     }
     let granted = scopes::granted(&p.scopes, &form.scopes);
     let any_data = granted.iter().any(|s| {
@@ -1524,7 +1620,10 @@ async fn consent_submit(
         ip: Some(ip),
     });
     let cookies = step.cookies(&pages);
-    finish(&pages, &step, &headers, &user, &session, &progress, granted, cookies).await
+    finish(
+        &pages, &step, &headers, &user, &session, &progress, granted, cookies,
+    )
+    .await
 }
 
 // ----------------------------------------------------------------- logout
@@ -1616,7 +1715,12 @@ async fn end_session(
     )
 }
 
-fn logged_out_page(headers: &HeaderMap, realm: &RealmRuntime, i18n: I18n, cookies: Vec<String>) -> Response {
+fn logged_out_page(
+    headers: &HeaderMap,
+    realm: &RealmRuntime,
+    i18n: I18n,
+    cookies: Vec<String>,
+) -> Response {
     let shell = Shell::new(i18n, headers, &realm.spec.display_name, "");
     let nonce = shell.nonce.clone();
     let t = MessageTemplate {
@@ -1644,13 +1748,25 @@ async fn logout_page(
         .unwrap_or_default();
     let (i18n, explicit) = I18n::negotiate(q.lang.as_deref(), &headers, &locales);
     let Some(realm) = realm_or_404(&pages, &realm_name) else {
-        return error_page(&headers, None, i18n, StatusCode::NOT_FOUND, i18n.t("idp-error-realm"));
+        return error_page(
+            &headers,
+            None,
+            i18n,
+            StatusCode::NOT_FOUND,
+            i18n.t("idp-error-realm"),
+        );
     };
     let plan = match check_logout(&realm, pages.store().as_ref(), &q.request()).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e.description, "idp: invalid logout request");
-            return error_page(&headers, Some(&realm), i18n, StatusCode::BAD_REQUEST, i18n.t("idp-logout-invalid"));
+            return error_page(
+                &headers,
+                Some(&realm),
+                i18n,
+                StatusCode::BAD_REQUEST,
+                i18n.t("idp-logout-invalid"),
+            );
         }
     };
     let session = current_session(&pages, &realm, &headers).await;
@@ -1667,7 +1783,8 @@ async fn logout_page(
             && plan.sid.is_some()
             && session.as_ref().map(|s| &s.sid) == plan.sid.as_ref());
     if auto {
-        cookies.push(end_session(&pages, &realm, session.as_ref(), plan.client_id.clone(), ip).await);
+        cookies
+            .push(end_session(&pages, &realm, session.as_ref(), plan.client_id.clone(), ip).await);
         return match plan.redirect {
             Some(to) => redirect(&to, cookies),
             None => logged_out_page(&headers, &realm, i18n, cookies),
@@ -1676,7 +1793,13 @@ async fn logout_page(
     let session = session.expect("checked above");
     let (binding, new_binding) = binding_of(&pages, &headers);
     if new_binding {
-        cookies.push(set_cookie(&pages.config, &cookie_name(&pages.config, CSRF_COOKIE), &binding, "Strict", None));
+        cookies.push(set_cookie(
+            &pages.config,
+            &cookie_name(&pages.config, CSRF_COOKIE),
+            &binding,
+            "Strict",
+            None,
+        ));
     }
     let user = pages
         .store()
@@ -1704,10 +1827,18 @@ async fn logout_page(
     let shell = Shell::new(i18n, &headers, &realm.spec.display_name, "");
     let nonce = shell.nonce.clone();
     let t = LogoutTemplate {
-        lede: i18n.t_arg2("idp-logout-lede", "realm", realm.spec.display_name.clone(), "user", who),
+        lede: i18n.t_arg2(
+            "idp-logout-lede",
+            "realm",
+            realm.spec.display_name.clone(),
+            "user",
+            who,
+        ),
         app_line,
         action: format!("/idp/{}/logout", realm.spec.name.as_str()),
-        csrf: pages.csrf.token(&binding, "logout", &logout_ix(Some(&session))),
+        csrf: pages
+            .csrf
+            .token(&binding, "logout", &logout_ix(Some(&session))),
         carry: q.carry(),
         cancel_href: format!("/idp/{}/account/apps", realm.spec.name.as_str()),
         shell,
@@ -1726,7 +1857,13 @@ async fn logout_submit(
 ) -> Response {
     let (i18n, _) = I18n::negotiate(None, &headers, &[]);
     let Some(realm) = realm_or_404(&pages, &realm_name) else {
-        return error_page(&headers, None, i18n, StatusCode::NOT_FOUND, i18n.t("idp-error-realm"));
+        return error_page(
+            &headers,
+            None,
+            i18n,
+            StatusCode::NOT_FOUND,
+            i18n.t("idp-error-realm"),
+        );
     };
     let session = current_session(&pages, &realm, &headers).await;
     let (binding, new_binding) = binding_of(&pages, &headers);
@@ -1739,12 +1876,24 @@ async fn logout_submit(
             q.csrf.as_deref().unwrap_or(""),
         );
     if !token_ok {
-        return error_page(&headers, Some(&realm), i18n, StatusCode::FORBIDDEN, i18n.t("idp-csrf"));
+        return error_page(
+            &headers,
+            Some(&realm),
+            i18n,
+            StatusCode::FORBIDDEN,
+            i18n.t("idp-csrf"),
+        );
     }
     let plan = match check_logout(&realm, pages.store().as_ref(), &q.request()).await {
         Ok(p) => p,
         Err(_) => {
-            return error_page(&headers, Some(&realm), i18n, StatusCode::BAD_REQUEST, i18n.t("idp-logout-invalid"));
+            return error_page(
+                &headers,
+                Some(&realm),
+                i18n,
+                StatusCode::BAD_REQUEST,
+                i18n.t("idp-logout-invalid"),
+            );
         }
     };
     let ip = client_ip(&pages.config, &headers, peer.0);
@@ -1780,13 +1929,23 @@ async fn render_account_login(
     let (binding, new_binding) = binding_of(pages, headers);
     let mut cookies = vec![];
     if new_binding {
-        cookies.push(set_cookie(&pages.config, &cookie_name(&pages.config, CSRF_COOKIE), &binding, "Strict", None));
+        cookies.push(set_cookie(
+            &pages.config,
+            &cookie_name(&pages.config, CSRF_COOKIE),
+            &binding,
+            "Strict",
+            None,
+        ));
     }
     cookies.extend(lang_cookie);
     let shell = Shell::new(i18n, headers, &realm.spec.display_name, "");
     let nonce = shell.nonce.clone();
     let t = LoginTemplate {
-        lede: i18n.t_arg("idp-login-lede-account", "realm", realm.spec.display_name.clone()),
+        lede: i18n.t_arg(
+            "idp-login-lede-account",
+            "realm",
+            realm.spec.display_name.clone(),
+        ),
         action: format!("/idp/{}/account/login", realm.spec.name.as_str()),
         ix: ACCOUNT_IX.into(),
         csrf: pages.csrf.token(&binding, "account-login", ACCOUNT_IX),
@@ -1810,10 +1969,26 @@ async fn apps_page(
     let (i18n, explicit) = I18n::negotiate(q.lang.as_deref(), &headers, &[]);
     let lang_cookie = explicit.then(|| i18n.cookie());
     let Some(realm) = realm_or_404(&pages, &realm_name) else {
-        return error_page(&headers, None, i18n, StatusCode::NOT_FOUND, i18n.t("idp-error-realm"));
+        return error_page(
+            &headers,
+            None,
+            i18n,
+            StatusCode::NOT_FOUND,
+            i18n.t("idp-error-realm"),
+        );
     };
     let Some(session) = current_session(&pages, &realm, &headers).await else {
-        return render_account_login(&pages, &realm, &headers, i18n, lang_cookie, "", None, StatusCode::OK).await;
+        return render_account_login(
+            &pages,
+            &realm,
+            &headers,
+            i18n,
+            lang_cookie,
+            "",
+            None,
+            StatusCode::OK,
+        )
+        .await;
     };
     let store = pages.store();
     let consents = store
@@ -1832,7 +2007,11 @@ async fn apps_page(
         apps.push(AppRow {
             meta: format!(
                 "{} · {}",
-                i18n.t_arg("idp-apps-granted", "date", c.granted_at.format("%Y-%m-%d").to_string()),
+                i18n.t_arg(
+                    "idp-apps-granted",
+                    "date",
+                    c.granted_at.format("%Y-%m-%d").to_string()
+                ),
                 c.endpoint
             ),
             scopes: c.scopes.join(" "),
@@ -1844,7 +2023,13 @@ async fn apps_page(
     let (binding, new_binding) = binding_of(&pages, &headers);
     let mut cookies: Vec<String> = lang_cookie.into_iter().collect();
     if new_binding {
-        cookies.push(set_cookie(&pages.config, &cookie_name(&pages.config, CSRF_COOKIE), &binding, "Strict", None));
+        cookies.push(set_cookie(
+            &pages.config,
+            &cookie_name(&pages.config, CSRF_COOKIE),
+            &binding,
+            "Strict",
+            None,
+        ));
     }
     let notice = q
         .revoked
@@ -1855,7 +2040,9 @@ async fn apps_page(
     let t = AppsTemplate {
         lede: i18n.t_arg("idp-apps-lede", "realm", realm.spec.display_name.clone()),
         action: format!("/idp/{}/account/apps", realm.spec.name.as_str()),
-        csrf: pages.csrf.token(&binding, "apps", &logout_ix(Some(&session))),
+        csrf: pages
+            .csrf
+            .token(&binding, "apps", &logout_ix(Some(&session))),
         apps,
         notice,
         logout_href: format!("/idp/{}/logout", realm.spec.name.as_str()),
@@ -1875,23 +2062,58 @@ async fn account_login(
 ) -> Response {
     let (i18n, _) = I18n::negotiate(None, &headers, &[]);
     let Some(realm) = realm_or_404(&pages, &realm_name) else {
-        return error_page(&headers, None, i18n, StatusCode::NOT_FOUND, i18n.t("idp-error-realm"));
+        return error_page(
+            &headers,
+            None,
+            i18n,
+            StatusCode::NOT_FOUND,
+            i18n.t("idp-error-realm"),
+        );
     };
     let (binding, new_binding) = binding_of(&pages, &headers);
     if new_binding
         || !csrf::same_origin(&headers, &pages.config.public_origin)
-        || !pages.csrf.verify(&binding, "account-login", ACCOUNT_IX, &form.csrf)
+        || !pages
+            .csrf
+            .verify(&binding, "account-login", ACCOUNT_IX, &form.csrf)
     {
-        return error_page(&headers, Some(&realm), i18n, StatusCode::FORBIDDEN, i18n.t("idp-csrf"));
+        return error_page(
+            &headers,
+            Some(&realm),
+            i18n,
+            StatusCode::FORBIDDEN,
+            i18n.t("idp-csrf"),
+        );
     }
     let ip = client_ip(&pages.config, &headers, peer.0);
-    match authenticate(&pages, &realm, &headers, &ip, &form.username, &form.password, None, i18n).await {
+    match authenticate(
+        &pages,
+        &realm,
+        &headers,
+        &ip,
+        &form.username,
+        &form.password,
+        None,
+        i18n,
+    )
+    .await
+    {
         Ok((_, _, cookie)) => redirect(
             &format!("/idp/{}/account/apps", realm.spec.name.as_str()),
             vec![cookie],
         ),
         Err(b) => {
-            render_account_login(&pages, &realm, &headers, i18n, None, form.username.trim(), Some(b), StatusCode::UNAUTHORIZED).await
+            render_account_login(
+                &pages,
+                &realm,
+                &headers,
+                i18n,
+                None,
+                form.username.trim(),
+                Some(b),
+                StatusCode::UNAUTHORIZED,
+            )
+            .await
         }
     }
 }
@@ -1915,7 +2137,13 @@ async fn apps_revoke(
 ) -> Response {
     let (i18n, _) = I18n::negotiate(None, &headers, &[]);
     let Some(realm) = realm_or_404(&pages, &realm_name) else {
-        return error_page(&headers, None, i18n, StatusCode::NOT_FOUND, i18n.t("idp-error-realm"));
+        return error_page(
+            &headers,
+            None,
+            i18n,
+            StatusCode::NOT_FOUND,
+            i18n.t("idp-error-realm"),
+        );
     };
     let Some(session) = current_session(&pages, &realm, &headers).await else {
         return redirect(&format!("/idp/{realm_name}/account/apps"), vec![]);
@@ -1923,9 +2151,17 @@ async fn apps_revoke(
     let (binding, new_binding) = binding_of(&pages, &headers);
     if new_binding
         || !csrf::same_origin(&headers, &pages.config.public_origin)
-        || !pages.csrf.verify(&binding, "apps", &logout_ix(Some(&session)), &form.csrf)
+        || !pages
+            .csrf
+            .verify(&binding, "apps", &logout_ix(Some(&session)), &form.csrf)
     {
-        return error_page(&headers, Some(&realm), i18n, StatusCode::FORBIDDEN, i18n.t("idp-csrf"));
+        return error_page(
+            &headers,
+            Some(&realm),
+            i18n,
+            StatusCode::FORBIDDEN,
+            i18n.t("idp-csrf"),
+        );
     }
     let store = pages.store();
     let ip = client_ip(&pages.config, &headers, peer.0);
@@ -1949,10 +2185,10 @@ async fn apps_revoke(
         .unwrap_or_default();
     let now = Utc::now();
     let aud = realm.endpoint_base(&form.endpoint).map(str::to_string);
-    for g in grants
-        .into_iter()
-        .filter(|g| aud.as_ref().is_none_or(|a| g.audience.iter().any(|x| x.trim_end_matches('/') == a)))
-    {
+    for g in grants.into_iter().filter(|g| {
+        aud.as_ref()
+            .is_none_or(|a| g.audience.iter().any(|x| x.trim_end_matches('/') == a))
+    }) {
         if let Ok(true) = store
             .revoke_grant(&realm.id, &g.id, "consent withdrawn by the user", now)
             .await

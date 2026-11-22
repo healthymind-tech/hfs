@@ -1,6 +1,6 @@
 # 內建授權伺服器的登入頁面（crates/idp-pages）。品牌名稱一律為英文。
 idp-brand = HealthyMind
-idp-product = HealthyMind 登入
+idp-product = 安全登入
 idp-skip = 跳到主要內容
 language-label = 語言
 theme-toggle-system = 主題：跟隨系統

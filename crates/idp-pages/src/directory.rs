@@ -349,7 +349,10 @@ mod tests {
 
     #[test]
     fn query_classification() {
-        assert_eq!(search_params("1970-01-02")[1], ("birthdate", "1970-01-02".into()));
+        assert_eq!(
+            search_params("1970-01-02")[1],
+            ("birthdate", "1970-01-02".into())
+        );
         assert_eq!(search_params("Shaw")[1], ("name", "Shaw".into()));
         assert_eq!(search_params("urn:mrn|123")[1].0, "identifier");
         assert_eq!(search_params("A123456")[1].0, "identifier");

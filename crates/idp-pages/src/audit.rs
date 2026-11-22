@@ -130,7 +130,8 @@ fn client_agent(o: &EventOrigin, client_id: &str) -> Value {
         "who": ident(&format!("{}/clients", o.issuer), client_id),
         "requestor": false,
     });
-    a["network"] = json!({"address": o.ip.clone().unwrap_or_else(|| "unknown".into()), "type": "2"});
+    a["network"] =
+        json!({"address": o.ip.clone().unwrap_or_else(|| "unknown".into()), "type": "2"});
     a
 }
 
@@ -299,7 +300,11 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             let o = origin(realm, ip);
             // A lockout is a refusal by policy ("8" serious failure);
             // a wrong credential a minor failure ("4").
-            let outcome = if reason.starts_with("locked") { "8" } else { "4" };
+            let outcome = if reason.starts_with("locked") {
+                "8"
+            } else {
+                "4"
+            };
             let mut ev = base(
                 observer,
                 coding(DCM, "110114", "User Authenticated"),
@@ -599,7 +604,11 @@ fn consent_event(
     }
     let mut entities = vec![];
     if let Some(p) = patient {
-        let reference = if p.contains('/') { p.to_string() } else { format!("Patient/{p}") };
+        let reference = if p.contains('/') {
+            p.to_string()
+        } else {
+            format!("Patient/{p}")
+        };
         entities.push(json!({
             "what": {"reference": reference},
             "type": coding(ENTITY_TYPE, "1", "Person"),

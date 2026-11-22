@@ -116,7 +116,10 @@ async fn env_with(branding: Value) -> Env {
             "drbob-password-1",
         ),
     ] {
-        admin.create_user(&realm.id, u, Some(pw), false).await.unwrap();
+        admin
+            .create_user(&realm.id, u, Some(pw), false)
+            .await
+            .unwrap();
     }
     let server = IdpServer::new(rt.clone(), IdpServerOptions::default());
     let mut patients = HashMap::new();
@@ -132,7 +135,9 @@ async fn env_with(branding: Value) -> Env {
         rt.clone(),
         server.completer(),
         Arc::new(MemoryPatientDirectory { patients }),
-        Lockout::new(Arc::new(helios_admin_auth::store::testing::MemoryStore::default())),
+        Lockout::new(Arc::new(
+            helios_admin_auth::store::testing::MemoryStore::default(),
+        )),
         CsrfKey::random(),
         PagesConfig {
             public_origin: ORIGIN.into(),
@@ -207,11 +212,8 @@ impl Browser {
             .finish();
         let mut req = s
             .post(path)
-            .add_header(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/x-www-form-urlencoded"),
-            )
-            .text(encoded);
+            .text(encoded)
+            .content_type("application/x-www-form-urlencoded");
         if let Some(o) = origin {
             req = req.add_header(header::ORIGIN, HeaderValue::from_str(o).unwrap());
         }
@@ -237,7 +239,10 @@ fn local(url: &str) -> String {
 
 fn field(html: &str, name: &str) -> String {
     let pat = format!("name=\"{name}\" value=\"");
-    let start = html.find(&pat).unwrap_or_else(|| panic!("no {name} in {html}")) + pat.len();
+    let start = html
+        .find(&pat)
+        .unwrap_or_else(|| panic!("no {name} in {html}"))
+        + pat.len();
     html[start..start + html[start..].find('"').unwrap()]
         .replace("&#x2b;", "+")
         .replace("&#43;", "+")
@@ -286,7 +291,12 @@ async fn login(e: &Env, b: &mut Browser, login_path: &str, user: &str, pw: &str)
     b.post(
         &e.server,
         "/idp/clinic/login",
-        &[("ix", &ix), ("csrf", &csrf), ("username", user), ("password", pw)],
+        &[
+            ("ix", &ix),
+            ("csrf", &csrf),
+            ("username", user),
+            ("password", pw),
+        ],
     )
     .await
 }
@@ -295,10 +305,6 @@ async fn token(e: &Env, code: &str) -> Value {
     let r = e
         .server
         .post("/idp/clinic/token")
-        .add_header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-www-form-urlencoded"),
-        )
         .text(
             form_urlencoded::Serializer::new(String::new())
                 .extend_pairs([
@@ -310,6 +316,7 @@ async fn token(e: &Env, code: &str) -> Value {
                 ])
                 .finish(),
         )
+        .content_type("application/x-www-form-urlencoded")
         .await;
     assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
     r.json()
@@ -358,7 +365,10 @@ async fn standalone_patient_launch_with_consent_issues_tokens_with_context() {
     let e = env().await;
     let mut b = Browser::default();
     let login_path = start(&e, &mut b, PATIENT_SCOPE, &[("nonce", "n-1")]).await;
-    assert!(login_path.starts_with("/idp/clinic/login?ix=hmix_"), "{login_path}");
+    assert!(
+        login_path.starts_with("/idp/clinic/login?ix=hmix_"),
+        "{login_path}"
+    );
     let r = login(&e, &mut b, &login_path, "alice", "alice-password-1").await;
     // One linked patient: no picker, straight to consent.
     assert_eq!(r.status_code(), StatusCode::SEE_OTHER, "{}", r.text());
@@ -366,7 +376,10 @@ async fn standalone_patient_launch_with_consent_issues_tokens_with_context() {
     assert!(consent.starts_with("/idp/clinic/consent?ix="), "{consent}");
     let page = b.get(&e.server, &consent).await;
     let html = page.text();
-    assert!(html.contains("Allow Growth Chart to access your data?"), "{html}");
+    assert!(
+        html.contains("Allow Growth Chart to access your data?"),
+        "{html}"
+    );
     assert!(html.contains("app.example"));
     assert!(html.contains("Patient: Amy Shaw"));
     assert!(html.contains("Read all data"));
@@ -391,9 +404,18 @@ async fn standalone_patient_launch_with_consent_issues_tokens_with_context() {
     assert_eq!(id["fhirUser"], "http://localhost/fhir/lab/Patient/p1");
 
     let ev = e.events.take();
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::LoginSucceeded { user_id, .. } if user_id == "u-alice")));
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::ConsentGranted { client_id, .. } if client_id == "app")));
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::TokenIssued { subject, .. } if subject == "u-alice")));
+    assert!(
+        ev.iter()
+            .any(|x| matches!(x, IdpEvent::LoginSucceeded { user_id, .. } if user_id == "u-alice"))
+    );
+    assert!(
+        ev.iter()
+            .any(|x| matches!(x, IdpEvent::ConsentGranted { client_id, .. } if client_id == "app"))
+    );
+    assert!(
+        ev.iter()
+            .any(|x| matches!(x, IdpEvent::TokenIssued { subject, .. } if subject == "u-alice"))
+    );
 }
 
 #[tokio::test]
@@ -414,7 +436,11 @@ async fn sso_reuses_the_session_and_remembered_consent_skips_the_screen_until_re
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     let r = b.get(&e.server, &lp).await;
     assert_eq!(r.status_code(), StatusCode::SEE_OTHER, "{}", r.text());
-    assert!(location(&r).starts_with(CB), "consent remembered: {}", location(&r));
+    assert!(
+        location(&r).starts_with(CB),
+        "consent remembered: {}",
+        location(&r)
+    );
 
     // Connected apps: listed; removing access deletes the consent and
     // revokes the grant at once.
@@ -431,19 +457,41 @@ async fn sso_reuses_the_session_and_remembered_consent_skips_the_screen_until_re
         .await;
     assert_eq!(r.status_code(), StatusCode::SEE_OTHER);
     let after = b.get(&e.server, &location(&r)).await.text();
-    assert!(after.contains("Access for Growth Chart was removed."), "{after}");
+    assert!(
+        after.contains("Access for Growth Chart was removed."),
+        "{after}"
+    );
     assert!(after.contains("You have not connected any apps."));
-    assert!(e.rt.realm("clinic").unwrap().grant_revoked(&gid), "immediate revocation");
+    assert!(
+        e.rt.realm("clinic").unwrap().grant_revoked(&gid),
+        "immediate revocation"
+    );
     let store = e.rt.store();
-    assert!(store.get_consent(&e.realm_id, "u-alice", "app", "lab").await.unwrap().is_none());
+    assert!(
+        store
+            .get_consent(&e.realm_id, "u-alice", "app", "lab")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Consent is asked again.
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     let r = b.get(&e.server, &lp).await;
-    assert!(location(&r).starts_with("/idp/clinic/consent"), "{}", location(&r));
+    assert!(
+        location(&r).starts_with("/idp/clinic/consent"),
+        "{}",
+        location(&r)
+    );
     let ev = e.events.take();
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::ConsentWithdrawn { .. })));
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::TokenRevoked { gid: g, .. } if *g == gid)));
+    assert!(
+        ev.iter()
+            .any(|x| matches!(x, IdpEvent::ConsentWithdrawn { .. }))
+    );
+    assert!(
+        ev.iter()
+            .any(|x| matches!(x, IdpEvent::TokenRevoked { gid: g, .. } if *g == gid))
+    );
 }
 
 #[tokio::test]
@@ -460,14 +508,23 @@ async fn unticked_scopes_are_not_granted_and_deny_returns_access_denied() {
         .post(
             &e.server,
             "/idp/clinic/consent",
-            &[("ix", &ix), ("csrf", &csrf), ("decision", "allow"), ("scope", "patient/*.rs"), ("scope", "system/*.cruds")],
+            &[
+                ("ix", &ix),
+                ("csrf", &csrf),
+                ("decision", "allow"),
+                ("scope", "patient/*.rs"),
+                ("scope", "system/*.cruds"),
+            ],
         )
         .await;
     let t = token(&e, &query_of(&location(&r))["code"]).await;
     let granted: Vec<&str> = t["scope"].as_str().unwrap().split(' ').collect();
     assert!(granted.contains(&"patient/*.rs"));
     assert!(!granted.contains(&"offline_access"), "{granted:?}");
-    assert!(!granted.contains(&"system/*.cruds"), "never more than requested");
+    assert!(
+        !granted.contains(&"system/*.cruds"),
+        "never more than requested"
+    );
     assert!(t.get("refresh_token").is_none());
 
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
@@ -478,7 +535,11 @@ async fn unticked_scopes_are_not_granted_and_deny_returns_access_denied() {
         .post(
             &e.server,
             "/idp/clinic/consent",
-            &[("ix", &field(&html, "ix")), ("csrf", &field(&html, "csrf")), ("decision", "deny")],
+            &[
+                ("ix", &field(&html, "ix")),
+                ("csrf", &field(&html, "csrf")),
+                ("decision", "deny"),
+            ],
         )
         .await;
     let q = query_of(&location(&r));
@@ -494,24 +555,43 @@ async fn caregiver_picks_from_linked_patients_only() {
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     let r = login(&e, &mut b, &lp, "carol", "carol-password-1").await;
     let picker = location(&r);
-    assert!(picker.starts_with("/idp/clinic/select-patient?ix="), "{picker}");
+    assert!(
+        picker.starts_with("/idp/clinic/select-patient?ix="),
+        "{picker}"
+    );
     let html = b.get(&e.server, &picker).await.text();
-    assert!(html.contains("Amy Shaw") && html.contains("Ben Shaw"), "{html}");
+    assert!(
+        html.contains("Amy Shaw") && html.contains("Ben Shaw"),
+        "{html}"
+    );
     assert!(!html.contains("Cleo Ortiz"), "unlinked patient not offered");
     assert!(!html.contains("idp-q"), "caregivers do not search");
     let (ix, csrf) = (field(&html, "ix"), field(&html, "csrf"));
     // A patient outside the linked set is refused.
     let r = b
-        .post(&e.server, "/idp/clinic/select-patient", &[("ix", &ix), ("csrf", &csrf), ("patient", "p3")])
+        .post(
+            &e.server,
+            "/idp/clinic/select-patient",
+            &[("ix", &ix), ("csrf", &csrf), ("patient", "p3")],
+        )
         .await;
     assert_eq!(r.status_code(), StatusCode::OK);
     assert!(r.text().contains("Choose one of the patients listed."));
     let r = b
-        .post(&e.server, "/idp/clinic/select-patient", &[("ix", &ix), ("csrf", &csrf), ("patient", "p2")])
+        .post(
+            &e.server,
+            "/idp/clinic/select-patient",
+            &[("ix", &ix), ("csrf", &csrf), ("patient", "p2")],
+        )
         .await;
     let consent = location(&r);
     assert!(consent.starts_with("/idp/clinic/consent"), "{consent}");
-    assert!(b.get(&e.server, &consent).await.text().contains("Patient: Ben Shaw"));
+    assert!(
+        b.get(&e.server, &consent)
+            .await
+            .text()
+            .contains("Patient: Ben Shaw")
+    );
     let r = allow(&e, &mut b, &consent, false).await;
     let t = token(&e, &query_of(&location(&r))["code"]).await;
     assert_eq!(t["patient"], "p2");
@@ -529,16 +609,30 @@ async fn practitioner_searches_patients_and_gets_fhir_user() {
     let r = login(&e, &mut b, &lp, "drbob", "drbob-password-1").await;
     let picker = location(&r);
     let html = b.get(&e.server, &format!("{picker}&q=Ortiz")).await.text();
-    assert!(html.contains("Cleo Ortiz") && !html.contains("Amy Shaw"), "{html}");
-    let html = b.get(&e.server, &format!("{picker}&q=1980-04-01")).await.text();
+    assert!(
+        html.contains("Cleo Ortiz") && !html.contains("Amy Shaw"),
+        "{html}"
+    );
+    let html = b
+        .get(&e.server, &format!("{picker}&q=1980-04-01"))
+        .await
+        .text();
     assert!(html.contains("Amy Shaw") && !html.contains("Cleo Ortiz"));
     let (ix, csrf) = (field(&html, "ix"), field(&html, "csrf"));
     let r = b
-        .post(&e.server, "/idp/clinic/select-patient", &[("ix", &ix), ("csrf", &csrf), ("patient", "nope")])
+        .post(
+            &e.server,
+            "/idp/clinic/select-patient",
+            &[("ix", &ix), ("csrf", &csrf), ("patient", "nope")],
+        )
         .await;
     assert!(r.text().contains("Choose one of the patients listed."));
     let r = b
-        .post(&e.server, "/idp/clinic/select-patient", &[("ix", &ix), ("csrf", &csrf), ("patient", "p3")])
+        .post(
+            &e.server,
+            "/idp/clinic/select-patient",
+            &[("ix", &ix), ("csrf", &csrf), ("patient", "p3")],
+        )
         .await;
     let r = allow(&e, &mut b, &location(&r), false).await;
     let t = token(&e, &query_of(&location(&r))["code"]).await;
@@ -571,7 +665,13 @@ async fn ehr_launch_carries_the_launch_context_without_a_picker() {
         .unwrap();
     assert_eq!(launch.iss, AUD);
     let mut b = Browser::default();
-    let lp = start(&e, &mut b, "openid fhirUser launch user/*.rs", &[("launch", &launch.launch)]).await;
+    let lp = start(
+        &e,
+        &mut b,
+        "openid fhirUser launch user/*.rs",
+        &[("launch", &launch.launch)],
+    )
+    .await;
     let r = login(&e, &mut b, &lp, "drbob", "drbob-password-1").await;
     let next = location(&r);
     assert!(next.starts_with("/idp/clinic/consent"), "no picker: {next}");
@@ -581,9 +681,16 @@ async fn ehr_launch_carries_the_launch_context_without_a_picker() {
     assert_eq!(t["encounter"], "enc-9");
     // The handle is single use.
     let r = b
-        .get(&e.server, &authorize_url("openid launch user/*.rs", &[("launch", &launch.launch)]))
+        .get(
+            &e.server,
+            &authorize_url("openid launch user/*.rs", &[("launch", &launch.launch)]),
+        )
         .await;
-    assert!(location(&r).contains("error=invalid_request"), "{}", location(&r));
+    assert!(
+        location(&r).contains("error=invalid_request"),
+        "{}",
+        location(&r)
+    );
 }
 
 #[tokio::test]
@@ -610,7 +717,11 @@ async fn wrong_passwords_are_generic_and_lock_the_account() {
     assert!(ghost.text().contains(msg) && wrong.text().contains(msg));
     login(&e, &mut b, &lp, "alice", "wrong-password").await;
     let third = login(&e, &mut b, &lp, "alice", "wrong-password").await;
-    assert!(third.text().contains("Too many failed attempts"), "{}", third.text());
+    assert!(
+        third.text().contains("Too many failed attempts"),
+        "{}",
+        third.text()
+    );
     // Locked: even the right password is refused.
     let right = login(&e, &mut b, &lp, "alice", "alice-password-1").await;
     assert_eq!(right.status_code(), StatusCode::UNAUTHORIZED);
@@ -626,8 +737,13 @@ async fn wrong_passwords_are_generic_and_lock_the_account() {
         .filter(|x| matches!(x, IdpEvent::LoginFailed { .. }))
         .count();
     assert!(failed >= 5, "{ev:?}");
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::LoginFailed { reason, .. } if reason.starts_with("locked"))));
-    assert!(!format!("{ev:?}").contains("wrong-password"), "no password in events");
+    assert!(ev.iter().any(
+        |x| matches!(x, IdpEvent::LoginFailed { reason, .. } if reason.starts_with("locked"))
+    ));
+    assert!(
+        !format!("{ev:?}").contains("wrong-password"),
+        "no password in events"
+    );
 }
 
 #[tokio::test]
@@ -638,27 +754,43 @@ async fn csrf_and_origin_are_enforced() {
     let html = b.get(&e.server, &lp).await.text();
     let (ix, csrf) = (field(&html, "ix"), field(&html, "csrf"));
     fn with<'a>(ix: &'a str, c: &'a str) -> Vec<(&'a str, &'a str)> {
-        vec![("ix", ix), ("csrf", c), ("username", "alice"), ("password", "alice-password-1")]
+        vec![
+            ("ix", ix),
+            ("csrf", c),
+            ("username", "alice"),
+            ("password", "alice-password-1"),
+        ]
     }
     // Missing token.
     let r = b.post(&e.server, "/idp/clinic/login", &with(&ix, "")).await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN);
     // Cross-site Origin with a valid token.
     let r = b
-        .post_origin(&e.server, "/idp/clinic/login", &with(&ix, &csrf), Some("https://evil.example"))
+        .post_origin(
+            &e.server,
+            "/idp/clinic/login",
+            &with(&ix, &csrf),
+            Some("https://evil.example"),
+        )
         .await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN);
     // Another browser (no binding cookie) replaying the token.
     let mut attacker = Browser::default();
-    let r = attacker.post(&e.server, "/idp/clinic/login", &with(&ix, &csrf)).await;
+    let r = attacker
+        .post(&e.server, "/idp/clinic/login", &with(&ix, &csrf))
+        .await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN);
     // Token of another interaction.
     let lp2 = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     let other_csrf = field(&b.get(&e.server, &lp2).await.text(), "csrf");
-    let r = b.post(&e.server, "/idp/clinic/login", &with(&ix, &other_csrf)).await;
+    let r = b
+        .post(&e.server, "/idp/clinic/login", &with(&ix, &other_csrf))
+        .await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN);
     // The real thing works.
-    let r = b.post(&e.server, "/idp/clinic/login", &with(&ix, &csrf)).await;
+    let r = b
+        .post(&e.server, "/idp/clinic/login", &with(&ix, &csrf))
+        .await;
     assert_eq!(r.status_code(), StatusCode::SEE_OTHER);
 }
 
@@ -672,14 +804,22 @@ async fn a_leaked_interaction_cannot_be_finished_in_another_browser() {
     let mut attacker = Browser::default();
     let r = attacker.get(&e.server, &consent).await;
     assert_eq!(r.status_code(), StatusCode::SEE_OTHER);
-    assert!(location(&r).starts_with("/idp/clinic/login"), "{}", location(&r));
+    assert!(
+        location(&r).starts_with("/idp/clinic/login"),
+        "{}",
+        location(&r)
+    );
     // Even with the victim's CSRF token.
     let html = victim.get(&e.server, &consent).await.text();
     let r = attacker
         .post(
             &e.server,
             "/idp/clinic/consent",
-            &[("ix", &field(&html, "ix")), ("csrf", &field(&html, "csrf")), ("decision", "allow")],
+            &[
+                ("ix", &field(&html, "ix")),
+                ("csrf", &field(&html, "csrf")),
+                ("decision", "allow"),
+            ],
         )
         .await;
     assert_ne!(r.status_code(), StatusCode::SEE_OTHER);
@@ -717,7 +857,11 @@ async fn hosted_pages_refuse_framing_and_inline_script() {
     let mut b = Browser::default();
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     let r = b.get(&e.server, &lp).await;
-    let csp = r.header(header::CONTENT_SECURITY_POLICY).to_str().unwrap().to_string();
+    let csp = r
+        .header(header::CONTENT_SECURITY_POLICY)
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
     assert!(!csp.contains("unsafe-inline"));
     assert_eq!(r.header(header::X_FRAME_OPTIONS), "DENY");
@@ -725,7 +869,13 @@ async fn hosted_pages_refuse_framing_and_inline_script() {
     assert_eq!(r.header(header::REFERRER_POLICY), "no-referrer");
     let html = r.text();
     // Every inline script carries this response's nonce.
-    let nonce = csp.split("'nonce-").nth(1).unwrap().split('\'').next().unwrap();
+    let nonce = csp
+        .split("'nonce-")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .next()
+        .unwrap();
     for part in html.split("<script").skip(1) {
         assert!(
             part.starts_with(" src=") || part.starts_with(&format!(" nonce=\"{nonce}\"")),
@@ -740,8 +890,15 @@ async fn hosted_pages_refuse_framing_and_inline_script() {
     let mut b = Browser::default();
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     let r = b.get(&e.server, &lp).await;
-    let csp = r.header(header::CONTENT_SECURITY_POLICY).to_str().unwrap().to_string();
-    assert!(csp.ends_with("frame-ancestors https://ehr.example"), "{csp}");
+    let csp = r
+        .header(header::CONTENT_SECURITY_POLICY)
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        csp.ends_with("frame-ancestors https://ehr.example"),
+        "{csp}"
+    );
     assert!(r.maybe_header(header::X_FRAME_OPTIONS).is_none());
 }
 
@@ -779,7 +936,10 @@ async fn rp_initiated_logout_confirms_and_only_redirects_to_registered_uris() {
     assert_eq!(r.status_code(), StatusCode::SEE_OTHER);
     assert_eq!(location(&r), "https://app.example/bye?state=s9");
     let ev = e.events.take();
-    assert!(ev.iter().any(|x| matches!(x, IdpEvent::Logout { user_id: Some(u), .. } if u == "u-alice")));
+    assert!(
+        ev.iter()
+            .any(|x| matches!(x, IdpEvent::Logout { user_id: Some(u), .. } if u == "u-alice"))
+    );
     // The session is gone: the next authorize asks for the password again.
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     assert_eq!(b.get(&e.server, &lp).await.status_code(), StatusCode::OK);
@@ -802,10 +962,16 @@ async fn logout_and_revoke_forms_need_csrf() {
     let mut b = Browser::default();
     let lp = start(&e, &mut b, PATIENT_SCOPE, &[]).await;
     login(&e, &mut b, &lp, "alice", "alice-password-1").await;
-    let r = b.post(&e.server, "/idp/clinic/logout", &[("csrf", "x")]).await;
+    let r = b
+        .post(&e.server, "/idp/clinic/logout", &[("csrf", "x")])
+        .await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN);
     let r = b
-        .post(&e.server, "/idp/clinic/account/apps", &[("csrf", "x"), ("client_id", "app"), ("endpoint", "lab")])
+        .post(
+            &e.server,
+            "/idp/clinic/account/apps",
+            &[("csrf", "x"), ("client_id", "app"), ("endpoint", "lab")],
+        )
         .await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN);
     let _ = HeaderName::from_static("x");
@@ -819,7 +985,12 @@ async fn pages_speak_traditional_chinese_with_an_english_brand() {
     let r = b.get(&e.server, &format!("{lp}&lang=zh-Hant")).await;
     let html = r.text();
     assert!(html.contains("lang=\"zh-Hant\""));
-    assert!(html.contains("登入 Riverside Clinic 以繼續使用 Growth Chart。"), "{html}");
-    assert!(html.contains("auth-logo__name\">HealthyMind<"), "brand stays English");
+    assert!(
+        html.contains("登入 Riverside Clinic 以繼續使用 Growth Chart。"),
+        "{html}"
+    );
+    assert!(html.contains("auth-logo__name\">安全登入<"));
+    assert!(html.contains("HealthyMind Tech"), "brand stays English");
+    assert!(!html.contains("療心"), "no Chinese brand");
     assert!(b.jar.get("hfs_lang").is_some_and(|v| v == "zh-Hant"));
 }

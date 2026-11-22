@@ -718,3 +718,10 @@ package rebases on.
 * `helios-endpoints`: `idp` added to `RESERVED_SEGMENTS`, so no FHIR endpoint can take `/idp`.
 * Migration SQL `hm-0020-idp-core` defined (`schema::IDP_CORE_SQL`). Wiring it into `FORK_MIGRATIONS` is package I2.
 * Tests: 40 unit tests (RFC 7636 / 7638 / OIDC `at_hash` vectors; ES256/ES384/RS256/RS384/PS256/PS384 tokens verified by `jsonwebtoken`; sealing AAD binding; rotation planner; scope algebra; redirect rules; refresh decisions; SMART/AS metadata; migration idempotency lint).
+
+### I4 / I5 / I8 — hosted pages, internal verification, audit (`hm/idp-b`)
+* Hosted pages live in their own crate **`crates/idp-pages`** (`helios-idp-pages`) instead of `crates/idp-server/src/pages`, so the two packages never share a manifest; both depend only on the `helios-idp` contracts (`interaction`, `store`, `events`), and `idp-server` never depends on the pages. Templates: `crates/idp-pages/templates/idp/`; catalogs (en, zh-Hant): `crates/idp-pages/locales/`.
+* I5: `EndpointAuth.provider` = `External` (default) | `Internal{realm}` in `crates/endpoints/src/model.rs`; `helios_auth::internal::InternalVerifier` + `InternalRealmSource` (the IdP runtime adapter is in `crates/hfs/src/idp.rs`). `helios-auth` does not depend on the IdP.
+* I8: rate limits and BALP mapping in `crates/idp-pages/src/{limits,audit}.rs`; `HFS_IDP` wiring in `crates/hfs/src/idp.rs`; ops guide `docs/ops/idp.md`; nginx draft in `docker/production/nginx.conf`.
+* Lockout reuses `admin_login_failures` (scope `IDP`); the per-address threshold is 4 × the realm's account threshold (design text said "5 failures" for both scopes; one shared NAT should not lock a whole clinic).
+* Caller address behind nginx: `X-Real-IP`, else the **last** `X-Forwarded-For` hop (earlier hops are client-controlled).

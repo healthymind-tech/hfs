@@ -186,14 +186,18 @@ pub async fn attach(
             match pool.clone() {
                 Some(p) => Arc::new(helios_idp::pg::PgStore::new(p)),
                 None => {
-                    warn!("HFS_IDP=on without PostgreSQL: the authorization server keeps its data in memory (development only)");
+                    warn!(
+                        "HFS_IDP=on without PostgreSQL: the authorization server keeps its data in memory (development only)"
+                    );
                     Arc::new(helios_idp::memory::MemoryStore::new())
                 }
             }
         }
         #[cfg(not(feature = "postgres"))]
         {
-            warn!("HFS_IDP=on without PostgreSQL: the authorization server keeps its data in memory (development only)");
+            warn!(
+                "HFS_IDP=on without PostgreSQL: the authorization server keeps its data in memory (development only)"
+            );
             Arc::new(helios_idp::memory::MemoryStore::new())
         }
     };
@@ -241,7 +245,12 @@ pub async fn attach(
     );
     let secure = base.scheme() == "https";
     let trust_forwarded = std::env::var("HFS_IDP_TRUST_FORWARDED")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
     let internal = std::env::var("HFS_IDP_INTERNAL_URL")
         .ok()
@@ -348,12 +357,20 @@ struct SeedFile {
 /// with their clients and users (existing realms are left alone). Meant for
 /// test stacks and CI; production realms come from the console wizard.
 async fn seed(rt: &Arc<IdpRuntime>, path: &str) -> anyhow::Result<()> {
-    warn!(path, "HFS_IDP_DEV_SEED is set: seeding authorization-server realms (development only)");
+    warn!(
+        path,
+        "HFS_IDP_DEV_SEED is set: seeding authorization-server realms (development only)"
+    );
     let raw = std::fs::read_to_string(path)?;
     let file: SeedFile = serde_json::from_str(&raw)?;
     let admin = helios_idp::admin::IdpAdmin::new(rt.clone());
     for r in file.realms {
-        if rt.store().get_realm_by_name(r.spec.name.as_str()).await?.is_some() {
+        if rt
+            .store()
+            .get_realm_by_name(r.spec.name.as_str())
+            .await?
+            .is_some()
+        {
             continue;
         }
         let rec = admin

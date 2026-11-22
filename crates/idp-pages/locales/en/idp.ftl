@@ -1,7 +1,7 @@
 # Hosted pages of the built-in authorization server (crates/idp-pages).
 # The brand is English in every language.
 idp-brand = HealthyMind
-idp-product = HealthyMind Sign-in
+idp-product = Secure sign-in
 idp-skip = Skip to content
 language-label = Language
 theme-toggle-system = Theme: follow system

@@ -122,9 +122,18 @@ mod tests {
         assert!(d.detail.contains("selected patient"));
         assert!(d.detail.contains("category=laboratory"));
         assert!(d.optional);
-        assert_eq!(describe(&i, "user/*.cruds").label, "Read, create, change and delete all data");
-        assert_eq!(describe(&i, "patient/Patient.read").label, "Read Patient records");
-        assert_eq!(describe(&i, "system/Condition.cu").label, "create, change Condition records");
+        assert_eq!(
+            describe(&i, "user/*.cruds").label,
+            "Read, create, change and delete all data"
+        );
+        assert_eq!(
+            describe(&i, "patient/Patient.read").label,
+            "Read Patient records"
+        );
+        assert_eq!(
+            describe(&i, "system/Condition.cu").label,
+            "create, change Condition records"
+        );
         assert!(!describe(&i, "openid").optional);
         assert!(!describe(&i, "launch/patient").optional);
         assert!(describe(&i, "offline_access").optional);
@@ -133,11 +142,19 @@ mod tests {
 
     #[test]
     fn granted_never_adds_unrequested_scopes() {
-        let req: Vec<String> = ["openid", "launch/patient", "patient/Observation.rs", "offline_access"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let ticked = vec!["patient/Observation.rs".to_string(), "system/*.cruds".to_string()];
+        let req: Vec<String> = [
+            "openid",
+            "launch/patient",
+            "patient/Observation.rs",
+            "offline_access",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let ticked = vec![
+            "patient/Observation.rs".to_string(),
+            "system/*.cruds".to_string(),
+        ];
         assert_eq!(
             granted(&req, &ticked),
             vec!["openid", "launch/patient", "patient/Observation.rs"]

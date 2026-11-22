@@ -12,12 +12,12 @@
 
 pub mod audit;
 pub mod csrf;
-pub mod limits;
-pub mod security;
 pub mod directory;
 pub mod i18n;
+pub mod limits;
 pub mod lockout;
 pub mod pages;
 pub mod scopes;
+pub mod security;
 
 pub use pages::{Pages, PagesConfig, router};

@@ -609,10 +609,10 @@ impl EndpointSpec {
             );
         }
         if let Some(auth) = &self.auth {
-            if let AuthProviderRef::Internal { realm } = &auth.provider {
-                if let Err(e) = crate::name::check_segment_grammar(realm) {
-                    errs.push("auth.provider.realm", e.to_string());
-                }
+            if let AuthProviderRef::Internal { realm } = &auth.provider
+                && let Err(e) = crate::name::check_segment_grammar(realm)
+            {
+                errs.push("auth.provider.realm", e.to_string());
             }
             if auth.mode != AuthMode::Off && auth.provider == AuthProviderRef::External {
                 match auth.issuer.as_deref().map(str::trim) {
@@ -624,13 +624,12 @@ impl EndpointSpec {
                     _ => errs.push("auth.jwksUrl", "required when auth is on"),
                 }
             }
-            if auth.mode != AuthMode::Off {
-                if !(auth.scopes.allow_patient
+            if auth.mode != AuthMode::Off
+                && !(auth.scopes.allow_patient
                     || auth.scopes.allow_user
                     || auth.scopes.allow_system)
-                {
-                    errs.push("auth.scopes", "at least one scope context must be allowed");
-                }
+            {
+                errs.push("auth.scopes", "at least one scope context must be allowed");
             }
             for a in &auth.algorithms {
                 if !matches!(

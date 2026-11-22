@@ -16,7 +16,7 @@ Crates: `helios-idp` (core, store), `helios-idp-server` (protocol endpoints),
 | `HFS_IDP_PUBLIC_BASE` | origin of `HFS_BASE_URL` | public origin; issuers are `{base}/idp/{realm}` (no trailing slash) |
 | `HFS_SECRET_KEYS` | — | required: realm signing keys are sealed with it; also keys the CSRF tokens so every instance accepts every other's forms |
 | `HFS_IDP_TRUST_FORWARDED` | `true` | take the caller address from `X-Real-IP` / the last `X-Forwarded-For` hop (nginx). Set `false` when HFS is reachable without the proxy |
-| `HFS_IDP_INTERNAL_URL` | `http://127.0.0.1:{HFS_PORT}` | loopback base the patient picker uses to search the FHIR API as the signed-in practitioner |
+| `HFS_IDP_INTERNAL_URL` | `http://127.0.0.1:{HFS_SERVER_PORT}` | loopback base the patient picker uses to search the FHIR API as the signed-in practitioner |
 | `HFS_IDP_RATE_TOKEN_CLIENT` / `_TOKEN_IP` / `_INTERACTIVE_IP` / `_INTROSPECT_CLIENT` / `_REVOKE_CLIENT` | 60 / 300 / 20 / 600 / 60 | per-minute token buckets (0 = unlimited), per instance |
 | `HFS_IDP_DEV_SEED` | — | **test stacks only**: JSON file of realms/clients/users created at start-up when missing (`crates/idp-pages/e2e/seed.json`) |
 

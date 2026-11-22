@@ -134,7 +134,9 @@ impl RateLimiter {
     }
 
     fn client_ip(&self, req: &Request) -> String {
-        if self.trust_forwarded && let Some(ip) = crate::limits::forwarded_ip(req.headers()) {
+        if self.trust_forwarded
+            && let Some(ip) = crate::limits::forwarded_ip(req.headers())
+        {
             return ip;
         }
         req.extensions()
@@ -183,7 +185,7 @@ fn classify(method: &Method, path: &str) -> Option<(String, Class)> {
         (&Method::POST, "introspect") => Class::Introspect,
         (&Method::POST, "revoke") => Class::Revoke,
         (_, "authorize") => Class::Interactive,
-        (&Method::POST, "login" | "consent" | "select-patient" | "logout") => Class::Interactive,
+        (&Method::POST, "login" | "consent" | "select-patient" | "logout" | "account/login" | "account/apps") => Class::Interactive,
         _ => Class::Other,
     };
     Some((realm.to_string(), class))

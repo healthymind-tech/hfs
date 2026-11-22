@@ -116,10 +116,8 @@ impl I18n {
     }
 
     pub fn t_arg(&self, key: &str, name: &str, value: impl Into<String>) -> String {
-        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::from([(
-            Cow::Owned(name.to_owned()),
-            FluentValue::from(value.into()),
-        )]);
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> =
+            HashMap::from([(Cow::Owned(name.to_owned()), FluentValue::from(value.into()))]);
         LOCALES
             .try_lookup_with_args(self.locale, key, &args)
             .unwrap_or_else(|| key.to_owned())
@@ -177,7 +175,12 @@ mod tests {
         let (l, explicit) = I18n::negotiate(Some("zh-Hant"), &h, &[]);
         assert_eq!(l.lang(), "zh-Hant");
         assert!(explicit);
-        assert_eq!(I18n::negotiate(Some("klingon"), &HeaderMap::new(), &[]).0.lang(), "en");
+        assert_eq!(
+            I18n::negotiate(Some("klingon"), &HeaderMap::new(), &[])
+                .0
+                .lang(),
+            "en"
+        );
     }
 
     #[test]
@@ -210,7 +213,11 @@ mod tests {
         };
         let en = keys("en");
         assert!(en.len() > 40);
-        assert_eq!(en, keys("zh-Hant"), "zh-Hant must define the same keys as en");
+        assert_eq!(
+            en,
+            keys("zh-Hant"),
+            "zh-Hant must define the same keys as en"
+        );
         let zh = I18n { locale: &ZH_HANT };
         for k in &plain("zh-Hant") {
             assert_ne!(zh.t(k), *k, "{k} unresolved in zh-Hant");

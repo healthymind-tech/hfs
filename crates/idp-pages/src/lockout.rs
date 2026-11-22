@@ -29,7 +29,12 @@ impl Attempt {
             Some(id) => format!("{realm_id}:user:{id}"),
             None => format!(
                 "{realm_id}:name:{}",
-                username.trim().to_lowercase().chars().take(256).collect::<String>()
+                username
+                    .trim()
+                    .to_lowercase()
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
             ),
         };
         Self {
