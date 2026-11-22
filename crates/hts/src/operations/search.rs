@@ -136,6 +136,13 @@ fn parse_search_query(
             "_summary" if modifier.is_none() => {
                 set_once(&mut query.summary, value, "_summary")?;
             }
+            // `_sort`: the first supported key wins; unsupported keys are
+            // ignored, as FHIR allows.
+            "_sort" if modifier.is_none() => {
+                if query.sort.is_none() {
+                    query.sort = value.split(',').find_map(crate::types::SearchSort::parse);
+                }
+            }
             // Unknown parameters remain lenient, matching the existing HTS
             // behavior. Only modifiers on the parameters above are rejected.
             _ => {}

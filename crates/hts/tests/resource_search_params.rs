@@ -327,3 +327,74 @@ async fn postgres_existing_rows_become_searchable_after_upgrade() {
     assert_eq!(total, 2);
     backend.pool().close();
 }
+
+/// Ids in response order (not sorted), for `_sort` checks.
+fn ordered_ids(body: &Value) -> Vec<String> {
+    body["entry"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| {
+                    let id = e["resource"]["id"].as_str().unwrap_or_default();
+                    id.split('|').next().unwrap().to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `_sort` orders results (UIF defect 3: the console browsers listed rows in
+/// import order). Name sorts case-insensitively, `-` reverses, unsupported
+/// keys are ignored, and the order survives paging and string filters.
+#[tokio::test(flavor = "multi_thread")]
+async fn sort_orders_results_and_pages_stably() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(BUNDLE).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem?_sort=name&_count=50").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let by_name = ordered_ids(&body);
+    let names: Vec<String> = body["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["resource"]["name"].as_str().unwrap_or("").to_lowercase())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "_sort=name must sort by name: {by_name:?}");
+
+    let (_, body) = app.get_fhir("/CodeSystem?_sort=-name&_count=50").await;
+    let mut reversed = ordered_ids(&body);
+    reversed.reverse();
+    let (_, body) = app.get_fhir("/CodeSystem?_sort=name&_count=50").await;
+    assert_eq!(ordered_ids(&body), reversed, "-name reverses the order");
+
+    // Paging keeps the sorted order.
+    let (_, all) = app.get_fhir("/CodeSystem?_sort=name&_count=50").await;
+    let (_, p1) = app
+        .get_fhir("/CodeSystem?_sort=name&_count=2&_offset=0")
+        .await;
+    let (_, p2) = app
+        .get_fhir("/CodeSystem?_sort=name&_count=2&_offset=2")
+        .await;
+    let mut paged = ordered_ids(&p1);
+    paged.extend(ordered_ids(&p2));
+    assert_eq!(paged, ordered_ids(&all)[..paged.len()].to_vec());
+
+    // With a string filter (the other SQL path).
+    let (_, body) = app
+        .get_fhir("/CodeSystem?name:contains=sup&_sort=-name")
+        .await;
+    assert_eq!(
+        ordered_ids(&body),
+        vec!["p2o-sup-versioned", "p2o-sup-other", "p2o-sup-bare"]
+    );
+
+    // Unsupported keys are ignored, not an error.
+    let (status, _) = app.get_fhir("/CodeSystem?_sort=publisher").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = app.get_fhir("/ConceptMap?_sort=-_lastUpdated").await;
+    assert_eq!(ordered_ids(&body), vec!["p2o-cm"]);
+}

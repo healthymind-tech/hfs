@@ -128,6 +128,9 @@ pub(crate) fn search_order_by(
     table: &str,
     query: &crate::types::ResourceSearchQuery,
 ) -> Cow<'static, str> {
+    if let Some(sort) = query.sort {
+        return Cow::Owned(explicit_sort_order_by(table, sort));
+    }
     let single_canonical =
         (query.url.is_some() || query.system.is_some()) && query.version.is_none();
     match (table, single_canonical) {
@@ -135,6 +138,33 @@ pub(crate) fn search_order_by(
         ("value_sets", true) => vs_precedence_order_by("value_sets"),
         ("concept_maps", true) => cm_precedence_order_by("concept_maps"),
         _ => Cow::Borrowed("created_at, id"),
+    }
+}
+
+/// `ORDER BY` for an explicit `_sort`. Text columns sort case-insensitively
+/// with empty values last in either direction (a nameless row is not "before
+/// A"), and every order ends in `id` so paging stays stable. Valid in both
+/// SQLite and PostgreSQL.
+fn explicit_sort_order_by(table: &str, sort: crate::types::SearchSort) -> String {
+    use crate::types::SearchSortField as F;
+    let column = match sort.field {
+        F::Name => "name",
+        F::Title => "title",
+        F::Url => "url",
+        F::Version => "version",
+        F::Status => "status",
+        // `concept_maps` has no `updated_at`; its rows are written once.
+        F::LastUpdated if table == "concept_maps" => "created_at",
+        F::LastUpdated => "updated_at",
+    };
+    let dir = if sort.descending { "DESC" } else { "ASC" };
+    if sort.field == F::LastUpdated {
+        format!("{column} {dir}, id {dir}")
+    } else {
+        format!(
+            "(CASE WHEN {column} IS NULL OR {column} = '' THEN 1 ELSE 0 END), \
+             LOWER({column}) {dir}, {column} {dir}, id"
+        )
     }
 }
 
@@ -525,6 +555,55 @@ pub(crate) fn bounded_cache_insert<K, V, S>(
         }
     }
     map.insert(key, value);
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use crate::types::{ResourceSearchQuery, SearchSort};
+
+    #[test]
+    fn explicit_sort_overrides_insertion_order() {
+        let q = ResourceSearchQuery {
+            sort: SearchSort::parse("name"),
+            ..Default::default()
+        };
+        let o = search_order_by("code_systems", &q);
+        assert!(o.contains("LOWER(name) ASC"), "{o}");
+        assert!(o.ends_with("id"), "{o}");
+        assert!(
+            o.starts_with("(CASE WHEN name IS NULL"),
+            "empty names last: {o}"
+        );
+    }
+
+    #[test]
+    fn descending_and_last_updated_map_per_table() {
+        let q = ResourceSearchQuery {
+            sort: SearchSort::parse("-_lastUpdated"),
+            ..Default::default()
+        };
+        assert_eq!(
+            search_order_by("code_systems", &q),
+            "updated_at DESC, id DESC"
+        );
+        assert_eq!(
+            search_order_by("concept_maps", &q),
+            "created_at DESC, id DESC"
+        );
+    }
+
+    #[test]
+    fn unsupported_sort_keys_parse_to_none() {
+        assert_eq!(SearchSort::parse("publisher"), None);
+        assert_eq!(SearchSort::parse("-url").map(|s| s.descending), Some(true));
+    }
+
+    #[test]
+    fn no_sort_keeps_the_default_order() {
+        let q = ResourceSearchQuery::default();
+        assert_eq!(search_order_by("code_systems", &q), "created_at, id");
+    }
 }
 
 #[cfg(test)]

@@ -99,6 +99,19 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
         Ok((vs.max(0) as u64, cm.max(0) as u64))
     }
 
+    async fn concept_counts(&self) -> Result<HashMap<String, u64>, HtsError> {
+        let c = self.client().await?;
+        let mut out = HashMap::new();
+        counts(
+            &c,
+            "SELECT system_id, COUNT(*) FROM concepts GROUP BY system_id",
+            &mut out,
+            |s, n| s.concepts = n,
+        )
+        .await?;
+        Ok(out.into_iter().map(|(id, s)| (id, s.concepts)).collect())
+    }
+
     async fn system_stats(&self) -> Result<HashMap<String, SystemStats>, HtsError> {
         let c = self.client().await?;
         let mut out = HashMap::new();
