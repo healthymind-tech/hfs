@@ -40,6 +40,23 @@ pub enum IdpEvent {
         client_id: String,
         endpoint: String,
         scopes: Vec<String>,
+        /// Patient in context (BALP AuthZconsent patient entity).
+        patient: Option<String>,
+        /// Whether the consent was stored for later requests.
+        remembered: bool,
+        ip: Option<String>,
+    },
+    ConsentDenied {
+        realm: String,
+        user_id: String,
+        client_id: String,
+        endpoint: String,
+        ip: Option<String>,
+    },
+    LockedOut {
+        realm: String,
+        username: Option<String>,
+        until_unix: i64,
         ip: Option<String>,
     },
     ConsentWithdrawn {
@@ -60,6 +77,8 @@ pub enum IdpEvent {
         gid: String,
         jti: String,
         grant_type: String,
+        /// Patient in the launch context, if any.
+        patient: Option<String>,
         ip: Option<String>,
     },
     /// Tokens issued from a refresh token (rotation).
@@ -131,7 +150,8 @@ impl IdpEventSink for TracingEventSink {
             IdpEvent::CodeReplay { .. }
             | IdpEvent::RefreshReuse { .. }
             | IdpEvent::ClientAuthFailed { .. }
-            | IdpEvent::LoginFailed { .. } => {
+            | IdpEvent::LoginFailed { .. }
+            | IdpEvent::LockedOut { .. } => {
                 tracing::warn!(target: "helios_idp::events", "{json}")
             }
             _ => tracing::info!(target: "helios_idp::events", "{json}"),

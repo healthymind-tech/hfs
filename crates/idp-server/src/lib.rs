@@ -52,6 +52,8 @@ pub struct IdpServerOptions {
     pub argon2_permits: usize,
     /// Pending authorization lifetime (seconds).
     pub interaction_ttl_secs: u32,
+    /// Minimum interval between forced client JWKS refetches (unknown kid).
+    pub jwks_min_refetch: std::time::Duration,
 }
 
 impl Default for IdpServerOptions {
@@ -61,6 +63,7 @@ impl Default for IdpServerOptions {
             jwks_fetcher: None,
             argon2_permits: 4,
             interaction_ttl_secs: 900,
+            jwks_min_refetch: jwks_fetch::MIN_REFETCH,
         }
     }
 }
@@ -86,7 +89,7 @@ impl IdpServer {
         Self {
             inner: Arc::new(Inner {
                 rt,
-                jwks: jwks_fetch::JwksCache::new(fetcher),
+                jwks: jwks_fetch::JwksCache::new(fetcher, opts.jwks_min_refetch),
                 argon2: tokio::sync::Semaphore::new(opts.argon2_permits.max(1)),
                 interaction_ttl_secs: opts.interaction_ttl_secs.clamp(60, 3600),
             }),

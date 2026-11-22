@@ -405,6 +405,7 @@ async fn authorization_code(
         gid: c.grant_id.clone(),
         jti: issued.jti.clone(),
         grant_type: "authorization_code".into(),
+        patient: c.context.patient.clone(),
         ip: ip.clone(),
     });
     Ok(Value::Object(resp))
@@ -674,6 +675,7 @@ async fn client_credentials(
         gid,
         jti: issued.jti,
         grant_type: "client_credentials".into(),
+        patient: None,
         ip: ip.clone(),
     });
     Ok(Value::Object(resp))

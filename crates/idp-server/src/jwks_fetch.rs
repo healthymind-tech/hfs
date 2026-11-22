@@ -132,13 +132,15 @@ impl JwksFetcher for HttpJwksFetcher {
 /// Per-URL cache in front of a fetcher.
 pub(crate) struct JwksCache {
     fetcher: Arc<dyn JwksFetcher>,
+    min_refetch: Duration,
     cache: Mutex<HashMap<String, (Value, Instant, Duration)>>,
 }
 
 impl JwksCache {
-    pub fn new(fetcher: Arc<dyn JwksFetcher>) -> Self {
+    pub fn new(fetcher: Arc<dyn JwksFetcher>, min_refetch: Duration) -> Self {
         Self {
             fetcher,
+            min_refetch,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -150,7 +152,7 @@ impl JwksCache {
             let c = self.cache.lock().expect("poisoned");
             if let Some((v, at, ttl)) = c.get(url) {
                 let fresh = at.elapsed() < *ttl;
-                let may_refetch = at.elapsed() >= MIN_REFETCH;
+                let may_refetch = at.elapsed() >= self.min_refetch;
                 if fresh && !(refresh && may_refetch) {
                     return Ok(keys_of(v));
                 }
