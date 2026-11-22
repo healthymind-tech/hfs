@@ -12675,10 +12675,11 @@ body.auth-page {
   line-height: 1.5;
 }
 
-/* Right-anchored menu panels (search "Recent", account) ran 36px past a
-   390px screen when opened: on phones they span the screen width. */
+/* Right-anchored menu panels in the page (search "Recent") ran 36px past a
+   390px screen when opened: on phones they span the screen width. (The
+   topbar account menu already fits.) */
 @media (max-width: 599px) {
-  .menu__panel--right {
+  .content .menu__panel--right {
     position: fixed;
     top: auto;
     left: 16px;
