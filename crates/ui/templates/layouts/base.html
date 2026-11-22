@@ -16,7 +16,7 @@
        the root; the per-user settings document (#151) is read from the
        second tag, and a layout without it (HTS) means "no such endpoint". -->
   <meta name="hfs-fhir-base" content="{{ status.fhir_base() }}">
-  <meta name="hfs-user-settings" content="{{ status.fhir_base() }}/_user/settings">
+  <meta name="hfs-user-settings" content="{{ status.settings_base() }}/_user/settings">
   <!-- Inline, ahead of everything else that can paint: stamps the stored
        theme (shared hfs_theme cookie; default "system") on <html> before
        first paint, so a dark choice never flashes light. Markup:

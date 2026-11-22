@@ -530,6 +530,12 @@ pub(crate) struct Status {
     /// built on it; before that, page scripts assumed the root and broke
     /// behind any prefix.
     fhir_base: String,
+    /// Where the per-user settings document lives: the endpoint's own FHIR
+    /// base, except while that endpoint is not serving (disabled or
+    /// provisioning answers every FHIR request with 503), when the server's
+    /// root base is used so the console's own preference reads do not fail
+    /// on every page of a disabled endpoint (UIF: 503 /_user/settings).
+    settings_base: String,
     /// The manager console's chrome (endpoint switcher, sectioned sidebar),
     /// when the manager is installed.
     manager: Option<manager::ManagerChrome>,
@@ -544,6 +550,17 @@ pub(crate) struct Status {
 /// whatever host it reached the UI on, which may be a different name than
 /// the configured public one (a port-forward, a loopback check), and an
 /// origin mismatch would turn every call into a blocked cross-origin request.
+/// The FHIR base the console's per-user settings are read from: the
+/// endpoint's own while it serves, the root base otherwise.
+pub(crate) fn settings_base(scope: Option<&manager::EndpointScope>, root: &str) -> String {
+    match scope {
+        Some(scope) if scope.endpoint.spec.status == helios_endpoints::EndpointStatus::Enabled => {
+            scope.fhir_base(root)
+        }
+        _ => root.to_string(),
+    }
+}
+
 pub(crate) fn fhir_base_path(public_base_url: &str) -> String {
     let path = match reqwest::Url::parse(public_base_url) {
         Ok(url) => url.path().to_string(),
@@ -903,6 +920,11 @@ impl Status {
     /// [`fhir_base_path`].
     pub(crate) fn fhir_base(&self) -> &str {
         &self.fhir_base
+    }
+
+    /// Base of the per-user settings document (see `settings_base`).
+    pub(crate) fn settings_base(&self) -> &str {
+        &self.settings_base
     }
 
     /// The effective tenant's display label: its registry display name, or the
@@ -10499,6 +10521,10 @@ pub(crate) fn current_status(
             Some(scope) => scope.fhir_base(&fhir_base_path(&state.public_base_url)),
             None => fhir_base_path(&state.public_base_url),
         },
+        settings_base: settings_base(
+            tenant.scope.as_deref(),
+            &fhir_base_path(&state.public_base_url),
+        ),
         manager: state
             .manager
             .as_deref()
@@ -10658,6 +10684,7 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                settings_base: String::new(),
                 manager: None,
                 csrf: None,
             },
@@ -10853,6 +10880,7 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                settings_base: String::new(),
                 manager: None,
                 csrf: None,
             },
@@ -11064,6 +11092,7 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                settings_base: String::new(),
                 manager: None,
                 csrf: None,
             },
@@ -12180,6 +12209,7 @@ mod user_summary_tests {
             user,
             bearer_only_auth: false,
             fhir_base: String::new(),
+            settings_base: String::new(),
             manager: None,
             csrf: None,
         }

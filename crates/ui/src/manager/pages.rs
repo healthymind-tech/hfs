@@ -861,6 +861,30 @@ fn opt_num(n: Option<u32>) -> String {
 }
 
 impl FormValues {
+    /// Show the server's effective values in the (disabled) fields of every
+    /// section that inherits them.
+    ///
+    /// Before UIF an inheriting section showed the spec type's defaults —
+    /// validation "Off" and terminology "Embedded value sets only" under a
+    /// toggle reading "Server setting: Validation: log" — so the greyed form
+    /// contradicted the line above it. Switching the toggle off now starts
+    /// from what the endpoint actually does today.
+    pub(crate) fn with_inherited(mut self, env: &view::EnvDefaults) -> Self {
+        if self.auth_inherit {
+            self.auth_mode = auth_mode_value(env.auth_mode);
+            self.auth_issuer = env.auth_issuer.clone().unwrap_or_default();
+            self.auth_audience = env.auth_audience.clone().unwrap_or_default();
+        }
+        if self.val_inherit {
+            self.val_mode = validation_mode_value(env.validation_mode);
+            self.val_terminology = terminology_validation_value(env.validation_terminology);
+        }
+        if self.term_inherit {
+            self.term_server_url = env.terminology_server.clone().unwrap_or_default();
+        }
+        self
+    }
+
     pub(crate) fn from_spec(spec: &EndpointSpec) -> Self {
         let auth = spec.auth.clone().unwrap_or_default();
         let cors = spec.cors.clone().unwrap_or_default();
@@ -1038,7 +1062,7 @@ fn section_response(
     let mut response = render(SectionPage {
         head: EpHeader::new(e, &c.server_base, &c.env),
         section: section.slug(),
-        v: FormValues::from_spec(spec),
+        v: FormValues::from_spec(spec).with_inherited(&c.env),
         errors,
         env: EnvView::new(&c.env),
         can_edit: locked.is_empty(),
@@ -2082,6 +2106,21 @@ mod tests {
         });
         let v = FormValues::from_spec(&spec);
         assert!(!v.auth_inherit && v.cors_inherit && v.val_inherit);
+        // Inherited sections show the server's values, explicit ones keep theirs.
+        let env = view::EnvDefaults::from_lookup(|k| match k {
+            "HFS_VALIDATION_MODE" => Some("log".into()),
+            "HFS_VALIDATION_TERMINOLOGY" => Some("remote".into()),
+            "HFS_AUTH_MODE" => Some("write-protect".into()),
+            "HFS_TERMINOLOGY_SERVER" => Some("http://hts:8090".into()),
+            _ => None,
+        });
+        let w = FormValues::from_spec(&spec).with_inherited(&env);
+        assert_eq!((w.val_mode, w.val_terminology), ("log", "remote"));
+        assert_eq!(w.term_server_url, "http://hts:8090");
+        assert_eq!(
+            w.auth_mode, "full",
+            "an explicit auth section is not overridden"
+        );
         assert_eq!(v.auth_mode, "full");
         assert_eq!(v.path, "lab");
         let health = health_tiles(&ServerHealth::default());

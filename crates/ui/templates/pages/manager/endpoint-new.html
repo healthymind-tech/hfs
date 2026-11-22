@@ -41,7 +41,7 @@
         <div class="mfield{% if self.bad("name") %} mfield--error{% endif %}">
           <label class="mfield__label" for="f-name">{{ i18n.t("mgr-field-name") }} <span class="mfield__req" aria-hidden="true">*</span></label>
           <input class="mfield__input mfield__input--mono" id="f-name" name="name" value="{{ nv.name }}" required aria-required="true" autocomplete="off"
-                 pattern="[a-z][a-z0-9-]{0,62}" data-slug-from="display_name"
+                 pattern="[a-z][a-z0-9\-]{0,62}" data-slug-from="display_name"
                  hx-get="/ui/endpoints/check" hx-trigger="input changed delay:300ms, change" hx-include="#f-name, #f-path" hx-target="#name-check"
                  aria-describedby="f-name-hint name-check{% if self.bad("name") %} f-name-err{% endif %}"{% if self.bad("name") %} aria-invalid="true"{% endif %}>
           <p class="mfield__hint" id="f-name-hint">{{ i18n.t("mgr-field-name-rules") }}</p>

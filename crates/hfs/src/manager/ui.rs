@@ -44,6 +44,7 @@ pub fn install_ui(ctx: &ManagerContext) {
         fallback,
         store: StoreBackend::new(ctx.store.clone()).with_registry(ctx.registry.clone()),
         key_ring: ctx.key_ring.is_some(),
+        terminology: ctx.config.terminology_server.clone(),
     };
     set_manager(
         ManagerRuntime::new(Arc::new(backend), ctx.registry.clone())
@@ -60,6 +61,8 @@ pub struct AdminApiBackend {
     /// For the health probe only (store round trip).
     store: StoreBackend,
     key_ring: bool,
+    /// `HFS_TERMINOLOGY_SERVER`, probed for the health strip.
+    terminology: Option<String>,
 }
 
 impl AdminApiBackend {
@@ -234,6 +237,11 @@ impl ManagerBackend for AdminApiBackend {
     async fn health(&self) -> ServerHealth {
         let mut health = self.store.health().await;
         health.key_ring = self.key_ring;
+        // A configured terminology server is probed (the store knows
+        // nothing about it); none configured stays "not reported".
+        if let Some(url) = &self.terminology {
+            health.terminology = helios_ui::manager::probe_terminology(url).await;
+        }
         // The live console sign-in mode (the store's view has none).
         if let Some(console) = super::console_auth::current() {
             health.console_mode = console.mode();
@@ -272,6 +280,7 @@ mod tests {
             fallback: AdminEndpointsState::builder(store.clone(), registry.clone()).build(),
             store: StoreBackend::new(store).with_registry(registry),
             key_ring: false,
+            terminology: None,
         }
     }
 
