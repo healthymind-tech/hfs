@@ -155,7 +155,7 @@ jobs:
             select: printf '%s\n' --lib --bins --tests
             # Crates that exist only on some branches (the FHIR servers
             # manager's helios-endpoints): tested when crates/<dir> exists.
-            optional: endpoints:helios-endpoints sync:helios-sync
+            optional: endpoints:helios-endpoints sync:helios-sync terminology:helios-terminology
     env:
       CARGO_BUILD_JOBS: 4
       HFS_TEST_PG_HOST: localhost

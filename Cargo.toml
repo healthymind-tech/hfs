@@ -19,6 +19,7 @@ default-members = [
 	"crates/ui-chrome",
 	"crates/admin-auth",
 	"crates/endpoints",
+	"crates/terminology",
 	"crates/sync",
 	"crates/persistence",
 	"crates/rest",
