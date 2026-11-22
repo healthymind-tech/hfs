@@ -53,6 +53,8 @@ Fork migrations in this build:
 | `hm-0008-endpoints` | `hfs_endpoints`, `hfs_endpoint_revisions`, `hfs_config_epochs` + `hfs_bump_config_epoch()` (statement triggers, `NOTIFY hfs_config`) | fork (FHIR server manager, [design](../design/fhir-server-manager.md) §4.1; inert until `HFS_MANAGER=on`) |
 | `hm-0009-console-auth` | `hfs_console_settings`, `hfs_console_users`, `hfs_console_role_bindings` | fork (design §4.2) |
 | `hm-0010-endpoint-sync` | `hfs_sync_jobs`, `hfs_sync_runs`, `hfs_sync_log`, `hfs_sync_conflicts`, `hfs_sync_item_state` | fork (design §4.3) |
+| `hm-0011-terminology-schema` | schema `terminology` + `hfs_terminology_state` (one row: `store`, `moved_from`, `moved_at`, `source_fingerprint`, `note`, `updated_at`) | unified server ([design](../design/unified-server.md) §5.4). **Not** in `FORK_MIGRATIONS`: applied by `PostgresBackend::apply_unified_migrations` only when terminology is embedded; checks `has_database_privilege(…, 'CREATE')` first |
+| `hm-0012-console-terminology-bindings` | `hfs_console_scope_bindings(subject, scope ∈ {terminology}, role)` + console epoch trigger | unified server (design §7.2), same rule as hm-0011. A sibling table, not a column on `hfs_console_role_bindings` (whose key is `(subject, endpoint_id)` with an FK to `hfs_endpoints`) |
 
 hm/p3-cluster first numbered 0002–0005 as ladder v48–v51; they were moved onto
 this track when it was merged with hm/p3-pgops (upstream has its own v48+). No
@@ -151,6 +153,60 @@ HELIOS_TEST_CONTAINER_PREFIX=myteam-pgtest cargo test ...
 HFS_TEST_PG_HOST=127.0.0.1 HFS_TEST_PG_PORT=5432 cargo test ...
 ```
 
+## 3a. One database: the terminology store in schema `terminology`
+
+The unified server ([design](../design/unified-server.md) §5) keeps HTS's
+tables **and** HTS's embedded resource store in schema `terminology` of the
+`hfs` database. Their pools connect with
+`options=-c search_path=terminology,public` (`helios_terminology::schema::with_search_path`).
+What makes that safe (package U1):
+
+- **Connection strings keep the schema.** `PostgresBackend` reads
+  `options=-c search_path=<schema>,…` from a URL into `PostgresConfig.schema`
+  and sends it in every connection's startup packet (it used to drop every
+  query parameter). HTS's pool appends `HTS_PG_STATEMENT_TIMEOUT_MS` to the
+  URL's `options` instead of replacing them.
+- **The schema must exist before any DDL.** Both stores call
+  `ensure_store_schema` at startup: when `search_path` names a schema first
+  that does not exist, PostgreSQL would silently fall back to `public` and the
+  store would create (or adopt!) its tables next to HFS's. The schema is
+  created instead, and startup fails if connections still resolve elsewhere.
+- **No unqualified catalog lookup.** Every `to_regclass`, `information_schema`,
+  `pg_class`/`pg_attribute`/`pg_constraint`/`pg_index(es)`/`pg_stats` lookup in
+  `crates/persistence/src/backends/postgres/**` and `crates/hts/src/**` is pinned
+  to `current_schema()` (`to_regclass(format('%I.%I', current_schema(), 'x'))`,
+  `table_schema = current_schema()`, `relnamespace = to_regnamespace(current_schema())`).
+  DDL naming an existing index by a computed name (`DROP INDEX … IF EXISTS`,
+  `ALTER INDEX … RENAME`) qualifies it with `in_store_schema()`.
+- **Guards** (`crates/persistence/tests/terminology_schema.rs`, CI group
+  persistence-postgres; `crates/hts/tests/postgres_terminology_schema.rs`, CI
+  group hts-postgres):
+  - `no_unqualified_catalog_lookups` scans the SQL string literals of both
+    crates and fails on any catalog lookup without `current_schema()` in the
+    same statement, or a bare `'name'::regclass`;
+  - `postgres_integration_terminology_schema_isolation` builds HFS in `public`,
+    initialises the embedded store in `terminology`, and compares a full
+    catalog + row-count snapshot of `public` before and after (and after a
+    restart with store tables dropped). On its first run it caught a real
+    fall-through: the v43/v50 date-index swaps ran `DROP INDEX IF EXISTS
+    idx_search_date_end` while the fresh store had no such index yet and
+    **dropped HFS's** `public.idx_search_date_end` / `idx_search_date_recent_end`;
+  - the HTS test does the same for HTS's 19 tables, and checks a missing schema
+    is created rather than `public` used.
+  Static DDL with `IF EXISTS` (`DROP INDEX IF EXISTS idx_x`) is covered by the
+  catalog snapshot, not by the scan: write new swaps with `in_store_schema()`.
+- The upstream ladder and the fork track run **per schema**: `terminology` has
+  its own `schema_version` and `hm_schema_migrations` (hm-0001..hm-0010 only).
+  The migration advisory lock is per database, so HFS and the embedded store
+  serialise their startup migrations (seconds).
+- Changing HTS's DDL text (U1 qualified four guards) changes the
+  `hts_schema_meta` fingerprint: the first start of a new image re-applies the
+  idempotent DDL once (measured 9 s to ready on the 8 GB production copy,
+  restarts 5 s).
+
+The data move from the separate `hts` database is `scripts/ops/unify-db.sh`
+([unified-server.md](unified-server.md)).
+
 ## 4. Rules for adding a schema change in this fork
 
 1. **Never** bump `SCHEMA_VERSION` or add a `vN → vN+1` step in the fork. That
@@ -168,6 +224,9 @@ HFS_TEST_PG_HOST=127.0.0.1 HFS_TEST_PG_PORT=5432 cargo test ...
    schema (initialize, then remove what the migration adds), runs
    `initialize_schema`, and asserts both the new objects and that pre-existing
    rows survive.
-5. When the change is generally useful, open an upstream PR. Once upstream
+5. Name objects so the terminology store cannot reach HFS's: catalog lookups
+   use `current_schema()`, and DDL on an object found by name qualifies it
+   (`in_store_schema()`); `terminology_schema.rs` must stay green (§3a).
+6. When the change is generally useful, open an upstream PR. Once upstream
    ships it under a number, the fork migration stays in the list (it becomes a
    no-op through its `IF NOT EXISTS` guards) — do not delete fork entries.

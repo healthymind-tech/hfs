@@ -1278,3 +1278,15 @@ Highest conflict risk:
 
 - 2026-11-23 U0: design, `crates/terminology` (19 tests), `RESERVED_SEGMENTS`
   += `terminology`, `idp`, CI optional group.
+- 2026-11-23 U1 (`hm/unify-u1`): schema isolation (both stores keep and
+  create their schema; every catalog lookup pinned to `current_schema()`;
+  computed-name index DDL qualified — the isolation test caught the v43/v50
+  date-index swaps dropping HFS's indexes from a fresh store), hm-0011/hm-0012
+  via `PostgresBackend::apply_unified_migrations` (not in `init_schema`),
+  `hfs_terminology_state.note`, **hm-0012 is a sibling table
+  `hfs_console_scope_bindings(subject, scope, role)`** rather than a column on
+  `hfs_console_role_bindings`, `scripts/ops/unify-db.sh` (+ production wrapper
+  `hfs-eval/deploy/unify-db.sh`), runbook `docs/ops/unified-server.md`.
+  Rehearsed on the production copy: 302 s total, terminology read pause 27 s
+  (template copy), FHIR 0 failed requests, 556/556 answers and `test_hts`
+  112/112 identical, peak disk +31 GB for an 8 GB source.

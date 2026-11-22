@@ -42,6 +42,25 @@ PG_CONTAINER=hfs-db PGUSER=postgres scripts/ops/pg-restore.sh <dump> hfs --repla
 It checks the sha256, creates the database, restores in parallel, runs
 `ANALYZE`, and prints the schema version, fork migrations and row counts.
 
+### One database (unified server)
+
+After the Stage-2 move ([unified-server.md](unified-server.md)) terminology is
+schema `terminology` inside `hfs` (≈ 9.6 GB instead of 1.6 GB on the
+rehearsal copy), and `hts` disappears after `unify-db.sh cleanup`:
+
+- `pg-backup.sh` without arguments backs up the default databases that exist
+  (`hts` is skipped once dropped); the `hfs` dump then contains terminology
+  (≈ 0.8 GB, ≈ 3–4 min);
+- production's pre-deploy dumps (`hfs-eval/deploy/predeploy-dump.sh`) split
+  it: `hfs-pre-<tag>-<stamp>.dump` with `--exclude-schema=terminology`
+  (309 MB, 77 s) and `hfs.terminology-pre-<tag>-<stamp>.dump` (`-n
+  terminology`, 505 MB, 129 s) only when `terminology_epoch` moved since the
+  newest one or it is older than 7 days; `rollback-restore.sh` restores both
+  (65 s + 79 s with `-j 8` on the rehearsal host, row counts identical);
+- restoring an `hfs` dump into a scratch database restores both schemas; a
+  terminology-only restore is `pg_restore -n terminology` (or the split dump)
+  into an `hfs` database whose `terminology` schema was dropped first.
+
 ## 2. WAL archiving and base backups (PITR)
 
 `docker/production/docker-compose.yml` runs PostgreSQL with
