@@ -16,7 +16,7 @@ use helios_endpoints::{
 };
 use serde::Deserialize;
 
-use super::backend::{BackendError, HealthState, ServerHealth};
+use super::backend::{BackendError, HealthState, ManagerBackend, ServerHealth, SyncJobView};
 use super::forms::{self, FieldErrors, Form, NewEndpoint, Section, release_label};
 use super::view::{
     self, Badge, DiffRow, EndpointCard, EnvDefaults, SyncRow, auth_mode_value,
@@ -375,7 +375,7 @@ pub(crate) async fn overview(
         Ok(list) => list,
         Err(e) => return unavailable(c, &e),
     };
-    let jobs = backend.sync_jobs().await.unwrap_or_default();
+    let jobs = sync_jobs_of(&backend).await.unwrap_or_default();
     let health = backend.health().await;
     // Counts and stats for every endpoint concurrently: one slow tenant must
     // not serialize the page.
@@ -746,7 +746,7 @@ pub(crate) async fn home(
             backend.history(&ep),
             futures_lite::future::zip(
                 fhir_get(&state, &scope, "/AuditEvent?_sort=-date&_count=6"),
-                backend.sync_jobs(),
+                sync_jobs_of(&backend),
             ),
         ),
     )
@@ -789,7 +789,7 @@ pub(crate) async fn home(
         audit,
         audit_error,
         sync_rows: view::sync_rows(&ep, &jobs),
-        sync_available: backend.sync_available(),
+        sync_available: sync_on(backend.as_ref()),
         warnings: forms::warnings(&e.spec, &other_specs),
         data_href: format!("/ui/e/{ep}/data"),
         can_admin,
@@ -1354,12 +1354,12 @@ pub(crate) async fn sync_page(
         Ok(x) => x,
         Err(r) => return r,
     };
-    let jobs = c.runtime.backend.sync_jobs().await.unwrap_or_default();
+    let jobs = sync_jobs_of(&c.runtime.backend).await.unwrap_or_default();
     let can_admin = c.can_admin();
     render(SyncPage {
         head: EpHeader::new(&e, &c.server_base, &c.env),
         sync_rows: view::sync_rows(&ep, &jobs),
-        available: c.runtime.backend.sync_available(),
+        available: sync_on(c.runtime.backend.as_ref()),
         can_admin,
         status: c.status,
         i18n: c.i18n,
@@ -2022,6 +2022,22 @@ pub(crate) async fn about(
             _ => FhirRelease::R4,
         }),
     })
+}
+
+/// Sync jobs for the manager pages: the backend's own, else those of the
+/// installed sync service.
+async fn sync_jobs_of(backend: &Arc<dyn ManagerBackend>) -> Result<Vec<SyncJobView>, BackendError> {
+    if !backend.sync_available()
+        && let Some(views) = crate::sync_pages::service_job_views().await
+    {
+        return Ok(views);
+    }
+    backend.sync_jobs().await
+}
+
+/// Whether sync is available to the manager pages (backend or service).
+fn sync_on(backend: &dyn ManagerBackend) -> bool {
+    backend.sync_available() || crate::sync_pages::service_available()
 }
 
 #[cfg(test)]

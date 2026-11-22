@@ -527,7 +527,7 @@ async fn deleting_a_submission_returns_to_the_list() {
     // its way back to the list (#1673).
     let (status, html) = get(&ctx, &detail_path).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(html.contains(r#"<a class="btn" href="/ui/bulk-import">Bulk Import</a>"#));
+    assert!(html.contains(r#"<a class="btn btn--primary" href="/ui/bulk-import">Bulk Import</a>"#));
 }
 
 /// A loopback Data Recipient that records the kick-off body it receives.
@@ -3019,5 +3019,5 @@ async fn an_unknown_submission_detail_is_the_not_found_page() {
     let ctx = ctx("http://localhost:9/");
     let (status, html) = get(&ctx, "/ui/bulk-import/00000000-0000-4000-8000-000000000000").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(html.contains(r#"<a class="btn" href="/ui/bulk-import">Bulk Import</a>"#));
+    assert!(html.contains(r#"<a class="btn btn--primary" href="/ui/bulk-import">Bulk Import</a>"#));
 }

@@ -214,6 +214,34 @@ async fn list_page(
     render(page)
 }
 
+/// The installed sync service's jobs as the manager pages show them — the
+/// endpoint home and Sync tab fall back to these when the manager backend
+/// has no sync store of its own (production's admin-API backend), which
+/// made them say "Sync jobs are not enabled on this server" while
+/// `/ui/sync` listed jobs.
+pub(crate) async fn service_job_views() -> Option<Vec<crate::manager::SyncJobView>> {
+    let s = service()?;
+    let list = s.list().await.ok()?;
+    Some(
+        list.into_iter()
+            .filter_map(|item| {
+                let job = serde_json::from_value::<SyncJob>(item.job.clone())
+                    .or_else(|_| redacted_to_job(&item.job))
+                    .ok()?;
+                Some(crate::manager::SyncJobView {
+                    job,
+                    last_run: item.last_run,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Whether the sync service (P6) is installed in this process.
+pub(crate) fn service_available() -> bool {
+    service().is_some()
+}
+
 /// A redacted job (secrets as `{"set": true}`) reshaped so it parses back
 /// into a [`SyncJob`] for display (secret fields replaced by a dummy
 /// envelope that is never shown).

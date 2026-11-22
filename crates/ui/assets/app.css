@@ -12811,6 +12811,64 @@ body.auth-page {
   }
 }
 
+/* Headings: no single character left on the last line (zh-Hant "…管理平 / 台"). */
+.page-head__title,
+.form-section__title,
+.card-head h2 {
+  text-wrap: balance;
+}
+
+/* A link with a leading icon: icon inline, not on a line of its own. */
+.link-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.link-icon svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+/* Stacked (phone) tables: the actions and number cells kept their desktop
+   right alignment and 64px width, so their label floated mid-row. */
+@media (max-width: 767px) {
+  .data-table--stack td.col-actions,
+  .data-table--stack td.col-num {
+    width: auto;
+    text-align: left;
+    align-items: center;
+    justify-items: start;
+  }
+}
+
+/* A tag never breaks inside (zh-Hant "預 / 設" stacked vertically). */
+.tag,
+.status-pill {
+  white-space: nowrap;
+}
+
+/* Toolbars with a search field: the field takes its own row on phones so
+   its placeholder is not cut ("Search by name or"). */
+@media (max-width: 599px) {
+  .toolbar:has(.toolbar__search) {
+    flex-wrap: wrap;
+  }
+
+  .toolbar__search {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+}
+
+/* One-line empty states inside cards read as quiet notes, not body copy. */
+.card__body > p.muted:only-child {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
 /* Progressive disclosure (manager.js `data-show-when`). */
 [data-show-when][hidden] {
   display: none !important;

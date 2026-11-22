@@ -32,7 +32,7 @@
     <div class="summary-list__row"><dt>{{ i18n.t("console-users-name") }}</dt><dd>{{ display_name }}</dd></div>
     <div class="summary-list__row"><dt>{{ i18n.t("console-bindings-subject") }}</dt><dd><code class="mono">{{ subject }}</code></dd></div>
     <div class="summary-list__row"><dt>{{ i18n.t("console-users-role") }}</dt><dd><span class="status-pill status-pill--accent">{% call ui::icon("shield") %}{% endcall %}<span>{{ role }}</span></span></dd></div>
-    <div class="summary-list__row"><dt>{{ i18n.t("console-sessions-via") }}</dt><dd>{{ via }}</dd></div>
+    <div class="summary-list__row"><dt>{{ i18n.t("console-sessions-via") }}</dt><dd>{{ i18n.t(via) }}</dd></div>
     {% for (ep, r) in endpoint_roles %}<div class="summary-list__row"><dt><code class="mono">{{ ep }}</code></dt><dd><span class="status-pill status-pill--muted">{{ r }}</span></dd></div>{% endfor %}
   </dl>
 </section>

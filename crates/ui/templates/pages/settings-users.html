@@ -127,7 +127,7 @@
     <thead><tr><th>{{ i18n.t("console-users-name") }}</th><th>{{ i18n.t("console-users-role") }}</th><th>{{ i18n.t("console-sessions-via") }}</th><th>{{ i18n.t("console-sessions-client") }}</th><th>{{ i18n.t("console-sessions-last-seen") }}</th><th></th></tr></thead>
     <tbody>
     {% for s in sessions %}
-    <tr><td>{{ s.display }} <code class="mono muted">{{ s.subject }}</code></td><td>{{ s.role }}</td><td>{{ s.via }}</td><td>{{ s.client }}</td><td>{{ s.last_seen }}</td>
+    <tr><td>{{ s.display }} <code class="mono muted">{{ s.subject }}</code></td><td>{{ s.role }}</td><td>{{ i18n.t(s.via) }}</td><td>{{ s.client }}</td><td>{{ s.last_seen }}</td>
       <td class="data-table__actions">{% if s.current %}<span class="status-pill status-pill--ok status-pill--sm">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("console-sessions-current") }}</span></span>{% else %}<form method="post" action="/ui/settings/sessions/{{ s.key }}/revoke" class="inline-form">{{ csrf_html|safe }}<button class="btn btn--small" type="submit">{{ i18n.t("console-sessions-revoke") }}</button></form>{% endif %}</td></tr>
     {% endfor %}
     </tbody>

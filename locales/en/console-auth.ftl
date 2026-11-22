@@ -100,6 +100,10 @@ console-sessions-client = Client
 console-sessions-last-seen = Last seen
 console-sessions-current = this session
 console-sessions-revoke = End session
+console-via-anonymous = anonymous visitor
+console-via-local = built-in account
+console-via-oidc = OpenID Connect single sign-on
+console-via-break-glass = break-glass administrator (HFS_ADMIN_PASSWORD)
 console-sessions-revoked = Session ended.
 
 console-account-title = Account

@@ -9934,7 +9934,7 @@ async fn unknown_ui_paths_render_the_not_found_page() {
             "{path}"
         );
         assert!(
-            html.contains(r#"<a class="btn" href="/ui">Home</a>"#),
+            html.contains(r#"<a class="btn btn--primary" href="/ui">Home</a>"#),
             "{path}"
         );
         assert!(!html.contains("OperationOutcome"), "{path}");

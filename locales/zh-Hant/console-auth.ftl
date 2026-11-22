@@ -98,6 +98,10 @@ console-sessions-client = 用戶端
 console-sessions-last-seen = 最近活動
 console-sessions-current = 本工作階段
 console-sessions-revoke = 結束工作階段
+console-via-anonymous = 匿名訪客
+console-via-local = 內建帳號
+console-via-oidc = OpenID Connect 單一登入
+console-via-break-glass = 緊急管理員（HFS_ADMIN_PASSWORD）
 console-sessions-revoked = 工作階段已結束。
 
 console-account-title = 帳號

@@ -69,13 +69,13 @@ fn classify(i18n: &I18n, e: &ConsoleError) -> (&'static str, String) {
     }
 }
 
-/// `via` as shown.
+/// Fluent key of how a session signed in (`via`), as shown.
 pub(crate) fn via_label(via: ConsoleVia) -> &'static str {
     match via {
-        ConsoleVia::Anonymous => "anonymous",
-        ConsoleVia::Local => "local account",
-        ConsoleVia::Oidc => "OpenID Connect",
-        ConsoleVia::BreakGlass => "break-glass (HFS_ADMIN_PASSWORD)",
+        ConsoleVia::Anonymous => "console-via-anonymous",
+        ConsoleVia::Local => "console-via-local",
+        ConsoleVia::Oidc => "console-via-oidc",
+        ConsoleVia::BreakGlass => "console-via-break-glass",
     }
 }
 
