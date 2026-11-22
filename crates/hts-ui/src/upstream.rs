@@ -555,6 +555,11 @@ pub fn browser_sort_label_key(sort: &str) -> &'static str {
     }
 }
 
+/// Percent-encode one query-string component.
+fn urlencoding_component(raw: &str) -> String {
+    form_urlencoded::byte_serialize(raw.as_bytes()).collect()
+}
+
 /// Filters accepted by the CS browser page and its rows fragment.
 ///
 /// `_count` and `_offset` are parsed from strings so a malformed query
@@ -1184,13 +1189,34 @@ impl UpstreamClient {
         let notfound_url = format!("{}/{}/{}", self.base_url, resource_type, id);
         let want = base_id(id);
 
-        for page in 0..MAX_PAGES {
-            let list_url = format!(
-                "{}/{}?_count={PAGE}&_offset={}",
+        // First a targeted `_id` search (HTS matches the logical id and the
+        // version-qualified storage ids). An HTS that ignores `_id` answers
+        // with an unfiltered page, which the id comparison below handles.
+        // Then page through the whole list. Both ask for `_summary=true`:
+        // only `id` and `url` are needed, and without it a ConceptMap page
+        // was 25 MB of full resources — 5–6 s on production, past the 5 s
+        // upstream timeout, so every ConceptMap detail page failed (UIF).
+        let mut urls = vec![(
+            format!(
+                "{}/{}?_id={}&_summary=true&_count=50",
                 self.base_url,
                 resource_type,
-                page * PAGE
-            );
+                urlencoding_component(want)
+            ),
+            false,
+        )];
+        urls.extend((0..MAX_PAGES).map(|page| {
+            (
+                format!(
+                    "{}/{}?_summary=true&_count={PAGE}&_offset={}",
+                    self.base_url,
+                    resource_type,
+                    page * PAGE
+                ),
+                true,
+            )
+        }));
+        for (list_url, paging) in urls {
             let response = self
                 .client
                 .get(&list_url)
@@ -1237,7 +1263,7 @@ impl UpstreamClient {
 
             // A short page is the last page. Stopping here keeps the common
             // case — a store smaller than one page — at exactly one request.
-            if entries.len() < PAGE {
+            if paging && entries.len() < PAGE {
                 break;
             }
         }

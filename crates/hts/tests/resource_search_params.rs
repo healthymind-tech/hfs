@@ -398,3 +398,26 @@ async fn sort_orders_results_and_pages_stably() {
     let (_, body) = app.get_fhir("/ConceptMap?_sort=-_lastUpdated").await;
     assert_eq!(ordered_ids(&body), vec!["p2o-cm"]);
 }
+
+/// `ConceptMap?_summary=true` returns metadata only (UIF: the console's id
+/// resolver pulled 25 MB of full maps per page and timed out).
+#[tokio::test(flavor = "multi_thread")]
+async fn concept_map_summary_omits_the_mapping_body() {
+    let app = TestApp::new().await;
+    app.import_bundle_ok(BUNDLE).await;
+    let (status, body) = app.get_fhir("/ConceptMap?_summary=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cm = &body["entry"][0]["resource"];
+    assert_eq!(cm["url"], "http://hts.test/p2o/cm/one");
+    assert!(cm.get("group").is_none(), "summary must drop group: {cm}");
+    let (_, full) = app.get_fhir("/ConceptMap").await;
+    assert!(full["entry"][0]["resource"].get("group").is_some());
+    // Also through the string-search path.
+    let (_, body) = app
+        .get_fhir("/ConceptMap?name:contains=cm&_summary=true")
+        .await;
+    assert!(
+        body["entry"][0]["resource"].get("group").is_none(),
+        "{body}"
+    );
+}
