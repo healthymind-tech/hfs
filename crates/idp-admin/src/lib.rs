@@ -7,3 +7,4 @@
 
 pub mod binding;
 pub mod diagnostic;
+pub mod service;

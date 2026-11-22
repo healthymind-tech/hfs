@@ -76,6 +76,9 @@ pub struct RunConfig {
     pub max_clock_skew_secs: i64,
     /// How long revocation may take to reach the FHIR endpoints.
     pub revocation_wait: Duration,
+    /// The endpoints are about to be bound (wizard): use them as `aud` but
+    /// do not expect them to trust the realm yet (endpoint checks skipped).
+    pub audience_only: bool,
     /// Test hook: shifts the runner's own clock (simulated skew).
     #[doc(hidden)]
     pub clock_offset_secs: i64,
@@ -94,6 +97,7 @@ impl RunConfig {
             timeout: Duration::from_secs(10),
             max_clock_skew_secs: 60,
             revocation_wait: Duration::from_secs(3),
+            audience_only: false,
             clock_offset_secs: 0,
         }
     }
@@ -410,8 +414,10 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
     }
     cx.meta = meta;
     // SMART configuration of every bound endpoint.
-    let eps = cx.cfg.endpoints.clone();
-    if eps.is_empty() {
+    let eps = if cx.cfg.audience_only { vec![] } else { cx.cfg.endpoints.clone() };
+    if cx.cfg.audience_only {
+        s.push(Check::skipped("discovery.smart", "endpoints-pending", "The endpoints are bound after these checks pass; their SMART configuration is checked then."));
+    } else if eps.is_empty() {
         s.push(
             Check::warn("discovery.smart", "endpoints-none", "No FHIR endpoint is bound, so no SMART configuration to check.")
                 .field("endpoints")
@@ -1230,6 +1236,10 @@ async fn fresh_code(cx: &mut Ctx) -> Result<(String, String), Check> {
 
 async fn step_fhir(cx: &mut Ctx, access: &str) -> Step {
     let mut s = new_step(5);
+    if cx.cfg.audience_only {
+        s.push(Check::skipped("fhir.pending", "endpoints-pending", "The endpoints are bound after these checks pass; the FHIR call runs then."));
+        return s;
+    }
     let eps = cx.cfg.endpoints.clone();
     if eps.is_empty() {
         s.push(Check::skipped("fhir.none", "endpoints-none", "No bound endpoint to call.").field("endpoints"));
@@ -1626,7 +1636,7 @@ async fn step_revocation(cx: &mut Ctx, access: &str) -> Step {
             None => {}
         }
     }
-    let Some(e) = cx.cfg.endpoints.first().cloned() else {
+    let Some(e) = cx.cfg.endpoints.first().cloned().filter(|_| !cx.cfg.audience_only) else {
         return s;
     };
     let base = e.base_url.trim_end_matches('/');
