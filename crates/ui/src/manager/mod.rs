@@ -37,9 +37,9 @@ use helios_endpoints::{
 };
 
 pub use backend::{
-    BackendError, DuplicateOutcome, EndpointStats, HealthState, ManagerBackend, ProbeLine,
-    SecretChange, SecretChanges, ServerHealth, SnapshotBackend, StoreBackend, SyncJobView,
-    probe_terminology,
+    BackendError, DuplicateOutcome, EndpointStats, HealthState, ManagerBackend, PeerAuth,
+    PeerRole, ProbeLine, SecretChange, SecretChanges, ServerHealth, SnapshotBackend, StoreBackend,
+    SyncJobView, SyncPeerVerifyRequest, VerifyReport, VerifyStatus, VerifyStep, probe_terminology,
 };
 pub use scope::EndpointScope;
 

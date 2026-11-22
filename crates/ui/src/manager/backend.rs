@@ -20,6 +20,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use helios_auth::OutboundGuard;
+pub use helios_auth::verify::{
+    PeerAuth, PeerRole, SyncPeerVerifyRequest, VerifyReport, VerifyStatus, VerifyStep,
+};
 use helios_endpoints::console::ConsoleAuthMode;
 use helios_endpoints::model::FieldError;
 use helios_endpoints::store::EndpointRevision;
@@ -293,6 +297,47 @@ pub trait ManagerBackend: Send + Sync {
         Err(BackendError::NotImplemented)
     }
 
+    /// `POST /admin/endpoints/{name}/$verify-auth` (or, with no endpoint —
+    /// the wizard — `POST /admin/endpoints/$verify-auth`): step-by-step
+    /// verification of `auth` (pass the effective, inherited settings to
+    /// verify those), optionally with a token.
+    async fn verify_auth(
+        &self,
+        _endpoint: Option<&str>,
+        _auth: &EndpointAuth,
+        _token: Option<&str>,
+    ) -> Result<VerifyReport, BackendError> {
+        Err(BackendError::NotImplemented)
+    }
+
+    /// `POST /admin/endpoints/{name}/$verify-auth` with an empty body: the
+    /// endpoint's stored auth, or the server-level settings it inherits.
+    async fn verify_effective_auth(
+        &self,
+        _endpoint: &str,
+        _token: Option<&str>,
+    ) -> Result<VerifyReport, BackendError> {
+        Err(BackendError::NotImplemented)
+    }
+
+    /// `POST /admin/endpoints/$verify-terminology`.
+    async fn verify_terminology(
+        &self,
+        _url: &str,
+        _token: Option<&str>,
+        _timeout_secs: Option<u64>,
+    ) -> Result<VerifyReport, BackendError> {
+        Err(BackendError::NotImplemented)
+    }
+
+    /// `POST /admin/sync/$verify-peer`.
+    async fn verify_sync_peer(
+        &self,
+        _request: SyncPeerVerifyRequest,
+    ) -> Result<VerifyReport, BackendError> {
+        Err(BackendError::NotImplemented)
+    }
+
     /// `GET /admin/endpoints/{name}/stats`; `None` when not reported.
     async fn stats(&self, _name: &str) -> Option<EndpointStats> {
         None
@@ -319,6 +364,11 @@ pub trait ManagerBackend: Send + Sync {
     fn writable(&self) -> bool {
         true
     }
+}
+
+/// The outbound policy of console-entered URLs (`HFS_OUTBOUND_ALLOW`).
+fn env_guard() -> OutboundGuard {
+    OutboundGuard::Policy(Arc::new(helios_endpoints::OutboundPolicy::from_env()))
 }
 
 /// [`ManagerBackend`] over the P0 store contracts, used until the P4 API
@@ -434,6 +484,41 @@ impl StoreBackend {
 
 #[async_trait]
 impl ManagerBackend for StoreBackend {
+    async fn verify_auth(
+        &self,
+        _endpoint: Option<&str>,
+        auth: &EndpointAuth,
+        token: Option<&str>,
+    ) -> Result<VerifyReport, BackendError> {
+        Ok(helios_auth::EndpointAuthProbe::new(env_guard())
+            .verify(auth, token)
+            .await)
+    }
+
+    async fn verify_terminology(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<VerifyReport, BackendError> {
+        let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(10).clamp(1, 120));
+        Ok(helios_auth::verify::verify_terminology_server(url, token, timeout, &env_guard()).await)
+    }
+
+    async fn verify_sync_peer(
+        &self,
+        request: SyncPeerVerifyRequest,
+    ) -> Result<VerifyReport, BackendError> {
+        Ok(helios_auth::verify::verify_fhir_peer(
+            &request.peer(),
+            request.role,
+            request.fhir_version.as_deref(),
+            &request.resource_types,
+            &env_guard(),
+        )
+        .await)
+    }
+
     async fn list(&self) -> Result<Vec<Endpoint>, BackendError> {
         Ok(self.store.list(false).await?)
     }

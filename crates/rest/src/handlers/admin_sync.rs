@@ -255,6 +255,100 @@ pub async fn test_connection(State(api): State<SyncApi>, Json(body): Json<Value>
     }
 }
 
+/// With `request.job_id`, fills an empty secret of `request.auth` from
+/// that job's stored side (same auth type only), so an existing job can be
+/// verified without retyping its write-only secret.
+pub async fn fill_stored_secret(
+    request: &mut helios_auth::verify::SyncPeerVerifyRequest,
+    s: &SyncService,
+) {
+    use helios_auth::verify::PeerAuth;
+    let Some(job_id) = request.job_id.clone() else {
+        return;
+    };
+    if let Ok(job) = s.job(&job_id).await {
+        let side = request.role.as_str();
+        let peer = match request.role {
+            helios_auth::verify::PeerRole::Source => &job.spec.source,
+            helios_auth::verify::PeerRole::Target => &job.spec.target,
+        };
+        if let helios_endpoints::sync::SyncPeer::External(x) = peer
+            && let Ok(stored) = helios_sync::secrets::open_auth(
+                &x.auth,
+                &job.id,
+                side,
+                s.runtime().env.key_ring.as_deref(),
+            )
+        {
+            use helios_sync::secrets::ResolvedAuth;
+            let text = |p: &helios_endpoints::secret::Plaintext| {
+                p.expose_str().unwrap_or_default().to_string()
+            };
+            match (&mut request.auth, &stored) {
+                (PeerAuth::Bearer { token }, ResolvedAuth::Bearer(t)) if token.is_empty() => {
+                    *token = text(t);
+                }
+                (PeerAuth::Basic { password, .. }, ResolvedAuth::Basic { password: p, .. })
+                    if password.is_empty() =>
+                {
+                    *password = text(p);
+                }
+                (
+                    PeerAuth::ClientCredentials { client_secret, .. },
+                    ResolvedAuth::ClientCredentials {
+                        client_secret: c, ..
+                    },
+                ) if client_secret.is_empty() => {
+                    *client_secret = text(c);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `POST /admin/sync/$verify-peer`: step-by-step verification of one
+/// external side of a sync job (`helios_auth::verify::verify_fhir_peer`,
+/// kinds `sync-source` / `sync-target`). Body:
+/// [`SyncPeerVerifyRequest`](helios_auth::verify::SyncPeerVerifyRequest)
+/// (`{role, url, auth: {type, …}, resourceTypes, fhirVersion?, jobId?}`);
+/// with `jobId`, an empty secret is taken from that job's stored side.
+/// Fetches go through the outbound policy (the sync service's, or
+/// `HFS_OUTBOUND_ALLOW` when sync is not installed). Always `200` with the
+/// report once the body parses.
+pub async fn verify_peer(State(api): State<SyncApi>, body: axum::body::Bytes) -> Response {
+    use helios_auth::verify::SyncPeerVerifyRequest;
+    let mut request: SyncPeerVerifyRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return outcome(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid",
+                &format!("invalid peer verification request: {e}"),
+                None,
+            );
+        }
+    };
+    let service = api.service().ok();
+    let policy = service
+        .as_ref()
+        .map(|s| s.runtime().env.http.policy().clone())
+        .unwrap_or_else(helios_endpoints::OutboundPolicy::from_env);
+    if let Some(s) = &service {
+        fill_stored_secret(&mut request, s).await;
+    }
+    let guard = helios_auth::OutboundGuard::Policy(Arc::new(policy));
+    let report = helios_auth::verify::verify_fhir_peer(
+        &request.peer(),
+        request.role,
+        request.fhir_version.as_deref(),
+        &request.resource_types,
+        &guard,
+    )
+    .await;
+    Json(report).into_response()
+}
+
 /// `GET /admin/sync/jobs/{id}`
 pub async fn get_job(State(api): State<SyncApi>, Path(id): Path<String>) -> Response {
     let s = svc!(api);

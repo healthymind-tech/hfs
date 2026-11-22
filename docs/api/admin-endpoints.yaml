@@ -399,6 +399,88 @@ paths:
         "422": {$ref: "#/components/responses/Unprocessable"}
         "501": {$ref: "#/components/responses/NotImplemented"}
 
+  /admin/endpoints/{name}/$verify-auth:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      tags: [endpoints]
+      operationId: verifyEndpointAuth
+      summary: Verify the endpoint's auth configuration step by step
+      description: |
+        Step-by-step verification ("configure, then verify") of the stored
+        `auth` section — or, when the endpoint inherits the server's
+        authentication, of the effective `HFS_AUTH_*` settings — or of an
+        unsaved section sent as the body. Steps, in order: `input`,
+        `outbound`, `connect`, `discovery`, `issuer`, `jwks-url`, `jwks`,
+        `algorithms`, `smart`, `audience`, `token` (with a token),
+        `audience-shared` (when another endpoint accepts the same tokens).
+        Nothing is refused up front: an outbound-policy refusal is a failed
+        `outbound` step. Each step carries a message `code` the console
+        translates (`verify-{code}` / `verify-{code}-fix`).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/VerifyAuthRequest"}
+      responses:
+        "200":
+          description: Verification report.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VerifyReport"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+
+  /admin/endpoints/$verify-auth:
+    post:
+      tags: [endpoints]
+      operationId: verifyNewEndpointAuth
+      summary: Verify an auth configuration before the endpoint exists (wizard)
+      description: Like `/admin/endpoints/{name}/$verify-auth`; an auth section is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/VerifyAuthRequest"}
+      responses:
+        "200":
+          description: Verification report.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VerifyReport"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+
+  /admin/endpoints/$verify-terminology:
+    post:
+      tags: [endpoints]
+      operationId: verifyTerminologyServer
+      summary: Verify a terminology server
+      description: |
+        Steps: `input`, `outbound`, `connect`, `metadata`, `token` (with a
+        token), `lookup` (LOINC 8867-4), `expand` (administrative-gender),
+        `latency` (slowest answer against the timeout).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: {type: string}
+                token: {type: string}
+                timeoutSecs: {type: integer, minimum: 1, maximum: 120, default: 10}
+      responses:
+        "200":
+          description: Verification report.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VerifyReport"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+
   /admin/endpoints/{name}/stats:
     parameters:
       - $ref: "#/components/parameters/Name"
@@ -868,6 +950,40 @@ components:
         detail: {type: string}
         keyCount: {type: integer}
         elapsedMs: {type: integer}
+
+    VerifyAuthRequest:
+      oneOf:
+        - $ref: "#/components/schemas/EndpointAuth"
+        - type: object
+          properties:
+            auth: {$ref: "#/components/schemas/EndpointAuth"}
+            token: {type: string, description: "A bearer JWT (with or without `Bearer `)."}
+
+    VerifyStep:
+      type: object
+      required: [id, status, code, params, elapsedMs, detail]
+      properties:
+        id: {type: string, description: Stable step id.}
+        status: {enum: [pass, warn, fail, skipped]}
+        field: {type: string, description: Console form field the step checks.}
+        code: {type: string, description: "Message code (Fluent `verify-{code}`, `verify-{code}-fix`)."}
+        params: {type: object, additionalProperties: {type: string}}
+        url: {type: string, description: URL contacted (credentials redacted).}
+        elapsedMs: {type: integer}
+        detail: {type: string, description: English sentence.}
+
+    VerifyReport:
+      type: object
+      required: [kind, ok, steps, suggestions, checkedAt]
+      properties:
+        kind: {enum: [endpoint-auth, terminology, sync-source, sync-target]}
+        ok: {type: boolean, description: No step failed.}
+        steps: {type: array, items: {$ref: "#/components/schemas/VerifyStep"}}
+        suggestions:
+          type: object
+          additionalProperties: {type: string}
+          description: Field → value the console may offer to fill in (`jwksUrl`, `issuer`).
+        checkedAt: {type: string, format: date-time}
 
     DuplicateRequest:
       type: object
