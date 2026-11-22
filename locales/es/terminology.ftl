@@ -77,6 +77,7 @@ hts-cs-browser-load-more = Cargar más
 hts-cs-browser-showing-count = Mostrando { $count ->
     [one] { $count } CodeSystem
    *[other] { $count } CodeSystems
+}
 hts-cs-browser-table-caption = CodeSystems que coinciden con los filtros activos.
 hts-cs-browser-column-url = URL
 hts-cs-browser-column-version = Versión
@@ -164,6 +165,7 @@ hts-vs-expand-count-hint = Hasta 500 conceptos por página; use Desplazamiento o
 hts-vs-browser-showing-count = Mostrando { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets
+}
 hts-vs-browser-table-caption = ValueSets que coinciden con los filtros activos.
 hts-vs-browser-column-url = URL
 hts-vs-browser-column-version = Versión
@@ -226,6 +228,7 @@ hts-vs-expand-raise-submit = Reintentar
 hts-vs-expand-tree-label = mostrando el árbol completo { $count ->
     [one] { $count } hoja
    *[other] { $count } hojas
+}
 hts-vs-expand-total-label = total { $total }
 hts-vs-expand-total-unknown = total (desconocido)
 hts-vs-expand-offset-label = offset { $offset }
@@ -254,6 +257,7 @@ hts-cm-browser-load-more = Cargar más
 hts-cm-browser-showing-count = Mostrando { $count ->
     [one] { $count } ConceptMap
    *[other] { $count } ConceptMaps
+}
 hts-cm-browser-table-caption = ConceptMaps que coinciden con los filtros activos.
 hts-cm-browser-column-url = URL
 hts-cm-browser-column-title = Título
@@ -305,6 +309,7 @@ hts-cm-translate-submit = Traducir
 hts-cm-translate-matches-count = { $count ->
     [one] { $count } coincidencia
    *[other] { $count } coincidencias
+}
 hts-cm-translate-no-matches = No hay coincidencias para este origen.
 hts-cm-translate-column-code = Código
 hts-cm-translate-column-system = Sistema
@@ -313,6 +318,7 @@ hts-cm-translate-column-mapping = { $kind ->
     [equivalence] Equivalencia
     [relationship] Relación
    *[other] Mapeo
+}
 hts-cm-translate-column-origin = Origen
 hts-vs-expand-advanced = Parametros avanzados
 hts-vs-expand-total = total { $n }
@@ -339,6 +345,7 @@ hts-import-resource-concept = Conceptos insertados
 hts-import-issues-heading = { $n ->
     [one] { $n } incidencia
    *[other] { $n } incidencias
+}
 hts-import-too-large-hint = La peticion supero el limite del servidor. Divide el Bundle en lotes mas pequenos y reintenta.
 hts-import-empty-bundle-error = Pega un Bundle JSON antes de enviar.
 hts-import-invalid-json-error = El cuerpo enviado no es JSON valido.
@@ -552,6 +559,7 @@ hts-del-pinned-note = Esta versión está fijada como actual; al eliminarla se q
 hts-del-deps = { $n ->
     [one] 1 recurso dependiente
    *[other] { $n } recursos dependientes
+}
 hts-del-deps-none = Ningún ValueSet, suplemento ni ConceptMap hace referencia a esta versión.
 hts-del-deps-warning = Estos recursos hacen referencia al sistema de códigos. Los que fijan esta versión dejan de funcionar; los demás pasan a la versión actual restante.
 hts-del-dep-type = Tipo
@@ -679,5 +687,6 @@ hts-term-sizes-pending = Conceptos contados. Midiendo el tamaño en disco: en un
 hts-term-stat-systems-counting = contando conceptos…
 hts-term-stat-concepts-counting = contando…
 hts-term-stat-concepts-shown = en todos los sistemas de códigos coincidentes
+
 tx-denied-current-role = You are signed in with the { $role } role.
 tx-searching = Searching…

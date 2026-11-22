@@ -13384,3 +13384,13 @@ select.ctl {
     color: var(--muted);
   }
 }
+@layer components {
+  .register-uris { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 6px 0 0; align-items: center; }
+  .register-uris dt { color: var(--muted); font-size: 13px; }
+  .register-uris dd { margin: 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; overflow-wrap: anywhere; }
+}
+@layer components {
+  .review-list { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 12px 0; font-size: 14px; }
+  .review-list dt { color: var(--muted); }
+  .review-list dd { margin: 0; display: flex; gap: 8px; align-items: center; justify-content: space-between; overflow-wrap: anywhere; }
+}

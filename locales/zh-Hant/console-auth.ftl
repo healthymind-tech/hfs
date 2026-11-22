@@ -158,3 +158,7 @@ auth-pw-rule-common = 不是常見密碼（儲存時檢查）
 auth-pw-submit = 儲存密碼並繼續
 auth-pw-later = 先登出，稍後再設定
 auth-account-identity = 目前登入身分
+console-settings-register-title = 請在身分提供者的用戶端中登錄以下網址：
+console-settings-redirect-uri = 重新導向 URI
+console-settings-post-logout-uri = 登出後重新導向 URI
+console-settings-pinned-explain = 由環境變數 { $var } 設定。請在部署設定（docker-compose／.env）中修改並重新啟動伺服器。

@@ -1349,7 +1349,6 @@ sql-param-default = predeterminado
 
 ## Página del navegador de CodeSystem.
 
-}
 
 ## Fase 5 — Cadenas compartidas del formulario de búsqueda HTS.
 
@@ -1380,14 +1379,12 @@ sql-param-default = predeterminado
 
 ## Página del navegador VS.
 
-}
 
 ## Página de detalle VS.
 
 
 ## Formulario y resultados de $expand.
 
-}
 
 ## HTS Slice D — Explorador y detalle de ConceptMap con banco de trabajo
 ## de $translate embebido (doc. de diseño §7.5). Cada clave tiene su par
@@ -1398,15 +1395,12 @@ sql-param-default = predeterminado
 
 ## Explorador de CM.
 
-}
 
 ## Detalle de CM.
 
 
 ## Formulario y resultados de $translate.
 
-}
-}
 
 ## HTS Slice E -- operaciones (design doc s7.6).
 
@@ -1423,7 +1417,6 @@ sql-param-default = predeterminado
 ## Slice F — Importacion (§7.7). Traducciones iniciales; revisar en la
 ## pasada de i18n (# TODO(F): review es).
 
-}
 
 
 ## Slice G — Diagnostico (§7.9). Traducciones iniciales; revisar en la
@@ -1720,7 +1713,6 @@ packages-removed = Eliminado: %deleted% recursos borrados, %kept% conservados.
 
 
 ## Terminology management (HTS_ADMIN_UI): inventory, delete, jobs, archive import
-}
 
 ## Administrator sign-in (HFS_ADMIN_PASSWORD / HTS_ADMIN_PASSWORD), shared by
 ## both consoles: /ui/admin/login and /ui/hts/login.

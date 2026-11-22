@@ -1353,7 +1353,6 @@ sql-param-default = Standardwert
 
 ## CodeSystem-Browserseite.
 
-}
 
 ## Phase 5 — HTS-Suchformular: gemeinsame Zeichenketten (CS / VS / CM).
 
@@ -1384,14 +1383,12 @@ sql-param-default = Standardwert
 
 ## VS-Browser-Seite.
 
-}
 
 ## VS-Detailseite.
 
 
 ## $expand — Formular und Ergebnisse.
 
-}
 
 ## HTS Slice D — ConceptMap-Browser und Detail mit eingebettetem
 ## $translate-Workbench (Designdokument §7.5). Jeder Schlüssel hat ein
@@ -1402,15 +1399,12 @@ sql-param-default = Standardwert
 
 ## CM-Browser-Seite.
 
-}
 
 ## CM-Detailseite.
 
 
 ## $translate-Formular und -Ergebnisse.
 
-}
-}
 
 ## HTS Slice E -- Standalone-Operations-Workbench (design doc s7.6).
 
@@ -1427,7 +1421,6 @@ sql-param-default = Standardwert
 ## Slice F — Import (§7.7). Erste Uebersetzung; im i18n-Review pruefen
 ## (# TODO(F): review de).
 
-}
 
 
 ## Slice G — Diagnose (§7.9). Erste Uebersetzung; im i18n-Review pruefen
@@ -1724,7 +1717,6 @@ packages-removed = Entfernt: %deleted% Ressourcen gelöscht, %kept% behalten.
 
 
 ## Terminology management (HTS_ADMIN_UI): inventory, delete, jobs, archive import
-}
 
 ## Administrator sign-in (HFS_ADMIN_PASSWORD / HTS_ADMIN_PASSWORD), shared by
 ## both consoles: /ui/admin/login and /ui/hts/login.

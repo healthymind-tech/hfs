@@ -379,6 +379,10 @@
       nextNav = null;
     }
     if (info.title) document.title = info.title;
+    // Menus opened to navigate (endpoint switcher, account) close, as they
+    // would on a fresh page.
+    var menus = document.querySelectorAll("#sidebar details.menu[open], .topbar details[open]");
+    for (var k = 0; k < menus.length; k++) menus[k].open = false;
     // Page-level body classes (`app-shell` on full-height workspaces).
     var keep = document.body.classList.contains("nav-open") ? " nav-open" : "";
     document.body.setAttribute("class", (info.bodyClass + keep).trim());

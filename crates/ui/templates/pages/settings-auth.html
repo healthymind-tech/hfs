@@ -34,6 +34,7 @@
 
   <fieldset class="mfield mfield--group form-grid__full">
     <legend class="mfield__label">{{ i18n.t("console-settings-mode") }}{% if self.pinned("mode") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ i18n.t("console-settings-pinned") }} HFS_CONSOLE_AUTH_MODE</span></span>{% endif %}</legend>
+    {% if self.pinned("mode") %}<p class="mfield__hint">{{ i18n.t_arg("console-settings-pinned-explain", "var", "HFS_CONSOLE_AUTH_MODE") }}</p>{% endif %}
     {% for (value, key) in modes %}
     <label class="mcheck mcheck--card">
       <input class="mcheck__input" type="radio" name="mode" value="{{ value }}"{% if form.mode == *value %} checked{% endif %}{% if self.pinned("mode") %} disabled{% endif %}>
@@ -57,6 +58,16 @@
   </label>
 
   <h2 class="form-section__title form-subhead form-grid__full">{{ i18n.t("console-settings-oidc") }}</h2>
+  {#- UX-12: what to register at the identity provider, ready to copy. -#}
+  <div class="verify-effective form-grid__full" id="oidc-register">
+    <p class="mfield__label">{{ i18n.t("console-settings-register-title") }}</p>
+    <dl class="register-uris">
+      <dt>{{ i18n.t("console-settings-redirect-uri") }}</dt>
+      <dd><code data-absolute="/ui/callback">/ui/callback</code> <button type="button" class="btn btn--small btn--ghost" data-copy="/ui/callback" data-absolute-copy="/ui/callback">{% call ui::icon("copy") %}{% endcall %}{{ i18n.t("mgr-copy") }}</button></dd>
+      <dt>{{ i18n.t("console-settings-post-logout-uri") }}</dt>
+      <dd><code data-absolute="/ui/login">/ui/login</code> <button type="button" class="btn btn--small btn--ghost" data-copy="/ui/login" data-absolute-copy="/ui/login">{% call ui::icon("copy") %}{% endcall %}{{ i18n.t("mgr-copy") }}</button></dd>
+    </dl>
+  </div>
   {% for (name, label, var, value) in oidc_fields %}
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ var }}</span></span>{% endif %}</span>

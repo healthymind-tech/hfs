@@ -77,6 +77,7 @@ hts-cs-browser-load-more = 載入更多
 hts-cs-browser-showing-count = 顯示 { $count ->
     [one] { $count }個CodeSystem
    *[other] { $count }個CodeSystem
+}
 hts-cs-browser-table-caption = 符合目前篩選條件的 CodeSystem。
 hts-cs-browser-column-url = URL
 hts-cs-browser-column-version = 版本
@@ -164,6 +165,7 @@ hts-browser-of-total = ，共 { $total } 筆
 hts-vs-browser-showing-count = 顯示 { $count ->
     [one] { $count }個ValueSet
    *[other] { $count }個ValueSet
+}
 hts-vs-browser-table-caption = 符合目前篩選條件的 ValueSet。
 hts-vs-browser-column-url = URL
 hts-vs-browser-column-version = 版本
@@ -226,6 +228,7 @@ hts-vs-expand-raise-submit = 重試
 hts-vs-expand-tree-label = 顯示完整樹狀結構，{ $count ->
     [one] { $count }個葉節點
    *[other] { $count }個葉節點
+}
 hts-vs-expand-total-label = 總數 { $total }
 hts-vs-expand-total-unknown = 總數（未知）
 hts-vs-expand-offset-label = offset { $offset }
@@ -254,6 +257,7 @@ hts-cm-browser-load-more = 載入更多
 hts-cm-browser-showing-count = 顯示 { $count ->
     [one] { $count }個ConceptMap
    *[other] { $count }個ConceptMap
+}
 hts-cm-browser-table-caption = 符合目前篩選條件的 ConceptMap。
 hts-cm-browser-column-url = URL
 hts-cm-browser-column-title = 標題
@@ -305,6 +309,7 @@ hts-cm-translate-submit = 轉譯
 hts-cm-translate-matches-count = { $count ->
     [one] { $count }筆符合結果
    *[other] { $count }筆符合結果
+}
 hts-cm-translate-no-matches = 此來源沒有符合的結果。
 hts-cm-translate-column-code = 代碼
 hts-cm-translate-column-system = 代碼系統
@@ -313,6 +318,7 @@ hts-cm-translate-column-mapping = { $kind ->
     [equivalence]等價關係
     [relationship]關係
    *[other]對應
+}
 hts-cm-translate-column-origin = 出處
 hts-vs-expand-advanced = 進階參數
 hts-vs-expand-total = 總數 { $n }
@@ -339,6 +345,7 @@ hts-import-resource-concept = 已插入的概念
 hts-import-issues-heading = { $n ->
     [one] { $n }個問題
    *[other] { $n }個問題
+}
 hts-import-too-large-hint = 請求超過伺服器的負載大小上限。請將 Bundle 拆成較小的批次後重試。
 hts-import-empty-bundle-error = 送出前請先貼上 JSON Bundle。
 hts-import-invalid-json-error = 送出的內容不是有效的 JSON。
@@ -552,6 +559,7 @@ hts-del-after-version = 未指定版本的查詢將改用版本 { $version }。
 hts-del-pinned-note = 此版本目前被指定為目前版本，刪除後指定即解除。
 hts-del-deps = { $n ->
    *[other] { $n } 個相依資源
+}
 hts-del-deps-none = 沒有 ValueSet、補充或 ConceptMap 參照此版本。
 hts-del-deps-warning = 下列資源參照此代碼系統。指定此版本者將失效；未指定版本者會改用剩下的目前版本。
 hts-del-dep-type = 類型
@@ -679,5 +687,6 @@ hts-term-sizes-pending = 概念已計數完成。正在量測儲存大小——�
 hts-term-stat-systems-counting = 正在計算概念數…
 hts-term-stat-concepts-counting = 計算中…
 hts-term-stat-concepts-shown = 所有符合的代碼系統合計
+
 tx-denied-current-role = 您目前的角色是 { $role }。
 tx-searching = 搜尋中…

@@ -77,6 +77,7 @@ hts-cs-browser-load-more = Mehr laden
 hts-cs-browser-showing-count = Es werden { $count ->
     [one] { $count } CodeSystem angezeigt
    *[other] { $count } CodeSysteme angezeigt
+}
 hts-cs-browser-table-caption = CodeSysteme, die zu den aktiven Filtern passen.
 hts-cs-browser-column-url = URL
 hts-cs-browser-column-version = Version
@@ -164,6 +165,7 @@ hts-vs-expand-count-hint = Höchstens 500 Konzepte pro Seite; für den Rest Offs
 hts-vs-browser-showing-count = Zeige { $count ->
     [one] { $count } ValueSet
    *[other] { $count } ValueSets
+}
 hts-vs-browser-table-caption = ValueSets, die den aktiven Filtern entsprechen.
 hts-vs-browser-column-url = URL
 hts-vs-browser-column-version = Version
@@ -226,6 +228,7 @@ hts-vs-expand-raise-submit = Erneut versuchen
 hts-vs-expand-tree-label = zeige den ganzen Baum { $count ->
     [one] { $count } Blatt
    *[other] { $count } Blätter
+}
 hts-vs-expand-total-label = insgesamt { $total }
 hts-vs-expand-total-unknown = insgesamt (unbekannt)
 hts-vs-expand-offset-label = offset { $offset }
@@ -254,6 +257,7 @@ hts-cm-browser-load-more = Mehr laden
 hts-cm-browser-showing-count = { $count ->
     [one] { $count } ConceptMap wird angezeigt
    *[other] { $count } ConceptMaps werden angezeigt
+}
 hts-cm-browser-table-caption = ConceptMaps, die den aktiven Filtern entsprechen.
 hts-cm-browser-column-url = URL
 hts-cm-browser-column-title = Titel
@@ -305,6 +309,7 @@ hts-cm-translate-submit = Übersetzen
 hts-cm-translate-matches-count = { $count ->
     [one] { $count } Treffer
    *[other] { $count } Treffer
+}
 hts-cm-translate-no-matches = Keine Treffer für diese Quelle.
 hts-cm-translate-column-code = Code
 hts-cm-translate-column-system = System
@@ -313,6 +318,7 @@ hts-cm-translate-column-mapping = { $kind ->
     [equivalence] Äquivalenz
     [relationship] Beziehung
    *[other] Mapping
+}
 hts-cm-translate-column-origin = Ursprung
 hts-vs-expand-advanced = Erweiterte Parameter
 hts-vs-expand-total = Gesamt { $n }
@@ -339,6 +345,7 @@ hts-import-resource-concept = Eingefuegte Konzepte
 hts-import-issues-heading = { $n ->
     [one] { $n } Hinweis
    *[other] { $n } Hinweise
+}
 hts-import-too-large-hint = Die Anfrage hat das Serverlimit ueberschritten. Teile das Bundle in kleinere Batches auf und versuche es erneut.
 hts-import-empty-bundle-error = Bitte ein JSON-Bundle einfuegen, bevor du absendest.
 hts-import-invalid-json-error = Der uebermittelte Inhalt ist kein gueltiges JSON.
@@ -552,6 +559,7 @@ hts-del-pinned-note = Diese Version ist als aktuell festgelegt; das Löschen heb
 hts-del-deps = { $n ->
     [one] 1 abhängige Ressource
    *[other] { $n } abhängige Ressourcen
+}
 hts-del-deps-none = Kein ValueSet, Supplement oder ConceptMap verweist auf diese Version.
 hts-del-deps-warning = Diese Ressourcen verweisen auf das Codesystem. Die auf diese Version festgelegten funktionieren nicht mehr; die übrigen weichen auf die verbleibende aktuelle Version aus.
 hts-del-dep-type = Typ
@@ -679,5 +687,6 @@ hts-term-sizes-pending = Konzepte sind gezählt. Speichergrößen werden gemesse
 hts-term-stat-systems-counting = Konzepte werden gezählt …
 hts-term-stat-concepts-counting = wird gezählt …
 hts-term-stat-concepts-shown = über alle passenden Codesysteme
+
 tx-denied-current-role = You are signed in with the { $role } role.
 tx-searching = Searching…

@@ -495,3 +495,5 @@ verify-block-details = 顯示全部檢查
 verify-block-save-anyway = 仍要儲存
 verify-block-create-anyway = 仍要建立
 verify-block-anyway-hint = 與其他變更一樣，會記錄在設定歷程中。
+mgr-copy = 複製
+mgr-review-edit = 修改

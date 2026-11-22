@@ -1928,6 +1928,7 @@ struct NewPreview {
     errors: FieldErrors,
     warnings: Vec<&'static str>,
     duplicate: bool,
+    summary: Vec<ReviewRow>,
 }
 
 impl NewPreview {
@@ -1943,16 +1944,33 @@ pub(crate) async fn preview_new(
     body: Bytes,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let form = Form::parse(&body);
+    let mut form = Form::parse(&body);
+    // As Create does (UX-03): an empty JWKS URL is the one discovery names.
+    if form.get("auth_choice") == "custom"
+        && !form.get("auth_issuer").is_empty()
+        && form.get("auth_jwks_url").is_empty()
+    {
+        let mut errs = FieldErrors::new();
+        let auth = forms::parse_auth(&form, None, &mut errs);
+        if let Ok(report) = runtime(&state).backend.verify_auth(None, &auth, None).await
+            && let Some(jwks) = report.suggestions.get("jwksUrl")
+        {
+            form.set("auth_jwks_url", jwks);
+        }
+    }
     let others = runtime(&state).backend.list().await.unwrap_or_default();
     let other_specs: Vec<&EndpointSpec> = others.iter().map(|o| &o.spec).collect();
+    let mut summary = Vec::new();
     let (json, errors, warnings, duplicate) = match forms::parse_new(&form) {
-        Ok(NewEndpoint::Create(spec, _)) => (
-            serde_json::to_string_pretty(&redacted_spec(&spec)).unwrap_or_default(),
-            FieldErrors::new(),
-            forms::warnings(&spec, &other_specs),
-            false,
-        ),
+        Ok(NewEndpoint::Create(spec, _)) => {
+            summary = review_rows(&i18n, &spec);
+            (
+                serde_json::to_string_pretty(&redacted_spec(&spec)).unwrap_or_default(),
+                FieldErrors::new(),
+                forms::warnings(&spec, &other_specs),
+                false,
+            )
+        }
         Ok(NewEndpoint::Duplicate { source, request }) => (
             serde_json::to_string_pretty(&serde_json::json!({
                 "duplicateOf": source,
@@ -1971,7 +1989,66 @@ pub(crate) async fn preview_new(
         errors,
         warnings,
         duplicate,
+        summary,
     })
+}
+
+/// One line of the wizard's readable review (UX-22): step, label, value.
+pub(crate) struct ReviewRow {
+    pub step: usize,
+    pub label: String,
+    pub value: String,
+}
+
+fn review_rows(i18n: &I18n, spec: &EndpointSpec) -> Vec<ReviewRow> {
+    let row = |step: usize, key: &str, value: String| ReviewRow {
+        step,
+        label: i18n.t(key),
+        value,
+    };
+    let inherited = i18n.t("mgr-inherit-label");
+    let mut rows = vec![
+        row(0, "mgr-field-display-name", spec.display_name.clone()),
+        row(0, "mgr-field-name", spec.name.clone()),
+        row(
+            0,
+            "mgr-field-path",
+            if spec.path.is_root() {
+                "/".into()
+            } else {
+                format!("/{}", spec.path.as_str())
+            },
+        ),
+        row(1, "mgr-field-fhir-version", release_label(spec.fhir_version).to_string()),
+    ];
+    match &spec.auth {
+        None => rows.push(row(2, "mgr-field-auth-mode", inherited.clone())),
+        Some(a) => {
+            rows.push(row(2, "mgr-field-auth-mode", i18n.t(view::auth_mode_key(a.mode))));
+            if a.mode != AuthMode::Off {
+                rows.push(row(2, "mgr-field-issuer", a.issuer.clone().unwrap_or_default()));
+                rows.push(row(2, "mgr-field-audience", a.audience.clone().unwrap_or_else(|| "—".into())));
+                rows.push(row(2, "mgr-field-jwks", a.jwks_url.clone().unwrap_or_default()));
+            }
+        }
+    }
+    rows.push(row(
+        3,
+        "mgr-field-validation-mode",
+        match &spec.validation {
+            None => inherited.clone(),
+            Some(v) => format!("{:?}", v.mode).to_lowercase(),
+        },
+    ));
+    rows.push(row(
+        3,
+        "mgr-term-server",
+        match &spec.terminology {
+            None => inherited,
+            Some(t) => t.server_url.clone().unwrap_or_default(),
+        },
+    ));
+    rows
 }
 
 #[derive(Template)]

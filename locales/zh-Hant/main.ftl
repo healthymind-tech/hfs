@@ -1352,7 +1352,6 @@ sql-param-default = 預設值
 
 ## CS browser page.
 
-}
 
 ## Phase 5 — HTS search-form shared strings (used by CS / VS / CM browsers).
 
@@ -1383,14 +1382,12 @@ sql-param-default = 預設值
 
 ## VS browser page.
 
-}
 
 ## VS detail page.
 
 
 ## VS $expand form + result labels.
 
-}
 
 ## HTS Slice D — ConceptMap browser + detail with embedded $translate
 ## workbench (design doc §7.5). Every key here has a peer in
@@ -1401,15 +1398,12 @@ sql-param-default = 預設值
 
 ## CM browser page.
 
-}
 
 ## CM detail page.
 
 
 ## CM $translate form + result labels.
 
-}
-}
 
 ## HTS Slice E -- standalone Operations workbench (design doc s7.6).
 ## Every user-visible string on `/ui/hts/operations` resolves to a key
@@ -1442,7 +1436,6 @@ sql-param-default = 預設值
 ## live under `hts-import-*`; `hts-nav-import` above is the sidebar
 ## label reused from the Phase 1 stub set.
 
-}
 
 
 ## Slice G — standalone Diagnostics page (design doc §7.9).
@@ -1742,7 +1735,6 @@ packages-removed = 已移除：刪除 %deleted% 筆資源，保留 %kept% 筆。
 
 
 ## Terminology management (HTS_ADMIN_UI): inventory, delete, jobs, archive import
-}
 
 ## Administrator sign-in (HFS_ADMIN_PASSWORD / HTS_ADMIN_PASSWORD), shared by
 ## both consoles: /ui/admin/login and /ui/hts/login.

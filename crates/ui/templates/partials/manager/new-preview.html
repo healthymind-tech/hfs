@@ -9,5 +9,15 @@
 <div class="notice {% if w.starts_with("mgr-warn") %}notice--warn{% else %}notice--info{% endif %}"><span>{{ i18n.t(w) }}</span></div>
 {% endfor %}
 {% if duplicate %}<p class="muted">{{ i18n.t("mgr-new-preview-duplicate") }}</p>{% endif %}
-<pre class="json-preview" tabindex="0" aria-label="{{ i18n.t("mgr-new-preview-json") }}">{{ json }}</pre>
+{%- if !summary.is_empty() %}
+<dl class="review-list">
+  {%- for r in summary %}
+  <dt>{{ r.label }}</dt><dd><span>{{ r.value }}</span> <button type="button" class="btn btn--small btn--ghost" data-wizard-go="{{ r.step }}">{{ i18n.t("mgr-review-edit") }}</button></dd>
+  {%- endfor %}
+</dl>
+{%- endif %}
+<details class="disclosure">
+  <summary>{{ i18n.t("mgr-new-preview-json") }}</summary>
+  <pre class="json-preview" tabindex="0" aria-label="{{ i18n.t("mgr-new-preview-json") }}">{{ json }}</pre>
+</details>
 {% endif %}

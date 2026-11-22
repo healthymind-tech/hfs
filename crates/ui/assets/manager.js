@@ -163,7 +163,8 @@
         heading.focus({ preventScroll: false });
       }
     }
-    nav.addEventListener("click", function (e) {
+    // The stepper, and the review's "Edit" links (UX-22), go to a step.
+    form.addEventListener("click", function (e) {
       var b = e.target.closest("[data-wizard-go]");
       if (b) show(parseInt(b.getAttribute("data-wizard-go"), 10), true);
     });
@@ -308,7 +309,18 @@
     return true;
   }
 
+  // Absolute URLs on this origin (what to register at an IdP, UX-12).
+  function absolutize() {
+    each("[data-absolute]", document, function (el) {
+      el.textContent = location.origin + el.getAttribute("data-absolute");
+    });
+    each("[data-absolute-copy]", document, function (el) {
+      el.setAttribute("data-copy", location.origin + el.getAttribute("data-absolute-copy"));
+    });
+  }
+
   function init() {
+    absolutize();
     syncShowWhen(document);
     each("[data-inherit-target]", document, syncInherit);
     each("form[data-typed-confirm]", document, function (f) {

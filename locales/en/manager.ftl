@@ -523,3 +523,5 @@ verify-block-details = Show all checks
 verify-block-save-anyway = Save anyway
 verify-block-create-anyway = Create anyway
 verify-block-anyway-hint = Recorded in the configuration history like every change.
+mgr-copy = Copy
+mgr-review-edit = Edit
