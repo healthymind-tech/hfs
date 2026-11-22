@@ -104,7 +104,7 @@ async fn main() {
     ];
     let mk = |id: &str, auth: ClientAuth, grants: Vec<GrantType>, scopes: &str| ClientSpec {
         client_id: id.into(),
-        name: format!("{id}"),
+        name: id.to_string(),
         auth,
         grant_types: grants,
         redirect_uris: redirects.clone(),
@@ -256,6 +256,7 @@ async fn main() {
         .route("/fhir/clinic/metadata", get(metadata))
         .route("/fhir/clinic/{rtype}/{id}", get(read))
         .route("/fhir/clinic/{rtype}", get(search))
+        .layer(axum::middleware::map_response(cors))
         .with_state(app)
         .merge(server.router());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -266,6 +267,16 @@ async fn main() {
     )
     .await
     .unwrap();
+}
+
+/// CORS on the stub FHIR endpoint (SMART: smart-configuration and the
+/// CapabilityStatement must be readable by browser apps).
+async fn cors(mut r: Response) -> Response {
+    r.headers_mut().insert(
+        "access-control-allow-origin",
+        axum::http::HeaderValue::from_static("*"),
+    );
+    r
 }
 
 #[derive(serde::Deserialize)]

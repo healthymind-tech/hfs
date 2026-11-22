@@ -354,7 +354,7 @@ async fn redirect_error(
         "state echo"
     );
     assert_eq!(q.get("iss").map(String::as_str), Some(ISS), "RFC 9207 iss");
-    assert!(q.get("code").is_none());
+    assert!(!q.contains_key("code"));
     (q.get("error").cloned().unwrap_or_default(), q)
 }
 
@@ -1820,4 +1820,56 @@ async fn disabled_client_and_realm() {
             .status,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_openid_connect_sign_in_needs_no_fhir_audience() {
+    let h = Harness::new().await;
+    let mut p = h.authz_params("app", "openid profile email");
+    p.retain(|(k, _)| k != "aud");
+    let ix = h.start(&p).await;
+    let code = h
+        .complete(
+            &ix,
+            h.decision("alice", &["openid", "profile", "email"], None),
+        )
+        .await
+        .param("code")
+        .unwrap()
+        .to_string();
+    let t = h
+        .token(
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", VERIFIER),
+                ("client_id", "app"),
+            ],
+            None,
+        )
+        .await
+        .json();
+    let jwks = h.get("/idp/clinic/jwks").await.json();
+    // Not usable at a FHIR endpoint: aud is the issuer only.
+    let c = verify_jwt(&jwks, t["access_token"].as_str().unwrap(), ISS);
+    assert_eq!(c["aud"], json!([ISS]));
+    let ic = verify_jwt(&jwks, t["id_token"].as_str().unwrap(), "app");
+    assert_eq!(ic["email"], "alice@example.org");
+    let r = h
+        .send(
+            axum::http::Request::get("/idp/clinic/userinfo")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", t["access_token"].as_str().unwrap()),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.json()["email"], "alice@example.org");
+    // FHIR scopes still need aud.
+    let mut p = h.authz_params("app", "openid patient/*.rs");
+    p.retain(|(k, _)| k != "aud");
+    assert_eq!(redirect_error(&h, &p).await.0, "invalid_request");
 }

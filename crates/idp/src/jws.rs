@@ -219,7 +219,7 @@ mod tests {
         let jwk = k.public_jwk().clone();
         // Not allowed alg.
         assert!(matches!(
-            verify(&t, &[jwk.clone()], &[SigningAlg::RS384]),
+            verify(&t, std::slice::from_ref(&jwk), &[SigningAlg::RS384]),
             Err(JwsError::Algorithm(_))
         ));
         // Wrong key under the same kid.
@@ -239,7 +239,7 @@ mod tests {
         let p2 = b64(br#"{"iss":"b","sub":"a"}"#);
         let tampered = format!("{}.{}.{}", parts[0], p2, parts[2]);
         assert_eq!(
-            verify(&tampered, &[jwk.clone()], &SigningAlg::ALL),
+            verify(&tampered, std::slice::from_ref(&jwk), &SigningAlg::ALL),
             Err(JwsError::Signature)
         );
         // alg none / HS256 headers.
@@ -249,7 +249,7 @@ mod tests {
                 .as_bytes());
             let forged = format!("{h}.{}.{}", parts[1], parts[2]);
             assert!(matches!(
-                verify(&forged, &[jwk.clone()], &SigningAlg::ALL),
+                verify(&forged, std::slice::from_ref(&jwk), &SigningAlg::ALL),
                 Err(JwsError::Algorithm(_))
             ));
         }
@@ -259,7 +259,7 @@ mod tests {
             .as_bytes());
         let confused = format!("{h}.{}.{}", parts[1], parts[2]);
         assert_eq!(
-            verify(&confused, &[jwk.clone()], &SigningAlg::ALL),
+            verify(&confused, std::slice::from_ref(&jwk), &SigningAlg::ALL),
             Err(JwsError::KeyMismatch)
         );
         // Missing kid.
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(
             verify(
                 &format!("{h}.{}.{}", parts[1], parts[2]),
-                &[jwk.clone()],
+                std::slice::from_ref(&jwk),
                 &SigningAlg::ALL
             ),
             Err(JwsError::MissingKid)
@@ -279,13 +279,13 @@ mod tests {
         assert_eq!(
             verify(
                 &format!("{h}.{}.{}", parts[1], parts[2]),
-                &[jwk.clone()],
+                std::slice::from_ref(&jwk),
                 &SigningAlg::ALL
             ),
             Err(JwsError::Critical)
         );
         // Junk.
-        assert!(verify("a.b", &[jwk.clone()], &SigningAlg::ALL).is_err());
+        assert!(verify("a.b", std::slice::from_ref(&jwk), &SigningAlg::ALL).is_err());
         assert!(verify(&"a".repeat(20000), &[jwk], &SigningAlg::ALL).is_err());
     }
 

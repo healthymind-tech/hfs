@@ -609,7 +609,8 @@ impl IdpAdmin {
                 "must differ from the username",
             ));
         }
-        if pw.chars().all(|c| Some(c) == pw.chars().next()) {
+        let first = pw.chars().next().unwrap_or_default();
+        if pw.chars().all(|c| c == first) {
             return Err(IdpError::invalid(
                 "password",
                 "must not repeat one character",

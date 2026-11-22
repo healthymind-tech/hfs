@@ -42,12 +42,15 @@ impl Params {
         let mut p = Params::default();
         for (k, v) in url::form_urlencoded::parse(raw) {
             let k = k.into_owned();
-            if p.map.contains_key(&k) {
-                if !p.dups.contains(&k) {
-                    p.dups.push(k);
+            match p.map.entry(k) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if !p.dups.contains(e.key()) {
+                        p.dups.push(e.key().clone());
+                    }
                 }
-            } else {
-                p.map.insert(k, v.into_owned());
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v.into_owned());
+                }
             }
         }
         p
