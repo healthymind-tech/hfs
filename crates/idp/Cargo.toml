@@ -1,0 +1,41 @@
+[package]
+name = "helios-idp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/idp"
+description = "Built-in OAuth 2.0 / OpenID Connect / SMART on FHIR authorization server (realms, clients, signing keys, tokens)"
+keywords = ["helios-software", "fhir", "smart-on-fhir", "oauth2", "openid-connect"]
+
+# Package 0 of docs/design/authorization-server.md: the protocol-independent
+# core (realm and client models, scope algebra, PKCE, signing keys and JWS,
+# token claim sets, discovery documents, opaque-token and refresh-rotation
+# rules, the store contract and the fork migration SQL). No axum, no
+# persistence, no HTTP: the protocol endpoints (package I1+) depend on this
+# crate; this crate depends only on helios-endpoints (names, sealed secrets).
+[dependencies]
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror = "2"
+async-trait = "0.1"
+url = "2.5"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+# Signing (JWS RS256/RS384/PS256/PS384/ES256/ES384) and EC key generation.
+# Already in the production binary through jsonwebtoken; constant time.
+ring = "0.17"
+# RSA key *generation* only (ring cannot generate RSA keys). Signing stays on
+# ring. aws-lc-rs is already in the lock (rustls); it is constant time and
+# avoids the RustCrypto `rsa` crate (RUSTSEC-2023-0071, no fix).
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
+
+[dev-dependencies]
+# Cross-check: tokens signed here verify with the resource server's library.
+jsonwebtoken = "9"
+tokio = { version = "1", features = ["macros", "rt"] }

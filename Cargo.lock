@@ -3655,6 +3655,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-idp"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "chrono",
+ "helios-endpoints",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "helios-observability"
 version = "0.2.9"
 dependencies = [

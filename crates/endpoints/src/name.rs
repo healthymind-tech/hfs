@@ -58,6 +58,9 @@ pub const RESERVED_SEGMENTS: &[&str] = &[
     "callback",
     "oauth",
     "oidc",
+    // Built-in authorization server realms (`/idp/{realm}`,
+    // docs/design/authorization-server.md D-2).
+    "idp",
     "well-known",
     "system",
     "internal",
