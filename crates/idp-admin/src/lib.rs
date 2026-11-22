@@ -5,6 +5,7 @@
 //! * [`diagnostic`] — configuration preflight + the ten live steps against
 //!   a realm's public URLs, reported in the console's Verify-panel shape.
 
+pub mod api;
 pub mod binding;
 pub mod diagnostic;
 pub mod service;
