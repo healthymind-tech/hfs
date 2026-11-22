@@ -12690,6 +12690,23 @@ body.auth-page {
   }
 }
 
+/* Overview health strip on tablets: five tiles in one row instead of 4 + 1
+   orphan (icons dropped to make room). */
+@media (min-width: 600px) and (max-width: 1100px) {
+  .health-strip {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .health-tile {
+    padding: 10px 12px;
+  }
+
+  .health-tile__icon {
+    display: none;
+  }
+}
+
 /* Progressive disclosure (manager.js `data-show-when`). */
 [data-show-when][hidden] {
   display: none !important;
