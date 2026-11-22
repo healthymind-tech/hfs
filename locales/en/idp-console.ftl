@@ -649,6 +649,9 @@ idpdiag-logout-prompt-none-unexpected = After sign-out, prompt=none answered une
 idpdiag-logout-prompt-none-unexpected-fix = Server defect; report it.
 idpdiag-token-already-expired = The token is already expired when received.
 idpdiag-token-already-expired-fix = Check token lifetimes and the server clock.
+idpdiag-rate-limited = The authorization server rate-limited the test (HTTP 429) even after waiting; the remaining checks could not run.
+idpdiag-rate-limited-fix = Wait a minute and run the test again. Each run makes about ten sign-in requests from the server's own address; raise HFS_IDP_RATE_INTERACTIVE_IP if tests run often.
+idpdiag-rate-waited = The authorization server's rate limits paused the test for { $secs } s (expected when tests run back to back).
 idpdiag-skipped-dependency = Skipped: it depends on step “{ $step }”, which failed.
 idpdiag-fixture-failed = Could not create the temporary test app or user: { $detail }
 idpdiag-fixture-failed-fix = Enable at least one launch mode and client type in the capabilities so a test app can be registered.

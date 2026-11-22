@@ -637,6 +637,9 @@ idpdiag-logout-prompt-none-unexpected = 登出後，prompt=none 的回應不如�
 idpdiag-logout-prompt-none-unexpected-fix = 這是伺服器缺陷，請回報。
 idpdiag-token-already-expired = 收到 token 時它已經過期。
 idpdiag-token-already-expired-fix = 檢查 token 有效期限與伺服器時鐘。
+idpdiag-rate-limited = 驗證伺服器即使等待後仍對測試限流（HTTP 429），其餘檢查無法執行。
+idpdiag-rate-limited-fix = 請等一分鐘再測試。每次測試會從伺服器自己的位址發出約十次登入請求；若經常測試，可調高 HFS_IDP_RATE_INTERACTIVE_IP。
+idpdiag-rate-waited = 驗證伺服器的速率限制讓測試暫停了 { $secs } 秒（連續測試時屬正常）。
 idpdiag-skipped-dependency = 已略過：它依賴的步驟「{ $step }」失敗。
 idpdiag-fixture-failed = 無法建立暫時測試用的應用程式或使用者：{ $detail }
 idpdiag-fixture-failed-fix = 在功能設定至少開啟一種啟動方式與用戶端類型，才能註冊測試應用程式。

@@ -89,6 +89,12 @@ pub struct Browser {
     /// (in-network address of the same server); URLs in the report and every
     /// issuer comparison stay public.
     rewrite: Option<(Url, Url)>,
+    /// Longest total wait for one request answered 429.
+    pub max_rate_wait: Duration,
+    /// Total time spent waiting out 429s (reported).
+    pub rate_waited: Duration,
+    /// A request stayed rate limited after the wait.
+    pub rate_limited: bool,
 }
 
 impl Browser {
@@ -103,6 +109,9 @@ impl Browser {
             client,
             jar: BTreeMap::new(),
             rewrite: None,
+            max_rate_wait: Duration::from_secs(65),
+            rate_waited: Duration::ZERO,
+            rate_limited: false,
         }
     }
 
@@ -174,7 +183,35 @@ impl Browser {
         self.jar.clear();
     }
 
+    /// Sends, waiting out `429 Too Many Requests` (the realm's rate limits
+    /// count the diagnostic's own sign-ins): honours `Retry-After` up to
+    /// [`Browser::max_rate_wait`] in total, then returns the 429.
     async fn send(
+        &mut self,
+        method: reqwest::Method,
+        url: &str,
+        headers: Vec<(&str, String)>,
+        body: Option<Body>,
+    ) -> Result<Exchange, FetchError> {
+        let mut waited = Duration::ZERO;
+        loop {
+            let x = self.send_once(method.clone(), url, headers.clone(), body.clone()).await?;
+            if x.status != 429 {
+                return Ok(x);
+            }
+            let secs = x.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5).clamp(1, 30);
+            let wait = Duration::from_secs(secs);
+            if waited + wait > self.max_rate_wait {
+                self.rate_limited = true;
+                return Ok(x);
+            }
+            waited += wait;
+            self.rate_waited += wait;
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn send_once(
         &mut self,
         method: reqwest::Method,
         url: &str,
@@ -254,6 +291,7 @@ impl Browser {
     }
 }
 
+#[derive(Clone)]
 enum Body {
     Form(Vec<(String, String)>),
     Raw(String, String),

@@ -36,6 +36,8 @@ struct Faults {
     clock_offset: i64,
     /// The app client is disabled.
     app_disabled: bool,
+    /// The first N /authorize requests answer 429 Retry-After: 1.
+    rate_limit_first: usize,
 }
 
 struct Mock {
@@ -154,6 +156,10 @@ fn issue_code(s: &mut Mock, q: &HashMap<String, String>) -> Response {
 
 async fn authorize(State(st): State<S>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let mut s = st.lock().unwrap();
+    if s.faults.rate_limit_first > 0 {
+        s.faults.rate_limit_first -= 1;
+        return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "1".to_string())], Json(json!({"error": "slow_down"}))).into_response();
+    }
     let cid = q.get("client_id").cloned().unwrap_or_default();
     let Some((redirects, enabled)) = s.clients.get(&cid).cloned() else {
         return error_page("Unknown client.");
@@ -559,4 +565,11 @@ async fn preflight_and_live_together() {
     let j = serde_json::to_value(&r).unwrap();
     assert_eq!(j["steps"].as_array().unwrap().len(), 11);
     let _ = thumbprint(&json!({}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limits_are_waited_out_and_reported() {
+    let r = run(Faults { rate_limit_first: 2, ..Default::default() }, None).await;
+    assert!(fails(&r).is_empty(), "{:#?}", r.problems());
+    assert_eq!(r.check("authorization-code.rate").map(|c| c.code.as_str()), Some("rate-waited"));
 }

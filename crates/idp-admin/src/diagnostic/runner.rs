@@ -241,7 +241,23 @@ pub async fn run(cfg: RunConfig, report: &mut Report) {
     s10.duration_ms = userinfo_ms + t10.elapsed().as_millis() as u64;
     s10.finish();
     steps.insert(10, s10);
+    note_rate_limits(&cx, &mut steps);
     report.steps.extend(steps.into_values());
+}
+
+/// Tells the operator when the realm's rate limits slowed the test down.
+fn note_rate_limits(cx: &Ctx, steps: &mut BTreeMap<u8, Step>) {
+    let waited = cx.b.rate_waited.as_secs();
+    if waited == 0 {
+        return;
+    }
+    if let Some(s) = steps.get_mut(&3) {
+        s.push(
+            Check::pass("authorization-code.rate", "rate-waited", format!("The authorization server's rate limits paused the test for {waited} s (expected when tests run back to back)."))
+                .param("secs", waited.to_string()),
+        );
+        s.finish();
+    }
 }
 
 async fn timed(f: impl std::future::Future<Output = Step>) -> Step {
@@ -797,6 +813,13 @@ fn state_check(params: &BTreeMap<String, String>, state: &str) -> String {
     }
 }
 
+fn rate_limited_check(id: &str, url: &str) -> Check {
+    Check::warn(id, "rate-limited", "The authorization server rate-limited the test (HTTP 429) even after waiting; the remaining checks could not run.")
+        .url(url)
+        .spec("design §10.2 rate limits")
+        .fix("Wait a minute and run the test again. Each run makes about ten sign-in requests from the server's own address; raise HFS_IDP_RATE_INTERACTIVE_IP if tests run often.")
+}
+
 fn hint_for_error(err: &str) -> &'static str {
     match err {
         "invalid_client" | "unauthorized_client" => "The client is unknown, disabled or not allowed this grant. Check the app under Clients.",
@@ -827,6 +850,7 @@ fn authz_failure(id: &str, o: AuthzOutcome, f: &Fixture) -> Check {
         .param("detail", text)
         .url(url)
         .fix("The page text names the problem: typically an unknown or disabled client, an unregistered redirect URI, or an aud that is not a bound endpoint."),
+        AuthzOutcome::Json { status: 429, url, .. } => rate_limited_check(id, &url),
         AuthzOutcome::Json { status, error, description, url } => Check::fail(id, "authorize-error", format!(
             "The authorization endpoint answered HTTP {status} {error}: {description}"
         ))

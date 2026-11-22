@@ -12,7 +12,7 @@
 <script src="/ui/assets/idp.js" defer></script>
 <header class="page-head page-head--row">
   <div class="page-head__text">
-    <a class="page-head__back" href="/ui/idp"><span class="icon">{% include "icons/chevron-left.svg" %}</span>{{ i18n.t("idpc-title") }}</a>
+    <p class="page-head__back"><a href="/ui/idp">← {{ i18n.t("idpc-title") }}</a></p>
     <h1 class="page-head__title">{% if realm.is_empty() %}{{ i18n.t("idpc-new-title") }}{% else %}{{ display_name }} <span class="status-pill status-pill--accent">{% call ui::icon("pencil") %}{% endcall %}<span>{{ i18n.t("idpc-status-draft-short") }}</span></span>{% endif %}</h1>
     <p class="page-head__lede">{% if realm.is_empty() %}{{ i18n.t("idpc-new-lede") }}{% else %}{{ i18n.t("idpc-draft-saved") }}{% endif %}</p>
   </div>

@@ -1,4 +1,6 @@
 /* Authorization servers console (/ui/idp). Uses the shared tokens only. */
+.form-section__body fieldset, .card fieldset, .idp-provider { border: 0; padding: 0; margin: 0 0 12px; min-width: 0; }
+.form-section__body legend, .idp-provider legend { padding: 0; margin-bottom: 6px; }
 .idp-head__issuer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 .idp-head__label { font-size: 12px; color: var(--muted-text); }
 .idp-tabs { margin: 0 0 16px; overflow-x: auto; }
