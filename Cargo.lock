@@ -3691,15 +3691,18 @@ dependencies = [
  "chrono",
  "helios-endpoints",
  "helios-idp",
+ "helios-persistence",
  "http-body-util",
  "jsonwebtoken",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-postgres",
  "tower",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

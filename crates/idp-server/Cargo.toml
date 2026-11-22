@@ -29,8 +29,16 @@ tracing = "0.1"
 # Client JWKS (private_key_jwt jwks_uri) fetching through the outbound guard.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+[features]
+default = []
+# Runs the flow tests on PgStore too (HFS_TEST_PG_HOST, IDP_TEST_STORE=pg).
+postgres = ["helios-idp/postgres"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken = "9"
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false, features = ["R4", "postgres"] }
+tokio-postgres = "0.7"
+uuid = { version = "1", features = ["v4"] }
