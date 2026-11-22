@@ -30,12 +30,13 @@
         <option value="external"{% if fis(side, "kind", "external", "endpoint") %} selected{% endif %}>{{ i18n.t("sync-peer-external") }}</option>
       </select>
     </div>
-    <div class="mfield">
+    <div class="mfield" data-show-when="{{ side }}_kind=endpoint">
       <label class="mfield__label" for="f-{{ side }}_endpoint">{{ i18n.t("sync-peer-endpoint") }}</label>
       <select class="mfield__input" id="f-{{ side }}_endpoint" name="{{ side }}_endpoint">
         {% for e in endpoints %}<option value="{{ e.name }}"{% if fv(side, "endpoint") == e.name %} selected{% endif %}>{{ e.label }}</option>{% endfor %}
       </select>
     </div>
+    <div data-show-when="{{ side }}_kind=external">
     {% call ui::field_text(i18n.t("sync-base-url"), side_field(side, "url"), fv(side, "url"), "", i18n.t("sync-base-url-hint"), "url", false, "https://fhir.example.org/fhir", false, true) %}{% endcall %}
     <div class="mfield">
       <label class="mfield__label" for="f-{{ side }}_auth">{{ i18n.t("sync-auth") }}</label>
@@ -45,11 +46,18 @@
         {% endfor %}
       </select>
     </div>
+    <div data-show-when="{{ side }}_auth=basic">
     {% call ui::field_text(i18n.t("sync-username"), side_field(side, "username"), fv(side, "username")) %}{% endcall %}
+    </div>
+    <div data-show-when="{{ side }}_auth=client-credentials">
     {% call ui::field_text(i18n.t("sync-token-url"), side_field(side, "token_url"), fv(side, "token_url"), "", "", "url") %}{% endcall %}
     {% call ui::field_text(i18n.t("sync-client-id"), side_field(side, "client_id"), fv(side, "client_id")) %}{% endcall %}
     {% call ui::field_text(i18n.t("sync-scope"), side_field(side, "scope"), fv(side, "scope")) %}{% endcall %}
+    </div>
+    <div data-show-when="{{ side }}_auth=bearer|basic|client-credentials">
     {% call ui::secret_field(i18n.t("sync-secret"), side_field(side, "secret"), false, i18n.t("sync-secret-hint")) %}{% endcall %}
+    </div>
+    </div>
   {% endcall %}
   {% endfor %}
   {% call ui::form_section("sync-data", i18n.t("sync-step-data")) %}
@@ -73,8 +81,12 @@
         {% endfor %}
       </select>
     </div>
+    <div data-show-when="trigger=interval">
     {% call ui::field_text(i18n.t("sync-every-secs"), "every_secs", v_or("every_secs", "3600"), "", "", "number") %}{% endcall %}
+    </div>
+    <div data-show-when="trigger=continuous|subscription">
     {% call ui::field_text(i18n.t("sync-poll-secs"), "poll_secs", v_or("poll_secs", "30"), "", "", "number") %}{% endcall %}
+    </div>
     <div class="mfield">
       <label class="mfield__label" for="f-conflict">{{ i18n.t("sync-conflict") }}</label>
       <select class="mfield__input" id="f-conflict" name="conflict">

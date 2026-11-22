@@ -51,7 +51,7 @@
         hx-trigger="input changed delay:300ms, change, submit"
         aria-label="{{ chrome.i18n.t("hts-cs-browser-filter-legend") }}">
     <section class="card table-card">
-      <div class="toolbar">
+      <div class="toolbar toolbar--filters">
         <label class="toolbar__search">
           {#- Inline so the icon sits in the flex row beside the input;
               `svg { display: block }` is global, so it needs a flex parent. -#}
@@ -82,6 +82,16 @@
                  placeholder="{{ chrome.i18n.t("hts-cs-browser-filter-version") }}"
                  aria-label="{{ chrome.i18n.t("hts-cs-browser-filter-version") }}"
                  autocomplete="off" spellcheck="false">
+        </label>
+        {#- Sort (UIF defect 3): rows used to come back in import order. A change
+            re-runs the debounced htmx filter like any other field. -#}
+        <label class="toolbar__select">
+          <span class="visually-hidden">{{ chrome.i18n.t("hts-browser-sort") }}</span>
+          <select name="sort" aria-label="{{ chrome.i18n.t("hts-browser-sort") }}" data-browser-sort>
+            {% for (value, key, selected) in view.sort_options() %}
+            <option value="{{ value }}"{% if selected %} selected{% endif %}>{{ chrome.i18n.t(key) }}</option>
+            {% endfor %}
+          </select>
         </label>
         <a class="btn" href="/ui/hts/code-systems">{{ chrome.i18n.t("hts-cs-browser-filter-reset") }}</a>
       </div>

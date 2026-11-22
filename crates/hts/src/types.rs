@@ -495,6 +495,47 @@ pub struct TranslateResponse {
 
 // ─── Search ───────────────────────────────────────────────────────────────────
 
+/// A column a resource search can be ordered by (`_sort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSortField {
+    Name,
+    Title,
+    Url,
+    Version,
+    Status,
+    LastUpdated,
+}
+
+/// One `_sort` key: a column and a direction (`-name` = descending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchSort {
+    pub field: SearchSortField,
+    pub descending: bool,
+}
+
+impl SearchSort {
+    /// Parse one `_sort` key (`name`, `-title`, `_lastUpdated`, …). `None`
+    /// for an unsupported key, which callers ignore (FHIR lets a server skip
+    /// sort keys it does not support).
+    pub fn parse(key: &str) -> Option<Self> {
+        let key = key.trim();
+        let (descending, name) = match key.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, key),
+        };
+        let field = match name {
+            "name" => SearchSortField::Name,
+            "title" => SearchSortField::Title,
+            "url" => SearchSortField::Url,
+            "version" => SearchSortField::Version,
+            "status" => SearchSortField::Status,
+            "_lastUpdated" => SearchSortField::LastUpdated,
+            _ => return None,
+        };
+        Some(Self { field, descending })
+    }
+}
+
 /// Query parameters for searching CodeSystem, ValueSet, or ConceptMap resources.
 ///
 /// All fields are optional — omitting a field means "no filter on that field".
@@ -543,6 +584,10 @@ pub struct ResourceSearchQuery {
     /// `_lastUpdated` predicates (each `[prefix]dateTime`), all ANDed.
     #[serde(skip)]
     pub last_updated: Vec<crate::string_search::DateSearch>,
+    /// `_sort`: explicit result order. `None` keeps the default (insertion
+    /// order, or canonical precedence for a single-URL search).
+    #[serde(skip)]
+    pub sort: Option<SearchSort>,
     /// Maximum number of results to return (default: 20).
     #[serde(rename = "_count")]
     pub count: Option<u32>,

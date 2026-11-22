@@ -13,9 +13,13 @@
 {% block breadcrumb %}{% endblock %}
 
 {% block content %}
-<header class="page-head">
+{#- Same shape as the manager error page (pages/manager/error.html). #}
+<div class="error-page">
+  <p class="error-page__code" aria-hidden="true">404</p>
   <h1 class="page-head__title">{{ i18n.t("not-found-title") }}</h1>
-</header>
-<div class="card notice">{{ i18n.t("not-found-text") }}</div>
-<a class="btn" href="{{ back_href }}">{{ back_label }}</a>
+  <p class="error-page__text">{{ i18n.t("not-found-text") }}</p>
+  <div class="error-page__actions">
+    <a class="btn btn--primary" href="{{ back_href }}">{{ back_label }}</a>
+  </div>
+</div>
 {% endblock %}

@@ -313,6 +313,17 @@ impl I18n {
             .unwrap_or_else(|| key.to_owned())
     }
 
+    /// Look up a message with any number of named placeables.
+    pub fn t_args(&self, key: &str, args: &[(&str, String)]) -> String {
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = args
+            .iter()
+            .map(|(k, v)| (Cow::Owned((*k).to_owned()), FluentValue::from(v.clone())))
+            .collect();
+        LOCALES
+            .try_lookup_with_args(self.locale, key, &args)
+            .unwrap_or_else(|| key.to_owned())
+    }
+
     /// Like [`Self::t_arg2`], but both placeable values are themselves
     /// **message keys**, resolved in the same locale before interpolation.
     ///

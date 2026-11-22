@@ -405,6 +405,12 @@
   box-sizing: border-box;
 }
 
+/* Links that no component styles (About page credits, capability lists,
+   "Refresh") took the UA's default blue / visited purple. */
+a {
+  color: var(--accent-text);
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -11859,4 +11865,1166 @@ html.js .reveal:not(.is-shown) {
   font-size: 12px;
   color: var(--muted);
 }
+}
+
+/* ==========================================================================
+   Standalone pages (sign-in, break-glass, forced password change, access
+   and sign-in messages, sign-out) of both consoles: layouts/auth.html in
+   crates/ui and crates/hts-ui, pieces from helios-ui-chrome (auth-*.html).
+   Same tokens as the console shell; desktop = brand panel | form panel,
+   below 960px one column with a compact brand header.
+   ========================================================================== */
+@layer pages {
+body.auth-page {
+  display: block;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--bg-content);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.auth {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+  isolation: isolate;
+}
+
+/* The console topbar's brand line on the page's top edge, and one faint
+   glow behind the card: nothing that competes with it. */
+.auth::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 4px;
+  background: var(--brand-gradient);
+}
+
+.auth::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(640px 420px at 50% 38%, color-mix(in srgb, var(--brand-mid) 9%, transparent), transparent 70%);
+}
+
+/* Logo and product name at the top of the card. */
+.auth-logo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 24px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--divider);
+  text-align: center;
+}
+
+.auth-logo__link {
+  display: inline-flex;
+  border-radius: var(--radius);
+  color: inherit;
+}
+
+.auth-logo__link:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 4px;
+}
+
+.auth-logo__img {
+  display: block;
+  width: auto;
+  height: 40px;
+}
+
+.auth-logo__name {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-wrap: balance;
+}
+
+/* ---- form panel --------------------------------------------------------- */
+.auth-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 20px 24px;
+  outline: none;
+}
+
+.auth-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.auth-lang {
+  background: color-mix(in srgb, var(--muted-soft) 80%, transparent);
+  border: 1px solid var(--surface-border);
+}
+
+.auth-lang .segmented__item {
+  min-height: 36px;
+  padding: 0 14px;
+  font-size: 13px;
+}
+
+.auth-lang .segmented__item:hover:not([aria-current="true"]) {
+  color: var(--text-strong);
+}
+
+.auth-center {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 0;
+}
+
+.auth-card {
+  position: relative;
+  width: 100%;
+  max-width: 420px;
+  padding: 32px 36px 32px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgb(14 23 38 / 6%), 0 18px 48px rgb(14 23 38 / 10%);
+  overflow: hidden;
+}
+
+[data-theme="dark"] .auth-card {
+  box-shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 24px 60px rgb(0 0 0 / 45%);
+}
+
+/* The endpoint cards' gradient top edge. */
+.auth-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: var(--brand-gradient);
+}
+
+.auth-head {
+  margin: 0 0 22px;
+  text-align: center;
+}
+
+.auth-head--center {
+  text-align: center;
+}
+
+.auth-title {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.auth-lede {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.auth-hint {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.auth-notice {
+  margin: 0 0 20px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.auth-notice > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.auth-notice__detail {
+  margin-top: 6px;
+  font-size: 12.5px;
+}
+
+.auth-notice__detail summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.auth-notice__detail code {
+  display: block;
+  margin-top: 4px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.auth-label {
+  color: var(--text-strong);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.auth-input {
+  width: 100%;
+  height: 46px;
+  padding: 0 14px;
+  font: inherit;
+  font-size: 15px;
+  color: var(--text-strong);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.auth-input:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--surface-border));
+}
+
+.auth-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-focus-ring) 35%, transparent);
+}
+
+.auth-input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.auth-input[aria-invalid="true"]:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+.auth-input-wrap {
+  position: relative;
+}
+
+.auth-input-wrap .auth-input {
+  padding-right: 52px;
+}
+
+/* Show password: hidden until auth.js runs (it does nothing without it). */
+.auth-reveal {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: none;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.auth-js .auth-reveal {
+  display: grid;
+}
+
+.auth-reveal:hover {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+.auth-reveal:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 0;
+}
+
+.auth-reveal svg {
+  width: 18px;
+  height: 18px;
+}
+
+.auth-reveal__hide,
+.auth-reveal[aria-pressed="true"] .auth-reveal__show {
+  display: none;
+}
+
+.auth-reveal[aria-pressed="true"] .auth-reveal__hide {
+  display: grid;
+}
+
+/* The message slot under each field: a fixed line, so an inline error or the
+   caps-lock hint never moves the form. */
+.auth-msg {
+  min-height: 20px;
+  margin: 0 0 6px;
+  padding-top: 2px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.auth-msg--error {
+  color: var(--danger-text);
+  font-weight: 500;
+}
+
+.auth-msg--caps {
+  color: var(--warn-text);
+  font-weight: 500;
+}
+
+.btn.auth-btn {
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 48px;
+  padding: 0 20px;
+  font-size: 15px;
+  font-weight: 600;
+  border-radius: 10px;
+  text-align: center;
+}
+
+.btn.auth-btn svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.btn.auth-btn.btn--primary {
+  box-shadow: 0 1px 2px rgb(14 23 38 / 12%), 0 6px 16px color-mix(in srgb, var(--accent-strong) 28%, transparent);
+}
+
+.btn.auth-btn.btn--primary:hover {
+  filter: brightness(1.07);
+}
+
+.btn.auth-btn--secondary {
+  background: var(--surface);
+  color: var(--text-strong);
+  box-shadow: none;
+}
+
+.auth-form .auth-btn {
+  margin-top: 6px;
+}
+
+.auth-idp-host {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 22px 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--surface-border);
+}
+
+.auth-aside {
+  margin: 24px 0 0;
+  padding-top: 20px;
+  border-top: 1px solid var(--surface-border);
+  text-align: center;
+  font-size: 13.5px;
+}
+
+.auth-aside a,
+.auth-link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 500;
+  text-decoration: none;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.auth-aside a:hover,
+.auth-link-btn:hover {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.auth-aside a:focus-visible,
+.auth-link-btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.auth-aside svg,
+.auth-link-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* Password policy checklist (live from auth.js; neutral without it). */
+.auth-policy {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 18px;
+  padding: 14px 16px;
+  list-style: none;
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+
+.auth-policy li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  line-height: 1.45;
+}
+
+.auth-policy__dot {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 1.5px solid var(--outline);
+  color: transparent;
+}
+
+.auth-policy__dot svg {
+  width: 11px;
+  height: 11px;
+}
+
+.auth-policy__dot--info {
+  border: 0;
+  color: var(--color-info-text);
+}
+
+.auth-policy__dot--info svg {
+  width: 16px;
+  height: 16px;
+}
+
+.auth-policy li[data-state="ok"] {
+  color: var(--ok-text);
+}
+
+.auth-policy li[data-state="ok"] .auth-policy__dot {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: var(--surface);
+}
+
+.auth-policy li[data-state="bad"] {
+  color: var(--danger-text);
+}
+
+.auth-policy li[data-state="bad"] .auth-policy__dot {
+  border-color: var(--danger);
+}
+
+/* Message pages: status icon, centred text, stacked actions. */
+.auth-status {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin: 4px auto 20px;
+  border-radius: 16px;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.auth-status svg {
+  width: 26px;
+  height: 26px;
+}
+
+.auth-status--lock {
+  color: var(--color-accent);
+  background: var(--color-accent-soft);
+  border-color: color-mix(in srgb, var(--color-accent) 25%, transparent);
+}
+
+.auth-status--warn {
+  color: var(--warn-text);
+  background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+}
+
+.auth-status--danger {
+  color: var(--danger-text);
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+.auth-detail {
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.auth-detail summary {
+  color: var(--muted);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-detail code {
+  display: block;
+  margin-top: 8px;
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.auth-actions {
+  display: grid;
+  gap: 10px;
+}
+
+.auth-actions__form {
+  display: contents;
+}
+
+.auth-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 8px;
+  padding-top: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.auth-foot__version {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+}
+
+/* ---- phones: the same card, full width with a 16px gutter ------------ */
+@media (max-width: 599px) {
+  .auth-main {
+    padding: 14px 16px 18px;
+  }
+
+  .auth-toolbar {
+    gap: 8px;
+  }
+
+  .auth-lang .segmented__item {
+    min-height: 34px;
+    padding: 0 10px;
+    font-size: 12.5px;
+  }
+
+  .auth-toolbar .theme-toggle {
+    width: 40px;
+    height: 40px;
+  }
+
+  .auth-center {
+    padding: 16px 0 24px;
+  }
+
+  .auth-card {
+    padding: 26px 20px 24px;
+    border-radius: 14px;
+  }
+
+  .auth-logo__img {
+    height: 34px;
+  }
+
+  .auth-title {
+    font-size: 21px;
+  }
+
+  /* One item per line: no separator left dangling at a line end. */
+  .auth-foot {
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .auth-foot__sep {
+    display: none;
+  }
+
+  /* 16px keeps iOS from zooming into the field on focus. */
+  .auth-input {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-input {
+    transition: none;
+  }
+}
+}
+
+/* Account page (in the shell): identity and password side by side. */
+@layer pages {
+.account-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.account-card {
+  margin: 0;
+}
+
+.account-card .auth-input-wrap .mfield__input {
+  padding-right: 48px;
+}
+
+.account-card .auth-reveal {
+  top: 1px;
+  right: 1px;
+}
+
+.account-card .auth-msg {
+  min-height: 0;
+  margin: 0;
+}
+
+.account-card .mfield {
+  margin-bottom: 12px;
+}
+}
+
+/* ==========================================================================
+   UI polish QA fixes (visual sweep of every console page at 1440 / 834 /
+   390, light and dark, en and zh-Hant). One block so the sweep is reviewable.
+   ========================================================================== */
+@layer pages {
+/* Overview brand band: follow the content padding of the drawer layout
+   (it overflowed the page by 16px at tablet widths). */
+@media (max-width: 1024px) {
+  .brand-band:not(.brand-band--card) {
+    margin: -20px -16px 20px;
+  }
+}
+
+/* Descriptions and ledes: no one-character orphan on the last line (zh-Hant
+   wrapped "…FHIR 版 / 本。"). */
+.page-head__lede,
+.form-section__desc,
+.mfield__hint,
+.notice,
+.empty-state p,
+.ep-head__desc {
+  text-wrap: pretty;
+}
+
+/* Editor JSON toolbar: "Collapse all" broke onto two lines at 390px. */
+.editor-json__act {
+  white-space: nowrap;
+}
+
+@media (max-width: 599px) {
+  .editor-json .card-head {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  .editor-format__hint {
+    display: none;
+  }
+}
+
+/* Headings: no single character left on the last line (zh-Hant "…管理平 / 台"). */
+.page-head__title,
+.form-section__title,
+.card-head h2 {
+  text-wrap: balance;
+}
+
+/* A link with a leading icon: icon inline, not on a line of its own. */
+.link-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.link-icon svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+/* Stacked (phone) tables: the actions and number cells kept their desktop
+   right alignment and 64px width, so their label floated mid-row. */
+@media (max-width: 767px) {
+  .data-table--stack td.col-actions,
+  .data-table--stack td.col-num {
+    width: auto;
+    text-align: left;
+    align-items: center;
+    justify-items: start;
+  }
+}
+
+@media (max-width: 767px) {
+  .data-table--stack td:empty {
+    display: none;
+  }
+
+  .data-table--stack td.data-table__actions {
+    display: block;
+    text-align: left;
+    white-space: normal;
+    padding-top: 8px;
+  }
+
+  .data-table--stack .row-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* A tag never breaks inside (zh-Hant "預 / 設" stacked vertically). */
+.tag,
+.status-pill {
+  white-space: nowrap;
+}
+
+/* Toolbars with a search field: the field takes its own row on phones so
+   its placeholder is not cut ("Search by name or"). */
+@media (max-width: 599px) {
+  .toolbar:has(.toolbar__search) {
+    flex-wrap: wrap;
+  }
+
+  .toolbar__search {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+}
+
+/* One-line empty states inside cards read as quiet notes, not body copy. */
+.card__body > p.muted:only-child {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+/* Right-anchored menu panels in the page (search "Recent") ran 36px past a
+   390px screen when opened: on phones they span the screen width. (The
+   topbar account menu already fits.) */
+@media (max-width: 599px) {
+  .content .menu__panel--right {
+    position: fixed;
+    top: auto;
+    left: 16px;
+    right: 16px;
+    width: auto;
+    max-width: none;
+    margin-top: 8px;
+  }
+}
+
+/* Overview health strip on tablets: five tiles in one row instead of 4 + 1
+   orphan (icons dropped to make room). */
+@media (min-width: 600px) and (max-width: 1100px) {
+  .health-strip {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .health-tile {
+    padding: 10px 12px;
+  }
+
+  .health-tile__icon {
+    display: none;
+  }
+}
+
+/* Tablets: the same panels (and the dashboard's type picker, which ran
+   220px past an 834px screen) stay inside the viewport, right-aligned. */
+@media (min-width: 600px) and (max-width: 900px) {
+  .content .menu__panel--right {
+    position: fixed;
+    top: auto;
+    left: auto;
+    right: 24px;
+    width: min(380px, calc(100vw - 48px));
+    margin-top: 8px;
+  }
+}
+
+/* Progressive disclosure (manager.js `data-show-when`). */
+[data-show-when][hidden] {
+  display: none !important;
+}
+
+/* Two-column form layout for long settings forms (wide screens only). */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  column-gap: 24px;
+  align-items: start;
+}
+
+.form-grid > .form-grid__full,
+.form-grid > input[type="hidden"] {
+  grid-column: 1 / -1;
+}
+
+.form-subhead {
+  margin: 12px 0 14px;
+  padding-top: 18px;
+  border-top: 1px solid var(--divider);
+}
+
+.form-lede {
+  margin: 0 0 14px;
+  max-width: 80ch;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+/* Grouped radio list (fieldset) without the UA frame. */
+fieldset.mfield--group {
+  margin: 0 0 16px;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+fieldset.mfield--group > legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 0;
+}
+
+.mcheck--card {
+  align-items: center;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.mcheck--card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.mcheck--card:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+.mcheck .mcheck__label svg {
+  display: inline-block;
+}
+
+/* "Set by ENV_VAR": an inline chip next to the label, not a stray line. */
+.pinned-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--muted-soft);
+  color: var(--muted-text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+.pinned-chip svg {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+}
+
+/* Compact controls inside tables and inline rows. */
+.ctl {
+  height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+select.ctl {
+  padding-right: 6px;
+}
+
+.ctl:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.ctl::placeholder {
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+.ctl-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.ctl-check input,
+.data-table input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent-strong);
+}
+
+.row-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+#users-table td,
+#sessions-table td,
+#bindings-table td {
+  vertical-align: middle;
+}
+
+.data-table__actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.binding-add {
+  margin-top: 12px;
+}
+
+.binding-add .ctl[type="text"] {
+  flex: 1 1 180px;
+}
+
+@media (max-width: 599px) {
+  /* Overview health strip: two per row instead of five full-width cards. */
+  .health-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .health-tile {
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .health-tile__icon {
+    width: 30px;
+    height: 30px;
+  }
+
+  .health-tile:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+
+  /* Data dashboard figures: two per row (five full-width cards before). */
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 10px;
+  }
+
+  .stat-grid > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+
+  .stat-grid > .stat {
+    min-height: 0;
+    padding: 14px 16px;
+  }
+
+  /* Footer: one item per line, no separator dangling at a line end. */
+  .site-footer {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .site-footer__sep {
+    display: none;
+  }
+
+  .site-footer__version {
+    margin-left: 0;
+  }
+}
+}
+
+/* ---------- UIF functional fixes (HTS browsers + terminology inventory) ---------- */
+@layer pages {
+  /* Filter toolbars: every control on the 42px line of the search inputs.
+     The Reset button used to be a 30px .btn beside 42px inputs (defect 3). */
+  .toolbar--filters > .btn,
+  .toolbar--filters > .chip {
+    height: 42px;
+    border-radius: 12px;
+    flex: 0 0 auto;
+  }
+  .toolbar__select {
+    display: flex;
+    flex: 0 0 auto;
+  }
+  .toolbar__select select {
+    appearance: none;
+    height: 42px;
+    padding: 0 36px 0 14px;
+    border: 1px solid var(--surface-border);
+    border-radius: 12px;
+    background: var(--input-bg, var(--surface)) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23888888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 12px center / 12px;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .toolbar__select select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  /* A long canonical URL on one line, clipped, full value in the tooltip
+     (defect 3: it wrapped mid-word across three lines). Stacked phone rows
+     keep wrapping — there is room for it there. */
+  .data-table .url--clip {
+    display: inline-block;
+    max-width: 34ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  @media (max-width: 640px) {
+    /* Long values (audit request URLs, canonicals) wrap inside stacked
+       phone rows instead of running past the card edge. */
+    .data-table--stack td {
+      overflow-wrap: anywhere;
+    }
+    .data-table--stack .url--clip {
+      max-width: none;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  .table-meta {
+    padding: 10px 14px 0;
+  }
+
+  /* Row action buttons on one baseline: the pin form used to be a
+     .form-actions block (12px top margin, even when empty) above Delete. */
+  .data-table .row-actions {
+    align-items: center;
+  }
+  .data-table .row-actions--start {
+    justify-content: flex-start;
+  }
+  /* The inventory is wide (eight columns): keep the source file short so
+     the actions column stays on screen at 1440 px. */
+  #hts-term-table .url--clip {
+    max-width: 20ch;
+  }
+  .data-table .row-actions form {
+    display: contents;
+  }
+  .data-table .row-actions .btn {
+    white-space: nowrap;
+  }
+  .data-table td.col-actions {
+    width: 1%;
+  }
 }

@@ -106,6 +106,7 @@ struct BrowserForm {
     name: Option<String>,
     title: Option<String>,
     status: Option<String>,
+    sort: Option<String>,
     #[serde(rename = "_count")]
     count: Option<String>,
     #[serde(rename = "_offset")]
@@ -133,6 +134,7 @@ impl BrowserForm {
             name: non_empty(self.name),
             title: non_empty(self.title),
             status: non_empty(self.status),
+            sort: crate::upstream::sanitize_browser_sort(self.sort),
             count,
             offset,
         }
@@ -242,6 +244,7 @@ impl BrowserRowsView {
             ("name", &self.filters.name),
             ("title", &self.filters.title),
             ("status", &self.filters.status),
+            ("sort", &self.filters.sort),
         ] {
             if let Some(v) = value
                 && !v.is_empty()
@@ -286,12 +289,30 @@ impl BrowserRowsView {
         if !status.is_empty() {
             ser.append_pair("status", status);
         }
+        if let Some(sort) = &self.filters.sort {
+            ser.append_pair("sort", sort);
+        }
         let query = ser.finish();
         if query.is_empty() {
             "/ui/hts/code-systems".to_owned()
         } else {
             format!("/ui/hts/code-systems?{query}")
         }
+    }
+
+    /// The sort control's options: `(value, label key, selected)`.
+    fn sort_options(&self) -> Vec<(&'static str, &'static str, bool)> {
+        let current = self.filters.effective_sort();
+        crate::upstream::BROWSER_SORTS
+            .iter()
+            .map(|s| {
+                (
+                    *s,
+                    crate::upstream::browser_sort_label_key(s),
+                    *s == current,
+                )
+            })
+            .collect()
     }
 
     /// Whether `status` is the chip currently selected — drives

@@ -1,41 +1,40 @@
-<!doctype html>
+{% extends "layouts/auth.html" %}
 {#
-  Console sign-in messages (package P3, crates/ui/src/login.rs): "your role
-  does not allow this page", "no access to this console" after an OIDC
-  sign-in, a failed sign-in, a refused cross-site request. Standalone like
-  the sign-in page: it may be shown to someone who cannot use the shell.
+  Console sign-in messages (package P3, crates/ui/src/login.rs) on the
+  standalone frame: "your role does not allow this page", "no access to this
+  console" after an OIDC sign-in, a failed sign-in, a refused cross-site
+  request, and the sign-out confirmation. Standalone: it may be shown to
+  someone who cannot use the shell.
 #}
-<html lang="{{ i18n.lang() }}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="robots" content="noindex">
-  <title>{{ title }} — {{ i18n.t("console-product-short") }}</title>
-  <link rel="icon" type="image/png" href="/ui/assets/logo.png">
-  <link rel="stylesheet" href="/ui/assets/app.css">
-  <style>
-    body.signin-page { display: block; }
-    .signin { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
-    .signin__band { position: fixed; inset: 0 0 auto 0; height: 6px;
-      background: linear-gradient(135deg, #0AEAFF, #3EADFF 50%, #756DFF); }
-    .signin__card { width: 100%; max-width: 480px; }
-    .signin__actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
-  </style>
-</head>
-<body class="signin-page">
-<div class="signin__band" aria-hidden="true"></div>
-<main class="signin">
-  <section class="card signin__card" aria-labelledby="message-title">
-    <h1 class="page-head__title" id="message-title">{{ title }}</h1>
-    <div class="card notice notice--warn" role="alert" id="console-message">{{ text }}</div>
-    <div class="signin__actions">
-      {% if let Some(href) = back_href %}<a class="btn" href="{{ href }}">{{ i18n.t("console-back") }}</a>{% endif %}
-      {% if show_sign_out %}
-      <form method="post" action="/ui/logout">{{ csrf_html|safe }}<button class="btn" type="submit">{{ i18n.t("console-sign-out") }}</button></form>
-      {% endif %}
-      {% if let Some(href) = end_session_href %}<a class="btn" href="{{ href }}">{{ i18n.t("console-sign-out-idp") }}</a>{% endif %}
-    </div>
-  </section>
-</main>
-</body>
-</html>
+{% block title %}{{ title }}{% endblock %}
+
+{% block card %}
+          <div class="auth-status auth-status--{{ tone }}" aria-hidden="true">{% if tone == "lock" %}{% include "icons/lock.svg" %}{% else if tone == "signout" %}{% include "icons/power.svg" %}{% else if tone == "danger" %}{% include "icons/alert.svg" %}{% else %}{% include "icons/shield.svg" %}{% endif %}</div>
+          <header class="auth-head auth-head--center">
+            <h1 class="auth-title" id="auth-title">{{ title }}</h1>
+            <p class="auth-lede" role="{% if tone == "signout" %}status{% else %}alert{% endif %}" id="console-message">{{ text }}</p>
+            {%- if let Some(h) = hint %}
+            <p class="auth-hint" id="console-message-hint">{{ h }}</p>
+            {%- endif %}
+          </header>
+          {%- if let Some(d) = detail %}
+          <details class="auth-detail">
+            <summary>{{ i18n.t("auth-technical-details") }}</summary>
+            <code>{{ d }}</code>
+          </details>
+          {%- endif %}
+          <div class="auth-actions">
+            {%- if show_sign_out && sign_out_primary %}
+            <form method="post" action="/ui/logout" class="auth-actions__form">{{ csrf_html|safe }}<button class="btn btn--primary auth-btn" type="submit" id="console-sign-out" data-busy-label="{{ i18n.t("auth-signing-out") }}">{% include "icons/power.svg" %}<span>{{ i18n.t("console-sign-out") }}</span></button></form>
+            {%- endif %}
+            {%- if let Some(href) = end_session_href %}
+            <a class="btn btn--primary auth-btn" href="{{ href }}" id="console-end-session">{{ i18n.t("console-sign-out-idp") }}</a>
+            {%- endif %}
+            {%- if let Some(href) = back_href %}
+            <a class="btn auth-btn{% if sign_out_primary || end_session_href.is_some() %} auth-btn--secondary{% else %} btn--primary{% endif %}" href="{{ href }}" id="console-back">{{ back_label }}</a>
+            {%- endif %}
+            {%- if show_sign_out && !sign_out_primary %}
+            <form method="post" action="/ui/logout" class="auth-actions__form">{{ csrf_html|safe }}<button class="btn auth-btn auth-btn--secondary" type="submit" id="console-sign-out">{% include "icons/power.svg" %}<span>{{ i18n.t("console-sign-out") }}</span></button></form>
+            {%- endif %}
+          </div>
+{% endblock %}

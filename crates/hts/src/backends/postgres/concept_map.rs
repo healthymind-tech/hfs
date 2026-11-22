@@ -329,7 +329,12 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-        super::search_table(&mut client, "concept_maps", "ConceptMap", query, false).await
+        // `_summary=true` reads metadata columns only, like CodeSystem and
+        // ValueSet. Without it a 1000-row page carried every map's full JSON
+        // (25 MB on production). Plain searches keep the stored resources:
+        // the console's browser lists their source and target.
+        let summary = query.summary.as_deref() == Some("true");
+        super::search_table(&mut client, "concept_maps", "ConceptMap", query, summary).await
     }
 }
 

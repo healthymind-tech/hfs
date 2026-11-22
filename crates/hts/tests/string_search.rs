@@ -235,8 +235,9 @@ async fn sqlite_preserves_resource_specific_hydration_behavior() {
     let (_, value_set_summary) = app.get_fhir("/ValueSet?name=cafe&_summary=true").await;
     assert!(entries(&value_set_summary)[0]["resource"]["compose"].is_null());
 
+    // ConceptMap honours `_summary` like CodeSystem/ValueSet (UIF): no `group`.
     let (_, concept_map_summary) = app.get_fhir("/ConceptMap?name=cafe&_summary=true").await;
-    assert!(entries(&concept_map_summary)[0]["resource"]["group"].is_array());
+    assert!(entries(&concept_map_summary)[0]["resource"]["group"].is_null());
 
     let (_, unfiltered_code_systems) = app.get_fhir("/CodeSystem").await;
     assert!(
@@ -295,7 +296,7 @@ async fn postgres_matches_string_and_hydration_contract() {
         (
             "/ConceptMap?title:contains=fe%20concept&_summary=true",
             "group",
-            true,
+            false,
             "cafe-cm",
         ),
     ] {

@@ -174,6 +174,27 @@ impl HealthState {
     }
 }
 
+/// Probe a terminology server's `/health` for the overview's health strip.
+///
+/// Before UIF the tile always read "Not reported" even with a healthy HTS
+/// configured, because nothing ever filled [`ServerHealth::terminology`].
+/// `2xx` is healthy, any other answer degraded, no answer (or a timeout of
+/// three seconds) down.
+pub async fn probe_terminology(base_url: &str) -> HealthState {
+    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return HealthState::Unknown;
+    };
+    match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => HealthState::Ok,
+        Ok(_) => HealthState::Degraded,
+        Err(_) => HealthState::Down,
+    }
+}
+
 /// The overview's health strip.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServerHealth {
@@ -604,6 +625,32 @@ impl ManagerBackend for SnapshotBackend {
 mod tests {
     use super::*;
     use helios_endpoints::{EndpointName, FhirRelease, MemoryEndpointStore};
+
+    async fn serve(status: u16) -> String {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(
+                move || async move { axum::http::StatusCode::from_u16(status).unwrap() },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn terminology_probe_reports_ok_degraded_and_down() {
+        assert_eq!(probe_terminology(&serve(200).await).await, HealthState::Ok);
+        assert_eq!(
+            probe_terminology(&serve(503).await).await,
+            HealthState::Degraded
+        );
+        assert_eq!(
+            probe_terminology("http://127.0.0.1:1").await,
+            HealthState::Down
+        );
+    }
 
     fn admin() -> Actor {
         Actor {

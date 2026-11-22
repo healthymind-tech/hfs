@@ -124,7 +124,9 @@ async fn list_formats() -> Json<Value> {
 #[derive(Debug, Deserialize, Default)]
 struct InventoryQuery {
     q: Option<String>,
-    /// `name` (default) or `size`.
+    /// `name` (default: title, then URL, A→Z), `concepts` (most concepts
+    /// first) or `size` (largest on disk first; falls back to concepts while
+    /// sizes are still being measured).
     sort: Option<String>,
     limit: Option<usize>,
     /// Hide versions without concepts (stubs, `not-present` placeholders).
@@ -132,20 +134,111 @@ struct InventoryQuery {
     populated: bool,
 }
 
+/// How long the inventory waits for the full (size) stats before answering
+/// without them; the scan keeps running and fills the cache.
+const STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long it then waits for the cheap concept counts.
+const COUNTS_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Inventory ordering. Pure, so the default order and every fallback are
+/// unit-tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InventorySort {
+    Name,
+    Concepts,
+    Size,
+}
+
+impl InventorySort {
+    pub(crate) fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("concepts") => Self::Concepts,
+            Some("size") => Self::Size,
+            _ => Self::Name,
+        }
+    }
+}
+
+/// The per-system facts the inventory sorts and filters on.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InventoryKey {
+    pub url: String,
+    pub title: Option<String>,
+    /// `None` while concepts are still being counted.
+    pub concepts: Option<u64>,
+    /// `None` while sizes are still being measured.
+    pub est_bytes: Option<u64>,
+}
+
+impl InventoryKey {
+    fn label(&self) -> String {
+        self.title.as_deref().unwrap_or(&self.url).to_lowercase()
+    }
+}
+
+/// Order systems for the inventory.
+///
+/// `Concepts` / `Size` put real content first (SNOMED, LOINC, ICD, NDC
+/// before thousands of small IG code systems) and break ties by name; `Size`
+/// uses concept counts until sizes are known, rather than leaving the list
+/// in an order nobody asked for (UIF defect 2).
+pub(crate) fn sort_inventory(keys: &mut [InventoryKey], sort: InventorySort) {
+    let by_name = |a: &InventoryKey, b: &InventoryKey| {
+        a.label().cmp(&b.label()).then_with(|| a.url.cmp(&b.url))
+    };
+    match sort {
+        InventorySort::Name => keys.sort_by(by_name),
+        InventorySort::Concepts => keys.sort_by(|a, b| {
+            b.concepts
+                .unwrap_or(0)
+                .cmp(&a.concepts.unwrap_or(0))
+                .then_with(|| by_name(a, b))
+        }),
+        InventorySort::Size => keys.sort_by(|a, b| {
+            let size = |k: &InventoryKey| k.est_bytes.or(k.concepts).unwrap_or(0);
+            size(b).cmp(&size(a)).then_with(|| by_name(a, b))
+        }),
+    }
+}
+
+/// Whether a system survives the "hide stubs" filter: it must have at least
+/// one concept. With counts still unknown, a `not-present` placeholder is
+/// hidden anyway — it has no concepts by definition — instead of letting the
+/// unchecked filter show every stub (UIF defect 2).
+pub(crate) fn keep_populated(concepts: Option<u64>, all_not_present: bool) -> bool {
+    match concepts {
+        Some(n) => n > 0,
+        None => !all_not_present,
+    }
+}
+
 async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiResult {
     let rows = core.ops.code_system_rows().await?;
-    // Stats can take seconds on a cold production database; wait a bounded
-    // time, then answer without them (the computation keeps going and fills
-    // the cache for the next request).
+    // Stats can take minutes on a production database (closure and
+    // designation scans over ~10 GB). Start both the full stats and the cheap
+    // concept count; answer with whatever is ready in time. Both keep
+    // running and fill their caches for the next request.
     let stats_task = {
         let core = core.clone();
         tokio::spawn(async move { core.system_stats().await })
     };
-    let (stats_at, stats) =
-        match tokio::time::timeout(std::time::Duration::from_secs(8), stats_task).await {
-            Ok(Ok(Ok((at, s)))) => (Some(at), Some(s)),
-            _ => (None, None),
-        };
+    let counts_task = {
+        let core = core.clone();
+        tokio::spawn(async move { core.concept_counts().await })
+    };
+    let (stats_at, stats) = match tokio::time::timeout(STATS_WAIT, stats_task).await {
+        Ok(Ok(Ok((at, s)))) => (Some(at), Some(s)),
+        _ => (None, None),
+    };
+    let counts: Option<Arc<HashMap<String, u64>>> = match &stats {
+        Some(s) => Some(Arc::new(
+            s.iter().map(|(k, v)| (k.clone(), v.concepts)).collect(),
+        )),
+        None => match tokio::time::timeout(COUNTS_WAIT, counts_task).await {
+            Ok(Ok(Ok(c))) => Some(c),
+            _ => None,
+        },
+    };
     let fp = core.ops.footprint().await.ok();
     let (vs, cm) = core.ops.resource_counts().await.unwrap_or((0, 0));
 
@@ -172,43 +265,52 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
 
     let empty: HashMap<String, SystemStats> = HashMap::new();
     let stats_ref = stats.as_deref().unwrap_or(&empty);
-    let mut systems: Vec<Value> = Vec::new();
+    let mut systems: Vec<(InventoryKey, Value)> = Vec::new();
     let mut total_concepts = 0u64;
     for (url, mut versions) in by_url {
         versions.sort_by(|a, b| {
             crate::version_order::compare_versions(b.version.as_deref(), a.version.as_deref())
         });
-        // Without stats, treat every row as populated so the pin and
-        // version order still decide.
-        let assumed: HashMap<String, SystemStats>;
-        let for_current = if stats.is_some() {
-            stats_ref
-        } else {
-            assumed = versions
-                .iter()
-                .map(|r| {
-                    (
-                        r.id.clone(),
-                        SystemStats {
-                            concepts: 1,
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect();
-            &assumed
-        };
+        // Concept counts decide which version is current; without them,
+        // treat every row as populated so the pin and version order decide.
+        let for_current: HashMap<String, SystemStats> = versions
+            .iter()
+            .map(|r| {
+                let concepts = match &counts {
+                    Some(c) => c.get(&r.id).copied().unwrap_or(0),
+                    None => 1,
+                };
+                (
+                    r.id.clone(),
+                    SystemStats {
+                        concepts,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
         let refs: Vec<&CodeSystemRow> = versions.iter().collect();
-        let current_id = effective_current(&refs, for_current).map(|r| r.id.clone());
+        let current_id = effective_current(&refs, &for_current).map(|r| r.id.clone());
         let mut sys_bytes = 0u64;
         let mut sys_concepts = 0u64;
         let vjson: Vec<Value> = versions
             .iter()
+            // "Hide stubs" hides stub *versions* too: a populated system
+            // (LOINC 2.83) keeps its real version but not the THO
+            // `not-present` placeholder (3.1.0) listed above it.
+            .filter(|r| {
+                !q.populated
+                    || keep_populated(
+                        counts.as_ref().map(|c| c.get(&r.id).copied().unwrap_or(0)),
+                        r.content == "not-present",
+                    )
+            })
             .map(|r| {
                 let s = stats_ref.get(&r.id);
+                let concepts = counts.as_ref().map(|c| c.get(&r.id).copied().unwrap_or(0));
                 let prov = core.provenance.get(&r.url, r.version.as_deref());
                 sys_bytes += s.map(|s| s.est_bytes).unwrap_or(0);
-                sys_concepts += s.map(|s| s.concepts).unwrap_or(0);
+                sys_concepts += concepts.unwrap_or(0);
                 json!({
                     "id": r.id,
                     "version": r.version,
@@ -220,6 +322,7 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
                     "pinned": r.pinned,
                     "current": current_id.as_deref() == Some(r.id.as_str()),
                     "stats": s,
+                    "concepts": concepts,
                     "imported_at": prov.as_ref().map(|p| p.imported_at.clone()),
                     "source": prov.as_ref().map(|p| p.source.clone()),
                     "sha256": prov.as_ref().and_then(|p| p.sha256.clone()),
@@ -231,24 +334,37 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
                 })
             })
             .collect();
-        if q.populated && stats.is_some() && sys_concepts == 0 {
+        let known_concepts = counts.as_ref().map(|_| sys_concepts);
+        let all_not_present = versions.iter().all(|r| r.content == "not-present");
+        if q.populated && !keep_populated(known_concepts, all_not_present) {
             continue;
         }
         total_concepts += sys_concepts;
         let title = versions
             .iter()
             .find_map(|r| r.title.clone().or_else(|| r.name.clone()));
-        systems.push(json!({
-            "url": url,
-            "title": title,
-            "concepts": stats.as_ref().map(|_| sys_concepts),
-            "est_bytes": stats.as_ref().map(|_| sys_bytes),
-            "versions": vjson,
-        }));
+        let key = InventoryKey {
+            url: url.clone(),
+            title: title.clone(),
+            concepts: known_concepts,
+            est_bytes: stats.as_ref().map(|_| sys_bytes),
+        };
+        systems.push((
+            key,
+            json!({
+                "url": url,
+                "title": title,
+                "concepts": known_concepts,
+                "est_bytes": stats.as_ref().map(|_| sys_bytes),
+                "versions": vjson,
+            }),
+        ));
     }
-    if q.sort.as_deref() == Some("size") {
-        systems.sort_by_key(|s| std::cmp::Reverse(s["est_bytes"].as_u64().unwrap_or(0)));
-    }
+    let sort = InventorySort::parse(q.sort.as_deref());
+    let mut keys: Vec<InventoryKey> = systems.iter().map(|(k, _)| k.clone()).collect();
+    sort_inventory(&mut keys, sort);
+    let mut by_key: HashMap<String, Value> = systems.into_iter().map(|(k, v)| (k.url, v)).collect();
+    let mut systems: Vec<Value> = keys.iter().filter_map(|k| by_key.remove(&k.url)).collect();
     let matched = systems.len();
     if let Some(limit) = q.limit {
         systems.truncate(limit);
@@ -256,14 +372,119 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
     Ok(Json(json!({
         "stats_computed_at": stats_at,
         "stats_pending": stats.is_none(),
+        "counts_pending": counts.is_none(),
         "database": fp,
         "value_sets": vs,
         "concept_maps": cm,
         "code_system_count": matched,
-        "total_concepts": stats.as_ref().map(|_| total_concepts),
+        "total_concepts": counts.as_ref().map(|_| total_concepts),
         "systems": systems,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn key(url: &str, title: &str, concepts: Option<u64>, bytes: Option<u64>) -> InventoryKey {
+        InventoryKey {
+            url: url.into(),
+            title: Some(title.into()),
+            concepts,
+            est_bytes: bytes,
+        }
+    }
+
+    fn urls(keys: &[InventoryKey]) -> Vec<&str> {
+        keys.iter().map(|k| k.url.as_str()).collect()
+    }
+
+    fn sample() -> Vec<InventoryKey> {
+        vec![
+            key(
+                "http://canadapost.ca/cs",
+                "Canada Post Province Codes",
+                Some(0),
+                Some(0),
+            ),
+            key(
+                "http://snomed.info/sct",
+                "SNOMED CT",
+                Some(370_000),
+                Some(9_000),
+            ),
+            key("http://loinc.org", "LOINC", Some(100_000), Some(12_000)),
+            key(
+                "http://hl7.org/fhir/sid/ndc",
+                "NDC",
+                Some(200_000),
+                Some(1_000),
+            ),
+        ]
+    }
+
+    #[test]
+    fn concepts_sort_puts_real_content_first() {
+        let mut k = sample();
+        sort_inventory(&mut k, InventorySort::Concepts);
+        assert_eq!(
+            urls(&k),
+            vec![
+                "http://snomed.info/sct",
+                "http://hl7.org/fhir/sid/ndc",
+                "http://loinc.org",
+                "http://canadapost.ca/cs"
+            ]
+        );
+    }
+
+    #[test]
+    fn size_sort_uses_bytes_and_falls_back_to_concepts_while_measuring() {
+        let mut k = sample();
+        sort_inventory(&mut k, InventorySort::Size);
+        assert_eq!(urls(&k)[0], "http://loinc.org");
+        let mut pending: Vec<InventoryKey> = sample()
+            .into_iter()
+            .map(|mut x| {
+                x.est_bytes = None;
+                x
+            })
+            .collect();
+        sort_inventory(&mut pending, InventorySort::Size);
+        assert_eq!(urls(&pending)[0], "http://snomed.info/sct");
+    }
+
+    #[test]
+    fn name_sort_is_by_title_case_insensitively() {
+        let mut k = sample();
+        sort_inventory(&mut k, InventorySort::Name);
+        assert_eq!(
+            k.iter()
+                .map(|x| x.title.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Canada Post Province Codes", "LOINC", "NDC", "SNOMED CT"]
+        );
+    }
+
+    #[test]
+    fn hide_stubs_filter_works_with_and_without_counts() {
+        assert!(!keep_populated(Some(0), false), "zero concepts is a stub");
+        assert!(keep_populated(Some(3), true));
+        // Counts still pending: not-present placeholders are hidden anyway.
+        assert!(!keep_populated(None, true));
+        assert!(keep_populated(None, false));
+    }
+
+    #[test]
+    fn unknown_sort_values_fall_back_to_name() {
+        assert_eq!(InventorySort::parse(None), InventorySort::Name);
+        assert_eq!(InventorySort::parse(Some("bogus")), InventorySort::Name);
+        assert_eq!(
+            InventorySort::parse(Some("concepts")),
+            InventorySort::Concepts
+        );
+    }
 }
 
 async fn refresh_stats(State(core): Core) -> ApiResult {

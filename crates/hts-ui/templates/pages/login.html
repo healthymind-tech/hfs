@@ -1,38 +1,39 @@
-{% extends "layouts/base.html" %}
-
+{% extends "layouts/auth.html" %}
 {#
-  Administrator sign-in (`HTS_ADMIN_PASSWORD`, crates/hts-ui/src/login.rs).
-  A plain form — no script — posting back to itself; on success the server
-  sets the `hts_admin` session cookie and redirects to `next`. Same catalog
-  keys and markup shape as the HFS console's `pages/admin-login.html`.
+  Administrator sign-in (`HTS_ADMIN_PASSWORD`, crates/hts-ui/src/login.rs) on
+  the standalone frame. A plain form posting back to itself; on success the
+  server sets the `hts_admin` session cookie and redirects to `next`. Same
+  markup as the HFS console's `pages/admin-login.html`.
 #}
+{% block title %}{{ chrome.i18n.t("admin-login-title") }}{% endblock %}
 
-{% block title %}{{ chrome.i18n.t("admin-login-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
-
-{% block content %}
-<header class="page-head">
-  <h1 class="page-head__title">{{ chrome.i18n.t("admin-login-title") }}</h1>
-  <p class="page-head__lede">{{ chrome.i18n.t("admin-login-lede") }}</p>
-</header>
-{% if locked %}
-<div class="card notice notice--warn" role="alert">{{ chrome.i18n.t_arg("admin-login-locked", "var", "HTS_ADMIN_PASSWORD") }}</div>
-{% else %}
-<section class="card admin-login">
-  {% if let Some(message) = error %}<div class="alert" role="alert">{{ message }}</div>{% endif %}
-  <form method="post" action="/ui/hts/login">
-    <input type="hidden" name="next" value="{{ next }}">
-    <label class="field">
-      <span class="field__label">{{ chrome.i18n.t("admin-login-user") }}</span>
-      <input class="field__input" type="text" name="username" value="{{ user }}" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-    </label>
-    <label class="field">
-      <span class="field__label">{{ chrome.i18n.t("admin-login-password") }}</span>
-      <input class="field__input" type="password" name="password" autocomplete="current-password" required autofocus>
-    </label>
-    <div class="form-actions form-actions--start">
-      <button class="btn btn--primary" type="submit">{{ chrome.i18n.t("admin-login-submit") }}</button>
-    </div>
-  </form>
-</section>
-{% endif %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ chrome.i18n.t("admin-login-title") }}</h1>
+            <p class="auth-lede">{{ chrome.i18n.t("auth-hts-lede") }}</p>
+          </header>
+          {%- if locked %}
+          <div class="notice notice--warn auth-notice" role="alert" id="admin-login-locked">{% include "icons/lock.svg" %}<span>{{ chrome.i18n.t_arg("admin-login-locked", "var", "HTS_ADMIN_PASSWORD") }}</span></div>
+          {%- else %}
+          {%- if let Some(message) = error %}
+          <div class="notice notice--danger auth-notice" role="alert" id="admin-login-error">{% include "icons/alert.svg" %}<span>{{ message }}</span></div>
+          {%- endif %}
+          <form method="post" action="/ui/hts/login" class="auth-form" data-auth-form>
+            <input type="hidden" name="next" value="{{ next }}">
+            <div class="auth-field">
+              <label class="auth-label" for="admin-username">{{ chrome.i18n.t("admin-login-user") }}</label>
+              <input class="auth-input" id="admin-username" type="text" name="username" value="{{ user }}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required aria-describedby="admin-username-msg" data-msg-required="{{ chrome.i18n.t("auth-required-username") }}">
+              <p class="auth-msg" id="admin-username-msg" aria-live="polite"></p>
+            </div>
+            <div class="auth-field">
+              <label class="auth-label" for="admin-password">{{ chrome.i18n.t("admin-login-password") }}</label>
+              <div class="auth-input-wrap">
+                <input class="auth-input" id="admin-password" type="password" name="password" autocomplete="current-password" required autofocus aria-describedby="admin-password-msg"{% if error.is_some() %} aria-invalid="true"{% endif %} data-msg-required="{{ chrome.i18n.t("auth-required-password") }}" data-caps="{{ chrome.i18n.t("auth-caps-lock") }}">
+                {{ auth.reveal(chrome.i18n)?|safe }}
+              </div>
+              <p class="auth-msg" id="admin-password-msg" aria-live="polite"></p>
+            </div>
+            <button class="btn btn--primary auth-btn" type="submit" data-busy-label="{{ chrome.i18n.t("auth-signing-in") }}">{{ chrome.i18n.t("admin-login-submit") }}</button>
+          </form>
+          {%- endif %}
 {% endblock %}

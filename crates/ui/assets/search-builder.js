@@ -1700,6 +1700,8 @@
       valueInput.className = "builder-row__value";
       valueInput.value = value;
       valueInput.placeholder = sections.dataset.msgValue;
+      // The placeholder is not a label (it vanishes on input).
+      valueInput.setAttribute("aria-label", sections.dataset.msgValue);
       valueInput.spellcheck = false;
       row.appendChild(valueInput);
     }

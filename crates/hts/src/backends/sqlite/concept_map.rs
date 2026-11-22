@@ -130,6 +130,8 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
             query.title = None;
         }
         let pool = self.pool().clone();
+        // `_summary=true`: metadata only, as for CodeSystem / ValueSet.
+        let summary = query.summary.as_deref() == Some("true");
 
         tokio::task::spawn_blocking(move || {
             let mut conn = pool
@@ -143,7 +145,7 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
                     "ConceptMap",
                     query,
                     string_search,
-                    false,
+                    summary,
                 );
             }
 
@@ -198,6 +200,7 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
                 let mut resource = resource_json
+                    .filter(|_| !summary)
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(

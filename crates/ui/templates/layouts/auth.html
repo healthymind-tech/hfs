@@ -1,0 +1,40 @@
+<!doctype html>
+{#
+  Standalone page frame (crates/ui/src/auth_shell.rs): sign-in, break-glass
+  sign-in, forced password change and the sign-in / access messages. Not the
+  console shell — nothing behind it is reachable yet — but the same design
+  system: app.css tokens, Figtree, the shared theme cookie + boot script
+  (light / dark / follow system) and the shared brand pieces from
+  helios-ui-chrome (brand panel, language segmented control, theme button,
+  attribution footer). One sign-in card centred on the page, the logo and
+  product name at its top; language and theme top right, footer below.
+#}
+<html lang="{{ i18n.lang() }}"{{ auth.theme_attrs()|safe }}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>{% block title %}{% endblock %} — {{ i18n.t("console-product-short") }}</title>
+{{ auth.brand_head()?|safe }}
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  {{ auth.theme_boot()?|safe }}
+  <script src="/ui/assets/theme.js" defer></script>
+  <script src="/ui/assets/auth.js" defer></script>
+</head>
+<body class="auth-page">
+  <a class="skip-link" href="#auth-main">{{ i18n.t("mgr-skip-to-content") }}</a>
+  <div class="auth">
+    <main class="auth-main" id="auth-main" tabindex="-1">
+      {{ auth.toolbar(i18n)?|safe }}
+      <div class="auth-center">
+        <section class="auth-card" aria-labelledby="auth-title">
+          {{ auth.brand(i18n)?|safe }}
+{% block card %}{% endblock %}
+        </section>
+{% block after_card %}{% endblock %}
+      </div>
+      {{ auth.footer(i18n)?|safe }}
+    </main>
+  </div>
+</body>
+</html>

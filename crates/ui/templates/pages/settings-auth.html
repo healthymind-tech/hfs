@@ -28,22 +28,22 @@
 {% if !break_glass_available %}<div class="notice notice--warn">{% call ui::icon("alert") %}{% endcall %}{{ i18n.t("console-settings-no-break-glass") }}</div>{% endif %}
 
 <form method="post" action="/ui/settings/auth" class="card form-section config-form" id="settings-auth-form">
-  <div class="form-section__body">
+  <div class="form-section__body form-grid">
   {{ csrf_html|safe }}
   <input type="hidden" name="revision" value="{{ revision }}">
 
-  <fieldset class="mfield">
-    <legend class="mfield__label">{{ i18n.t("console-settings-mode") }}{% if self.pinned("mode") %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">{{ i18n.t("console-settings-pinned") }} HFS_CONSOLE_AUTH_MODE</small>{% endif %}</legend>
+  <fieldset class="mfield mfield--group form-grid__full">
+    <legend class="mfield__label">{{ i18n.t("console-settings-mode") }}{% if self.pinned("mode") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ i18n.t("console-settings-pinned") }} HFS_CONSOLE_AUTH_MODE</span></span>{% endif %}</legend>
     {% for (value, key) in modes %}
-    <label class="mcheck">
-      <input type="radio" name="mode" value="{{ value }}"{% if form.mode == *value %} checked{% endif %}{% if self.pinned("mode") %} disabled{% endif %}>
-      <span>{{ i18n.t(key) }}</span>
+    <label class="mcheck mcheck--card">
+      <input class="mcheck__input" type="radio" name="mode" value="{{ value }}"{% if form.mode == *value %} checked{% endif %}{% if self.pinned("mode") %} disabled{% endif %}>
+      <span class="mcheck__label">{{ i18n.t(key) }}</span>
     </label>
     {% endfor %}
   </fieldset>
 
   <label class="mfield">
-    <span class="mfield__label">{{ i18n.t("console-settings-anonymous-role") }}{% if self.pinned("anonymousRole") %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">HFS_CONSOLE_ANONYMOUS_ROLE</small>{% endif %}</span>
+    <span class="mfield__label">{{ i18n.t("console-settings-anonymous-role") }}{% if self.pinned("anonymousRole") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_ANONYMOUS_ROLE</span></span>{% endif %}</span>
     <select class="mfield__input" name="anonymousRole"{% if self.pinned("anonymousRole") %} disabled{% endif %}>
       {% for value in ["none", "viewer", "editor"] %}
       <option value="{{ value }}"{% if form.anonymous_role == *value %} selected{% endif %}>{{ value }}</option>
@@ -51,29 +51,29 @@
     </select>
   </label>
 
-  <label class="mcheck">
-    <input type="checkbox" name="breakGlass" value="true"{% if form.break_glass %} checked{% endif %}{% if self.pinned("breakGlass") %} disabled{% endif %}>
-    <span>{{ i18n.t("console-settings-break-glass") }}{% if self.pinned("breakGlass") %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">HFS_CONSOLE_BREAK_GLASS</small>{% endif %}</span>
+  <label class="mcheck form-grid__full">
+    <input class="mcheck__input" type="checkbox" name="breakGlass" value="true"{% if form.break_glass %} checked{% endif %}{% if self.pinned("breakGlass") %} disabled{% endif %}>
+    <span class="mcheck__label">{{ i18n.t("console-settings-break-glass") }}{% if self.pinned("breakGlass") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_BREAK_GLASS</span></span>{% endif %}</span>
   </label>
 
-  <h2 class="form-section__title">{{ i18n.t("console-settings-oidc") }}</h2>
+  <h2 class="form-section__title form-subhead form-grid__full">{{ i18n.t("console-settings-oidc") }}</h2>
   {% for (name, label, var, value) in oidc_fields %}
   <label class="mfield">
-    <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">{{ var }}</small>{% endif %}</span>
+    <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ var }}</span></span>{% endif %}</span>
     <input class="mfield__input" type="text" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %} autocomplete="off" spellcheck="false">
   </label>
   {% endfor %}
   <label class="mfield">
-    <span class="mfield__label">{{ i18n.t("console-settings-oidc-secret") }}{% if self.pinned("oidc.clientSecret") %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">HFS_CONSOLE_OIDC_CLIENT_SECRET</small>{% endif %}
+    <span class="mfield__label">{{ i18n.t("console-settings-oidc-secret") }}{% if self.pinned("oidc.clientSecret") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_OIDC_CLIENT_SECRET</span></span>{% endif %}
       — {% if secret_set %}{{ i18n.t("console-settings-secret-set") }}{% else %}{{ i18n.t("console-settings-secret-unset") }}{% endif %}</span>
     <input class="mfield__input" type="password" name="oidc.clientSecret" value="" autocomplete="new-password"{% if self.pinned("oidc.clientSecret") || !key_ring %} disabled{% endif %}>
     {% if !key_ring %}<span class="mfield__hint">{{ i18n.t("console-settings-secret-no-keyring") }}</span>{% endif %}
   </label>
   {% if secret_set && !self.pinned("oidc.clientSecret") %}
-  <label class="mcheck"><input type="checkbox" name="oidc.clientSecret.clear" value="true"> <span>{{ i18n.t("console-settings-secret-clear") }}</span></label>
+  <label class="mcheck form-grid__full"><input class="mcheck__input" type="checkbox" name="oidc.clientSecret.clear" value="true"> <span class="mcheck__label">{{ i18n.t("console-settings-secret-clear") }}</span></label>
   {% endif %}
   <label class="mfield">
-    <span class="mfield__label">{{ i18n.t("console-settings-oidc-default-role") }}{% if self.pinned("oidc.defaultRole") %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">HFS_CONSOLE_OIDC_DEFAULT_ROLE</small>{% endif %}</span>
+    <span class="mfield__label">{{ i18n.t("console-settings-oidc-default-role") }}{% if self.pinned("oidc.defaultRole") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_OIDC_DEFAULT_ROLE</span></span>{% endif %}</span>
     <select class="mfield__input" name="oidc.defaultRole"{% if self.pinned("oidc.defaultRole") %} disabled{% endif %}>
       {% for value in ["none", "viewer", "editor", "admin"] %}
       <option value="{{ value }}"{% if form.default_role == *value %} selected{% endif %}>{{ value }}</option>
@@ -81,25 +81,25 @@
     </select>
   </label>
 
-  <h2 class="form-section__title">{{ i18n.t("console-settings-local") }}</h2>
+  <h2 class="form-section__title form-subhead form-grid__full">{{ i18n.t("console-settings-local") }}</h2>
   {% for (name, label, var, value) in number_fields %}
   <label class="mfield">
-    <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">{{ var }}</small>{% endif %}</span>
+    <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ var }}</span></span>{% endif %}</span>
     <input class="mfield__input" type="number" min="1" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %}>
   </label>
   {% endfor %}
   <label class="mfield">
-    <span class="mfield__label">{{ i18n.t("console-settings-allowed-origins") }}{% if self.pinned("allowedOrigins") %} {% call ui::icon("lock") %}{% endcall %}<small class="mfield__hint">HFS_CONSOLE_ALLOWED_ORIGINS</small>{% endif %}</span>
+    <span class="mfield__label">{{ i18n.t("console-settings-allowed-origins") }}{% if self.pinned("allowedOrigins") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_ALLOWED_ORIGINS</span></span>{% endif %}</span>
     <input class="mfield__input" type="text" name="allowedOrigins" value="{{ form.allowed_origins }}"{% if self.pinned("allowedOrigins") %} disabled{% endif %} spellcheck="false">
   </label>
 
   {% if !field_errors.is_empty() %}
-  <ul class="notice notice--danger" role="alert" id="settings-field-errors">
+  <ul class="notice notice--danger form-grid__full" role="alert" id="settings-field-errors">
     {% for (f, m) in field_errors %}<li><code>{{ f }}</code>: {{ m }}</li>{% endfor %}
   </ul>
   {% endif %}
 
-  <div class="form-actions form-actions--start">
+  <div class="form-actions form-actions--start form-grid__full">
     <button class="btn btn--primary" type="submit">{{ i18n.t("console-save") }}</button>
   </div>
   </div>
@@ -109,7 +109,7 @@
 <section class="card form-section" id="oidc-test">
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-settings-test-title") }}</h2></header>
   <div class="form-section__body">
-  <p>{% if test_passed %}{% call ui::icon("check-circle") %}{% endcall %} {{ i18n.t("console-settings-test-passed") }}{% else %}{{ i18n.t("console-settings-test-lede") }}{% endif %}</p>
+  <p class="muted">{% if test_passed %}{% call ui::icon("check-circle") %}{% endcall %} {{ i18n.t("console-settings-test-passed") }}{% else %}{{ i18n.t("console-settings-test-lede") }}{% endif %}</p>
   <form method="post" action="/ui/settings/auth/test">
     {{ csrf_html|safe }}
     <button class="btn" type="submit">{{ i18n.t("console-settings-test-button") }}</button>

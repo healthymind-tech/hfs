@@ -40,6 +40,7 @@
 
 mod account;
 mod admin_login;
+mod auth_shell;
 mod bulk_export;
 mod bulk_import;
 mod capability;
@@ -529,6 +530,12 @@ pub(crate) struct Status {
     /// built on it; before that, page scripts assumed the root and broke
     /// behind any prefix.
     fhir_base: String,
+    /// Where the per-user settings document lives: the endpoint's own FHIR
+    /// base, except while that endpoint is not serving (disabled or
+    /// provisioning answers every FHIR request with 503), when the server's
+    /// root base is used so the console's own preference reads do not fail
+    /// on every page of a disabled endpoint (UIF: 503 /_user/settings).
+    settings_base: String,
     /// The manager console's chrome (endpoint switcher, sectioned sidebar),
     /// when the manager is installed.
     manager: Option<manager::ManagerChrome>,
@@ -543,6 +550,17 @@ pub(crate) struct Status {
 /// whatever host it reached the UI on, which may be a different name than
 /// the configured public one (a port-forward, a loopback check), and an
 /// origin mismatch would turn every call into a blocked cross-origin request.
+/// The FHIR base the console's per-user settings are read from: the
+/// endpoint's own while it serves, the root base otherwise.
+pub(crate) fn settings_base(scope: Option<&manager::EndpointScope>, root: &str) -> String {
+    match scope {
+        Some(scope) if scope.endpoint.spec.status == helios_endpoints::EndpointStatus::Enabled => {
+            scope.fhir_base(root)
+        }
+        _ => root.to_string(),
+    }
+}
+
 pub(crate) fn fhir_base_path(public_base_url: &str) -> String {
     let path = match reqwest::Url::parse(public_base_url) {
         Ok(url) => url.path().to_string(),
@@ -902,6 +920,11 @@ impl Status {
     /// [`fhir_base_path`].
     pub(crate) fn fhir_base(&self) -> &str {
         &self.fhir_base
+    }
+
+    /// Base of the per-user settings document (see `settings_base`).
+    pub(crate) fn settings_base(&self) -> &str {
+        &self.settings_base
     }
 
     /// The effective tenant's display label: its registry display name, or the
@@ -2333,7 +2356,10 @@ pub fn mount_with_conformance_source_and_runtime(
         // Answer 404 until a login is installed (see `login::installed`).
         .route("/ui/login", get(login::login))
         .route("/ui/callback", get(login::callback))
-        .route("/ui/logout", axum::routing::post(login::logout))
+        .route(
+            "/ui/logout",
+            axum::routing::get(login::logout_confirm).post(login::logout),
+        )
         // Administrator sign-in (`HFS_ADMIN_PASSWORD`): the form, and the
         // sign-out its session's account menu offers.
         .route(
@@ -10139,7 +10165,13 @@ fn build_chart(
         .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
-    let axis_max = nice_ceil(peak).max(1);
+    // Small peaks round up to a multiple of 4, so the five gridlines (max,
+    // ¾, ½, ¼, 0) carry distinct whole numbers: a peak of 3 used to label
+    // the axis 3, 2, 1, 0, 0.
+    let axis_max = match nice_ceil(peak).max(1) {
+        m if m < 40 => m.div_ceil(4) * 4,
+        m => m,
+    };
 
     // Map sample index -> x, cumulative value -> y (SVG y grows downward).
     let x_at = |i: i64| -> i64 {
@@ -10489,6 +10521,10 @@ pub(crate) fn current_status(
             Some(scope) => scope.fhir_base(&fhir_base_path(&state.public_base_url)),
             None => fhir_base_path(&state.public_base_url),
         },
+        settings_base: settings_base(
+            tenant.scope.as_deref(),
+            &fhir_base_path(&state.public_base_url),
+        ),
         manager: state
             .manager
             .as_deref()
@@ -10648,6 +10684,7 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                settings_base: String::new(),
                 manager: None,
                 csrf: None,
             },
@@ -10843,6 +10880,7 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                settings_base: String::new(),
                 manager: None,
                 csrf: None,
             },
@@ -11054,6 +11092,7 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
                 fhir_base: String::new(),
+                settings_base: String::new(),
                 manager: None,
                 csrf: None,
             },
@@ -12170,6 +12209,7 @@ mod user_summary_tests {
             user,
             bearer_only_auth: false,
             fhir_base: String::new(),
+            settings_base: String::new(),
             manager: None,
             csrf: None,
         }

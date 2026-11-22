@@ -239,6 +239,12 @@ pub type StatsSnapshot = (String, Arc<HashMap<String, ops::SystemStats>>);
 pub struct StatsCache {
     pub value: tokio::sync::RwLock<Option<StatsSnapshot>>,
     pub refresh: tokio::sync::Mutex<()>,
+    /// Concepts per CodeSystem storage id — the one cheap column of the full
+    /// stats (a single `GROUP BY` over `concepts`), cached separately so the
+    /// inventory can count concepts, hide stubs and order by content while
+    /// the slow size scan of a multi-GB database is still running.
+    pub counts: tokio::sync::RwLock<Option<Arc<HashMap<String, u64>>>>,
+    pub counts_refresh: tokio::sync::Mutex<()>,
 }
 
 /// Shared state of the admin surface.
@@ -294,6 +300,27 @@ impl AdminCore {
     /// Drop cached stats (after any write job).
     pub async fn invalidate_stats(&self) {
         *self.stats.value.write().await = None;
+        *self.stats.counts.write().await = None;
+    }
+
+    /// Concepts per CodeSystem storage id: from the full stats when they are
+    /// cached, otherwise from the cheap count (computed once and cached).
+    pub async fn concept_counts(&self) -> Result<Arc<HashMap<String, u64>>, AdminError> {
+        if let Some((_, stats)) = self.stats.value.read().await.clone() {
+            return Ok(Arc::new(
+                stats.iter().map(|(k, v)| (k.clone(), v.concepts)).collect(),
+            ));
+        }
+        if let Some(c) = self.stats.counts.read().await.clone() {
+            return Ok(c);
+        }
+        let _guard = self.stats.counts_refresh.lock().await;
+        if let Some(c) = self.stats.counts.read().await.clone() {
+            return Ok(c);
+        }
+        let counts = Arc::new(self.ops.concept_counts().await?);
+        *self.stats.counts.write().await = Some(counts.clone());
+        Ok(counts)
     }
 
     /// Current per-system stats, computing them if the cache is empty.

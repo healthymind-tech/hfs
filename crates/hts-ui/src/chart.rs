@@ -67,6 +67,11 @@ pub(crate) struct ChartView {
     /// Each becomes its own `<polyline class="series">`; the breaks between
     /// them are the stretches nobody was watching.
     pub polylines: Vec<String>,
+    /// The last point of each run, drawn as a dot (`.series-end`). A run of a
+    /// single interval is one point, and a one-point `<polyline>` paints
+    /// nothing — so without this a sparse series rendered as an empty chart
+    /// under a non-empty headline (UIF defect 1).
+    pub ends: Vec<AxisTick>,
     /// Horizontal value gridlines, top (largest) to bottom (zero).
     pub y_ticks: Vec<AxisTick>,
     /// Time labels along the bottom, oldest (left) to "now" (right).
@@ -77,9 +82,6 @@ pub(crate) struct ChartView {
     pub height: i64,
     /// 1-based palette slot (`--series-N`), so the line matches its legend dot.
     pub color: usize,
-    /// The most recent in-window rate, compact — the card's headline number.
-    /// Empty when `has_data` is false.
-    pub latest: String,
 }
 
 /// Floor for the value axis when traffic is low or absent.
@@ -148,6 +150,19 @@ pub(crate) fn build_chart(
         }
     }
     let polylines: Vec<String> = segments.iter().map(|seg| seg.join(" ")).collect();
+    // `AxisTick` reused as a plain point: `pos` = x, `label_y` = y.
+    let ends: Vec<AxisTick> = segments
+        .iter()
+        .filter_map(|seg| seg.last())
+        .filter_map(|xy| {
+            let (x, y) = xy.split_once(',')?;
+            Some(AxisTick {
+                label: String::new(),
+                pos: x.parse().ok()?,
+                label_y: y.parse().ok()?,
+            })
+        })
+        .collect();
 
     // Evenly spaced time labels across the window, oldest first. Tick count
     // is per-window so every label lands on a whole minute or hour.
@@ -168,14 +183,11 @@ pub(crate) fn build_chart(
     ChartView {
         has_data: !in_window.is_empty(),
         polylines,
+        ends,
         y_ticks: y_axis_ticks(axis_max, height, plot_bottom, lang),
         x_ticks,
         height,
         color,
-        latest: in_window
-            .last()
-            .map(|p| compact_count(p.per_min, lang))
-            .unwrap_or_default(),
     }
 }
 
@@ -281,7 +293,7 @@ mod tests {
         assert!(view.polylines.is_empty(), "no data must plot no polyline");
         assert_eq!(view.y_ticks.len(), 5, "the axis frame still renders");
         assert_eq!(view.x_ticks.len(), 6);
-        assert!(view.latest.is_empty());
+        assert!(view.ends.is_empty());
     }
 
     #[test]
@@ -327,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn every_run_gets_an_end_marker_so_a_lone_interval_is_visible() {
+        let now = 10_000.0;
+        let points = [
+            point(now - 600.0, 10, true),
+            point(now - 60.0, 90, true),
+            point(now - 45.0, 95, false),
+        ];
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
+        assert_eq!(view.ends.len(), 2, "one marker per run: {:?}", view.ends);
+        let last = view.polylines[1].split(' ').next_back().unwrap();
+        assert_eq!(
+            format!("{},{}", view.ends[1].pos, view.ends[1].label_y),
+            last
+        );
+    }
+
+    #[test]
     fn points_outside_the_window_are_dropped_not_squeezed_in() {
         let now = 10_000.0;
         let points = [
@@ -354,7 +383,7 @@ mod tests {
         let points = [point(now - 2_000.0, 5, true), point(now - 100.0, 8, false)];
         let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         assert_eq!(view.polylines.len(), 1);
-        assert_eq!(view.latest, "8");
+        assert_eq!(view.ends.len(), 1);
     }
 
     #[test]

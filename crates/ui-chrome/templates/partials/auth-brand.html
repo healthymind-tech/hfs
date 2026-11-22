@@ -1,0 +1,12 @@
+{#
+  SHARED CHROME -- the brand header at the top of the sign-in card of both
+  consoles (`helios_ui_chrome::auth_brand()`): the official horizontal logo,
+  modest and centred, and the product name as a small title in the request's
+  language. The logo's wordmark is decorative; the name is real text.
+#}<div class="auth-logo">
+            <a class="auth-logo__link" href="{{ brand.home }}" aria-label="{{ i18n.t(brand.product_key) }}">
+              <img class="auth-logo__img" src="{{ brand.assets }}/brand/healthymind-logo-horizontal@2x.png" alt="" width="181" height="40">
+            </a>
+            <p class="auth-logo__name">{{ i18n.t(brand.product_key) }}</p>
+          </div>
+{#- -#}

@@ -326,6 +326,20 @@ impl TerminologyAdmin for SqliteTerminologyBackend {
         .await
     }
 
+    async fn concept_counts(&self) -> Result<HashMap<String, u64>, HtsError> {
+        self.blocking(|conn| {
+            let mut out: HashMap<String, SystemStats> = HashMap::new();
+            count_by_system(
+                conn,
+                "SELECT system_id, COUNT(*) FROM concepts GROUP BY system_id",
+                &mut out,
+                |s, n| s.concepts = n,
+            )?;
+            Ok(out.into_iter().map(|(id, s)| (id, s.concepts)).collect())
+        })
+        .await
+    }
+
     async fn system_stats(&self) -> Result<HashMap<String, SystemStats>, HtsError> {
         self.blocking(|conn| {
             let mut out: HashMap<String, SystemStats> = HashMap::new();

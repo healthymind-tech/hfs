@@ -163,6 +163,18 @@ pub trait TerminologyAdmin: Send + Sync {
     /// callers cache the result.
     async fn system_stats(&self) -> Result<HashMap<String, SystemStats>, HtsError>;
 
+    /// Concepts per CodeSystem storage id only — the first, cheap query of
+    /// [`Self::system_stats`]. Backends override it with that single query;
+    /// the default derives it from the full scan.
+    async fn concept_counts(&self) -> Result<HashMap<String, u64>, HtsError> {
+        Ok(self
+            .system_stats()
+            .await?
+            .into_iter()
+            .map(|(id, s)| (id, s.concepts))
+            .collect())
+    }
+
     /// Database footprint.
     async fn footprint(&self) -> Result<DbFootprint, HtsError>;
 

@@ -1462,7 +1462,7 @@ hts-home-chart-series-5xx = 5xx
 hts-home-chart-empty-unreachable = /metrics is unreachable — no new samples are arriving.
 hts-home-chart-empty-none = No samples collected yet.
 hts-home-chart-empty-first = Collecting the first interval — a rate needs two samples.
-hts-home-chart-empty-window = No samples in this window. Sampling only runs while this page is open.
+hts-home-chart-empty-window = No samples in this window yet. The console samples /metrics every 15 s.
 hts-home-chart-axis-now = now
 hts-home-chart-axis-minutes = -{ $n }m
 hts-home-chart-axis-hours = -{ $n }h
@@ -2036,11 +2036,12 @@ hts-home-tile-status-sub = backend { $backend } · FHIR { $version }
 hts-home-tile-uptime-sub = hts v{ $version } · no restarts since { $since } UTC
 hts-home-tile-uptime-sub-noclock = hts v{ $version }
 hts-home-tile-loaded-systems-sub = { $mib } MiB bundled on disk
-hts-home-tile-requests-sub = { $ms } ms average · from /metrics
+hts-home-tile-requests-sub = { $ms } ms average · all routes since start
 
 # Chart caption, composed from the SELECTED window and status class.
 # Each locale owns its own word order through the two placeables.
-hts-home-chart-hint = { $window }, { $classes }. Sampled while this page is open. Excludes this page's own 15 s refresh and /metrics scrapes.
+hts-home-chart-hint = { $window }, { $classes }: average per minute over the observed time. Sampled every 15 s; excludes the console's own refresh and /metrics scrapes.
+hts-home-chart-stats = { $total } requests in { $minutes } min observed · latest { $latest }/min · peak { $peak }/min
 hts-home-chart-hint-window-15m = Last 15 minutes
 hts-home-chart-hint-window-1h = Last hour
 hts-home-chart-hint-window-6h = Last 6 hours
@@ -2549,3 +2550,16 @@ sql-library-select-title = Select a query or view
 sql-library-select-lede = Choose an item from the list or create a new one.
 sql-library-unavailable-title = The selection is unavailable
 sql-library-unavailable-lede = The available queries and views could not be verified.
+
+# UIF functional fixes: browser sort/total, terminology inventory, HTS topbar.
+hts-browser-sort = Sort by
+hts-browser-sort-name = Name (A–Z)
+hts-browser-sort-title = Title (A–Z)
+hts-browser-sort-url = Canonical URL
+hts-browser-sort-updated = Recently updated
+hts-browser-total = { $total } matching
+hts-term-sort-concepts = Most concepts first
+hts-term-sizes-pending = Concepts are counted. Measuring storage sizes — on a large database this takes a few minutes; the table updates by itself.
+hts-term-stat-systems-counting = counting concepts…
+hts-term-stat-concepts-counting = counting…
+hts-term-stat-concepts-shown = across all matching code systems

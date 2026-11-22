@@ -43,6 +43,7 @@ use helios_auth::{AccessOutcome, PENDING_COOKIE, SESSION_COOKIE, SessionStore};
 use helios_endpoints::console::{CONSOLE_ISSUER, ConsoleAuthMode, ConsolePrincipal};
 use serde::Deserialize;
 
+use crate::auth_shell::{AuthShell, Banner};
 use crate::csrf::CsrfField;
 use crate::{I18n, RequestLocale, WebState};
 
@@ -239,6 +240,15 @@ pub(crate) async fn callback(
         return not_configured();
     };
     let secure = login.sessions.config().cookie_secure;
+    let locale = request
+        .extensions()
+        .get::<RequestLocale>()
+        .copied()
+        .unwrap_or_default();
+    let headers = request.headers().clone();
+    let login_failed = |status: StatusCode, detail: &str, secure: bool| {
+        login_failed(status, detail, secure, locale, &headers)
+    };
 
     if let Some(error) = query.error {
         let detail = query.error_description.unwrap_or_default();
@@ -334,13 +344,25 @@ fn not_configured() -> Response {
         .into_response()
 }
 
-fn login_failed(status: StatusCode, detail: &str, secure: bool) -> Response {
-    let mut response = (
-        status,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        format!("Login failed: {detail}"),
-    )
-        .into_response();
+fn login_failed(
+    status: StatusCode,
+    detail: &str,
+    secure: bool,
+    locale: RequestLocale,
+    headers: &HeaderMap,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let mut page = ConsoleMessagePage::new(
+        i18n,
+        Some(headers),
+        "danger",
+        i18n.t("console-login-failed-title"),
+        i18n.t("auth-login-failed-text"),
+    );
+    page.detail = Some(detail.to_string());
+    page.back_href = Some("/ui/login".into());
+    page.back_label = i18n.t("auth-try-again");
+    let mut response = message_page(status, page);
     append_cookie(&mut response, &cookie(PENDING_COOKIE, "", Some(0), secure));
     response
 }
@@ -568,17 +590,56 @@ async fn denied_dispatch(
     no_store(response)
 }
 
-/// Sign-in, "not allowed" and failure messages.
+/// Sign-in, "not allowed", failure and sign-out messages, on the standalone
+/// frame (`templates/pages/console-message.html`).
 #[derive(Template)]
 #[template(path = "pages/console-message.html")]
 pub(crate) struct ConsoleMessagePage {
     pub(crate) i18n: I18n,
+    pub(crate) auth: AuthShell,
+    /// Icon and accent: `lock` (access), `warn`, `danger` (failure),
+    /// `signout`.
+    pub(crate) tone: &'static str,
     pub(crate) title: String,
     pub(crate) text: String,
+    /// A second, smaller paragraph (what to do next).
+    pub(crate) hint: Option<String>,
+    /// Technical detail, folded (an IdP error, …).
+    pub(crate) detail: Option<String>,
     pub(crate) back_href: Option<String>,
+    pub(crate) back_label: String,
     pub(crate) show_sign_out: bool,
+    /// Sign out is the page's main action (the sign-out confirmation).
+    pub(crate) sign_out_primary: bool,
     pub(crate) csrf_html: String,
     pub(crate) end_session_href: Option<String>,
+}
+
+impl ConsoleMessagePage {
+    /// A message page with no actions yet.
+    pub(crate) fn new(
+        i18n: I18n,
+        headers: Option<&HeaderMap>,
+        tone: &'static str,
+        title: String,
+        text: String,
+    ) -> Self {
+        Self {
+            auth: AuthShell::new(&i18n, headers, ""),
+            tone,
+            title,
+            text,
+            hint: None,
+            detail: None,
+            back_href: None,
+            back_label: i18n.t("console-back"),
+            show_sign_out: false,
+            sign_out_primary: false,
+            csrf_html: String::new(),
+            end_session_href: None,
+            i18n,
+        }
+    }
 }
 
 pub(crate) fn message_page(status: StatusCode, page: ConsoleMessagePage) -> Response {
@@ -601,33 +662,85 @@ pub(crate) struct DeniedQuery {
 async fn denied(
     locale: RequestLocale,
     csrf: CsrfField,
+    headers: HeaderMap,
     resolved: Option<Extension<Resolved>>,
     Query(q): Query<DeniedQuery>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let (title, text) = match q.kind.as_deref() {
-        Some("csrf") => (i18n.t("console-csrf-title"), i18n.t("console-csrf-text")),
-        _ => (
-            i18n.t("console-forbidden-title"),
-            i18n.t_arg(
-                "console-forbidden-text",
-                "role",
-                q.need.unwrap_or_else(|| "admin".into()),
-            ),
-        ),
+    let mut page = match q.kind.as_deref() {
+        Some("csrf") => {
+            let mut p = ConsoleMessagePage::new(
+                i18n,
+                Some(&headers),
+                "warn",
+                i18n.t("console-csrf-title"),
+                i18n.t("console-csrf-text"),
+            );
+            p.back_label = i18n.t("auth-back-to-console");
+            p
+        }
+        _ => {
+            let mut p = ConsoleMessagePage::new(
+                i18n,
+                Some(&headers),
+                "lock",
+                i18n.t("console-forbidden-title"),
+                i18n.t_arg(
+                    "console-forbidden-text",
+                    "role",
+                    q.need.unwrap_or_else(|| "admin".into()),
+                ),
+            );
+            p.hint = resolved.as_ref().map(|r| {
+                i18n.t_arg2(
+                    "auth-signed-in-as",
+                    "user",
+                    r.principal.display_name.clone(),
+                    "role",
+                    r.principal.role.as_str(),
+                )
+            });
+            p.back_label = i18n.t("auth-back-to-console");
+            p
+        }
     };
-    message_page(
-        StatusCode::FORBIDDEN,
-        ConsoleMessagePage {
-            i18n,
-            title,
-            text,
-            back_href: Some("/ui".into()),
-            show_sign_out: resolved.is_some(),
-            csrf_html: csrf.html(),
-            end_session_href: None,
-        },
-    )
+    page.back_href = Some("/ui".into());
+    page.show_sign_out = resolved.is_some();
+    page.csrf_html = csrf.html();
+    message_page(StatusCode::FORBIDDEN, page)
+}
+
+/// `GET /ui/logout` — the sign-out confirmation (a sign-out is a `POST`;
+/// a typed or bookmarked `/ui/logout` lands here instead of a bare 405).
+pub(crate) async fn logout_confirm(
+    locale: RequestLocale,
+    csrf: CsrfField,
+    headers: HeaderMap,
+    resolved: Option<Extension<Resolved>>,
+    signed_in: Option<Extension<SignedIn>>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let who = resolved
+        .as_ref()
+        .map(|r| r.principal.display_name.clone())
+        .or_else(|| signed_in.as_ref().map(|s| s.0.0.display().to_string()));
+    let Some(who) = who else {
+        // Nobody to sign out: the sign-in page.
+        return no_store(Redirect::to("/ui/login").into_response());
+    };
+    let mut page = ConsoleMessagePage::new(
+        i18n,
+        Some(&headers),
+        "signout",
+        i18n.t("auth-signout-title"),
+        i18n.t_arg("auth-signout-text", "user", who),
+    );
+    page.back_href = Some("/ui".into());
+    page.back_label = i18n.t("auth-cancel");
+    page.show_sign_out = true;
+    page.sign_out_primary = true;
+    page.csrf_html = csrf.html();
+    message_page(StatusCode::OK, page)
 }
 
 /// The console sign-in page.
@@ -635,11 +748,17 @@ async fn denied(
 #[template(path = "pages/login.html")]
 struct ConsoleLoginPage {
     i18n: I18n,
+    auth: AuthShell,
+    heading: String,
     lede: String,
-    notice: Option<String>,
-    error: Option<String>,
+    notice: Option<Banner>,
+    error: Option<Banner>,
+    /// The error concerns the credentials (marks both fields invalid).
+    field_error: bool,
     show_idp: bool,
     idp_href: String,
+    /// Host of the OIDC issuer, shown under the button ("via …").
+    idp_host: String,
     show_form: bool,
     next: String,
     user: String,
@@ -647,7 +766,6 @@ struct ConsoleLoginPage {
     break_glass_href: String,
     show_idp_link: bool,
     idp_page_href: String,
-    lang_suffix: String,
 }
 
 fn query_pair(key: &str, value: &str) -> String {
@@ -656,17 +774,27 @@ fn query_pair(key: &str, value: &str) -> String {
         .finish()
 }
 
-struct LoginView {
+struct LoginView<'h> {
     local: bool,
     next: String,
     user: String,
-    notice: Option<String>,
-    error: Option<String>,
+    notice: Option<Banner>,
+    error: Option<Banner>,
+    field_error: bool,
+    headers: Option<&'h HeaderMap>,
+}
+
+/// Host of an issuer URL, for the "via …" line under the SSO button.
+fn issuer_host(issuer: &str) -> String {
+    reqwest::Url::parse(issuer)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// Renders the sign-in page for the current mode, or `None` when there is
 /// nothing to sign in to (mode none with an anonymous role, no `?local=1`).
-fn login_view(console: &ConsoleAuth, i18n: I18n, v: LoginView) -> Option<ConsoleLoginPage> {
+fn login_view(console: &ConsoleAuth, i18n: I18n, v: LoginView<'_>) -> Option<ConsoleLoginPage> {
     let mode = console.mode();
     let bg = console.break_glass_available();
     let (show_idp, show_form, lede) = match mode {
@@ -675,17 +803,37 @@ fn login_view(console: &ConsoleAuth, i18n: I18n, v: LoginView) -> Option<Console
         ConsoleAuthMode::None if !v.local && console.anonymous().is_some() => return None,
         _ => (false, true, "console-login-lede-break-glass"),
     };
+    let heading = if lede == "console-login-lede-break-glass" {
+        i18n.t("admin-login-title")
+    } else {
+        i18n.t("console-login-title")
+    };
     let next_q = query_pair("next", &v.next);
     let mut error = v.error;
     if show_form && !bg && mode != ConsoleAuthMode::Local && error.is_none() {
-        error = Some(i18n.t_arg("admin-login-locked", "var", "HFS_ADMIN_PASSWORD"));
+        error = Some(Banner::warn(i18n.t_arg(
+            "admin-login-locked",
+            "var",
+            "HFS_ADMIN_PASSWORD",
+        )));
     }
+    let idp_host = console
+        .settings()
+        .oidc
+        .as_ref()
+        .map(|o| issuer_host(&o.issuer))
+        .unwrap_or_default();
+    let lang_suffix = format!("&{next_q}{}", if v.local { "&local=1" } else { "" });
     Some(ConsoleLoginPage {
+        auth: AuthShell::new(&i18n, v.headers, &lang_suffix),
+        heading,
         lede: i18n.t(lede),
         notice: v.notice,
         error,
+        field_error: v.field_error,
         show_idp,
         idp_href: format!("/ui/login/oidc?{next_q}"),
+        idp_host,
         show_form: show_form && (bg || mode == ConsoleAuthMode::Local),
         next: v.next,
         user: v.user,
@@ -693,7 +841,6 @@ fn login_view(console: &ConsoleAuth, i18n: I18n, v: LoginView) -> Option<Console
         break_glass_href: format!("/ui/login?local=1&{next_q}"),
         show_idp_link: mode == ConsoleAuthMode::Oidc && v.local,
         idp_page_href: format!("/ui/login?{next_q}"),
-        lang_suffix: format!("&{next_q}{}", if v.local { "&local=1" } else { "" }),
         i18n,
     })
 }
@@ -711,12 +858,27 @@ async fn console_login_page(
         return no_store(Redirect::to(&next).into_response());
     }
     let i18n = I18n::new(locale);
+    // A console session cookie that no longer resolves: the session expired
+    // (idle / absolute lifetime) or was ended elsewhere — say so, instead of
+    // a bare sign-in form that looks like nothing happened.
+    let expired = !signed_out
+        && helios_auth::cookie_value(headers, helios_admin_auth::console::SESSION_COOKIE)
+            .is_some_and(|v| !v.is_empty());
+    let notice = if signed_out {
+        Some(Banner::ok(i18n.t("console-login-signed-out")))
+    } else if expired {
+        Some(Banner::info(i18n.t("auth-session-expired")))
+    } else {
+        None
+    };
     let view = LoginView {
         local: query.local.is_some(),
         next: next.clone(),
         user: String::new(),
-        notice: signed_out.then(|| i18n.t("console-login-signed-out")),
+        notice,
         error: None,
+        field_error: false,
+        headers: Some(headers),
     };
     match login_view(console, i18n, view) {
         Some(page) => no_store(crate::render(page)),
@@ -749,13 +911,15 @@ pub(crate) async fn login_local_submit(
     let next = helios_admin_auth::safe_next(next.as_deref(), "/ui", "/ui");
     let peer = connect.map(|c| c.0.0.ip());
     let i18n = I18n::new(locale);
-    let failed = |status: StatusCode, error: String| {
+    let failed = |status: StatusCode, error: Banner, field_error: bool| {
         let view = LoginView {
             local: true,
             next: next.clone(),
             user: user.clone(),
             notice: None,
             error: Some(error),
+            field_error,
+            headers: Some(&headers),
         };
         let page = login_view(&console, i18n, view)
             .map(crate::render)
@@ -779,22 +943,32 @@ pub(crate) async fn login_local_submit(
             };
             redirect_with(&target, cookies)
         }
-        LoginResult::Invalid => failed(StatusCode::UNAUTHORIZED, i18n.t("admin-login-invalid")),
+        LoginResult::Invalid => failed(
+            StatusCode::UNAUTHORIZED,
+            Banner::danger(i18n.t("admin-login-invalid")),
+            true,
+        ),
         LoginResult::RateLimited(left) => {
             let minutes = left.as_secs().div_ceil(60).max(1);
             let mut response = failed(
                 StatusCode::TOO_MANY_REQUESTS,
-                i18n.t_arg("admin-login-throttled", "minutes", minutes),
+                Banner::warn(i18n.t_arg("admin-login-throttled", "minutes", minutes)),
+                false,
             );
             if let Ok(v) = HeaderValue::from_str(&left.as_secs().max(1).to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, v);
             }
             response
         }
-        LoginResult::CrossOrigin => failed(StatusCode::FORBIDDEN, i18n.t("admin-login-cross-site")),
+        LoginResult::CrossOrigin => failed(
+            StatusCode::FORBIDDEN,
+            Banner::warn(i18n.t("admin-login-cross-site")),
+            false,
+        ),
         LoginResult::Unavailable(detail) => failed(
             StatusCode::SERVICE_UNAVAILABLE,
-            i18n.t_arg("console-error-unavailable", "detail", detail),
+            Banner::danger(i18n.t_arg("console-error-unavailable", "detail", detail)),
+            false,
         ),
     }
 }
@@ -820,7 +994,11 @@ async fn login_oidc(
                 next,
                 user: String::new(),
                 notice: None,
-                error: Some(i18n.t_arg("console-login-no-oidc", "reason", reason)),
+                error: Some(
+                    Banner::danger(i18n.t("auth-sso-unavailable")).with_detail(reason.to_string()),
+                ),
+                field_error: false,
+                headers: Some(&headers),
             };
             match login_view(&console, i18n, view) {
                 Some(page) => {
@@ -877,18 +1055,8 @@ async fn console_callback(
             cookies,
             end_session,
         } => {
-            let mut r = message_page(
-                StatusCode::FORBIDDEN,
-                ConsoleMessagePage {
-                    title: i18n.t("console-noaccess-title"),
-                    text: i18n.t_arg("console-noaccess-text", "user", display),
-                    back_href: None,
-                    show_sign_out: false,
-                    csrf_html: String::new(),
-                    end_session_href: end_session,
-                    i18n,
-                },
-            );
+            let page = no_access_page(i18n, request.headers(), display, end_session);
+            let mut r = message_page(StatusCode::FORBIDDEN, page);
             for c in cookies {
                 r.headers_mut().append(header::SET_COOKIE, c);
             }
@@ -896,20 +1064,40 @@ async fn console_callback(
         }
         OidcOutcome::Failed(detail) => {
             tracing::warn!(error = %detail, "console OIDC sign-in failed");
-            message_page(
-                StatusCode::BAD_REQUEST,
-                ConsoleMessagePage {
-                    title: i18n.t("console-login-failed-title"),
-                    text: detail,
-                    back_href: Some("/ui/login".into()),
-                    show_sign_out: false,
-                    csrf_html: String::new(),
-                    end_session_href: None,
-                    i18n,
-                },
-            )
+            let mut page = ConsoleMessagePage::new(
+                i18n,
+                Some(request.headers()),
+                "danger",
+                i18n.t("console-login-failed-title"),
+                i18n.t("auth-login-failed-text"),
+            );
+            page.detail = Some(detail);
+            page.back_href = Some("/ui/login".into());
+            page.back_label = i18n.t("auth-try-again");
+            message_page(StatusCode::BAD_REQUEST, page)
         }
     }
+}
+
+/// "No access to this console": an OIDC sign-in that maps to no role.
+fn no_access_page(
+    i18n: I18n,
+    headers: &HeaderMap,
+    display: String,
+    end_session: Option<String>,
+) -> ConsoleMessagePage {
+    let mut page = ConsoleMessagePage::new(
+        i18n,
+        Some(headers),
+        "lock",
+        i18n.t("console-noaccess-title"),
+        i18n.t_arg("console-noaccess-text", "user", display),
+    );
+    page.hint = Some(i18n.t("auth-noaccess-hint"));
+    page.end_session_href = end_session;
+    page.back_href = Some("/ui/login".into());
+    page.back_label = i18n.t("auth-use-other-account");
+    page
 }
 
 /// Console sign-out (same-site posts only).
@@ -1715,6 +1903,600 @@ mod console_tests {
         assert_eq!(r.location, "/ui/login?local=1&next=/ui/packages");
     }
 
+    // ---- standalone pages (UI polish): design system, theme, states ----
+
+    async fn call_h(app: &Router, path: &str, headers: &[(&str, &str)]) -> Reply {
+        let mut b = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(header::HOST, "hfs.test");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let r = app
+            .clone()
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = r.status();
+        let location = r
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(r.into_body(), 8 << 20).await.unwrap();
+        Reply {
+            status,
+            location,
+            cookies: Vec::new(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        }
+    }
+
+    /// A live local-account session (`via` local needs an existing user).
+    async fn local_session(rt: &ConsoleAuth, name: &str, role: ConsoleRole) -> (String, String) {
+        let (u, _) = rt
+            .create_user(
+                "t",
+                NewUser {
+                    username: name.into(),
+                    role: Some(role),
+                    password: Some("tidy-Lantern-41-orbit".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut u2 = u.clone();
+        u2.must_change_password = false;
+        let u2 = rt.store().update_user(u2, u.revision).await.unwrap();
+        session(rt, name, role, ConsoleVia::Local, Some(u2.id)).await
+    }
+
+    /// What every standalone page shares with the console shell.
+    fn assert_standalone(body: &str) {
+        assert!(body.contains(r#"<body class="auth-page">"#), "{body}");
+        assert!(body.contains("/ui/assets/app.css"));
+        assert!(body.contains("/ui/assets/theme.js"));
+        assert!(body.contains("/ui/assets/auth.js"));
+        assert!(body.contains("hfs_theme"), "inline theme boot script");
+        assert!(
+            body.contains("prefers-color-scheme"),
+            "boot follows the system"
+        );
+        assert!(body.contains("/ui/assets/brand/healthymind-logo-horizontal@2x.png"));
+        assert!(body.contains("/ui/assets/brand/favicon.svg"));
+        assert!(body.contains("data-theme-cycle"), "theme button");
+        assert!(
+            body.contains(r#"class="segmented auth-lang""#),
+            "language switch"
+        );
+        assert!(body.contains(r#"aria-current="true""#));
+        assert!(body.contains("Helios FHIR Server"), "attribution footer");
+        assert!(
+            body.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "version"
+        );
+        assert!(body.contains(r##"class="skip-link" href="#auth-main""##));
+        assert_eq!(body.matches("<h1").count(), 1, "one h1");
+        assert!(!body.contains(r#"class="sidebar""#), "no console shell");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_in_page_is_the_branded_standalone_frame() {
+        let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
+        let app = app(rt);
+        let r = call_h(&app, "/ui/login?next=/ui/e/default", &[]).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_standalone(&r.body);
+        // Form: labels, autocomplete, the P3 fields unchanged, affordances.
+        for needle in [
+            r#"action="/ui/login/local""#,
+            r#"<input type="hidden" name="next" value="/ui/e/default">"#,
+            r#"for="signin-username""#,
+            r#"for="signin-password""#,
+            r#"autocomplete="username""#,
+            r#"autocomplete="current-password""#,
+            "data-pw-reveal",
+            "data-caps=",
+            r#"aria-describedby="signin-password-msg""#,
+            "data-busy-label",
+        ] {
+            assert!(r.body.contains(needle), "{needle}: {}", r.body);
+        }
+        // Language links keep `next`; the current one is marked.
+        assert!(
+            r.body
+                .contains("?lang=zh-Hant&amp;next=%2Fui%2Fe%2Fdefault")
+                || r.body
+                    .contains("?lang=zh-Hant&#38;next=%2Fui%2Fe%2Fdefault"),
+            "{}",
+            r.body
+        );
+        assert!(r.body.contains(r#"hreflang="en" aria-current="true""#));
+        // The product name under the logo, in the request's language;
+        // a plain sign-in card, no marketing panel.
+        assert!(
+            r.body
+                .contains(r#"<p class="auth-logo__name">HealthyMind FHIR Server Manager</p>"#)
+        );
+        assert!(!r.body.contains("tagline"), "no marketing panel");
+        let zh = call_h(
+            &app,
+            "/ui/login",
+            &[(header::COOKIE.as_str(), "hfs_lang=zh-Hant")],
+        )
+        .await;
+        assert_standalone(&zh.body);
+        assert!(zh.body.contains(r#"<html lang="zh-Hant""#));
+        assert!(
+            zh.body
+                .contains(r#"<p class="auth-logo__name">療心智能 FHIR 伺服器管理平台</p>"#)
+        );
+        assert!(zh.body.contains("顯示密碼"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn standalone_pages_follow_the_console_theme() {
+        let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
+        let app = app(rt.clone());
+        // The shared theme cookie (written by the console's theme button).
+        let r = call_h(
+            &app,
+            "/ui/login",
+            &[(header::COOKIE.as_str(), "hfs_theme=dark")],
+        )
+        .await;
+        assert!(
+            r.body
+                .contains(r#"<html lang="en" data-theme-pref="dark" data-theme="dark">"#),
+            "{}",
+            r.body
+        );
+        let r = call_h(
+            &app,
+            "/ui/login",
+            &[(header::COOKIE.as_str(), "hfs_theme=light")],
+        )
+        .await;
+        assert!(
+            r.body
+                .contains(r#"data-theme-pref="light" data-theme="light""#)
+        );
+        // "Follow system": the client hint when the browser sends one …
+        let r = call_h(
+            &app,
+            "/ui/login",
+            &[
+                (header::COOKIE.as_str(), "hfs_theme=system"),
+                ("sec-ch-prefers-color-scheme", "dark"),
+            ],
+        )
+        .await;
+        assert!(
+            r.body
+                .contains(r#"data-theme-pref="system" data-theme="dark""#)
+        );
+        // … else the inline boot script resolves prefers-color-scheme.
+        let r = call_h(&app, "/ui/login", &[]).await;
+        assert!(r.body.contains(r#"<html lang="en">"#), "{}", r.body);
+        assert!(
+            r.body
+                .contains(r#"matchMedia("(prefers-color-scheme: dark)")"#)
+        );
+        // The dark tokens the stamped attribute selects exist in app.css.
+        let css = include_str!("../assets/app.css");
+        assert!(css.contains("[data-theme=\"dark\"] {\n  color-scheme: dark;"));
+        assert!(css.contains("[data-theme=\"dark\"] .auth-card"));
+        assert!(css.contains("body.auth-page {"));
+        // Message pages and the forced password change too.
+        let r = call_h(
+            &app,
+            "/ui/callback?error=access_denied&state=x",
+            &[(header::COOKIE.as_str(), "hfs_theme=dark")],
+        )
+        .await;
+        assert!(r.body.contains(r#"data-theme="dark""#), "{}", r.body);
+        let (cookie, _) = local_session(&rt, "viewer-1", ConsoleRole::Viewer).await;
+        let r = call_h(
+            &app,
+            "/ui/settings/users",
+            &[(
+                header::COOKIE.as_str(),
+                &format!("{cookie}; hfs_theme=dark"),
+            )],
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+        assert!(r.body.contains(r#"data-theme="dark""#));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_in_states_signed_out_expired_wrong_password() {
+        let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
+        let app = app(rt);
+        let r = call_h(&app, "/ui/login?signed_out=1", &[]).await;
+        assert!(
+            r.body.contains(
+                r#"class="notice notice--ok auth-notice" role="status" id="signin-notice""#
+            ),
+            "{}",
+            r.body
+        );
+        assert!(r.body.contains("You have signed out."));
+        // A console cookie that no longer resolves: the session ended.
+        let r = call_h(
+            &app,
+            "/ui/login?next=/ui",
+            &[(header::COOKIE.as_str(), "hfs_console=gone")],
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.body.contains("Your session has ended"), "{}", r.body);
+        assert!(r.body.contains("notice--info"));
+        let r = call_h(&app, "/ui/login", &[]).await;
+        assert!(
+            !r.body.contains("signin-notice"),
+            "no notice on a first visit"
+        );
+        // Wrong password: 401, the user name kept, both fields marked invalid.
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/login/local",
+            "",
+            "",
+            Some("username=alice&password=nope&next=/ui"),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        assert!(
+            r.body
+                .contains(r#"notice--danger auth-notice" role="alert" id="signin-error""#),
+            "{}",
+            r.body
+        );
+        assert!(r.body.contains(r#"value="alice""#));
+        assert_eq!(r.body.matches(r#"aria-invalid="true""#).count(), 2);
+        assert!(!r.body.contains("nope"), "password never echoed");
+        assert_standalone(&r.body);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lockout_is_shown_as_a_warning_with_retry_after() {
+        let (rt, _) = runtime(
+            env(&[
+                ("HFS_CONSOLE_AUTH_MODE", "local"),
+                ("HFS_CONSOLE_LOCKOUT_FAILURES", "2"),
+            ]),
+            Some(BG),
+            opts(),
+        )
+        .await;
+        let app = app(rt.clone());
+        local_session(&rt, "bob", ConsoleRole::Viewer).await;
+        let mut last = None;
+        for _ in 0..4 {
+            last = Some(
+                call(
+                    &app,
+                    Method::POST,
+                    "/ui/login/local",
+                    "",
+                    "",
+                    Some("username=bob&password=nope&next=/ui"),
+                )
+                .await,
+            );
+        }
+        let r = last.unwrap();
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.body.contains("notice--warn auth-notice"), "{}", r.body);
+        assert!(r.body.contains("Too many failed attempts"));
+        assert_standalone(&r.body);
+        if let Ok(dir) = std::env::var("UIP_PREVIEW_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(format!("{dir}/login-locked.html"), &r.body).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oidc_sign_in_page_shows_the_idp_and_a_small_break_glass_link() {
+        let (rt, _) = runtime(
+            env(&[
+                ("HFS_CONSOLE_AUTH_MODE", "oidc"),
+                (
+                    "HFS_CONSOLE_OIDC_ISSUER",
+                    "https://sso.example.org/realms/r",
+                ),
+                ("HFS_CONSOLE_OIDC_CLIENT_ID", "hfs-web"),
+            ]),
+            Some(BG),
+            opts(),
+        )
+        .await;
+        let app = app(rt);
+        let r = call_h(&app, "/ui/login", &[]).await;
+        assert_standalone(&r.body);
+        assert!(r.body.contains(r#"class="btn btn--primary auth-btn" href="/ui/login/oidc?next=%2Fui" id="signin-idp""#), "{}", r.body);
+        assert!(r.body.contains("via sso.example.org"));
+        assert!(r.body.contains(r#"<p class="auth-aside"><a href="/ui/login?local=1&amp;next=%2Fui" id="signin-break-glass">"#) || r.body.contains(r#"id="signin-break-glass""#));
+        // Break-glass form: titled as such, with the way back to SSO.
+        let r = call_h(&app, "/ui/login?local=1", &[]).await;
+        assert!(r.body.contains("Administrator sign-in"));
+        assert!(r.body.contains(r#"id="signin-back-to-idp""#));
+        assert!(r.body.contains(r#"id="signin-form""#));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_pages_role_csrf_callback_failure_and_no_access() {
+        let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
+        let app = app(rt.clone());
+        let (cookie, _) = local_session(&rt, "viewer-1", ConsoleRole::Viewer).await;
+        let r = call(&app, Method::GET, "/ui/settings/users", &cookie, "", None).await;
+        assert!(console_forbidden(&r));
+        assert_standalone(&r.body);
+        assert!(r.body.contains("auth-status--lock"));
+        assert!(r.body.contains("This page needs the admin role"));
+        assert!(
+            r.body.contains("You are signed in as viewer-1"),
+            "{}",
+            r.body
+        );
+        assert!(r.body.contains(r#"href="/ui" id="console-back""#));
+        assert!(r.body.contains(r#"action="/ui/logout""#) && r.body.contains(r#"name="_csrf""#));
+
+        let r = call(
+            &app,
+            Method::GET,
+            "/ui/console/denied?kind=csrf",
+            &cookie,
+            "",
+            None,
+        )
+        .await;
+        assert!(r.body.contains("auth-status--warn"), "{}", r.body);
+
+        let r = call_h(&app, "/ui/callback?error=access_denied&state=x", &[]).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        assert_standalone(&r.body);
+        assert!(r.body.contains("auth-status--danger"));
+        assert!(r.body.contains(r#"<details class="auth-detail">"#));
+        assert!(r.body.contains(r#"href="/ui/login" id="console-back""#));
+        assert!(r.body.contains("Try again"));
+
+        // No access (an OIDC account without a role; needs an IdP live, so
+        // the page is rendered from its builder).
+        let i18n = crate::I18n::new(crate::RequestLocale::default());
+        let page = super::no_access_page(
+            i18n,
+            &axum::http::HeaderMap::new(),
+            "Dr. Lin".into(),
+            Some("https://sso.example.org/logout".into()),
+        );
+        let html = askama::Template::render(&page).unwrap();
+        assert_standalone(&html);
+        assert!(html.contains("No access to this console"));
+        assert!(html.contains("Dr. Lin"));
+        assert!(html.contains(r#"href="https://sso.example.org/logout" id="console-end-session""#));
+        assert!(html.contains(r#"href="/ui/login" id="console-back""#));
+        if let Ok(dir) = std::env::var("UIP_PREVIEW_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(format!("{dir}/no-access.html"), &html).unwrap();
+            let i18n = crate::I18n::from_tag("zh-Hant").unwrap();
+            let page = super::no_access_page(
+                i18n,
+                &axum::http::HeaderMap::new(),
+                "林醫師".into(),
+                Some("https://sso.example.org/logout".into()),
+            );
+            std::fs::write(
+                format!("{dir}/no-access-zh-Hant.html"),
+                askama::Template::render(&page).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_out_confirmation_page() {
+        let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
+        let app = app(rt.clone());
+        let (cookie, csrf) = local_session(&rt, "ops", ConsoleRole::Admin).await;
+        let r = call(&app, Method::GET, "/ui/logout", &cookie, "", None).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        assert_standalone(&r.body);
+        assert!(r.body.contains("Sign out?"));
+        assert!(
+            r.body
+                .contains(r#"<form method="post" action="/ui/logout""#)
+        );
+        assert!(
+            r.body.contains(&format!(r#"name="_csrf" value="{csrf}""#)),
+            "{}",
+            r.body
+        );
+        assert!(r.body.contains(r#"id="console-sign-out""#));
+        assert!(r.body.contains(r#"href="/ui" id="console-back""#));
+        // Not signed in: the sign-in page.
+        let r = call(&app, Method::GET, "/ui/logout", "", "", None).await;
+        assert!(
+            r.location.starts_with("/ui/login"),
+            "{} {}",
+            r.status,
+            r.location
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forced_password_change_is_standalone_with_field_errors() {
+        let (rt, _) = runtime(env(&[("HFS_CONSOLE_AUTH_MODE", "local")]), Some(BG), opts()).await;
+        let (_, otp) = rt
+            .create_user(
+                "t",
+                NewUser {
+                    username: "newbie".into(),
+                    role: Some(ConsoleRole::Editor),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let otp = otp.unwrap();
+        let app = app(rt.clone());
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/login/local",
+            "",
+            "",
+            Some(&format!("username=newbie&password={otp}&next=/ui")),
+        )
+        .await;
+        let (cookie, csrf) = cookie_of(&r);
+        let r = call(&app, Method::GET, "/ui/account/password", &cookie, "", None).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_standalone(&r.body);
+        for needle in [
+            r#"id="password-form""#,
+            r#"name="_csrf""#,
+            r#"autocomplete="username" value="newbie""#,
+            r#"name="current" autocomplete="current-password""#,
+            r#"name="new" autocomplete="new-password""#,
+            r#"name="confirm" autocomplete="new-password""#,
+            r#"class="auth-policy""#,
+            r#"data-rule="length" data-min="12""#,
+            r#"id="pw-sign-out""#,
+        ] {
+            assert!(r.body.contains(needle), "{needle}: {}", r.body);
+        }
+        // Too short: the error sits on the new-password field.
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/account/password",
+            &cookie,
+            &csrf,
+            Some(&format!("current={otp}&new=short&confirm=short")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.body.contains(r#"class="auth-msg auth-msg--error" id="pw-new-msg" aria-live="polite">The password must have at least 12 characters."#), "{}", r.body);
+        // Mismatch: on the confirmation.
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/account/password",
+            &cookie,
+            &csrf,
+            Some(&format!(
+                "current={otp}&new=calm-River-77-stone&confirm=calm-River-77-stonf"
+            )),
+        )
+        .await;
+        assert!(
+            r.body.contains(
+                r#"id="pw-confirm-msg" aria-live="polite">The new passwords do not match."#
+            ),
+            "{}",
+            r.body
+        );
+        // Wrong current password: on the current field, localized.
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/account/password",
+            &cookie,
+            &csrf,
+            Some("current=wrong-one-123&new=calm-River-77-stone&confirm=calm-River-77-stone"),
+        )
+        .await;
+        assert!(
+            r.body.contains(
+                r#"id="pw-current-msg" aria-live="polite">The current password is wrong."#
+            ),
+            "{}",
+            r.body
+        );
+        // Done: the regular in-shell account page afterwards.
+        let r = call(
+            &app,
+            Method::POST,
+            "/ui/account/password",
+            &cookie,
+            &csrf,
+            Some(&format!(
+                "current={otp}&new=calm-River-77-stone&confirm=calm-River-77-stone"
+            )),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER);
+        let r = call(&app, Method::GET, "/ui/account", &cookie, "", None).await;
+        assert!(!r.body.contains("auth-page"), "back in the console shell");
+    }
+
+    #[test]
+    fn standalone_page_keys_exist_in_en_and_zh_hant() {
+        let read = |locale: &str| {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../locales")
+                .join(locale);
+            let mut all = String::new();
+            for f in std::fs::read_dir(dir).unwrap() {
+                all.push_str(&std::fs::read_to_string(f.unwrap().path()).unwrap());
+            }
+            all
+        };
+        let (en, zh) = (read("en"), read("zh-Hant"));
+        let templates = [
+            include_str!("../templates/layouts/auth.html"),
+            include_str!("../templates/pages/login.html"),
+            include_str!("../templates/pages/console-message.html"),
+            include_str!("../templates/pages/password-change.html"),
+            include_str!("../templates/pages/admin-login.html"),
+            include_str!("../../hts-ui/templates/layouts/auth.html"),
+            include_str!("../../hts-ui/templates/pages/login.html"),
+            include_str!("../../ui-chrome/templates/partials/auth-brand.html"),
+            include_str!("../../ui-chrome/templates/partials/auth-toolbar.html"),
+            include_str!("../../ui-chrome/templates/partials/auth-footer.html"),
+            include_str!("../../ui-chrome/templates/partials/password-toggle.html"),
+            include_str!("login.rs"),
+            include_str!("account.rs"),
+            include_str!("auth_shell.rs"),
+            include_str!("../../hts-ui/src/login.rs"),
+        ];
+        let mut seen = 0;
+        for src in templates {
+            for (i, _) in src.match_indices("\"auth-") {
+                let key: String = src[i + 1..]
+                    .chars()
+                    .take_while(|c| *c == '-' || c.is_ascii_alphanumeric())
+                    .collect();
+                // CSS classes (`class="auth-card"`) share the prefix.
+                let css = include_str!("../assets/app.css");
+                let is_class = css.match_indices(&format!(".{key}")).any(|(j, m)| {
+                    css[j + m.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| !(c.is_ascii_alphanumeric() || c == '-'))
+                });
+                // File names (`partials/auth-brand.html`) share it too.
+                let is_file = src[i + 1 + key.len()..].starts_with('.');
+                if key.len() < 7 || key.ends_with('-') || is_class || is_file {
+                    continue;
+                }
+                seen += 1;
+                assert!(en.contains(&format!("\n{key} =")), "en is missing {key}");
+                assert!(
+                    zh.contains(&format!("\n{key} =")),
+                    "zh-Hant is missing {key}"
+                );
+            }
+        }
+        assert!(seen > 30, "found only {seen} keys");
+    }
+
     #[test]
     fn console_catalogs_share_keys_and_cover_the_templates() {
         use std::collections::BTreeSet;
@@ -1746,6 +2528,8 @@ mod console_tests {
         for tpl in [
             include_str!("../templates/pages/login.html"),
             include_str!("../templates/pages/console-message.html"),
+            include_str!("../templates/pages/password-change.html"),
+            include_str!("../templates/pages/admin-login.html"),
             include_str!("../templates/pages/account.html"),
             include_str!("../templates/pages/settings-auth.html"),
             include_str!("../templates/pages/settings-users.html"),

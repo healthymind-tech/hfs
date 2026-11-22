@@ -11,9 +11,12 @@
 {% block title %}{{ chrome.i18n.t("not-found-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
 
 {% block content %}
-<header class="page-head">
+<div class="error-page">
+  <p class="error-page__code" aria-hidden="true">404</p>
   <h1 class="page-head__title">{{ chrome.i18n.t("not-found-title") }}</h1>
-</header>
-<div class="card notice">{{ chrome.i18n.t("not-found-text") }}</div>
-<a class="btn" href="/ui/hts">{{ chrome.i18n.t("hts-nav-home") }}</a>
+  <p class="error-page__text">{{ chrome.i18n.t("not-found-text") }}</p>
+  <div class="error-page__actions">
+    <a class="btn btn--primary" href="/ui/hts">{{ chrome.i18n.t("hts-nav-home") }}</a>
+  </div>
+</div>
 {% endblock %}

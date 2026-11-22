@@ -84,6 +84,7 @@ pub use login::COOKIE as ADMIN_COOKIE;
 // its type must be nameable by the `hts` binary and by the test rings.
 // `MetricsSample`/`StatusCounts` come with it — `MetricsRing::push` takes a
 // sample, so without them the public ring would have no callable surface.
+pub use home::spawn_metrics_sampler;
 pub use metrics_parse::StatusCounts;
 pub use metrics_ring::{MetricsRing, MetricsSample};
 pub use upstream::{
@@ -266,6 +267,47 @@ fn hfs_console_known() -> bool {
     HFS_CONSOLE.try_with(|known| *known).unwrap_or(false)
 }
 
+/// Environment variable naming the FHIR console the topbar switcher links
+/// to (`/ui` when HFS shares the origin, or an absolute URL).
+pub const HFS_CONSOLE_URL_ENV: &str = "HTS_UI_HFS_CONSOLE_URL";
+
+/// The configured FHIR console URL, read once.
+fn configured_hfs_console() -> Option<&'static str> {
+    static URL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    URL.get_or_init(|| hfs_console_from(std::env::var(HFS_CONSOLE_URL_ENV).ok()))
+        .as_deref()
+}
+
+/// Normalise the configured value: blank means unset.
+fn hfs_console_from(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+/// Where the switcher's "FHIR Server" entry points, if anywhere.
+///
+/// The explicit setting wins. Without it, the `helios_hfs_console` cookie
+/// is the only evidence of a same-origin HFS — and it is only set once the
+/// browser has loaded an HFS page, so an operator who went straight to
+/// `/ui/hts/login` got a topbar with no way back (UIF defect 4).
+fn hfs_console_href(configured: Option<&'static str>, cookie: bool) -> Option<&'static str> {
+    configured.or(cookie.then_some(helios_ui_chrome::HFS_CONSOLE_PATH))
+}
+
+/// Up to two initials for the account avatar, like the FHIR console's.
+fn initials(name: &str) -> String {
+    let parts: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut out: String = match parts.as_slice() {
+        [] => String::new(),
+        [one] => one.chars().take(2).collect(),
+        [first, .., last] => first.chars().take(1).chain(last.chars().take(1)).collect(),
+    };
+    out = out.to_uppercase();
+    out
+}
+
 /// The generic "not found" page, `404` inside the full chrome.
 #[derive(askama::Template)]
 #[template(path = "pages/not-found.html")]
@@ -322,10 +364,12 @@ impl Chrome<'_> {
         // account and offer Sign out. Otherwise the signed-out shape.
         let user = login::signed_in();
         let hint = self.i18n.t("admin-user-hint");
+        let avatar = user.as_deref().map(initials).unwrap_or_default();
         let identity = match user.as_deref() {
             Some(name) => helios_ui_chrome::UserIdentity {
                 display: Some(name),
                 secondary: Some(hint.as_str()),
+                initials: (!avatar.is_empty()).then_some(avatar.as_str()),
                 can_logout: true,
                 logout_href: login::LOGOUT_PATH,
                 ..Default::default()
@@ -347,7 +391,7 @@ impl Chrome<'_> {
             &self.i18n,
             helios_ui_chrome::ProductLinks {
                 current: helios_ui_chrome::Product::Terminology,
-                fhir: hfs_console_known().then_some(helios_ui_chrome::HFS_CONSOLE_PATH),
+                fhir: hfs_console_href(configured_hfs_console(), hfs_console_known()),
                 terminology: Some(helios_ui_chrome::HTS_CONSOLE_PATH),
             },
         )
@@ -409,6 +453,35 @@ pub(crate) fn render_page(rendered: Result<String, askama::Error>) -> Response {
 
 /// Cheap constructor for local mount tests: an [`HtsUiState`] pointed at a
 /// closed loopback port so upstream calls fail deterministically.
+#[cfg(test)]
+mod topbar_tests {
+    use super::*;
+
+    #[test]
+    fn switcher_links_to_the_configured_console_without_a_cookie() {
+        assert_eq!(hfs_console_href(Some("/ui"), false), Some("/ui"));
+        assert_eq!(
+            hfs_console_href(Some("https://fhir.example.org/ui"), true),
+            Some("https://fhir.example.org/ui")
+        );
+        assert_eq!(hfs_console_href(None, true), Some("/ui"));
+        assert_eq!(hfs_console_href(None, false), None);
+        assert_eq!(hfs_console_from(Some("  ".into())), None);
+        assert_eq!(
+            hfs_console_from(Some(" /ui ".into())).as_deref(),
+            Some("/ui")
+        );
+    }
+
+    #[test]
+    fn avatar_initials_match_the_fhir_console() {
+        assert_eq!(initials("admin"), "AD");
+        assert_eq!(initials("console-admin"), "CA");
+        assert_eq!(initials("Jane Q Doe"), "JD");
+        assert_eq!(initials(""), "");
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 fn test_state() -> Arc<HtsUiState> {
