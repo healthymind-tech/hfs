@@ -266,6 +266,7 @@ fn source_fluent_key(source: &str) -> &'static str {
 fn chip_fluent_key(kind: &str) -> &'static str {
     match kind {
         "conflict" => "sp-chip-conflict",
+        "duplicate" => "sp-chip-duplicate",
         "overrides" => "sp-chip-overrides",
         _ => "sp-chip-shadowed",
     }
@@ -297,7 +298,7 @@ pub(crate) struct Facet {
 /// `DuplicateCode` conflict #242 rejects; cross-source mates are a
 /// supported override resolved by source precedence.
 pub(crate) struct SlotChip {
-    /// "conflict" | "overrides" | "shadowed"
+    /// "conflict" | "duplicate" | "overrides" | "shadowed"
     pub kind: &'static str,
     /// Fluent key for the chip label.
     pub key: &'static str,
@@ -392,6 +393,54 @@ pub(crate) struct SpView {
     pub max_recent: usize,
 }
 
+/// How `other` relates to `param` on a shared `(base, code)` slot.
+///
+/// Same source: a real `"conflict"` only when the two definitions would
+/// search differently. Installed IGs routinely re-publish the same
+/// parameter under their own canonical URL (US Core and TW Core both ship
+/// `Location.address` as `address`); whichever one the registry keeps, the
+/// search behaves the same, so that is an informational `"duplicate"`.
+fn slot_kind(param: &SearchParameterDefinition, other: &SearchParameterDefinition) -> &'static str {
+    if other.source == param.source {
+        if same_search_behaviour(param, other) {
+            "duplicate"
+        } else {
+            "conflict"
+        }
+    } else if source_rank(param.source) > source_rank(other.source) {
+        "overrides"
+    } else {
+        "shadowed"
+    }
+}
+
+/// True when two definitions of one `(base, code)` slot extract and match
+/// the same values: same type, same expression (whitespace-insensitive),
+/// same reference targets and composite components.
+fn same_search_behaviour(a: &SearchParameterDefinition, b: &SearchParameterDefinition) -> bool {
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+    fn sorted(v: &Option<Vec<String>>) -> Vec<String> {
+        let mut v = v.clone().unwrap_or_default();
+        v.sort();
+        v.dedup();
+        v
+    }
+    let components = |d: &SearchParameterDefinition| -> Vec<(String, String)> {
+        d.component
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| (c.definition.clone(), squash(&c.expression)))
+            .collect()
+    };
+    a.param_type == b.param_type
+        && squash(&a.expression) == squash(&b.expression)
+        && sorted(&a.target) == sorted(&b.target)
+        && components(a) == components(b)
+}
+
 pub(crate) fn build_view(
     snapshot: &VersionSnapshot,
     query: &SpQuery,
@@ -412,23 +461,25 @@ pub(crate) fn build_view(
                 .push(param);
         }
     }
-    let chips_for = |param: &Arc<SearchParameterDefinition>| -> Vec<SlotChip> {
-        let mut kinds: Vec<&'static str> = Vec::new();
+    // Every slot-mate of `param` with its relationship kind, in snapshot
+    // order and without repeats (a mate sharing several bases counts once).
+    let mates_of = |param: &Arc<SearchParameterDefinition>| -> Vec<(&'static str, &Arc<SearchParameterDefinition>)> {
+        let mut out: Vec<(&'static str, &Arc<SearchParameterDefinition>)> = Vec::new();
         for base in &param.base {
             for other in &slots[&(base.as_str(), param.code.as_str())] {
-                if Arc::ptr_eq(other, param) {
+                if Arc::ptr_eq(other, param) || out.iter().any(|(_, o)| Arc::ptr_eq(o, other)) {
                     continue;
                 }
-                let kind = if other.source == param.source {
-                    "conflict"
-                } else if source_rank(param.source) > source_rank(other.source) {
-                    "overrides"
-                } else {
-                    "shadowed"
-                };
-                if !kinds.contains(&kind) {
-                    kinds.push(kind);
-                }
+                out.push((slot_kind(param, other), other));
+            }
+        }
+        out
+    };
+    let chips_for = |param: &Arc<SearchParameterDefinition>| -> Vec<SlotChip> {
+        let mut kinds: Vec<&'static str> = Vec::new();
+        for (kind, _) in mates_of(param) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
             }
         }
         kinds
@@ -627,13 +678,14 @@ pub(crate) fn build_view(
     let detail = query.sel.as_deref().and_then(|sel| {
         params.iter().find(|p| p.url == sel).map(|param| {
             let mut notes: Vec<SpNote> = Vec::new();
+            let mates = mates_of(param);
             for chip in chips_for(param) {
-                let mates: Vec<String> = param
-                    .base
+                // Only the definitions this note is about: a cross-source
+                // override is not part of a same-source duplicate, and so on.
+                let urls: Vec<String> = mates
                     .iter()
-                    .flat_map(|base| slots[&(base.as_str(), param.code.as_str())].iter())
-                    .filter(|other| !Arc::ptr_eq(other, param))
-                    .map(|other| other.url.clone())
+                    .filter(|(kind, _)| *kind == chip.kind)
+                    .map(|(_, other)| other.url.clone())
                     .collect();
                 notes.push(SpNote {
                     severity: if chip.kind == "conflict" {
@@ -643,10 +695,11 @@ pub(crate) fn build_view(
                     },
                     kind: match chip.kind {
                         "conflict" => "conflict",
+                        "duplicate" => "duplicate",
                         "overrides" => "overrides",
                         _ => "shadowed",
                     },
-                    arg: mates.join(", "),
+                    arg: urls.join(", "),
                 });
             }
             if param.expression.is_empty() {
@@ -1046,6 +1099,50 @@ mod tests {
     }
 
     #[test]
+    fn same_source_identical_definitions_are_a_duplicate_not_a_conflict() {
+        // US Core and TW Core both publish Location.address as `address`.
+        let one = def(
+            "http://hl7.org/fhir/us/core/SearchParameter/us-core-location-address",
+            "address",
+            &["Location"],
+            SearchParameterSource::Stored,
+        );
+        let mut two = def(
+            "https://twcore.mohw.gov.tw/ig/twcore/SearchParameter/Location-address",
+            "address",
+            &["Location"],
+            SearchParameterSource::Stored,
+        );
+        two.expression = format!(" {} ", one.expression);
+        let snapshot = VersionSnapshot {
+            params: vec![Arc::new(one), Arc::new(two)],
+            spec_loaded: true,
+            listing_unsupported: false,
+            resource_ids: Default::default(),
+        };
+        let query = SpQuery {
+            sel: Some(
+                "http://hl7.org/fhir/us/core/SearchParameter/us-core-location-address".into(),
+            ),
+            ..SpQuery::default()
+        };
+        let view = build_view(&snapshot, &query, &no_rail(), "en");
+        assert!(
+            view.rows
+                .iter()
+                .all(|r| r.chips.len() == 1 && r.chips[0].kind == "duplicate")
+        );
+        let detail = view.detail.expect("detail");
+        assert_eq!(detail.notes.len(), 1);
+        assert_eq!(detail.notes[0].severity, "info");
+        assert_eq!(detail.notes[0].kind, "duplicate");
+        assert_eq!(
+            detail.notes[0].arg,
+            "https://twcore.mohw.gov.tw/ig/twcore/SearchParameter/Location-address"
+        );
+    }
+
+    #[test]
     fn same_source_slot_mates_are_a_conflict() {
         let one = def(
             "http://example.org/a",
@@ -1053,12 +1150,13 @@ mod tests {
             &["Observation"],
             SearchParameterSource::Embedded,
         );
-        let two = def(
+        let mut two = def(
             "http://example.org/b",
             "code",
             &["Observation"],
             SearchParameterSource::Embedded,
         );
+        two.expression = "Observation.value".into();
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(one), Arc::new(two)],
             spec_loaded: true,

@@ -208,6 +208,7 @@
         <span class="lint__sev" aria-hidden="true">{% if note.severity == "error" %}✕{% else if note.severity == "warn" %}▲{% else %}ⓘ{% endif %}</span>
         <span>
           {% if note.kind == "conflict" %}{{ i18n.t_arg("sp-note-conflict", "url", note.arg.clone()) }}
+          {% else if note.kind == "duplicate" %}{{ i18n.t_arg("sp-note-duplicate", "url", note.arg.clone()) }}
           {% else if note.kind == "overrides" %}{{ i18n.t_arg("sp-note-overrides", "url", note.arg.clone()) }}
           {% else if note.kind == "shadowed" %}{{ i18n.t_arg("sp-note-shadowed", "url", note.arg.clone()) }}
           {% else if note.kind == "empty-expression" %}{{ i18n.t("sp-note-empty-expression") }}

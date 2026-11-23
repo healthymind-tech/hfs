@@ -4175,6 +4175,7 @@ tr:hover .result-id__copy,
 
 .tag--config,
 .tag--overrides,
+.tag--duplicate,
 .tag--shadowed {
   background: var(--warn-soft);
   color: var(--warn);
@@ -5031,6 +5032,10 @@ tr:hover .result-id__copy,
   border-radius: 9px;
   font-size: 12px;
   line-height: 1.45;
+  /* Canonical URLs have no spaces: let them break anywhere instead of
+     running past the box's rounded edge. */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .lint__item--error {
