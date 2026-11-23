@@ -278,7 +278,8 @@ fn endpoints(step: &mut Step, input: &PreflightInput<'_>, realm: &str, issuer: &
             Some(e) if !e.trusts(realm, issuer) => {
                 let actual = match &e.provider {
                     EndpointProvider::External { issuer: Some(i) } => i.clone(),
-                    EndpointProvider::External { issuer: None } => "(none)".into(),
+                    EndpointProvider::External { issuer: None } if e.auth_mode == "inherit" => "the server-wide authentication settings".into(),
+                    EndpointProvider::External { issuer: None } => "no authorization server".into(),
                     EndpointProvider::Internal { realm } => format!("internal realm {realm}"),
                 };
                 step.push(
