@@ -1,0 +1,54 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{# Every built-in authorization server (realm) and unfinished wizard drafts. #}
+{% block title %}{{ i18n.t("idpc-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="/ui/assets/idp.css">
+{% call ui::page_header(i18n.t("idpc-title"), i18n.t("idpc-lede")) %}
+  {% if keys_available %}<a class="btn btn--primary" href="/ui/idp/new">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpc-new") }}</a>{% endif %}
+{% endcall %}
+{% include "partials/idp/flash.html" %}
+{% if !keys_available %}
+<section class="notice notice--warn" role="alert"><p><strong>{{ i18n.t("idpc-no-keyring") }}</strong></p><p>{{ i18n.t("idpc-no-keyring-detail") }}</p></section>
+{% endif %}
+{% if let Some(e) = error %}<section class="notice notice--danger" role="alert"><p>{{ e }}</p></section>{% endif %}
+<section class="card table-card">
+  {% if rows.is_empty() %}
+    {% call ui::empty_state("shield", i18n.t("idpc-empty"), i18n.t("idpc-empty-detail")) %}
+      {% if keys_available %}<a class="btn btn--primary" href="/ui/idp/new">{{ i18n.t("idpc-new") }}</a>{% endif %}
+    {% endcall %}
+  {% else %}
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack idp-realms">
+      <thead><tr>
+        <th scope="col">{{ i18n.t("idpc-col-name") }}</th>
+        <th scope="col">{{ i18n.t("idpc-col-issuer") }}</th>
+        <th scope="col">{{ i18n.t("idpc-col-endpoints") }}</th>
+        <th scope="col">{{ i18n.t("idpc-col-clients") }}</th>
+        <th scope="col">{{ i18n.t("idpc-col-users") }}</th>
+        <th scope="col">{{ i18n.t("idpc-col-key-age") }}</th>
+        <th scope="col">{{ i18n.t("idpc-col-status") }}</th>
+      </tr></thead>
+      <tbody>
+      {% for r in rows %}
+        {% let look = self.status_look(r) %}
+        <tr>
+          <td data-label="{{ i18n.t("idpc-col-name") }}">
+            {% if let Some(d) = r.draft %}<a href="/ui/idp/new/{{ r.name }}/{{ d.step }}">{{ r.display_name }}</a> <a class="btn btn--small" href="/ui/idp/new/{{ r.name }}/{{ d.step }}">{{ i18n.t("idpc-resume") }}</a>
+            {% else %}<a href="/ui/idp/{{ r.name }}">{{ r.display_name }}</a>{% endif %}
+            <div class="idp-sub"><code>{{ r.name }}</code></div>
+          </td>
+          <td data-label="{{ i18n.t("idpc-col-issuer") }}"><code class="idp-wrap">{{ r.issuer }}</code></td>
+          <td data-label="{{ i18n.t("idpc-col-endpoints") }}">{% if r.endpoints.is_empty() %}—{% else %}{{ r.endpoints.join(", ") }}{% endif %}</td>
+          <td data-label="{{ i18n.t("idpc-col-clients") }}">{{ r.clients }}</td>
+          <td data-label="{{ i18n.t("idpc-col-users") }}">{{ r.users }}</td>
+          <td data-label="{{ i18n.t("idpc-col-key-age") }}">{% if let Some(d) = r.key_age_days %}{{ i18n.t_arg("idpc-days", "count", *d) }}{% else %}—{% endif %}</td>
+          <td data-label="{{ i18n.t("idpc-col-status") }}">{% call ui::pill_raw(look.0, look.1, look.2) %}{% endcall %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

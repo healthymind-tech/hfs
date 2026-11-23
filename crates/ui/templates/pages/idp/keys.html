@@ -1,0 +1,44 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("idpc-tab-keys") }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% if let Some(e) = error %}<p class="notice notice--danger" role="alert">{{ e }}</p>{% endif %}
+<section class="card table-card" id="keys">
+  <header class="card-head"><h2>{{ i18n.t("idpc-keys-published") }}</h2><p class="card-head__meta">{{ i18n.t_arg2("idpc-keys-policy", "days", rotate_days.to_string(), "hours", prepublish_hours.to_string()) }}</p></header>
+  {% if rows.is_empty() %}<div class="card__body"><p class="notice notice--danger">{{ i18n.t("idpc-keys-none") }}</p></div>{% else %}
+  <div class="table-wrap" tabindex="0"><table class="data-table data-table--stack">
+    <thead><tr><th scope="col">{{ i18n.t("idpc-key-alg") }}</th><th scope="col">{{ i18n.t("idpc-key-status") }}</th><th scope="col">{{ i18n.t("idpc-key-kid") }}</th><th scope="col">{{ i18n.t("idpc-key-created") }}</th><th scope="col">{{ i18n.t("idpc-key-activated") }}</th><th scope="col">{{ i18n.t("idpc-key-until") }}</th></tr></thead>
+    <tbody>{% for k in rows %}<tr>
+      <td data-label="{{ i18n.t("idpc-key-alg") }}">{{ k.alg }}</td>
+      <td data-label="{{ i18n.t("idpc-key-status") }}"><span class="status-pill status-pill--{{ k.tone }}"><span>{{ i18n.t(k.status_key) }}</span></span>{% if k.status_key == "idpc-key-status-active" %} <span class="idp-sub">{{ i18n.t_arg("idpc-days", "count", k.age_days) }}</span>{% endif %}</td>
+      <td data-label="{{ i18n.t("idpc-key-kid") }}"><code class="idp-wrap">{{ k.kid }}</code></td>
+      <td data-label="{{ i18n.t("idpc-key-created") }}">{{ k.created }}</td>
+      <td data-label="{{ i18n.t("idpc-key-activated") }}">{{ k.activated }}</td>
+      <td data-label="{{ i18n.t("idpc-key-until") }}">{{ k.until }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  <div class="card__body"><p class="idp-sub">{{ i18n.t_arg("idpc-keys-retired", "count", retired as i64) }}</p></div>
+</section>
+<section class="card">
+  <header class="card-head"><h2>{{ i18n.t("idpc-keys-rotate") }}</h2></header>
+  <div class="card__body">
+    <p>{{ i18n.t("idpc-keys-rotate-detail") }}</p>
+    <div class="form-actions form-actions--start">
+      <form method="post" action="/ui/idp/{{ head.name }}/keys/rotate"><button type="submit" class="btn btn--primary">{% call ui::icon("sync") %}{% endcall %}{{ i18n.t("idpc-keys-rotate-now") }}</button></form>
+      <form method="post" action="/ui/idp/{{ head.name }}/keys/promote"><button type="submit" class="btn" data-confirm="{{ i18n.t("idpc-keys-promote-confirm") }}">{{ i18n.t("idpc-keys-promote") }}</button></form>
+    </div>
+  </div>
+</section>
+<section class="card danger-zone">
+  <h2 class="danger-zone__heading">{{ i18n.t("idpc-keys-emergency") }}</h2>
+  <form method="post" action="/ui/idp/{{ head.name }}/keys/emergency" class="danger-zone__row" data-typed-confirm="{{ head.name }}">
+    <div><p>{{ i18n.t("idpc-keys-emergency-detail") }}</p>
+      <label class="mfield__label" for="f-confirm">{{ i18n.t_arg("idpc-type-name", "name", head.name.clone()) }}</label>
+      <input class="mfield__input" id="f-confirm" name="confirm" autocomplete="off"></div>
+    <button type="submit" class="btn btn--danger" data-typed-confirm-submit>{% call ui::icon("alert") %}{% endcall %}{{ i18n.t("idpc-keys-emergency-now") }}</button>
+  </form>
+</section>
+{% endblock %}

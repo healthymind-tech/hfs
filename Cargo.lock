@@ -3378,6 +3378,7 @@ dependencies = [
  "chrono",
  "form_urlencoded",
  "helios-endpoints",
+ "helios-idp",
  "http 1.5.0",
  "jsonwebtoken",
  "rand 0.8.8",
@@ -3551,6 +3552,10 @@ dependencies = [
  "helios-endpoints",
  "helios-fhir",
  "helios-hts",
+ "helios-idp",
+ "helios-idp-admin",
+ "helios-idp-pages",
+ "helios-idp-server",
  "helios-observability",
  "helios-persistence",
  "helios-rest",
@@ -3566,6 +3571,7 @@ dependencies = [
  "openssl",
  "parking_lot 0.12.5",
  "reqwest",
+ "serde",
  "serde_json",
  "sqlparser",
  "tempfile",
@@ -3661,6 +3667,115 @@ dependencies = [
  "tower",
  "tracing",
  "unic-langid",
+]
+
+[[package]]
+name = "helios-idp"
+version = "0.2.9"
+dependencies = [
+ "arc-swap",
+ "argon2",
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "chrono",
+ "deadpool-postgres",
+ "helios-endpoints",
+ "helios-persistence",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "helios-idp-admin"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "helios-endpoints",
+ "helios-idp",
+ "helios-idp-server",
+ "http-body-util",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "helios-idp-pages"
+version = "0.2.9"
+dependencies = [
+ "askama",
+ "async-trait",
+ "axum",
+ "axum-test",
+ "base64 0.22.1",
+ "chrono",
+ "fluent-templates",
+ "form_urlencoded",
+ "helios-admin-auth",
+ "helios-audit",
+ "helios-endpoints",
+ "helios-idp",
+ "helios-idp-server",
+ "helios-ui-chrome",
+ "hmac 0.12.1",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tower",
+ "tracing",
+ "unic-langid",
+ "url",
+]
+
+[[package]]
+name = "helios-idp-server"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "helios-endpoints",
+ "helios-idp",
+ "helios-persistence",
+ "http-body-util",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3776,6 +3891,7 @@ dependencies = [
  "helios-fhir",
  "helios-fhir-validator",
  "helios-fhirpath",
+ "helios-idp",
  "helios-observability",
  "helios-persistence",
  "helios-serde",
@@ -3986,6 +4102,8 @@ dependencies = [
  "helios-fhir",
  "helios-fhir-validator",
  "helios-hts-ui",
+ "helios-idp",
+ "helios-idp-admin",
  "helios-observability",
  "helios-persistence",
  "helios-sof",

@@ -1,0 +1,31 @@
+{#- Sessions + grants with revoke buttons. Needs `sessions`, `grants`, `self.back()`. -#}
+<section class="card table-card" id="sessions">
+  <header class="card-head"><h2>{{ i18n.t("idpc-sessions") }}</h2><p class="card-head__meta">{{ i18n.t("idpc-sessions-hint") }}</p></header>
+  {% if sessions.is_empty() %}<div class="card__body"><p class="idp-sub">{{ i18n.t("idpc-sessions-none") }}</p></div>{% else %}
+  <div class="table-wrap" tabindex="0"><table class="data-table data-table--stack">
+    <thead><tr><th scope="col">{{ i18n.t("idpc-col-user") }}</th><th scope="col">{{ i18n.t("idpc-col-started") }}</th><th scope="col">{{ i18n.t("idpc-col-last-seen") }}</th><th scope="col"><span class="visually-hidden">{{ i18n.t("idpc-col-actions") }}</span></th></tr></thead>
+    <tbody>{% for s in sessions %}<tr>
+      <td data-label="{{ i18n.t("idpc-col-user") }}">{{ s.user }}{% if !s.alive %} <span class="tag tag--muted">{{ i18n.t("idpc-session-idle") }}</span>{% endif %}</td>
+      <td data-label="{{ i18n.t("idpc-col-started") }}">{{ s.started }}</td>
+      <td data-label="{{ i18n.t("idpc-col-last-seen") }}">{{ s.last_seen }}</td>
+      <td class="data-table__actions"><form method="post" action="/ui/idp/{{ head.name }}/sessions/session/{{ s.id }}/revoke"><input type="hidden" name="back" value="{{ self.back() }}"><button type="submit" class="btn btn--small btn--danger-outline" data-confirm="{{ i18n.t_arg("idpc-session-revoke-confirm", "user", s.user.clone()) }}">{{ i18n.t("idpc-revoke") }}</button></form></td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+</section>
+<section class="card table-card" id="grants">
+  <header class="card-head"><h2>{{ i18n.t("idpc-grants") }}</h2><p class="card-head__meta">{{ i18n.t("idpc-grants-hint") }}</p></header>
+  {% if grants.is_empty() %}<div class="card__body"><p class="idp-sub">{{ i18n.t("idpc-grants-none") }}</p></div>{% else %}
+  <div class="table-wrap" tabindex="0"><table class="data-table data-table--stack">
+    <thead><tr><th scope="col">{{ i18n.t("idpc-col-app") }}</th><th scope="col">{{ i18n.t("idpc-col-user") }}</th><th scope="col">{{ i18n.t("idpc-col-scopes") }}</th><th scope="col">{{ i18n.t("idpc-col-granted") }}</th><th scope="col">{{ i18n.t("idpc-col-expires") }}</th><th scope="col"><span class="visually-hidden">{{ i18n.t("idpc-col-actions") }}</span></th></tr></thead>
+    <tbody>{% for g in grants %}<tr>
+      <td data-label="{{ i18n.t("idpc-col-app") }}"><code>{{ g.client }}</code></td>
+      <td data-label="{{ i18n.t("idpc-col-user") }}">{{ g.user }}</td>
+      <td data-label="{{ i18n.t("idpc-col-scopes") }}"><code class="idp-wrap">{{ g.scopes }}</code></td>
+      <td data-label="{{ i18n.t("idpc-col-granted") }}">{{ g.created }}</td>
+      <td data-label="{{ i18n.t("idpc-col-expires") }}">{{ g.expires }}{% if !g.active %} <span class="tag tag--muted">{{ i18n.t("idpc-grant-expired") }}</span>{% endif %}</td>
+      <td class="data-table__actions"><form method="post" action="/ui/idp/{{ head.name }}/sessions/grant/{{ g.id }}/revoke"><input type="hidden" name="back" value="{{ self.back() }}"><button type="submit" class="btn btn--small btn--danger-outline" data-confirm="{{ i18n.t_arg("idpc-grant-revoke-confirm", "client", g.client.clone()) }}">{{ i18n.t("idpc-revoke") }}</button></form></td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+</section>

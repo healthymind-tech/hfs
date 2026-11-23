@@ -10,6 +10,7 @@ mgr-nav-section-operate = 營運
 mgr-nav-section-terminology = 術語
 mgr-nav-section-idp = 授權伺服器
 mgr-nav-section-server = 伺服器
+mgr-nav-section-idp = 驗證伺服器
 mgr-nav-section-settings = 系統設定
 mgr-nav-overview = 所有端點
 mgr-nav-endpoint-home = 端點首頁

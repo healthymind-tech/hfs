@@ -1,0 +1,6 @@
+{%- if keys.is_empty() %}<p class="notice notice--warn">{{ i18n.t("idpc-keys-none") }}</p>{% else %}
+<div class="table-wrap" tabindex="0" id="keys"><table class="data-table data-table--stack">
+  <thead><tr><th scope="col">{{ i18n.t("idpc-key-alg") }}</th><th scope="col">{{ i18n.t("idpc-key-status") }}</th><th scope="col">{{ i18n.t("idpc-key-kid") }}</th><th scope="col">{{ i18n.t("idpc-key-created") }}</th></tr></thead>
+  <tbody>{% for k in keys %}<tr><td data-label="{{ i18n.t("idpc-key-alg") }}">{{ k.alg }}</td><td data-label="{{ i18n.t("idpc-key-status") }}"><span class="status-pill status-pill--{{ k.tone }}"><span>{{ i18n.t(k.status_key) }}</span></span></td><td data-label="{{ i18n.t("idpc-key-kid") }}"><code>{{ k.kid }}</code></td><td data-label="{{ i18n.t("idpc-key-created") }}">{{ k.created }}</td></tr>{% endfor %}</tbody>
+</table></div>
+{%- endif %}

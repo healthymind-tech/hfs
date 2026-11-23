@@ -1,0 +1,29 @@
+{% extends "idp/layout.html" %}
+{% block title %}{{ shell.i18n.t("idp-login-title") }}{% endblock %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ shell.i18n.t("idp-login-title") }}</h1>
+            <p class="auth-lede">{{ lede }}</p>
+          </header>
+          {%- if let Some(b) = error %}
+          {% include "idp/banner.html" %}
+          {%- endif %}
+          <form method="post" action="{{ action }}" id="idp-login-form" class="auth-form" data-auth-form>
+            <input type="hidden" name="ix" value="{{ ix }}">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <div class="auth-field">
+              <label class="auth-label" for="idp-username">{{ shell.i18n.t("idp-username") }}</label>
+              <input class="auth-input" id="idp-username" type="text" name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required maxlength="256" aria-describedby="idp-username-msg"{% if username.is_empty() %} autofocus{% endif %}{% if error.is_some() %} aria-invalid="true"{% endif %} data-msg-required="{{ shell.i18n.t("idp-required-username") }}">
+              <p class="auth-msg" id="idp-username-msg" aria-live="polite"></p>
+            </div>
+            <div class="auth-field">
+              <label class="auth-label" for="idp-password">{{ shell.i18n.t("idp-password") }}</label>
+              <div class="auth-input-wrap">
+                <input class="auth-input" id="idp-password" type="password" name="password" autocomplete="current-password" required maxlength="256" aria-describedby="idp-password-msg"{% if !username.is_empty() %} autofocus{% endif %}{% if error.is_some() %} aria-invalid="true"{% endif %} data-msg-required="{{ shell.i18n.t("idp-required-password") }}" data-caps="{{ shell.i18n.t("idp-caps-lock") }}">
+                {{ reveal|safe }}
+              </div>
+              <p class="auth-msg" id="idp-password-msg" aria-live="polite"></p>
+            </div>
+            <button class="btn btn--primary auth-btn" type="submit" id="idp-login-submit" data-busy-label="{{ shell.i18n.t("idp-signing-in") }}">{{ shell.i18n.t("idp-submit") }}</button>
+          </form>
+{% endblock %}

@@ -1,0 +1,13 @@
+{% extends "idp/layout.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ title }}</h1>
+          </header>
+          {%- if let Some(b) = banner %}
+          {% include "idp/banner.html" %}
+          {%- endif %}
+          {%- if !text.is_empty() %}
+          <p class="auth-lede" id="idp-message">{{ text }}</p>
+          {%- endif %}
+{% endblock %}

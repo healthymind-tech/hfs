@@ -75,6 +75,8 @@ mod sql_libraries;
 mod sql_views;
 mod subscriptions;
 mod sync_pages;
+/// Built-in authorization server console (`/ui/idp`, design I6).
+pub mod idp;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
 #[doc(hidden)]
@@ -2428,6 +2430,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
         .merge(sync_pages::routes())
+        .merge(idp::routes())
         // Persists the sidebar's FHIR-version choice (#343) and redirects back.
         .route("/ui/version", axum::routing::post(set_version))
         // The tenant selector (#344): lazily-loaded options and the persisted

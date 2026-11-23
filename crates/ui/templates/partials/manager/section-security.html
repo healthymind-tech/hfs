@@ -30,6 +30,10 @@
         <span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-full-desc") }}</span>
       </label>
     </div>
+    {#- Built-in IdP (HFS_IDP=on): External / Internal provider choice. -#}
+    <div data-show-when="auth_mode=write-protect|full">
+    {% include "partials/idp/security-provider.html" %}
+    </div>
     {#- UX-23: the IdP fields only matter with a token mode; Issuer first,
         then Audience, then the JWKS URL (filled from discovery). -#}
     <div class="form-grid" data-show-when="auth_mode=write-protect|full">

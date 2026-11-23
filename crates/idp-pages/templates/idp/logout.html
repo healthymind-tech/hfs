@@ -1,0 +1,21 @@
+{% extends "idp/layout.html" %}
+{% block title %}{{ shell.i18n.t("idp-logout-title") }}{% endblock %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ shell.i18n.t("idp-logout-title") }}</h1>
+            <p class="auth-lede">{{ lede }}</p>
+            {%- if !app_line.is_empty() %}
+            <p class="auth-hint">{{ app_line }}</p>
+            {%- endif %}
+          </header>
+          <form method="post" action="{{ action }}" class="auth-form" id="idp-logout-form">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            {%- for (k, v) in carry %}
+            <input type="hidden" name="{{ k }}" value="{{ v }}">
+            {%- endfor %}
+            <div class="idp-actions">
+              <a class="btn auth-btn auth-btn--secondary" href="{{ cancel_href }}" id="idp-logout-cancel">{{ shell.i18n.t("idp-logout-cancel") }}</a>
+              <button class="btn btn--primary auth-btn" type="submit" id="idp-logout-submit">{{ shell.i18n.t("idp-logout-submit") }}</button>
+            </div>
+          </form>
+{% endblock %}

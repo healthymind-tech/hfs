@@ -74,6 +74,7 @@ pub const FORK_MIGRATIONS: &[&str] = &[
     FORK_ENDPOINTS,
     FORK_CONSOLE_AUTH,
     FORK_ENDPOINT_SYNC,
+    FORK_IDP_CORE,
 ];
 
 /// FHIR server manager: endpoint registry `hfs_endpoints`, its change
@@ -88,6 +89,14 @@ pub const FORK_CONSOLE_AUTH: &str = "hm-0009-console-auth";
 /// FHIR server manager: sync jobs, runs, logs, conflicts and per-item state
 /// (design §4.3).
 pub const FORK_ENDPOINT_SYNC: &str = "hm-0010-endpoint-sync";
+
+/// Built-in authorization server, phase 1: realms, signing keys, clients,
+/// users, sessions, consents, grants, one-time artefacts and refresh token
+/// families (docs/design/authorization-server.md §9). The IdP owns the
+/// `hm-0020`…`hm-0029` block. The SQL is [`FORK_IDP_CORE_SQL`], a copy of
+/// `helios_idp::schema::IDP_CORE_SQL` (helios-idp's `pg_idp` test asserts
+/// the two are identical; persistence cannot depend on helios-idp).
+pub const FORK_IDP_CORE: &str = "hm-0020-idp-core";
 
 /// Fork migration replacing the `search_index` extended statistics with
 /// dependency-only objects and lowering the token column's statistics
@@ -422,6 +431,7 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
             FORK_ENDPOINTS => fork_endpoints(client).await?,
             FORK_CONSOLE_AUTH => fork_console_auth(client).await?,
             FORK_ENDPOINT_SYNC => fork_endpoint_sync(client).await?,
+            FORK_IDP_CORE => fork_idp_core(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
         client
@@ -5376,6 +5386,233 @@ async fn fork_console_auth(client: &deadpool_postgres::Client) -> StorageResult<
         .map_err(|e| pg_error(format!("Fork migration {FORK_CONSOLE_AUTH} failed: {e}")))
 }
 
+/// SQL of fork migration [`FORK_IDP_CORE`]. Every statement is idempotent.
+pub const FORK_IDP_CORE_SQL: &str = r#"
+INSERT INTO hfs_config_epochs (scope) VALUES ('idp') ON CONFLICT (scope) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS hfs_idp_realms (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    spec       JSONB NOT NULL,
+    enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+    revision   BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by TEXT,
+    updated_by TEXT,
+    deleted_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_idp_realms_name
+    ON hfs_idp_realms (name) WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS hfs_idp_signing_keys (
+    realm_id    TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    kid         TEXT NOT NULL,
+    alg         TEXT NOT NULL CHECK (alg IN ('RS256','RS384','PS256','PS384','ES256','ES384')),
+    status      TEXT NOT NULL CHECK (status IN ('next','active','retiring','retired')),
+    public_jwk  JSONB NOT NULL,
+    private_key TEXT NOT NULL,          -- hmsec:v1 envelope, AAD idp-realm:{realm}:signing-key:{kid}
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    activate_at TIMESTAMPTZ,
+    retire_at   TIMESTAMPTZ,
+    expire_at   TIMESTAMPTZ,
+    PRIMARY KEY (realm_id, kid)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_idp_signing_keys_active
+    ON hfs_idp_signing_keys (realm_id, alg) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS hfs_idp_clients (
+    realm_id          TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    client_id         TEXT NOT NULL,
+    spec              JSONB NOT NULL,
+    registration      TEXT NOT NULL DEFAULT 'admin' CHECK (registration IN ('admin','dcr','udap')),
+    registration_token_hash TEXT,       -- RFC 7592 registration access token (sha256)
+    software_id       TEXT,
+    disabled          BOOLEAN NOT NULL DEFAULT FALSE,
+    revision          BIGINT NOT NULL DEFAULT 1,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by        TEXT,
+    PRIMARY KEY (realm_id, client_id)
+);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_users (
+    id               TEXT PRIMARY KEY,
+    realm_id         TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    username         TEXT NOT NULL,
+    kind             TEXT NOT NULL CHECK (kind IN ('patient','practitioner','related-person','staff')),
+    profile          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    external_subject TEXT,
+    disabled         BOOLEAN NOT NULL DEFAULT FALSE,
+    must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+    revision         BIGINT NOT NULL DEFAULT 1,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login_at    TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_idp_users_username
+    ON hfs_idp_users (realm_id, lower(username));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_idp_users_external
+    ON hfs_idp_users (realm_id, external_subject) WHERE external_subject IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS hfs_idp_user_links (
+    user_id      TEXT NOT NULL REFERENCES hfs_idp_users (id) ON DELETE CASCADE,
+    endpoint     TEXT NOT NULL,
+    reference    TEXT NOT NULL,
+    is_fhir_user BOOLEAN NOT NULL DEFAULT FALSE,
+    accessible_patients TEXT[] NOT NULL DEFAULT '{}',
+    PRIMARY KEY (user_id, endpoint, reference)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hfs_idp_user_links_fhir_user
+    ON hfs_idp_user_links (user_id, endpoint) WHERE is_fhir_user;
+
+CREATE TABLE IF NOT EXISTS hfs_idp_credentials (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES hfs_idp_users (id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL CHECK (kind IN ('password','totp','webauthn','recovery-code')),
+    secret       TEXT NOT NULL,          -- argon2id hash, or hmsec:v1 envelope (TOTP seed)
+    meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_credentials_user ON hfs_idp_credentials (user_id, kind);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_sessions (
+    id_hash      TEXT PRIMARY KEY,       -- sha256 of the session cookie value
+    realm_id     TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    user_id      TEXT NOT NULL REFERENCES hfs_idp_users (id) ON DELETE CASCADE,
+    sid          TEXT NOT NULL,          -- OIDC sid claim (not the cookie)
+    auth_time    TIMESTAMPTZ NOT NULL,
+    amr          TEXT[] NOT NULL DEFAULT '{}',
+    acr          TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    revoked_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_sessions_user ON hfs_idp_sessions (realm_id, user_id);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_consents (
+    realm_id   TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    user_id    TEXT NOT NULL REFERENCES hfs_idp_users (id) ON DELETE CASCADE,
+    client_id  TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    scopes     TEXT[] NOT NULL,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    PRIMARY KEY (realm_id, user_id, client_id, endpoint)
+);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_grants (
+    id         TEXT PRIMARY KEY,         -- gid claim of every token of the grant
+    realm_id   TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    client_id  TEXT NOT NULL,
+    subject    TEXT NOT NULL,
+    scopes     TEXT[] NOT NULL,
+    audience   TEXT[] NOT NULL,
+    context    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fhir_user  TEXT,
+    sso_session_id TEXT,                 -- digest of the SSO cookie (online_access)
+    auth_time  TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,     -- last access/refresh token expiry
+    revoked_at TIMESTAMPTZ,
+    revoked_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_grants_revoked
+    ON hfs_idp_grants (realm_id, revoked_at) WHERE revoked_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_grants_subject ON hfs_idp_grants (realm_id, subject);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_codes (
+    code_hash  TEXT PRIMARY KEY,
+    realm_id   TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    grant_id   TEXT NOT NULL,
+    payload    JSONB NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+-- A consumed code leaves a tombstone so a replay revokes its grant (RFC 6749 §4.1.2).
+CREATE TABLE IF NOT EXISTS hfs_idp_code_tombstones (
+    code_hash  TEXT PRIMARY KEY,
+    realm_id   TEXT NOT NULL,
+    grant_id   TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_launches (
+    handle_hash TEXT PRIMARY KEY,
+    realm_id    TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    payload     JSONB NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+
+-- Pending authorizations between /authorize and the hosted pages (hmix_ handles).
+CREATE TABLE IF NOT EXISTS hfs_idp_interactions (
+    id_hash    TEXT PRIMARY KEY,
+    realm_id   TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    payload    JSONB NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_interactions_expiry ON hfs_idp_interactions (expires_at);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_refresh_families (
+    family_id          TEXT PRIMARY KEY,
+    realm_id           TEXT NOT NULL REFERENCES hfs_idp_realms (id) ON DELETE CASCADE,
+    grant_id           TEXT NOT NULL REFERENCES hfs_idp_grants (id) ON DELETE CASCADE,
+    client_id          TEXT NOT NULL,
+    subject            TEXT NOT NULL,
+    current_generation INTEGER NOT NULL DEFAULT 0,
+    payload            JSONB NOT NULL,
+    sso_session_id     TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    absolute_expiry    TIMESTAMPTZ NOT NULL,
+    revoked_at         TIMESTAMPTZ,
+    revoked_reason     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_refresh_families_grant ON hfs_idp_refresh_families (grant_id);
+CREATE TABLE IF NOT EXISTS hfs_idp_refresh_tokens (
+    token_hash TEXT PRIMARY KEY,
+    family_id  TEXT NOT NULL REFERENCES hfs_idp_refresh_families (family_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    UNIQUE (family_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS hfs_idp_jti (
+    realm_id   TEXT NOT NULL,
+    client_id  TEXT NOT NULL,
+    jti        TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (realm_id, client_id, jti)
+);
+CREATE INDEX IF NOT EXISTS idx_hfs_idp_jti_expiry ON hfs_idp_jti (expires_at);
+
+DROP TRIGGER IF EXISTS trg_hfs_idp_realms_epoch ON hfs_idp_realms;
+CREATE TRIGGER trg_hfs_idp_realms_epoch
+    AFTER INSERT OR UPDATE OR DELETE ON hfs_idp_realms
+    FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('idp');
+DROP TRIGGER IF EXISTS trg_hfs_idp_keys_epoch ON hfs_idp_signing_keys;
+CREATE TRIGGER trg_hfs_idp_keys_epoch
+    AFTER INSERT OR UPDATE OR DELETE ON hfs_idp_signing_keys
+    FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('idp');
+DROP TRIGGER IF EXISTS trg_hfs_idp_clients_epoch ON hfs_idp_clients;
+CREATE TRIGGER trg_hfs_idp_clients_epoch
+    AFTER INSERT OR UPDATE OR DELETE ON hfs_idp_clients
+    FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('idp');
+DROP TRIGGER IF EXISTS trg_hfs_idp_grants_epoch ON hfs_idp_grants;
+CREATE TRIGGER trg_hfs_idp_grants_epoch
+    AFTER UPDATE OF revoked_at ON hfs_idp_grants
+    FOR EACH STATEMENT EXECUTE FUNCTION hfs_bump_config_epoch('idp');
+"#;
+
+/// Fork migration `hm-0020-idp-core` (built-in authorization server).
+/// Requires `hm-0008-endpoints` (`hfs_config_epochs`, `hfs_bump_config_epoch`).
+async fn fork_idp_core(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(FORK_IDP_CORE_SQL)
+        .await
+        .map_err(|e| pg_error(format!("Failed to apply {FORK_IDP_CORE}: {e}")))
+}
+
 /// Fork migration `hm-0010-endpoint-sync` (FHIR server manager, design §4.3).
 ///
 /// Runs are claimed through `cluster_jobs` (kind `endpoint-sync`, lease +
@@ -7842,6 +8079,7 @@ mod postgres_integration_migrations {
         fork_endpoints(&client).await.unwrap();
         fork_console_auth(&client).await.unwrap();
         fork_endpoint_sync(&client).await.unwrap();
+        fork_idp_core(&client).await.unwrap();
         initialize_schema(&mut client).await.expect("reinitialize");
         assert_eq!(
             applied_fork_migrations(&client).await.unwrap().len(),

@@ -1,0 +1,44 @@
+[package]
+name = "helios-idp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/idp-server"
+description = "HTTP protocol endpoints of the built-in SMART / OAuth 2.0 / OpenID Connect authorization server"
+keywords = ["helios-software", "fhir", "smart-on-fhir", "oauth2", "openid-connect"]
+
+# Packages I1 (protocol endpoints) and I3 (client authentication) of
+# docs/design/authorization-server.md: /idp/{realm}/{authorize,token,
+# introspect,revoke,userinfo,jwks,.well-known/*} and the
+# AuthorizationCompleter the hosted pages (helios-idp-pages) finish with.
+[dependencies]
+helios-idp = { path = "../idp", version = "0.2.9" }
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+axum = { version = "0.8", features = ["form", "query"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "net"] }
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+url = "2.5"
+base64 = "0.22"
+tracing = "0.1"
+# Client JWKS (private_key_jwt jwks_uri) fetching through the outbound guard.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[features]
+default = []
+# Runs the flow tests on PgStore too (HFS_TEST_PG_HOST, IDP_TEST_STORE=pg).
+postgres = ["helios-idp/postgres"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+jsonwebtoken = "9"
+helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false, features = ["R4", "postgres"] }
+tokio-postgres = "0.7"
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,39 @@
+<!doctype html>
+{#
+  Frame of the authorization server's hosted pages (crates/idp-pages): the
+  console's standalone sign-in frame — app.css tokens, Figtree, the shared
+  theme cookie + boot script (light / dark / follow system), language and
+  theme top right, one centred card with the heart mark and the English
+  brand, footer below. Strict CSP: the only inline script is the theme
+  boot, carrying this response's nonce.
+#}
+<html lang="{{ shell.i18n.lang() }}"{{ shell.theme_attrs|safe }}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <meta name="referrer" content="same-origin">
+  <title>{% block title %}{% endblock %} — {{ shell.realm_display }}</title>
+{{ shell.brand_head|safe }}
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <link rel="stylesheet" href="/idp/assets/idp.css">
+  {{ shell.theme_boot|safe }}
+  <script src="/ui/assets/theme.js" defer></script>
+  <script src="/ui/assets/auth.js" defer></script>
+</head>
+<body class="auth-page idp-page">
+  <a class="skip-link" href="#auth-main">{{ shell.i18n.t("idp-skip") }}</a>
+  <div class="auth">
+    <main class="auth-main" id="auth-main" tabindex="-1">
+      {{ shell.toolbar|safe }}
+      <div class="auth-center">
+        <section class="auth-card" aria-labelledby="auth-title">
+          {{ shell.brand|safe }}
+{% block card %}{% endblock %}
+        </section>
+      </div>
+      {{ shell.footer|safe }}
+    </main>
+  </div>
+</body>
+</html>

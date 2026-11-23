@@ -11,6 +11,7 @@ mgr-nav-section-operate = Operate
 mgr-nav-section-terminology = Terminology
 mgr-nav-section-idp = Authorization servers
 mgr-nav-section-server = Server
+mgr-nav-section-idp = Authorization servers
 mgr-nav-section-settings = Settings
 mgr-nav-overview = All endpoints
 mgr-nav-endpoint-home = Endpoint home

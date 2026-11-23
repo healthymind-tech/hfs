@@ -82,6 +82,7 @@ const UNSCOPED: &[&str] = &[
     "/ui/account",
     "/ui/settings",
     "/ui/sync",
+    "/ui/idp",
     "/ui/version",
     "/ui/tenant",
     "/ui/tenants",

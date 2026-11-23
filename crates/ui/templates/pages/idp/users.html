@@ -1,0 +1,41 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("idpc-tab-users") }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% include "partials/idp/errors.html" %}
+<p class="idp-sub">{{ i18n.t("idpc-source") }}: <strong>{{ i18n.t(source_key) }}</strong>{% if !local %} — {{ i18n.t("idpc-users-console-note") }}{% endif %}</p>
+<section class="card table-card">
+  {% if rows.is_empty() %}
+    {% call ui::empty_state("users", i18n.t("idpc-users-none"), i18n.t("idpc-users-none-detail")) %}{% endcall %}
+  {% else %}
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack">
+      <thead><tr><th scope="col">{{ i18n.t("idpc-user-username") }}</th><th scope="col">{{ i18n.t("idpc-user-display") }}</th><th scope="col">{{ i18n.t("idpc-user-kind") }}</th><th scope="col">{{ i18n.t("idpc-user-link") }}</th><th scope="col">{{ i18n.t("idpc-col-status") }}</th></tr></thead>
+      <tbody>
+      {% for u in rows %}
+      <tr>
+        <td data-label="{{ i18n.t("idpc-user-username") }}"><a href="/ui/idp/{{ head.name }}/users/{{ u.id }}">{{ u.username }}</a></td>
+        <td data-label="{{ i18n.t("idpc-user-display") }}">{{ u.display }}</td>
+        <td data-label="{{ i18n.t("idpc-user-kind") }}">{{ i18n.t(u.kind_key) }}</td>
+        <td data-label="{{ i18n.t("idpc-user-link") }}">{% if u.fhir_user.is_empty() %}—{% else %}<code>{{ u.fhir_user }}</code>{% endif %}</td>
+        <td data-label="{{ i18n.t("idpc-col-status") }}">{% if u.disabled %}{% call ui::pill_raw("muted", "lock", i18n.t("idpc-status-disabled")) %}{% endcall %}{% else %}{% call ui::pill_raw("ok", "check-circle", i18n.t("idpc-status-enabled")) %}{% endcall %}{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+<form method="post" action="/ui/idp/{{ head.name }}/users" novalidate data-idp-track>
+  <details class="card disclosure idp-add"{% if open_form %} open{% endif %}>
+    <summary class="disclosure__summary">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpc-user-add") }}</summary>
+    <div class="disclosure__body">
+      {% include "partials/idp/user-form.html" %}
+      {% call ui::checkbox(i18n.t("idpc-user-must-change"), "user_must_change", false) %}{% endcall %}
+      <button type="submit" class="btn btn--primary">{{ i18n.t("idpc-user-add") }}</button>
+    </div>
+  </details>
+</form>
+{% endblock %}

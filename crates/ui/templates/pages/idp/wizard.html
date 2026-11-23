@@ -1,0 +1,242 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{#
+  Creation wizard (design §11.2). One page per step; every step saves the
+  draft server-side (a disabled realm), so the operator can leave and come
+  back. Steps: 1 basics · 2 keys · 3 users · 4 apps · 5 capabilities ·
+  6 endpoints · 7 review & test.
+#}
+{% block title %}{{ i18n.t("idpc-new-title") }} · {{ self.step_label() }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="/ui/assets/idp.css">
+<script src="/ui/assets/idp.js" defer></script>
+<header class="page-head page-head--row">
+  <div class="page-head__text">
+    <p class="page-head__back"><a href="/ui/idp">← {{ i18n.t("idpc-title") }}</a></p>
+    <h1 class="page-head__title">{% if realm.is_empty() %}{{ i18n.t("idpc-new-title") }}{% else if self.finished_ok() %}{{ display_name }} <span class="status-pill status-pill--ok">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("idpc-status-enabled") }}</span></span>{% else %}{{ display_name }} <span class="status-pill status-pill--accent">{% call ui::icon("pencil") %}{% endcall %}<span>{{ i18n.t("idpc-status-draft-short") }}</span></span>{% endif %}</h1>
+    <p class="page-head__lede">{% if realm.is_empty() %}{{ i18n.t("idpc-new-lede") }}{% else if self.finished_ok() %}{{ i18n.t("idpc-finish-lede") }}{% else %}{{ i18n.t("idpc-draft-saved") }}{% endif %}</p>
+  </div>
+  {% if !realm.is_empty() && finish.is_none() %}
+  <div class="page-head__actions">
+    <form method="post" action="/ui/idp/new/{{ realm }}/discard"><button type="submit" class="btn btn--danger-outline btn--small" data-confirm="{{ i18n.t("idpc-discard-confirm") }}">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("idpc-discard") }}</button></form>
+  </div>
+  {% endif %}
+</header>
+
+<ol class="stepper idp-stepper" role="list" aria-label="{{ i18n.t("idpc-steps-label") }}">
+  {% for s in nav %}
+  <li class="stepper__step">
+    {% if s.href.is_empty() || s.state == "todo" %}
+    <span class="stepper__btn{% if s.state == "done" %} is-done{% endif %}"{% if s.state == "current" %} aria-current="step"{% endif %}><span class="stepper__num">{{ s.n }}</span><span class="stepper__label">{{ i18n.t(s.label_key) }}</span></span>
+    {% else %}
+    <a class="stepper__btn{% if s.state == "done" %} is-done{% endif %}" href="{{ s.href }}"{% if s.state == "current" %} aria-current="step"{% endif %}><span class="stepper__num">{{ s.n }}</span><span class="stepper__label">{{ i18n.t(s.label_key) }}</span></a>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ol>
+
+{% include "partials/idp/errors.html" %}
+
+{% if step == 1 %}
+<form method="post" action="/ui/idp/new" class="wizard" novalidate data-idp-track>
+  {% call ui::form_section("basics", i18n.t("idpc-step-basics"), i18n.t("idpc-step-basics-desc")) %}
+    {% if !keys_available %}<p class="notice notice--warn" role="alert">{{ i18n.t("idpc-no-keyring-detail") }}</p>{% endif %}
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("idpc-field-display-name"), "display_name", self.v("display_name"), self.err("display_name"), i18n.t("idpc-field-display-name-hint"), "text", true, "Patient apps") %}{% endcall %}
+      {% call ui::field_text(i18n.t("idpc-field-name"), "name", self.v("name"), self.err("name"), i18n.t("idpc-field-name-hint"), "text", true, "patients", false, true) %}{% endcall %}
+    </div>
+    <p class="idp-preview" data-idp-issuer-preview data-base="{{ public_base }}/idp/">{{ i18n.t("idpc-issuer-preview") }} <code data-idp-issuer>{{ public_base }}/idp/{% if self.v("name").is_empty() %}…{% else %}{{ self.v("name") }}{% endif %}</code></p>
+    <fieldset>
+      <legend class="mfield__label">{{ i18n.t("idpc-template") }}</legend>
+      <div class="radio-cards__grid">
+        {% for t in templates %}
+        <label class="radio-card">
+          <input type="radio" name="template" value="{{ t.value }}"{% if t.checked %} checked{% endif %}>
+          <span class="radio-card__title">{{ i18n.t(t.label_key) }}</span>
+          <span class="radio-card__desc">{{ i18n.t(t.hint_key) }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </fieldset>
+  {% endcall %}
+  <div class="form-actions"><button type="submit" class="btn btn--primary"{% if !keys_available %} disabled{% endif %}>{{ i18n.t("idpc-next") }} {% call ui::icon("arrow-right") %}{% endcall %}</button></div>
+</form>
+
+{% else if step == 2 %}
+<form method="post" action="/ui/idp/new/{{ realm }}/2" novalidate data-idp-track>
+  {% call ui::form_section("keys", i18n.t("idpc-step-keys"), i18n.t("idpc-step-keys-desc")) %}
+    <fieldset class="checks{% if !self.err("signingAlgs").is_empty() %} checks--error{% endif %}" id="f-signingAlgs">
+      <legend class="mfield__label">{{ i18n.t("idpc-algs") }}</legend>
+      {% for a in algs %}
+      <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-alg-{{ a.value }}" name="alg" value="{{ a.value }}"{% if a.checked %} checked{% endif %} aria-describedby="f-alg-{{ a.value }}-hint"><label class="mcheck__label" for="f-alg-{{ a.value }}">{{ i18n.t(a.label_key) }}</label><p class="mcheck__hint" id="f-alg-{{ a.value }}-hint">{{ i18n.t(a.hint_key) }}</p></div>
+      {% endfor %}
+      {% if !self.err("signingAlgs").is_empty() %}<p class="mfield__error">{{ self.err("signingAlgs") }}</p>{% endif %}
+      {% if oidc_on %}<p class="mfield__hint">{{ i18n.t("idpc-algs-oidc-note") }}</p>{% endif %}
+    </fieldset>
+    <div class="form-grid">
+      <div class="mfield">
+        <label class="mfield__label" for="f-rsa_bits">{{ i18n.t("idpc-rsa-bits") }}</label>
+        <select class="mfield__input" id="f-rsa_bits" name="rsa_bits">
+          {% for b in ["2048", "3072", "4096"] %}<option value="{{ b }}"{% if rsa_bits == *b %} selected{% endif %}>{{ i18n.t_arg("idpc-rsa-bits-option", "bits", b.to_string()) }}</option>{% endfor %}
+        </select>
+      </div>
+      {% call ui::field_text(i18n.t("idpc-rotate-days"), "rotation.rotateAfterDays", rotate_days, self.err("rotation.rotateAfterDays"), i18n.t("idpc-rotate-days-hint"), "number", false, "90") %}{% endcall %}
+    </div>
+    <h3 class="idp-h3">{{ i18n.t("idpc-keys-generated") }}</h3>
+    {% include "partials/idp/key-table.html" %}
+  {% endcall %}
+  {% include "partials/idp/wizard-actions.html" %}
+</form>
+
+{% else if step == 3 %}
+<form method="post" action="/ui/idp/new/{{ realm }}/3" novalidate data-idp-track>
+  {% call ui::form_section("users", i18n.t("idpc-step-users"), i18n.t("idpc-step-users-desc")) %}
+    <fieldset id="f-userSource">
+      <legend class="mfield__label">{{ i18n.t("idpc-source") }}</legend>
+      <div class="radio-cards__grid">
+        <label class="radio-card"><input type="radio" name="user_source" value="local"{% if user_source == "local" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("idpc-source-local") }}</span><span class="radio-card__desc">{{ i18n.t("idpc-source-local-desc") }}</span></label>
+        <label class="radio-card"><input type="radio" name="user_source" value="console"{% if user_source == "console" %} checked{% endif %}><span class="radio-card__title">{{ i18n.t("idpc-source-console") }}</span><span class="radio-card__desc">{{ i18n.t("idpc-source-console-desc") }}</span></label>
+        <label class="radio-card"><input type="radio" name="user_source" value="upstream" disabled><span class="radio-card__title">{{ i18n.t("idpc-source-upstream") }}</span><span class="radio-card__desc">{{ i18n.t("idpc-source-upstream-desc") }}</span></label>
+      </div>
+    </fieldset>
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("idpc-password-min"), "security.passwordMinLength", password_min, self.err("security.passwordMinLength"), i18n.t("idpc-password-min-hint"), "number", false, "12") %}{% endcall %}
+      {% call ui::field_text(i18n.t("idpc-lockout"), "security.lockoutThreshold", lockout, self.err("security.lockoutThreshold"), i18n.t("idpc-lockout-hint"), "number", false, "5") %}{% endcall %}
+    </div>
+    <p class="mfield__hint">{{ i18n.t("idpc-fhiruser-explain") }}</p>
+    <h3 class="idp-h3">{{ i18n.t("idpc-users-in-realm") }}</h3>
+    {% if users.is_empty() %}<p class="idp-sub">{{ i18n.t("idpc-users-none") }}</p>{% else %}
+    <ul class="idp-list">{% for u in users %}<li><strong>{{ u.username }}</strong> · {{ i18n.t(u.kind_key) }}{% if !u.fhir_user.is_empty() %} · <code>{{ u.fhir_user }}</code>{% endif %}</li>{% endfor %}</ul>
+    {% endif %}
+    <details class="disclosure"{% if !self.v("user_username").is_empty() || !self.err("user_username").is_empty() || !self.err("user_password").is_empty() || !self.err("user_reference").is_empty() %} open{% endif %}>
+      <summary class="disclosure__summary">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpc-user-add") }}</summary>
+      <div class="disclosure__body">
+        {% include "partials/idp/user-form.html" %}
+        <button type="submit" class="btn" name="action" value="add_user">{{ i18n.t("idpc-user-add") }}</button>
+      </div>
+    </details>
+  {% endcall %}
+  {% include "partials/idp/wizard-actions.html" %}
+</form>
+
+{% else if step == 4 %}
+{% if let Some((cid, secret)) = new_secret %}{% include "partials/idp/secret-once.html" %}{% endif %}
+<section class="card form-section" id="clients">
+  <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("idpc-step-clients") }}</h2><p class="form-section__desc">{{ i18n.t("idpc-step-clients-desc") }}</p></header>
+  <div class="form-section__body">
+  {% if clients.is_empty() %}<p class="idp-sub">{{ i18n.t("idpc-clients-none") }}</p>{% else %}
+  <ul class="idp-list">
+    {% for cl in clients %}
+    <li id="client-{{ cl.client_id }}"><strong>{{ cl.name }}</strong> <code>{{ cl.client_id }}</code> · {{ i18n.t(cl.kind_key) }}{% if !cl.redirects.is_empty() %} · <code class="idp-wrap">{{ cl.redirects }}</code>{% endif %}
+      <form method="post" action="/ui/idp/new/{{ realm }}/4" class="idp-inline"><button type="submit" class="btn btn--small btn--danger-outline" name="action" value="delete_client:{{ cl.client_id }}" data-confirm="{{ i18n.t_arg("idpc-client-delete-confirm", "client", cl.client_id.clone()) }}">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("idpc-delete") }}</button></form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  </div>
+</section>
+<form method="post" action="/ui/idp/new/{{ realm }}/4" novalidate data-idp-track>
+  <details class="card disclosure idp-add"{% if clients.is_empty() || !errors.is_empty() %} open{% endif %}>
+    <summary class="disclosure__summary">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpc-client-add") }}</summary>
+    <div class="disclosure__body">
+      {% include "partials/idp/client-form.html" %}
+      <button type="submit" class="btn btn--primary" name="action" value="add_client">{{ i18n.t("idpc-client-add") }}</button>
+    </div>
+  </details>
+</form>
+<form method="post" action="/ui/idp/new/{{ realm }}/4">{% include "partials/idp/wizard-actions.html" %}</form>
+
+{% else if step == 5 %}
+<form method="post" action="/ui/idp/new/{{ realm }}/5" novalidate data-idp-track id="caps-form">
+  {% call ui::form_section("capabilities", i18n.t("idpc-step-capabilities"), i18n.t("idpc-step-capabilities-desc")) %}
+    <div class="idp-cols">
+      <div>
+        {% include "partials/idp/capabilities.html" %}
+      </div>
+      <div class="idp-preview-pane">
+        <h3 class="idp-h3">{{ i18n.t("idpc-smart-preview") }}</h3>
+        <p class="mfield__hint">{{ i18n.t("idpc-smart-preview-hint") }}</p>
+        <div id="smart-preview" hx-post="/ui/idp/new/{{ realm }}/preview" hx-include="#caps-form" hx-trigger="change from:#caps-form delay:300ms" aria-live="polite"><pre class="json-preview"><code>{{ smart_preview }}</code></pre></div>
+      </div>
+    </div>
+  {% endcall %}
+  {% include "partials/idp/wizard-actions.html" %}
+</form>
+
+{% else if step == 6 %}
+<form method="post" action="/ui/idp/new/{{ realm }}/6" novalidate data-idp-track>
+  {% call ui::form_section("endpoints", i18n.t("idpc-step-endpoints"), i18n.t("idpc-step-endpoints-desc")) %}
+    {% if endpoints.is_empty() %}<p>{{ i18n.t("idpc-no-endpoints") }}</p>{% else %}
+    <div class="idp-eps">
+    {% for e in endpoints %}
+      <label class="mcheck mcheck--card idp-ep" id="ep-{{ e.name }}">
+        <input type="checkbox" class="mcheck__input" name="endpoint" value="{{ e.name }}"{% if e.chosen %} checked{% endif %}>
+        <span class="mcheck__label"><strong>{{ e.name }}</strong> <code class="idp-wrap">{{ e.base_url }}</code></span>
+        <span class="mcheck__hint">{{ i18n.t("idpc-ep-today") }} {{ i18n.t(e.state_key) }}{% if !e.state_detail.is_empty() %} (<code class="idp-wrap">{{ e.state_detail }}</code>){% endif %} · {{ i18n.t("idpc-ep-mode") }} {{ e.mode_before }}
+        {% if e.changes %}<br><span class="idp-warn">{% call ui::icon("alert") %}{% endcall %}{{ i18n.t("idpc-ep-switch-warning") }}</span>{% endif %}</span>
+      </label>
+    {% endfor %}
+    </div>
+    {% endif %}
+    <div class="form-grid">
+      <div class="mfield">
+        <label class="mfield__label" for="f-bind_mode">{{ i18n.t("idpc-bind-mode") }}</label>
+        <select class="mfield__input" id="f-bind_mode" name="bind_mode">
+          <option value="keep"{% if bind_mode == "keep" %} selected{% endif %}>{{ i18n.t("idpc-bind-mode-keep") }}</option>
+          <option value="write-protect"{% if bind_mode == "write-protect" %} selected{% endif %}>{{ i18n.t("idpc-bind-mode-write-protect") }}</option>
+          <option value="full"{% if bind_mode == "full" %} selected{% endif %}>{{ i18n.t("idpc-bind-mode-full") }}</option>
+        </select>
+        <p class="mfield__hint">{{ i18n.t("idpc-bind-mode-hint") }}</p>
+      </div>
+      {% call ui::field_text(i18n.t("idpc-test-patient"), "test_patient", test_patient, self.err("test_patient"), i18n.t("idpc-test-patient-hint"), "text", false, "example", false, true) %}{% endcall %}
+    </div>
+    <p class="notice notice--info">{{ i18n.t("idpc-bind-after-checks") }}</p>
+  {% endcall %}
+  {% include "partials/idp/wizard-actions.html" %}
+</form>
+
+{% else %}
+{% if let Some(f) = finish %}
+<section class="card idp-result">
+  {% if f.ok %}
+  <p class="notice notice--ok" role="status">{% call ui::icon("check-circle") %}{% endcall %}{{ i18n.t("idpc-finish-ok") }}</p>
+  {% else %}
+  <p class="notice notice--warn" role="alert">{% call ui::icon("alert") %}{% endcall %}{{ i18n.t("idpc-finish-problems") }}</p>
+  {% endif %}
+  {% if !f.bound.is_empty() %}<p>{{ i18n.t("idpc-finish-bound") }} <strong>{{ f.bound.join(", ") }}</strong></p>{% endif %}
+  {% if !f.not_bound.is_empty() %}<p>{{ i18n.t("idpc-finish-not-bound") }} <strong>{{ f.not_bound.join(", ") }}</strong></p>{% endif %}
+  <div class="form-actions form-actions--start">
+    <a class="btn btn--primary" href="/ui/idp/{{ realm }}">{{ i18n.t("idpc-finish-open") }}</a>
+    <a class="btn" href="/ui/idp/{{ realm }}/test">{{ i18n.t("idpc-test-again") }}</a>
+    {% if !f.not_bound.is_empty() %}<form method="post" action="/ui/idp/new/{{ realm }}/7" class="idp-inline"><button type="submit" class="btn">{{ i18n.t("idpc-finish-retry") }}</button></form>{% endif %}
+  </div>
+  <h3 class="idp-h3">{{ i18n.t("idpc-next-steps") }}</h3>
+  <ol class="idp-next">
+    <li>{{ i18n.t("idpc-next-register") }}</li>
+    <li>{{ i18n.t("idpc-next-users") }}</li>
+    <li>{{ i18n.t("idpc-next-inferno") }}</li>
+  </ol>
+</section>
+{% else %}
+<section class="card form-section">
+  <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("idpc-step-review") }}</h2><p class="form-section__desc">{{ i18n.t("idpc-step-review-desc") }}</p></header>
+  <div class="form-section__body">
+    <dl class="idp-review">
+      {% for r in review %}
+      <div class="idp-review__row"><dt>{{ i18n.t(r.label_key) }}</dt><dd>{{ r.value }}</dd><dd class="idp-review__edit">{% if r.edit_step > 1 %}<a href="/ui/idp/new/{{ realm }}/{{ r.edit_step }}">{{ i18n.t("idpc-edit") }}</a>{% endif %}</dd></div>
+      {% endfor %}
+    </dl>
+    <details class="disclosure"><summary class="disclosure__summary">{{ i18n.t("idpc-review-json") }}</summary><div class="disclosure__body"><pre class="json-preview"><code>{{ smart_preview }}</code></pre></div></details>
+  </div>
+</section>
+<form method="post" action="/ui/idp/new/{{ realm }}/7" data-idp-finish>
+  <div class="form-actions">
+    <a class="btn" href="/ui/idp/new/{{ realm }}/6">{{ i18n.t("idpc-back") }}</a>
+    <button type="submit" class="btn btn--primary" data-idp-busy="{{ i18n.t("idpc-finish-running") }}">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("idpc-finish") }}</button>
+  </div>
+</form>
+<h2 class="idp-h2">{{ i18n.t("idpc-preflight-title") }}</h2>
+{% endif %}
+<section class="card"><div class="card__body">{% include "partials/idp/verify.html" %}</div></section>
+{% endif %}
+{% endblock %}

@@ -31,6 +31,7 @@ pub mod audit;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod internal;
 pub mod jwks;
 pub mod outbound;
 pub mod policy;
@@ -48,6 +49,10 @@ pub use discovery::{
     ProbeStep, SmartConfiguration,
 };
 pub use error::{AuthError, FhirOperation};
+pub use internal::{
+    InternalRealmSource, InternalVerifier, MemoryRealmSource, RealmTrust, TrustedKey,
+    install_internal_realms, internal_realms,
+};
 pub use jwks::JwksCache;
 pub use outbound::{
     NoOpOutboundAuthProvider, OutboundAuthProvider, StaticBearerOutboundAuthProvider,

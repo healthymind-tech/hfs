@@ -1,0 +1,18 @@
+{#- SMART capabilities toggles + token lifetimes (wizard step 5, Settings). Needs `groups`, `lifetimes`, `err`. -#}
+{% for g in groups %}
+<fieldset class="checks idp-capgroup">
+  <legend class="mfield__label">{{ i18n.t(g.title_key) }}</legend>
+  {% for t in g.items %}
+  <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-features.{{ t.name }}" name="{{ t.name }}" value="on"{% if t.checked %} checked{% endif %} aria-describedby="f-features.{{ t.name }}-hint"><label class="mcheck__label" for="f-features.{{ t.name }}">{{ i18n.t(t.label_key) }}</label><p class="mcheck__hint" id="f-features.{{ t.name }}-hint">{{ i18n.t(t.hint_key) }}</p></div>
+  {% endfor %}
+</fieldset>
+{% endfor %}
+{% if !self.err("features").is_empty() %}<p class="mfield__error" id="f-features">{{ self.err("features") }}</p>{% endif %}
+<fieldset class="idp-lifetimes">
+  <legend class="mfield__label">{{ i18n.t("idpc-lifetimes") }}</legend>
+  <div class="form-grid">
+  {% for l in lifetimes %}
+    {% call ui::field_text(i18n.t(l.label_key), l.name, l.value, self.err(l.name), i18n.t(l.hint_key), "number") %}{% endcall %}
+  {% endfor %}
+  </div>
+</fieldset>

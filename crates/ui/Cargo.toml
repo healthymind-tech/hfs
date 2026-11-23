@@ -126,15 +126,14 @@ helios-ui-chrome = { path = "../ui-chrome", version = "0.2.9" }
 # The terminology console, embedded as the Terminology section at
 # `/ui/terminology` (unified-server design §9): one sign-in, one shell.
 helios-hts-ui = { path = "../hts-ui", version = "0.2.9", default-features = false }
-# The terminology route namespace and role table (design §3.2, §7.2).
-helios-terminology = { path = "../terminology", version = "0.2.9" }
 
 # The FHIR server manager contracts (package P0): endpoint model, routing
 # snapshot/registry, store traits, console roles and sync job model. The
 # manager console (src/manager) reads endpoints only through these types.
 helios-endpoints = { path = "../endpoints", version = "0.2.9" }
-# The server's terminology service for the editor's `$expand` picker and the
-# health probe (docs/design/unified-server.md U2).
+# The server's terminology service (editor `$expand` picker, health probe;
+# docs/design/unified-server.md U2) plus the terminology route namespace and
+# role table (design §3.2, §7.2).
 helios-terminology = { path = "../terminology", version = "0.2.9" }
 
 # Administrator sign-in for the console's admin pages (`/ui/admin/login`, the
@@ -188,6 +187,13 @@ helios-persistence = { path = "../persistence", version = "0.2.9", default-featu
 # Sync console pages (FHIR server manager P6): server-rendered over the
 # sync service.
 helios-sync = { path = "../sync", version = "0.2.9", default-features = false }
+
+# Built-in authorization server console (docs/design/authorization-server.md
+# I6): realm list, creation wizard, management pages and the diagnostic,
+# server-rendered over helios-idp-admin's console service (in-process, no
+# self-calls). Inert unless the server installs the service (HFS_IDP=on).
+helios-idp = { path = "../idp", version = "0.2.9" }
+helios-idp-admin = { path = "../idp-admin", version = "0.2.9" }
 
 
 [dev-dependencies]

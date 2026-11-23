@@ -1,0 +1,50 @@
+{% extends "idp/layout.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ title }}</h1>
+            <p class="auth-lede">{{ lede }}</p>
+          </header>
+          {%- if let Some(b) = error %}
+          {% include "idp/banner.html" %}
+          {%- endif %}
+          <ul class="idp-facts">
+            <li id="idp-consent-user">{{ signed_in }}</li>
+            {%- if let Some(p) = patient %}
+            <li id="idp-consent-patient">{{ p }}</li>
+            {%- endif %}
+          </ul>
+          <form method="post" action="{{ action }}" class="auth-form" id="idp-consent-form">
+            <input type="hidden" name="ix" value="{{ ix }}">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <p class="idp-section">{{ shell.i18n.t("idp-consent-scopes") }}</p>
+            <ul class="idp-scopes">
+              {%- for s in scopes %}
+              <li class="idp-scope">
+                {%- if s.optional %}
+                <label class="idp-scope__label" for="idp-scope-{{ loop.index }}">
+                  <input type="checkbox" name="scope" id="idp-scope-{{ loop.index }}" value="{{ s.scope }}" checked>
+                  <span><span class="idp-scope__text">{{ s.label }}</span>{% if !s.detail.is_empty() %} <span class="idp-scope__detail">{{ s.detail }}</span>{% endif %}<code class="idp-scope__code">{{ s.scope }}</code></span>
+                </label>
+                {%- else %}
+                <span class="idp-scope__label idp-scope__label--fixed">
+                  <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                  <span><span class="idp-scope__text">{{ s.label }}</span><code class="idp-scope__code">{{ s.scope }}</code></span>
+                </span>
+                {%- endif %}
+              </li>
+              {%- endfor %}
+            </ul>
+            {%- if has_optional %}
+            <p class="auth-hint">{{ shell.i18n.t("idp-consent-untick") }}</p>
+            {%- endif %}
+            <label class="idp-remember" for="idp-remember">
+              <input type="checkbox" name="remember" id="idp-remember" value="1">
+              <span>{{ shell.i18n.t("idp-consent-remember") }}</span>
+            </label>
+            <div class="idp-actions">
+              <button class="btn auth-btn auth-btn--secondary" type="submit" name="decision" value="deny" id="idp-consent-deny" formnovalidate>{{ shell.i18n.t("idp-consent-deny") }}</button>
+              <button class="btn btn--primary auth-btn" type="submit" name="decision" value="allow" id="idp-consent-allow">{{ shell.i18n.t("idp-consent-allow") }}</button>
+            </div>
+          </form>
+{% endblock %}

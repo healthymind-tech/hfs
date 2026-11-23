@@ -1,0 +1,51 @@
+[package]
+name = "helios-idp-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/idp-admin"
+description = "Admin API (/admin/idp) and the \"test this auth server\" diagnostic of the built-in authorization server"
+keywords = ["helios-software", "fhir", "smart-on-fhir", "oauth2", "openid-connect"]
+
+# Packages I6/I7 of docs/design/authorization-server.md: the admin HTTP API
+# over `helios_idp::admin::IdpAdmin` (package IdP A) and the diagnostic
+# runner, which drives a realm through its PUBLIC URLs (discovery, the real
+# hosted login form, token, introspection, revocation, userinfo, logout, a
+# FHIR call on each bound endpoint) with a throw-away client pair and user,
+# and reports per step with a fix. The console pages (crates/ui `idp`)
+# render the same report.
+[dependencies]
+helios-idp = { path = "../idp", version = "0.2.9" }
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror = "2"
+async-trait = "0.1"
+url = "2.5"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+tracing = "0.1"
+# The diagnostic is an HTTP client of the realm's public URLs. Redirects are
+# followed by hand (the authorization response is read from `Location`, never
+# fetched) and cookies are kept in a per-run jar.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Reads the hosted login / consent / patient-picker forms (CSRF token and
+# field names come from the page, so no code path bypasses the real form).
+scraper = { version = "0.27", default-features = false }
+# Verifies id_token / access token signatures against the published JWKS
+# with the resource server's library (independent of the signer).
+jsonwebtoken = "9"
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+# Real protocol endpoints (IdP A) for the end-to-end diagnostic test.
+helios-idp-server = { path = "../idp-server", version = "0.2.9" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

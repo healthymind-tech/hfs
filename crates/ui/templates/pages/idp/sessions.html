@@ -1,0 +1,11 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("idpc-tab-sessions") }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% if !sessions.is_empty() %}
+<form method="post" action="/ui/idp/{{ head.name }}/sessions/all-sessions/all/revoke" class="idp-toolbar"><button type="submit" class="btn btn--danger-outline" data-confirm="{{ i18n.t("idpc-sessions-revoke-all-confirm") }}">{{ i18n.t("idpc-sessions-revoke-all") }}</button></form>
+{% endif %}
+{% include "partials/idp/session-tables.html" %}
+{% endblock %}
