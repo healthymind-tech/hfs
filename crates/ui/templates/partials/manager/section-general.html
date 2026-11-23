@@ -35,7 +35,7 @@
 {% endcall %}
 
 {% call ui::form_section("sec-console", i18n.t("mgr-sec-console"), i18n.t("mgr-sec-console-desc")) %}
-  <fieldset class="radio-cards">
+  <fieldset class="radio-cards" id="f-console_access">
     <legend class="mfield__label">{{ i18n.t("mgr-field-console-access") }}</legend>
     <label class="radio-card">
       <input type="radio" name="console_access" value="role-based"{% if v.console_access == "role-based" %} checked{% endif %}>

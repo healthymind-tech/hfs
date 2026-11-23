@@ -38,7 +38,7 @@
 </section>
 
 {% if local %}
-<section class="card form-section account-card" aria-labelledby="account-password-title">
+<section class="card form-section account-card" id="account-password" aria-labelledby="account-password-title">
   <header class="form-section__head"><h2 class="form-section__title" id="account-password-title">{{ i18n.t("console-account-password") }}</h2></header>
   <div class="form-section__body">
   <form method="post" action="/ui/account/password" id="password-form" data-auth-form>

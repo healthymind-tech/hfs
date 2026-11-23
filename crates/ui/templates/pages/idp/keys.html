@@ -22,7 +22,7 @@
   {% endif %}
   <div class="card__body"><p class="idp-sub">{{ i18n.t_arg("idpc-keys-retired", "count", retired as i64) }}</p></div>
 </section>
-<section class="card">
+<section class="card" id="keys-rotate">
   <header class="card-head"><h2>{{ i18n.t("idpc-keys-rotate") }}</h2></header>
   <div class="card__body">
     <p>{{ i18n.t("idpc-keys-rotate-detail") }}</p>
@@ -32,7 +32,7 @@
     </div>
   </div>
 </section>
-<section class="card danger-zone">
+<section class="card danger-zone" id="keys-emergency">
   <h2 class="danger-zone__heading">{{ i18n.t("idpc-keys-emergency") }}</h2>
   <form method="post" action="/ui/idp/{{ head.name }}/keys/emergency" class="danger-zone__row" data-typed-confirm="{{ head.name }}">
     <div><p>{{ i18n.t("idpc-keys-emergency-detail") }}</p>

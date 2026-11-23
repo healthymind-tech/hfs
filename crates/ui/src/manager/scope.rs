@@ -88,6 +88,8 @@ const UNSCOPED: &[&str] = &[
     "/ui/tenants",
     "/ui/json-view",
     "/ui/status",
+    // The console-wide search: one per server (its results name endpoints).
+    "/ui/find",
 ];
 
 /// Query keys that belong to the per-endpoint dashboard, not the overview.

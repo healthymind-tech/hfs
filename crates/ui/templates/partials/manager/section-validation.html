@@ -2,7 +2,7 @@
   {% call ui::inherit_toggle("val_inherit", v.val_inherit, "val-fields", i18n.t_arg("mgr-inherit-validation", "mode", i18n.t(env.validation_key))) %}{% endcall %}
   <fieldset class="inherit-target" id="val-fields"{% if v.val_inherit %} disabled{% endif %}>
     <legend class="mfield__label">{{ i18n.t("mgr-field-validation-mode") }}</legend>
-    <div class="radio-cards__grid">
+    <div class="radio-cards__grid" id="f-val_mode">
       <label class="radio-card">
         <input type="radio" name="val_mode" value="off"{% if v.val_mode == "off" %} checked{% endif %}>
         <span class="radio-card__title">{{ i18n.t("mgr-validation-mode-off") }}</span>
@@ -34,7 +34,7 @@
   </fieldset>
 {% endcall %}
 
-<section class="card form-section" aria-labelledby="sec-igs-title">
+<section class="card form-section" aria-labelledby="sec-igs-title" id="sec-igs">
   <header class="form-section__head">
     <h2 class="form-section__title" id="sec-igs-title">{{ i18n.t("mgr-sec-igs") }}</h2>
     <p class="form-section__desc">{{ i18n.t("mgr-sec-igs-desc") }}</p>

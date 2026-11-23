@@ -32,7 +32,7 @@
   {{ csrf_html|safe }}
   <input type="hidden" name="revision" value="{{ revision }}">
 
-  <fieldset class="mfield mfield--group form-grid__full">
+  <fieldset class="mfield mfield--group form-grid__full" id="cs-mode">
     <legend class="mfield__label">{{ i18n.t("console-settings-mode") }}{% if self.pinned("mode") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ i18n.t("console-settings-pinned") }} HFS_CONSOLE_AUTH_MODE</span></span>{% endif %}</legend>
     {% if self.pinned("mode") %}<p class="mfield__hint">{{ i18n.t_arg("console-settings-pinned-explain", "var", "HFS_CONSOLE_AUTH_MODE") }}</p>{% endif %}
     {% for (value, key) in modes %}
@@ -45,7 +45,7 @@
 
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t("console-settings-anonymous-role") }}{% if self.pinned("anonymousRole") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_ANONYMOUS_ROLE</span></span>{% endif %}</span>
-    <select class="mfield__input" name="anonymousRole"{% if self.pinned("anonymousRole") %} disabled{% endif %}>
+    <select class="mfield__input" id="cs-anonymousRole" name="anonymousRole"{% if self.pinned("anonymousRole") %} disabled{% endif %}>
       {% for value in ["none", "viewer", "editor"] %}
       <option value="{{ value }}"{% if form.anonymous_role == *value %} selected{% endif %}>{{ value }}</option>
       {% endfor %}
@@ -53,11 +53,11 @@
   </label>
 
   <label class="mcheck form-grid__full">
-    <input class="mcheck__input" type="checkbox" name="breakGlass" value="true"{% if form.break_glass %} checked{% endif %}{% if self.pinned("breakGlass") %} disabled{% endif %}>
+    <input class="mcheck__input" type="checkbox" id="cs-breakGlass" name="breakGlass" value="true"{% if form.break_glass %} checked{% endif %}{% if self.pinned("breakGlass") %} disabled{% endif %}>
     <span class="mcheck__label">{{ i18n.t("console-settings-break-glass") }}{% if self.pinned("breakGlass") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_BREAK_GLASS</span></span>{% endif %}</span>
   </label>
 
-  <h2 class="form-section__title form-subhead form-grid__full">{{ i18n.t("console-settings-oidc") }}</h2>
+  <h2 class="form-section__title form-subhead form-grid__full" id="cs-oidc">{{ i18n.t("console-settings-oidc") }}</h2>
   {#- UX-12: what to register at the identity provider, ready to copy. -#}
   <div class="verify-effective form-grid__full" id="oidc-register">
     <p class="mfield__label">{{ i18n.t("console-settings-register-title") }}</p>
@@ -71,13 +71,13 @@
   {% for (name, label, var, value) in oidc_fields %}
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ var }}</span></span>{% endif %}</span>
-    <input class="mfield__input" type="text" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %} autocomplete="off" spellcheck="false">
+    <input class="mfield__input" type="text" id="cs-{{ name }}" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %} autocomplete="off" spellcheck="false">
   </label>
   {% endfor %}
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t("console-settings-oidc-secret") }}{% if self.pinned("oidc.clientSecret") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_OIDC_CLIENT_SECRET</span></span>{% endif %}
       — {% if secret_set %}{{ i18n.t("console-settings-secret-set") }}{% else %}{{ i18n.t("console-settings-secret-unset") }}{% endif %}</span>
-    <input class="mfield__input" type="password" name="oidc.clientSecret" value="" autocomplete="new-password"{% if self.pinned("oidc.clientSecret") || !key_ring %} disabled{% endif %}>
+    <input class="mfield__input" type="password" id="cs-oidc.clientSecret" name="oidc.clientSecret" value="" autocomplete="new-password"{% if self.pinned("oidc.clientSecret") || !key_ring %} disabled{% endif %}>
     {% if !key_ring %}<span class="mfield__hint">{{ i18n.t("console-settings-secret-no-keyring") }}</span>{% endif %}
   </label>
   {% if secret_set && !self.pinned("oidc.clientSecret") %}
@@ -85,23 +85,23 @@
   {% endif %}
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t("console-settings-oidc-default-role") }}{% if self.pinned("oidc.defaultRole") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_OIDC_DEFAULT_ROLE</span></span>{% endif %}</span>
-    <select class="mfield__input" name="oidc.defaultRole"{% if self.pinned("oidc.defaultRole") %} disabled{% endif %}>
+    <select class="mfield__input" id="cs-oidc.defaultRole" name="oidc.defaultRole"{% if self.pinned("oidc.defaultRole") %} disabled{% endif %}>
       {% for value in ["none", "viewer", "editor", "admin"] %}
       <option value="{{ value }}"{% if form.default_role == *value %} selected{% endif %}>{{ value }}</option>
       {% endfor %}
     </select>
   </label>
 
-  <h2 class="form-section__title form-subhead form-grid__full">{{ i18n.t("console-settings-local") }}</h2>
+  <h2 class="form-section__title form-subhead form-grid__full" id="cs-local">{{ i18n.t("console-settings-local") }}</h2>
   {% for (name, label, var, value) in number_fields %}
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t(label) }}{% if self.pinned(name) %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>{{ var }}</span></span>{% endif %}</span>
-    <input class="mfield__input" type="number" min="1" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %}>
+    <input class="mfield__input" type="number" min="1" id="cs-{{ name }}" name="{{ name }}" value="{{ value }}"{% if self.pinned(name) %} disabled{% endif %}>
   </label>
   {% endfor %}
   <label class="mfield">
     <span class="mfield__label">{{ i18n.t("console-settings-allowed-origins") }}{% if self.pinned("allowedOrigins") %} <span class="pinned-chip">{% call ui::icon("lock") %}{% endcall %}<span>HFS_CONSOLE_ALLOWED_ORIGINS</span></span>{% endif %}</span>
-    <input class="mfield__input" type="text" name="allowedOrigins" value="{{ form.allowed_origins }}"{% if self.pinned("allowedOrigins") %} disabled{% endif %} spellcheck="false">
+    <input class="mfield__input" type="text" id="cs-allowedOrigins" name="allowedOrigins" value="{{ form.allowed_origins }}"{% if self.pinned("allowedOrigins") %} disabled{% endif %} spellcheck="false">
   </label>
 
   {% if !field_errors.is_empty() %}
