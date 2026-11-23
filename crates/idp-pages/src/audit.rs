@@ -8,7 +8,7 @@
 //! | event | AuditEvent | profile claimed |
 //! |---|---|---|
 //! | token issued / refreshed | type DCM 110114 *User Authenticated*, subtype `urn:ihe:event-type-code#ITI-71`, agents client (DCM 110150) + auth-server (`AuthzOauthService`) + user (IRCP), one token-request entity (role 24, `query` = the request without secrets) | `IHE.IUA.71` (BALP 1.1.4) |
-//! | consent granted for a patient | type DCM 110113, agents client / user / userorg / authorizer, entities patient + consent | `IHE.BasicAudit.AuthZconsent` |
+//! | consent granted for a patient | type DCM 110113, subtype `AuthZsubType#AuthZ-Consent`, agents client / user / userorg / authorizer (= the audit source), entities patient + consent | `IHE.BasicAudit.AuthZconsent` |
 //! | login success / failure, lockout | type DCM 110114, subtype DCM 110122 *Login* | — (BALP defines no login profile; ATNA pattern) |
 //! | logout | type DCM 110114, subtype DCM 110123 *Logout* | — |
 //! | consent denied / withdrawn, consent without a patient | type DCM 110113 | — |
@@ -116,7 +116,7 @@ fn host_of(issuer: &str) -> String {
 /// The authorization server as an agent.
 fn server_agent(o: &EventOrigin, requestor: bool) -> Value {
     json!({
-        "type": {"coding": [coding(BALP_AGENT, "AuthzOauthService", "Authorization Server")]},
+        "type": {"coding": [coding(BALP_AGENT, "AuthzOauthService", "OAuth Authorization Server")]},
         "who": ident(&o.issuer, &o.realm),
         "requestor": requestor,
         "network": {"address": host_of(&o.issuer), "type": "1"},
@@ -272,7 +272,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             let o = origin(realm, ip);
             let mut ev = base(
                 observer,
-                coding(DCM, "110114", "User Authenticated"),
+                coding(DCM, "110114", "User Authentication"),
                 vec![coding(DCM, "110122", "Login")],
                 "0",
                 None,
@@ -307,7 +307,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             };
             let mut ev = base(
                 observer,
-                coding(DCM, "110114", "User Authenticated"),
+                coding(DCM, "110114", "User Authentication"),
                 vec![coding(DCM, "110122", "Login")],
                 outcome,
                 Some(reason),
@@ -338,7 +338,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             let o = origin(realm, ip);
             let mut ev = base(
                 observer,
-                coding(DCM, "110114", "User Authenticated"),
+                coding(DCM, "110114", "User Authentication"),
                 vec![coding(DCM, "110123", "Logout")],
                 "0",
                 None,
@@ -403,7 +403,7 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             let o = origin(realm, ip);
             let mut ev = base(
                 observer,
-                coding(DCM, "110114", "User Authenticated"),
+                coding(DCM, "110114", "User Authentication"),
                 vec![coding(DCM, "110122", "Login")],
                 "8",
                 Some(&format!("account locked until {until_unix}")),
@@ -527,7 +527,7 @@ fn token_event(
 ) -> Value {
     let mut ev = base(
         observer,
-        coding(DCM, "110114", "User Authenticated"),
+        coding(DCM, "110114", "User Authentication"),
         vec![coding(IHE_EVENT, "ITI-71", "Get Access Token")],
         "0",
         None,
@@ -583,9 +583,10 @@ fn consent_event(
         "who": {"display": origin.realm.clone(), "identifier": {"system": origin.issuer.clone(), "value": origin.realm.clone()}},
         "requestor": false,
     });
+    // BALP val-audit-source: the authorizer is the audit source itself.
     let authorizer = json!({
         "type": {"coding": [coding("http://terminology.hl7.org/CodeSystem/extra-security-role-type", "authserver", "authorization server")]},
-        "who": ident(&origin.issuer, &origin.realm),
+        "who": {"reference": observer},
         "requestor": false,
     });
     ev["agent"] = json!([
@@ -616,6 +617,11 @@ fn consent_event(
         }));
         if outcome == "0" && what == "consent-granted" {
             ev["meta"] = json!({"profile": [PROFILE_AUTHZ_CONSENT]});
+            ev["subtype"] = json!([coding(
+                "https://profiles.ihe.net/ITI/BALP/CodeSystem/AuthZsubType",
+                "AuthZ-Consent",
+                "Authorization Decision using Roles and Consent"
+            )]);
         }
     }
     entities.push(consent);

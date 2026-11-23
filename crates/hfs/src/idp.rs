@@ -226,6 +226,7 @@ pub async fn attach(
         seed(&rt, path.trim()).await?;
     }
     let _watcher = rt.spawn_watcher(Duration::from_secs(1));
+    spawn_maintenance(rt.clone(), pool.clone());
     // Endpoint changes (created, renamed path) change the realms' audience
     // URLs: reload the realms when the endpoint registry moves on.
     {
@@ -418,4 +419,64 @@ async fn seed(rt: &Arc<IdpRuntime>, path: &str) -> anyhow::Result<()> {
     }
     rt.reload().await?;
     Ok(())
+}
+
+/// Advisory-lock key of the maintenance lease ("HMIDPMNT").
+#[cfg(feature = "postgres")]
+const MAINTENANCE_LOCK: i64 = 0x484d_4944_504d_4e54;
+
+/// Expired-artefact purge and key rotation (`IdpAdmin::run_maintenance`)
+/// every minute. With PostgreSQL only the instance holding the
+/// transaction-scoped advisory lock runs it (a cluster lease: the others
+/// skip that tick); single-node deployments just run it.
+fn spawn_maintenance(
+    rt: Arc<IdpRuntime>,
+    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))] pool: Option<PgPool>,
+) {
+    tokio::spawn(async move {
+        let admin = helios_idp::admin::IdpAdmin::new(rt);
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            #[cfg(feature = "postgres")]
+            if let Some(pool) = &pool {
+                match maintenance_under_lease(pool, &admin).await {
+                    Ok(Some((purged, actions))) if purged > 0 || actions > 0 => {
+                        info!(purged, key_actions = actions, "idp maintenance")
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "idp maintenance failed"),
+                }
+                continue;
+            }
+            match admin.run_maintenance(chrono::Utc::now()).await {
+                Ok((purged, actions)) if purged > 0 || actions > 0 => {
+                    info!(purged, key_actions = actions, "idp maintenance")
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "idp maintenance failed"),
+            }
+        }
+    });
+}
+
+#[cfg(feature = "postgres")]
+async fn maintenance_under_lease(
+    pool: &PgPool,
+    admin: &helios_idp::admin::IdpAdmin,
+) -> anyhow::Result<Option<(u64, usize)>> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let row = tx
+        .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&MAINTENANCE_LOCK])
+        .await?;
+    let held: bool = row.get(0);
+    let out = if held {
+        Some(admin.run_maintenance(chrono::Utc::now()).await?)
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(out)
 }

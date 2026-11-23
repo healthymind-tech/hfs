@@ -184,7 +184,10 @@ fn classify(method: &Method, path: &str) -> Option<(String, Class)> {
         (&Method::POST, "introspect") => Class::Introspect,
         (&Method::POST, "revoke") => Class::Revoke,
         (_, "authorize") => Class::Interactive,
-        (&Method::POST, "login" | "consent" | "select-patient" | "logout" | "account/login" | "account/apps") => Class::Interactive,
+        (
+            &Method::POST,
+            "login" | "consent" | "select-patient" | "logout" | "account/login" | "account/apps",
+        ) => Class::Interactive,
         _ => Class::Other,
     };
     Some((realm.to_string(), class))

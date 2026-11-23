@@ -5,7 +5,7 @@
  */
 .idp-page .auth-card { max-width: 460px; }
 
-.idp-section { margin: 0; font-weight: 600; color: var(--text-strong); }
+.idp-section { margin: var(--space-2) 0 0; font-weight: 600; color: var(--text-strong); }
 
 .idp-facts {
   list-style: none; margin: 0 0 var(--space-2); padding: var(--space-3);
@@ -33,7 +33,7 @@
 }
 
 .idp-remember {
-  display: flex; gap: var(--space-2); align-items: center;
+  display: flex; gap: var(--space-2); align-items: center; margin-top: var(--space-2);
   color: var(--text); font-size: 0.9rem; cursor: pointer;
 }
 .idp-remember input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
@@ -45,9 +45,10 @@
 .idp-actions .auth-btn { width: 100%; margin: 0; justify-content: center; text-align: center; }
 
 .idp-search { display: grid; gap: var(--space-1); margin-bottom: var(--space-3); }
-.idp-search__row { display: grid; grid-template-columns: 1fr auto; gap: var(--space-2); }
+.idp-search__row { display: grid; grid-template-columns: 1fr auto; gap: var(--space-2); align-items: stretch; }
+.idp-search__row .btn { height: auto; min-height: 100%; padding-inline: var(--space-4); }
 
-.idp-choices { border: 0; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.idp-choices { border: 0; margin: 0 0 var(--space-3); padding: 0; display: grid; gap: var(--space-2); }
 .idp-choice {
   display: grid; grid-template-columns: 20px 1fr; gap: var(--space-2);
   align-items: center; padding: var(--space-3);

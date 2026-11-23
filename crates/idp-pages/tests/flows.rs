@@ -864,6 +864,12 @@ async fn hosted_pages_refuse_framing_and_inline_script() {
         .to_string();
     assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
     assert!(!csp.contains("unsafe-inline"));
+    // A submission may be redirected to the app: form-action allows exactly
+    // the client's registered redirect origin besides 'self'.
+    assert!(
+        csp.contains("form-action 'self' https://app.example;"),
+        "{csp}"
+    );
     assert_eq!(r.header(header::X_FRAME_OPTIONS), "DENY");
     assert_eq!(r.header(header::CACHE_CONTROL), "no-store");
     assert_eq!(r.header(header::REFERRER_POLICY), "same-origin");

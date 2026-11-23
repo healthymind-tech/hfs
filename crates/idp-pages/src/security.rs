@@ -4,8 +4,10 @@
 //! * **CSP** `default-src 'self'`, scripts only from `'self'` plus a
 //!   per-response nonce (the inline theme boot script and the form_post
 //!   auto-submit), no `unsafe-inline`, `object-src 'none'`, `base-uri
-//!   'none'`, `form-action` limited to `'self'` (plus, on the form_post
-//!   page only, the client's redirect origin).
+//!   'none'`, `form-action` limited to `'self'` plus the origin a submission
+//!   may be redirected to (the client's registered redirect URI on the
+//!   sign-in, picker and consent pages; the registered post-logout URI on
+//!   the sign-out page) — browsers apply `form-action` to redirects too.
 //! * **Clickjacking**: `frame-ancestors 'none'` and `X-Frame-Options: DENY`
 //!   by default. A realm may allow EHR embedding for listed `https` origins
 //!   (`branding.frameAncestors`); then `frame-ancestors` names exactly those

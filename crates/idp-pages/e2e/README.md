@@ -12,7 +12,7 @@ export HFS_IDP=on HFS_MANAGER=on HFS_ADMIN_PASSWORD=admin-e2e-password
 export HFS_SECRET_KEYS="k1:$(head -c32 /dev/urandom | base64)"
 export HFS_IDP_DEV_SEED=crates/idp-pages/e2e/seed.json   # realms clinic + other
 export HFS_BASE_URL=http://localhost:19612 HFS_SERVER_PORT=19612
-export HFS_IDP_TRUST_FORWARDED=false
+export HFS_IDP_TRUST_FORWARDED=false HFS_IDP_RATE_INTERACTIVE_IP=1000   # the suite signs in many times from one address
 export HFS_AUDIT_BACKEND=file HFS_AUDIT_FILE_PATH=/tmp/idp-audit.ndjson HFS_AUDIT_AUTH_EVENTS=true
 hfs   # any storage backend; PostgreSQL keeps the IdP state across restarts
 ```

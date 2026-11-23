@@ -379,6 +379,26 @@ struct Page {
     cookies: Vec<String>,
     nonce: String,
     frame_ancestors: Vec<String>,
+    /// Origin a form on the page may end up at through a redirect (CSP
+    /// `form-action` also applies to redirects after a submission).
+    form_target: Option<String>,
+}
+
+/// The CSP source of a redirect URI the browser may be sent to after a
+/// form submission: `scheme://host[:port]` for http(s), `scheme:` for a
+/// private-use scheme (RFC 8252 native apps).
+fn form_target_of(uri: &str) -> Option<String> {
+    let u = url::Url::parse(uri).ok()?;
+    match u.scheme() {
+        "http" | "https" => Some(u.origin().ascii_serialization()),
+        s if s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')) =>
+        {
+            Some(format!("{s}:"))
+        }
+        _ => None,
+    }
 }
 
 impl Page {
@@ -391,7 +411,12 @@ impl Page {
             frame_ancestors: realm
                 .map(|r| security::frame_ancestors(&r.spec.branding))
                 .unwrap_or_default(),
+            form_target: None,
         }
+    }
+    fn form_target(mut self, uri: Option<&str>) -> Self {
+        self.form_target = uri.and_then(form_target_of);
+        self
     }
     fn status(mut self, s: StatusCode) -> Self {
         self.status = s;
@@ -411,7 +436,12 @@ impl IntoResponse for Page {
             self.html,
         )
             .into_response();
-        security::apply(r.headers_mut(), &self.nonce, &self.frame_ancestors, None);
+        security::apply(
+            r.headers_mut(),
+            &self.nonce,
+            &self.frame_ancestors,
+            self.form_target.as_deref(),
+        );
         for c in self.cookies {
             if let Ok(v) = HeaderValue::from_str(&c) {
                 r.headers_mut().append(header::SET_COOKIE, v);
@@ -757,6 +787,7 @@ fn render_login(
         shell,
     };
     Page::new(t.render().unwrap_or_default(), nonce, Some(&step.realm))
+        .form_target(Some(&step.pending.redirect_uri))
         .status(status)
         .cookies(step.cookies(pages))
         .into_response()
@@ -1360,6 +1391,7 @@ async fn render_picker(
         shell,
     };
     Page::new(t.render().unwrap_or_default(), nonce, Some(&step.realm))
+        .form_target(Some(&step.pending.redirect_uri))
         .cookies(step.cookies(pages))
         .into_response()
 }
@@ -1521,6 +1553,7 @@ async fn render_consent(
         shell,
     };
     Page::new(t.render().unwrap_or_default(), nonce, Some(&step.realm))
+        .form_target(Some(&step.pending.redirect_uri))
         .cookies(step.cookies(pages))
         .into_response()
 }
@@ -1846,6 +1879,7 @@ async fn logout_page(
         shell,
     };
     Page::new(t.render().unwrap_or_default(), nonce, Some(&realm))
+        .form_target(plan.redirect.as_deref())
         .cookies(cookies)
         .into_response()
 }

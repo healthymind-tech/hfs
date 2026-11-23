@@ -37,11 +37,19 @@ async fn interactive_posts_get_429_with_retry_after() {
     }
     let r = s.post("/idp/r/login").await;
     assert_eq!(r.status_code(), StatusCode::TOO_MANY_REQUESTS);
-    let after: u64 = r.header(header::RETRY_AFTER).to_str().unwrap().parse().unwrap();
+    let after: u64 = r
+        .header(header::RETRY_AFTER)
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!((1..=20).contains(&after), "{after}");
     assert!(r.text().contains("slow_down"));
     // Other realms and other classes have their own buckets.
-    assert_eq!(s.post("/idp/other/login").await.status_code(), StatusCode::OK);
+    assert_eq!(
+        s.post("/idp/other/login").await.status_code(),
+        StatusCode::OK
+    );
     assert_eq!(s.post("/idp/r/token").await.status_code(), StatusCode::OK);
     // Discovery / JWKS are not limited by this layer.
     for _ in 0..10 {
@@ -68,12 +76,21 @@ async fn token_endpoint_limits_per_client() {
         .unwrap()
     };
     for _ in 0..2 {
-        let r = s.post("/idp/r/token").add_header(header::AUTHORIZATION, basic("a")).await;
+        let r = s
+            .post("/idp/r/token")
+            .add_header(header::AUTHORIZATION, basic("a"))
+            .await;
         assert_eq!(r.status_code(), StatusCode::OK);
     }
-    let r = s.post("/idp/r/token").add_header(header::AUTHORIZATION, basic("a")).await;
+    let r = s
+        .post("/idp/r/token")
+        .add_header(header::AUTHORIZATION, basic("a"))
+        .await;
     assert_eq!(r.status_code(), StatusCode::TOO_MANY_REQUESTS);
-    let r = s.post("/idp/r/token").add_header(header::AUTHORIZATION, basic("b")).await;
+    let r = s
+        .post("/idp/r/token")
+        .add_header(header::AUTHORIZATION, basic("b"))
+        .await;
     assert_eq!(r.status_code(), StatusCode::OK, "another client");
 }
 
@@ -91,13 +108,19 @@ async fn a_forged_forwarded_for_does_not_reset_the_bucket() {
     for fake in ["1.1.1.1", "2.2.2.2"] {
         let r = s
             .post("/idp/r/login")
-            .add_header("x-forwarded-for", HeaderValue::from_str(&format!("{fake}, 203.0.113.7")).unwrap())
+            .add_header(
+                "x-forwarded-for",
+                HeaderValue::from_str(&format!("{fake}, 203.0.113.7")).unwrap(),
+            )
             .await;
         assert_eq!(r.text(), "203.0.113.7");
     }
     let r = s
         .post("/idp/r/login")
-        .add_header("x-forwarded-for", HeaderValue::from_static("9.9.9.9, 203.0.113.7"))
+        .add_header(
+            "x-forwarded-for",
+            HeaderValue::from_static("9.9.9.9, 203.0.113.7"),
+        )
         .await;
     assert_eq!(r.status_code(), StatusCode::TOO_MANY_REQUESTS);
 }

@@ -26,8 +26,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from playwright.sync_api import sync_playwright
-
 BASE = os.environ.get("HFS_E2E_BASE", "http://localhost:19612").rstrip("/")
 ADMIN = "Basic " + base64.b64encode(
     ("admin:" + os.environ.get("HFS_E2E_ADMIN_PASSWORD", "")).encode()
@@ -144,30 +142,84 @@ def authorize_url(realm, aud, scope, challenge, extra=None, redirect=CB):
     return f"{BASE}/idp/{realm}/authorize?" + urllib.parse.urlencode(q), q["state"]
 
 
+APP_PORT = int(os.environ.get("HFS_E2E_APP_PORT", "19619"))
+_APP_HITS = []
+
+
+def start_app_server():
+    """The app's redirect target: `https://app.example/…` is mapped to a
+    local HTTPS server (self-signed, `--host-resolver-rules`) that records
+    every request it receives."""
+    import http.server
+    import ssl
+    import subprocess
+    import tempfile
+    import threading
+
+    d = tempfile.mkdtemp(prefix="idp-e2e-")
+    cert, key = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=app.example", "-keyout", key, "-out", cert],
+                   check=True, capture_output=True)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if not self.path.startswith("/favicon"):
+                _APP_HITS.append("https://app.example" + self.path)
+            body = b"<!doctype html><title>app</title><h1>app</h1>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_POST = do_GET
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", APP_PORT), H)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 class App:
-    """Records navigations to the app's redirect URI. Playwright does not
-    route redirect hops, so the requests are observed (`request` event) and
-    the browser's own navigation to the fake host is allowed to fail."""
+    """Navigations that reached the app (the local HTTPS server)."""
 
     def __init__(self, ctx):
-        self.hits = []
-        ctx.on("request", self.seen)
-
-    def seen(self, request):
-        if request.url.startswith("https://app.example/"):
-            self.hits.append(request.url)
+        self.hits = _APP_HITS
 
     def last(self):
         return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.hits[-1]).query)) if self.hits else {}
 
+    def mark(self):
+        self._mark = len(self.hits)
+
+    def wait(self, page, timeout_ms=8000):
+        """Waits for a navigation to the app after `mark()`; its query."""
+        waited = 0
+        while len(self.hits) <= getattr(self, "_mark", 0) and waited < timeout_ms:
+            page.wait_for_timeout(100)
+            waited += 100
+        return self.last() if len(self.hits) > getattr(self, "_mark", 0) else {}
+
 
 def goto(page, url):
     """Navigates; a navigation that ends at the (unresolvable) app is fine."""
-    try:
-        page.goto(url)
-    except Exception as e:  # noqa: BLE001
-        if "ERR_NAME_NOT_RESOLVED" not in str(e) and "ERR_ABORTED" not in str(e):
-            raise
+    for attempt in range(3):
+        try:
+            return page.goto(url)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if "interrupted by another navigation" in msg and attempt < 2:
+                page.wait_for_timeout(500)
+                continue
+            if "ERR_NAME_NOT_RESOLVED" not in msg and "ERR_ABORTED" not in msg:
+                raise
+            return None
 
 
 def token(realm, code, verifier):
@@ -196,12 +248,18 @@ def set_theme(ctx, theme):
 # ------------------------------------------------------------------- flows
 
 def run(shots):
+    from playwright.sync_api import sync_playwright
+
     ensure_endpoints()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(executable_path=CHROME if os.path.exists(CHROME) else None)
+        start_app_server()
+        browser = pw.chromium.launch(
+            executable_path=CHROME if os.path.exists(CHROME) else None,
+            args=[f"--host-resolver-rules=MAP app.example:443 127.0.0.1:{APP_PORT}"],
+        )
 
         # 1. Standalone launch, patient (one linked record): login → consent.
-        ctx = browser.new_context(color_scheme="dark", viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(ignore_https_errors=True, color_scheme="dark", viewport={"width": 1280, "height": 900})
         set_theme(ctx, "dark")
         app = App(ctx)
         page = ctx.new_page()
@@ -222,9 +280,9 @@ def run(shots):
               page.content()[:400])
         shot(page, shots, "02-consent-dark")
         page.check("#idp-remember")
+        app.mark()
         page.click("#idp-consent-allow")
-        page.wait_for_timeout(300)
-        q = app.last()
+        q = app.wait(page)
         check("code returned with state and iss", q.get("code") and q.get("state") == state
               and q.get("iss") == f"{BASE}/idp/clinic", q)
         st, _, t = token("clinic", q.get("code", ""), v)
@@ -257,12 +315,12 @@ def run(shots):
         # 2. Remembered consent: second authorization goes straight back.
         v, c = pkce()
         url, _ = authorize_url("clinic", LAB, "openid fhirUser launch/patient patient/*.rs offline_access", c)
-        n = len(app.hits)
+        app.mark()
         goto(page, url)
-        page.wait_for_timeout(300)
-        check("SSO + remembered consent: no page shown", len(app.hits) == n + 1 and app.last().get("code"), page.url)
+        q2 = app.wait(page)
+        check("SSO + remembered consent: no page shown", bool(q2.get("code")), page.url)
         # Connected apps: remove access.
-        page.goto(f"{BASE}/idp/clinic/account/apps")
+        goto(page, f"{BASE}/idp/clinic/account/apps")
         check("connected apps lists Growth Chart", page.is_visible("text=Growth Chart"), page.content()[:300])
         shot(page, shots, "05-apps-dark")
         page.click(f"button[data-app='{CLIENT}']")
@@ -271,27 +329,29 @@ def run(shots):
         goto(page, url.replace("st-", "st2-"))
         check("consent asked again after removal", "/consent?ix=" in page.url, page.url)
         # Deny → access_denied.
+        app.mark()
         page.click("#idp-consent-deny")
-        page.wait_for_timeout(300)
-        check("deny returns access_denied", app.last().get("error") == "access_denied", app.last())
+        q3 = app.wait(page)
+        check("deny returns access_denied", q3.get("error") == "access_denied", q3)
 
         # 3. RP-initiated logout (confirmation page).
-        page.goto(f"{BASE}/idp/clinic/logout?client_id={CLIENT}&post_logout_redirect_uri="
+        goto(page, f"{BASE}/idp/clinic/logout?client_id={CLIENT}&post_logout_redirect_uri="
                   + urllib.parse.quote("https://app.example/bye") + "&state=bye1")
         check("logout asks for confirmation", page.is_visible("#idp-logout-submit"), page.content()[:300])
         shot(page, shots, "06-logout-dark")
+        app.mark()
         page.click("#idp-logout-submit")
-        page.wait_for_timeout(300)
+        app.wait(page)
         check("logout redirects to the registered URI with state",
               app.hits[-1].startswith("https://app.example/bye") and "state=bye1" in app.hits[-1], app.hits[-1:])
-        page.goto(f"{BASE}/idp/clinic/logout?client_id={CLIENT}&post_logout_redirect_uri="
+        goto(page, f"{BASE}/idp/clinic/logout?client_id={CLIENT}&post_logout_redirect_uri="
                   + urllib.parse.quote("https://evil.example/"))
         check("unregistered post-logout URI: error page, no redirect",
               page.url.startswith(BASE) and page.is_visible("text=The sign-out request is not valid."), page.url)
         ctx.close()
 
         # 4. Caregiver picker + practitioner search (light theme).
-        ctx = browser.new_context(color_scheme="light", viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(ignore_https_errors=True, color_scheme="light", viewport={"width": 1280, "height": 900})
         set_theme(ctx, "light")
         app = App(ctx)
         page = ctx.new_page()
@@ -313,13 +373,13 @@ def run(shots):
         page.click("#idp-picker-submit")
         page.wait_for_load_state()
         shot(page, shots, "13-consent-light")
+        app.mark()
         page.click("#idp-consent-allow")
-        page.wait_for_timeout(300)
-        st, _, t = token("clinic", app.last().get("code", ""), v)
+        st, _, t = token("clinic", app.wait(page).get("code", ""), v)
         check("caregiver token for the picked patient", st == 200 and t.get("patient") == "p2", (st, t))
         ctx.close()
 
-        ctx = browser.new_context(color_scheme="dark", viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(ignore_https_errors=True, color_scheme="dark", viewport={"width": 1280, "height": 900})
         set_theme(ctx, "dark")
         app = App(ctx)
         page = ctx.new_page()
@@ -335,9 +395,9 @@ def run(shots):
         shot(page, shots, "03-picker-search-dark")
         page.click("#idp-picker-submit")
         page.wait_for_load_state()
+        app.mark()
         page.click("#idp-consent-allow")
-        page.wait_for_timeout(300)
-        st, _, t = token("clinic", app.last().get("code", ""), v)
+        st, _, t = token("clinic", app.wait(page).get("code", ""), v)
         check("practitioner token: picked patient + fhirUser", st == 200 and t.get("patient") == "p3"
               and claims(t["id_token"]).get("fhirUser") == f"{LAB}/Practitioner/dr1", (st, t))
         if st == 200:
@@ -346,7 +406,7 @@ def run(shots):
         ctx.close()
 
         # 5. Security: lockout, CSRF, open redirect, clickjacking.
-        ctx = browser.new_context(color_scheme="dark", viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(ignore_https_errors=True, color_scheme="dark", viewport={"width": 1280, "height": 900})
         set_theme(ctx, "dark")
         app = App(ctx)
         page = ctx.new_page()
@@ -398,13 +458,13 @@ def run(shots):
                 framed_ok = True
         check("login page refuses to be framed", framed_ok, fr.url if fr else None)
         # Unknown interaction.
-        page.goto(f"{BASE}/idp/clinic/login?ix=hmix_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        goto(page, f"{BASE}/idp/clinic/login?ix=hmix_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         check("unknown interaction: error page", page.is_visible("text=expired or was already used"), page.content()[:200])
         shot(page, shots, "10-error-dark")
         ctx.close()
 
         # 6. Phone width + zh-Hant.
-        ctx = browser.new_context(color_scheme="dark", viewport={"width": 390, "height": 844}, device_scale_factor=2)
+        ctx = browser.new_context(ignore_https_errors=True, color_scheme="dark", viewport={"width": 390, "height": 844}, device_scale_factor=2)
         set_theme(ctx, "dark")
         App(ctx)
         page = ctx.new_page()
@@ -458,8 +518,12 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if not a.audit_only:
         run(a.shots)
-    b = audit_checks(a.audit_file)
-    if a.audit_out:
+    b = None
+    if a.audit_file:
+        b = audit_checks(a.audit_file)
+    else:
+        print("SKIP audit checks (pass --audit-file with the HFS_AUDIT_FILE_PATH output)")
+    if a.audit_out and b is not None:
         with open(a.audit_out, "w") as f:
             json.dump(b, f, indent=1)
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
