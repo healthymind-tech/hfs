@@ -158,6 +158,7 @@
             </td>
             <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
               <div class="row-actions">
+                {% if r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}<a class="btn" href="{{ crate::paths::ui() }}/explore?system={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}" title="{{ chrome.i18n.t("tx-explore-action-hint") }}">{{ chrome.i18n.t("tx-explore-action") }}</a>{% endif %}
                 <a class="btn btn--danger" href="{{ crate::paths::manage() }}/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
               </div>
             </td>

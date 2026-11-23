@@ -95,6 +95,10 @@ mod tests {
             c(&post, "/ui/terminology/code-systems/x"),
             Some(ConsoleRole::Editor)
         );
+        assert_eq!(
+            c(&get, "/ui/terminology/explore/data"),
+            Some(ConsoleRole::Viewer)
+        );
         assert_eq!(c(&get, "/ui/terminology/import"), Some(ConsoleRole::Admin));
         assert_eq!(c(&get, "/ui/terminology/jobs/7"), Some(ConsoleRole::Admin));
         assert_eq!(

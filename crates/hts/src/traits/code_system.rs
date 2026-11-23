@@ -142,6 +142,18 @@ pub trait CodeSystemOperations: Send + Sync {
         Ok(false)
     }
 
+    /// `$hm-explore` (HealthyMind): the console explorers' paged reads
+    /// (see [`crate::explore`]). The default answers 501.
+    async fn explore(
+        &self,
+        _ctx: &TenantContext,
+        _req: &crate::explore::ExploreRequest,
+    ) -> Result<serde_json::Value, HtsError> {
+        Err(HtsError::NotSupported(
+            "$hm-explore is not implemented by this backend".into(),
+        ))
+    }
+
     /// The in-memory SNOMED CT concept model of `url` (at `version`, the
     /// latest when unpinned), built on first use; `None` when the system has
     /// no stored concept model. The default has none.

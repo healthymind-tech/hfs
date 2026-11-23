@@ -309,7 +309,7 @@ pub(crate) fn active_page(path: &str) -> &'static str {
         .trim_start_matches('/');
     match rest.split('/').next().unwrap_or("") {
         "" => "tx-home",
-        "code-systems" | "concepts" => "tx-code-systems",
+        "code-systems" | "concepts" | "explore" => "tx-code-systems",
         "value-sets" => "tx-value-sets",
         "concept-maps" => "tx-concept-maps",
         "manage" => "tx-manage",
@@ -560,6 +560,7 @@ mod tests {
         assert_eq!(active_page("/ui/terminology"), "tx-home");
         assert_eq!(active_page("/ui/terminology/value-sets/x"), "tx-value-sets");
         assert_eq!(active_page("/ui/terminology/concepts"), "tx-code-systems");
+        assert_eq!(active_page("/ui/terminology/explore"), "tx-code-systems");
         assert_eq!(active_page("/ui/terminology/manage/delete"), "tx-manage");
     }
 }

@@ -352,6 +352,10 @@ where
             get(get_validate_code_handler::<B>).post(validate_code_handler::<B>),
         )
         .route(
+            "/CodeSystem/$hm-explore",
+            get(crate::explore::explore_handler::<B>),
+        )
+        .route(
             "/CodeSystem/$subsumes",
             get(get_subsumes_handler::<B>).post(subsumes_handler::<B>),
         )
