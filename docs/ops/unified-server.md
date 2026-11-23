@@ -181,6 +181,57 @@ index builds took 1,459 s for a 4.6 GB HTS restore on a busy host
 for the whole move with writes frozen, **≈ 10 s** FHIR interruption (the hfs
 restart of the switch) and no other FHIR impact.
 
+## 4a. Terminology imports next to FHIR traffic (U3)
+
+Admin-job imports (`/admin/terminology/imports`, console Import, registry
+installs) run on the niced `tx-import-*` runtime with their own pool and are
+paced; the knobs (embedded service only):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HFS_TERMINOLOGY_IMPORT_DEFER_EVICTION` | `true` | while an import writes, the per-second epoch eviction of every terminology/validator cache is deferred; the job evicts once at its end. **The measure that keeps FHIR tails flat** (below) |
+| `HFS_TERMINOLOGY_IMPORT_DUTY` | `0.5` | write duty cycle: after a batch that took *t*, pause *t*·(1−duty)/duty (`1` = no pacing) |
+| `HFS_TERMINOLOGY_IMPORT_PROBE_SLOW_MS` | `25` | serving-pool probe; slower than this doubles the pause (up to `…_MAX_PAUSE_MS`, default 2000); `0` = no probe |
+| `HFS_TERMINOLOGY_IMPORT_BATCH_SIZE` | `2000` | concepts per write transaction (standalone HTS 5000) |
+| `HFS_TERMINOLOGY_IMPORT_SYNC_COMMIT` | `false` | `false` = `synchronous_commit=off` for the import pool's sessions only (an interrupted import is re-run anyway; FHIR commits stay durable) |
+| `HFS_TERMINOLOGY_IMPORT_PG_POOL_SIZE` | `4` | the import pool |
+
+Measured (test server, production-data copy on one PostgreSQL instance and
+disk, LOINC 2.83 = 257 266 concepts imported as an admin job while 8 clients
+run `GET Patient?_count=50`, create Observation, a 20-entry transaction and
+`/tx` `$validate-code`; p95 during import ÷ p95 idle, limits 1.15 / 1.15 /
+1.15 / 1.25):
+
+| Configuration | Patient | Observation | transaction | `$validate-code` | import |
+|---|---|---|---|---|---|
+| no pacing, no deferral (5000/batch, sync commit) | 0.85 | 0.87 | 1.40 | 1.49 | 475 s |
+| pacing 0.5 + probe, no deferral | 0.78 | 0.90 | 1.70 | 1.35 | 846 s |
+| pacing 0.25 + probe, no deferral | 0.94 | 1.11 | 1.94 | 1.67 | 884 s |
+| deferral only (no pacing) | 1.09 | 1.11 | 1.07 | 1.13 | 624 s |
+| **defaults (deferral + pacing 0.5 + probe)** | **1.06** | **1.09** | **1.07** | **1.06** | 858 s |
+
+Pacing alone does not help: the tails came from the cache evictions every
+import batch triggered (validation went cold for the whole import), not from
+I/O. With deferral the limits hold even on a shared disk. Trade-off: while an
+import of code system *X* runs, answers about *X* from this instance's caches
+can be up to the import's age stale (the data is half-written anyway); every
+other instance still evicts on each epoch move.
+
+If a deployment still sees I/O contention (much larger releases, slower
+disks), the remaining lever is to give the terminology schema its own disk:
+
+```sql
+-- as superuser, on a separate volume mounted into the PG container
+CREATE TABLESPACE terminology_ts OWNER hfs LOCATION '/var/lib/postgresql/tsdata';
+ALTER TABLE terminology.concepts SET TABLESPACE terminology_ts;   -- per large table
+-- (concepts, concept_properties, concept_designations, concept_closure, concept_hierarchy,
+--  snomed_relationships, refset_members, value_set_expansions); takes an ACCESS EXCLUSIVE lock
+-- per table: do it in the freeze window (HFS_TERMINOLOGY_READONLY=true).
+```
+
+WAL stays shared (one cluster); full SNOMED/LOINC/NDC releases can also run
+off-hours or as the one-off `hts import` CLI against the same schema.
+
 ## 5. After the move
 
 - Watch for a week: `/health` `components.terminology`, terminology latency,
