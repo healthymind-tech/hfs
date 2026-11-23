@@ -68,7 +68,8 @@ async fn terminology_pages_render_inside_the_console_shell() {
             headers.contains_key(header::CONTENT_SECURITY_POLICY),
             "{path}: CSP"
         );
-        assert_eq!(html.matches("<html").count(), 1, "{path}: one document");
+        assert_eq!(html.matches("<html lang").count(), 1, "{path}: one document");
+        assert_eq!(html.matches(r#"id="sidebar""#).count(), 1, "{path}: one shell");
     }
 }
 

@@ -312,6 +312,13 @@
       go(url.href);
       return;
     }
+    // A request the old page still has in flight (a filter that fired on
+    // blur when the link was clicked) must not land after the new page:
+    // abort it, so it neither swaps nor pushes its URL.
+    var busy = document.querySelectorAll("#main .htmx-request");
+    for (var b = 0; b < busy.length; b++) {
+      if (busy[b] !== elt && window.htmx) window.htmx.trigger(busy[b], "htmx:abort");
+    }
     startProgress();
     var xhr = detail.xhr;
     if (xhr) xhr.addEventListener("loadend", stopProgress);
@@ -319,7 +326,14 @@
 
   document.addEventListener("htmx:beforeSwap", function (event) {
     var detail = event.detail || {};
-    if (!isBoosted(detail)) return;
+    if (!isBoosted(detail)) {
+      // A fragment for a page that is gone: drop it (no swap, no history).
+      var src = detail.elt;
+      if ((src && !src.isConnected) || (detail.target && !detail.target.isConnected)) {
+        detail.shouldSwap = false;
+      }
+      return;
+    }
     var xhr = detail.xhr;
     var url = (xhr && xhr.responseURL) || (detail.pathInfo && detail.pathInfo.responsePath) || location.href;
     var type = xhr ? xhr.getResponseHeader("Content-Type") || "" : "";
