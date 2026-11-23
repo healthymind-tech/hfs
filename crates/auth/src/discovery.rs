@@ -564,7 +564,9 @@ pub(crate) async fn send_raw(
         .bytes()
         .await
         .map_err(|e| FetchError::from_reqwest(url, &e))?;
-    if body.len() > 1024 * 1024 {
+    // CapabilityStatements of servers with many profiles run to megabytes
+    // (this server's own: ~2.6 MB with the core packages).
+    if body.len() > 32 * 1024 * 1024 {
         return Err(FetchError::TooLarge {
             url: redact_url(url),
         });
