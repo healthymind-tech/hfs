@@ -7400,12 +7400,30 @@ pub async fn apply_unified_fork_migrations(
     client: &mut deadpool_postgres::Client,
     terminology_schema: &str,
 ) -> StorageResult<Vec<&'static str>> {
+    apply_fork_migrations(client, terminology_schema, UNIFIED_FORK_MIGRATIONS).await
+}
+
+/// Applies only `hm-0012` (console terminology-scope bindings): a server
+/// whose terminology is remote still has the console's Terminology section
+/// and its Users-page bindings, but no `terminology` schema of its own.
+/// Embedded later, [`apply_unified_fork_migrations`] adds `hm-0011` only.
+pub async fn apply_console_fork_migrations(
+    client: &mut deadpool_postgres::Client,
+) -> StorageResult<Vec<&'static str>> {
+    apply_fork_migrations(client, "terminology", &[FORK_CONSOLE_TERMINOLOGY_BINDINGS]).await
+}
+
+async fn apply_fork_migrations(
+    client: &mut deadpool_postgres::Client,
+    terminology_schema: &str,
+    names: &[&'static str],
+) -> StorageResult<Vec<&'static str>> {
     let sql_0011 = hm_0011_sql(terminology_schema)?;
     acquire_migration_lock(client).await?;
     let result = async {
         ensure_fork_migrations_table(&*client).await?;
         let mut applied_now = Vec::new();
-        for name in UNIFIED_FORK_MIGRATIONS {
+        for name in names {
             let applied = client
                 .query_opt(
                     "SELECT 1 FROM hm_schema_migrations WHERE name = $1",

@@ -1243,6 +1243,12 @@ impl PostgresBackend {
         super::schema::apply_unified_fork_migrations(&mut client, terminology_schema).await
     }
 
+    /// Applies only the console's `hm-0012` (remote terminology).
+    pub async fn apply_console_fork_migrations(&self) -> StorageResult<Vec<&'static str>> {
+        let mut client = self.get_client().await?;
+        super::schema::apply_console_fork_migrations(&mut client).await
+    }
+
     /// `hfs_terminology_state` (hm-0011), `None` before the migration or
     /// before anything recorded a row.
     pub async fn terminology_state(

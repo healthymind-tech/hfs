@@ -64,8 +64,10 @@ pub fn install_ui(ctx: &ManagerContext) {
 /// [`helios_ui::terminology_console::ScopeBindings`] over the U1 table
 /// `hfs_console_scope_bindings(subject, scope, role)`. Lookups are cached
 /// for a few seconds (one per page otherwise); writes clear the cache.
-/// Before the unified migrations have run the table is absent: lookups
-/// answer "no binding" and writes report the error.
+/// The table comes from `terminology::apply_unified_migrations` at startup
+/// (hm-0012, embedded or remote terminology); should it still be missing
+/// (an older database opened read-only), lookups answer "no binding" and
+/// writes report the error.
 #[cfg(feature = "postgres")]
 struct PgScopeBindings {
     pool: helios_endpoints::pg::deadpool_postgres::Pool,
