@@ -14318,3 +14318,16 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     box-shadow: none;
   }
 }
+
+/* Card-head tool rows wrap inside narrow cards (32px buttons at 13px are a
+   little wider than the old 30px/12px ones); a chip there stays one line. */
+@layer pages {
+  .card-head:has(> .card-head__tools--wrap) {
+    flex-wrap: wrap;
+    row-gap: var(--s2);
+  }
+
+  .card-head__tools .chip {
+    white-space: nowrap;
+  }
+}
