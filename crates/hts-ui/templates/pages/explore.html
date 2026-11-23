@@ -1,0 +1,73 @@
+{#-
+  Terminology explorer (HealthyMind) — one visual explorer per kind of
+  code system (src/explore.rs). The server renders the head and an empty,
+  skeleton-filled stage; `term-explorer.js` builds the explorer from the
+  JSON config below and reads `explore/data` + `explore/concept`.
+
+  Styles live in `crates/ui/assets/term-explorer.css` (`.tx-ex*`), not in
+  app.css. The `<script src>` in the content makes the persistent shell load
+  this page as a full document (shell.js), so the script starts fresh.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ chrome.i18n.t_arg("tx-explore-title", "name", title.to_string()) }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<link rel="stylesheet" href="{{ crate::paths::assets() }}/term-explorer.css">
+<section id="tx-explore" aria-labelledby="tx-explore-heading">
+  {% if let Some(reason) = degraded %}
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong>
+    {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    {{ chrome.i18n.t("hts-degraded-body") }}
+  </aside>
+  {% endif %}
+  {% if let Some(outcome) = outcome %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  <header class="page-head page-head--back-link tx-ex-head">
+    <a class="back-link" href="{{ crate::paths::ui() }}/code-systems">
+      <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+      <span>{{ chrome.i18n.t("hts-cs-browser-title") }}</span>
+    </a>
+    <div class="page-head__copy page-head__copy--spaced">
+      <span class="stat__label">{{ chrome.i18n.t("tx-explore-eyebrow") }}</span>
+      <h1 id="tx-explore-heading" class="page-head__title">
+        {{ title }}
+        {% if !version.is_empty() %}<span class="tag tag--param">v{{ version }}</span>{% endif %}
+        <span class="tag tag--config tx-ex-kind" data-kind="{{ kind }}">{{ chrome.i18n.t(self.kind_label_key().as_str()) }}</span>
+      </h1>
+      <p class="page-head__lede">{{ chrome.i18n.t(format!("tx-explore-lede-{}", self.kind).as_str()) }}</p>
+      <div class="facets facets--bare">
+        {% if let Some(n) = concepts %}
+        <span class="chip">{{ chrome.i18n.t("tx-explore-concepts") }} <span class="count">{{ chrome.i18n.num(*n) }}</span></span>
+        {% endif %}
+        {% if !hierarchy_meaning.is_empty() %}
+        <span class="chip">hierarchyMeaning <span class="count">{{ hierarchy_meaning }}</span></span>
+        {% endif %}
+        {% if !content.is_empty() && content != "complete" %}
+        <span class="chip">{{ chrome.i18n.t("hts-cs-detail-content-mode") }} <span class="count">{{ content }}</span></span>
+        {% endif %}
+        <code class="url tx-ex-url">{{ system }}</code>
+        {% if !cs_id.is_empty() %}
+        <a class="btn btn--sm" href="{{ crate::paths::ui() }}/code-systems/{{ cs_id|urlencode_strict }}/lookup">{{ chrome.i18n.t("tx-explore-open-cs") }}</a>
+        {% endif %}
+      </div>
+    </div>
+  </header>
+
+  {% if !config_json.is_empty() %}
+  <div class="tx-ex" id="tx-explorer" data-kind="{{ kind }}" aria-busy="true">
+    <div class="tx-ex__boot" aria-hidden="true">
+      <span class="tx-ex-skel" style="width:62%"></span>
+      <span class="tx-ex-skel" style="width:48%"></span>
+      <span class="tx-ex-skel" style="width:36%"></span>
+    </div>
+    <noscript><p class="notice">{{ chrome.i18n.t("tx-explore-noscript") }}</p></noscript>
+  </div>
+  <script type="application/json" id="tx-explorer-config">{{ config_json|safe }}</script>
+  <script src="{{ crate::paths::assets() }}/term-explorer.js" defer></script>
+  {% endif %}
+</section>
+{% endblock %}

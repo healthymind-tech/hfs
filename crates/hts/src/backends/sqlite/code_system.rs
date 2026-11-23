@@ -851,6 +851,14 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         Ok(lang)
     }
 
+    async fn explore(
+        &self,
+        _ctx: &TenantContext,
+        req: &crate::explore::ExploreRequest,
+    ) -> Result<serde_json::Value, HtsError> {
+        self.explore_impl(req).await
+    }
+
     async fn code_system_is_hierarchical(
         &self,
         _ctx: &TenantContext,

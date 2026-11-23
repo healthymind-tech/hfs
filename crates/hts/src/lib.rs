@@ -64,6 +64,7 @@ pub mod config;
 pub mod ecl;
 pub mod embedded;
 pub mod error;
+pub mod explore;
 pub(crate) mod implicit_vs;
 pub mod import;
 pub(crate) mod language;

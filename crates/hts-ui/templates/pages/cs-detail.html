@@ -99,6 +99,10 @@
           {% if !summary.publisher.is_empty() %}
           <span class="chip">{{ summary.publisher }}</span>
           {% endif %}
+          {#- Terminology explorer (HealthyMind, src/explore.rs). -#}
+          {% if !summary.url.is_empty() %}
+          <a class="btn btn--primary btn--sm" href="{{ crate::paths::ui() }}/explore?system={{ summary.url|urlencode_strict }}{% if !summary.version.is_empty() %}&amp;version={{ summary.version|urlencode_strict }}{% endif %}" title="{{ chrome.i18n.t("tx-explore-action-hint") }}">{{ chrome.i18n.t("tx-explore-action") }}</a>
+          {% endif %}
         </div>
 
         <div class="kv-grid">

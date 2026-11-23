@@ -9,6 +9,7 @@ pub mod schema;
 
 mod code_system;
 mod concept_map;
+mod explore;
 pub(crate) mod fhir_ids;
 mod value_set;
 

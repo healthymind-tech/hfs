@@ -53,6 +53,7 @@ mod chart;
 mod code_systems;
 mod concept_maps;
 mod concepts;
+mod explore;
 mod home;
 mod i18n;
 mod import;
@@ -194,6 +195,7 @@ pub fn embedded_router(state: Arc<HtsUiState>, admin: Option<Router>) -> Router 
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
         .merge(concepts::routes())
+        .merge(explore::routes())
         .merge(import::routes())
         .merge(admin::routes())
         .merge(capability::routes())
@@ -323,6 +325,7 @@ pub fn router_with_admin(
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
         .merge(concepts::routes())
+        .merge(explore::routes())
         .merge(import::routes())
         .merge(admin::routes())
         .merge(login::routes())

@@ -501,6 +501,19 @@ Every normalized table (CodeSystems, ValueSets, ConceptMaps, concepts, propertie
 | $translate (instance) | GET/POST | `/ConceptMap/{id}/$translate` |
 | $closure | POST | `/ConceptMap/$closure` |
 
+`GET /CodeSystem/$hm-explore` (HealthyMind extension, plain JSON) backs the console's
+terminology explorers: `mode=stats|children|buckets|facets|members|search|node` over one
+stored CodeSystem (`system`, `version`), every answer paged (`count` ≤ 500, `offset`) and
+capped (counts stop at 100 000), so nothing reads a whole SNOMED CT or NDC. `children`
+lists one level with child counts (no `code`: the hierarchy roots; `prefix`,
+`order=code|display|code-desc`, `descendants=1`); `buckets` groups a level by the code
+segment before `sep` (NDC labelers); `facets`/`members` count and list concepts by
+property value within `filter=PROPERTY=value` (LOINC axes); `search` matches codes and
+all words of the display; `node` returns parents, the path to a root and, for SNOMED CT,
+the attribute groups from the in-memory concept model. `alt=url[|version]` adds the label
+of the same code in another stored system (the Taiwan Chinese editions), `lang=zh` a
+designation in that language. See `src/explore.rs`.
+
 ### CRUD & Search
 
 | Interaction | Method | URL |

@@ -6262,3 +6262,36 @@ mod paging_tests {
         );
     }
 }
+
+// ── Terminology explorers (HealthyMind) ─────────────────────────────────
+
+impl UpstreamClient {
+    /// `GET /CodeSystem/$hm-explore?…` — the explorers' paged reads (see
+    /// `helios_hts::explore`). `query` is forwarded as is; the caller
+    /// whitelists it. Root scans of the largest systems can take a few
+    /// seconds the first time, hence the longer timeout.
+    pub(crate) async fn explore_json(
+        &self,
+        query: &[(String, String)],
+    ) -> Result<Value, UpstreamError> {
+        let url = format!("{}/CodeSystem/$hm-explore", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .query(query)
+            .timeout(Duration::from_secs(30))
+            .header("Accept", "application/json")
+            .send_via(self, "explore", &url)
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
+            op: "explore",
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
+        if !status.is_success() {
+            return Err(status_to_error("explore", &url, status.as_u16(), &body));
+        }
+        Ok(body)
+    }
+}
