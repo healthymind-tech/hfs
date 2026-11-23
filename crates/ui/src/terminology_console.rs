@@ -341,7 +341,15 @@ async fn section(
         Ok(uri) => uri,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let request = Request::from_parts(parts, body);
+    // A fresh request: the host's extensions (its matched path parameters
+    // above all) must not reach the embedded router, whose own routes
+    // extract theirs. It needs only the method, URI, headers and body.
+    let mut forwarded = Request::new(body);
+    *forwarded.method_mut() = parts.method;
+    *forwarded.uri_mut() = parts.uri;
+    *forwarded.version_mut() = parts.version;
+    *forwarded.headers_mut() = parts.headers;
+    let request = forwarded;
     let router = installed.router.clone();
     helios_ui_chrome::shell::scope_host_frame(Arc::new(frame), async move {
         match tower::ServiceExt::oneshot(router, request).await {

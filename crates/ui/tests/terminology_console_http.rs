@@ -86,6 +86,17 @@ async fn a_boosted_request_gets_the_whole_page_not_a_fragment() {
 }
 
 #[tokio::test]
+async fn detail_routes_with_their_own_path_parameters_work() {
+    // The host route's wildcard must not reach the embedded router's
+    // `Path` extractors (it used to answer 500 "Wrong number of path
+    // arguments").
+    let (status, _, html) = get("/ui/terminology/code-systems/snomed-ct", &[]).await;
+    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{html}");
+    assert!(!html.contains("Wrong number of path arguments"));
+    assert!(html.contains(r#"id="sidebar""#));
+}
+
+#[tokio::test]
 async fn links_point_at_the_terminology_section() {
     let (_, _, html) = get("/ui/terminology/code-systems", &[]).await;
     assert!(html.contains(r#"action="/ui/terminology/code-systems/rows""#));
