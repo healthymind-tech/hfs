@@ -86,7 +86,10 @@ impl RetentionStorage for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("retention begin: {e}")))?;
         let has_fts: bool = tx
-            .query_one("SELECT to_regclass('resource_fts') IS NOT NULL", &[])
+            .query_one(
+                "SELECT to_regclass(format('%I.%I', current_schema(), 'resource_fts')) IS NOT NULL",
+                &[],
+            )
             .await
             .map(|r| r.get(0))
             .unwrap_or(false);

@@ -83,6 +83,23 @@ fn materializes<S: ResourceStorage>(state: &AppState<S>) -> bool {
 /// deployment does not materialize terminology). Any other Library — a non-SQL
 /// one included — yields `Some`, possibly empty, so an update that drops the
 /// last dependency releases what the previous version held.
+/// The terminology client for SQL-on-FHIR dependencies: the server's
+/// terminology service (embedded or remote), `None` when there is none.
+fn sof_client<S: ResourceStorage>(state: &AppState<S>) -> Option<TerminologyServiceClient> {
+    crate::terminology::terminology_for(
+        state.terminology_server_url(),
+        crate::terminology::TxCaller::Sof,
+    )
+    .map(|(label, service)| {
+        TerminologyServiceClient::from_service(
+            label,
+            service,
+            crate::terminology::ExpansionLimits::default(),
+            crate::terminology::DEFAULT_REQUEST_TIMEOUT,
+        )
+    })
+}
+
 pub(crate) async fn prepare_library_write<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
@@ -117,13 +134,10 @@ where
             Err(RestError::NotFound { .. }) => {}
             Err(other) => return Err(other),
         }
-        let relation = match state.terminology_server_url() {
-            Some(base) => {
-                let client = TerminologyServiceClient::new(base.to_string());
-                fetch_relation(&client, &dep.url, max_rows)
-                    .await
-                    .map_err(|e| e.into_rest(&dep.label, &dep.url))?
-            }
+        let relation = match sof_client(state) {
+            Some(client) => fetch_relation(&client, &dep.url, max_rows)
+                .await
+                .map_err(|e| e.into_rest(&dep.label, &dep.url))?,
             None => None,
         };
         match relation {
@@ -144,13 +158,13 @@ where
             None => {
                 if let Some(kind) = stored_terminology_kind(state, tenant, &dep.url).await? {
                     return Err(RestError::UnprocessableEntity {
-                        message: match state.terminology_server_url() {
-                            Some(_) => format!(
+                        message: match state.has_terminology() {
+                            true => format!(
                                 "depends-on '{}' is a {kind} ({}), but the terminology server \
                                  has no {kind} at that URL to expand",
                                 dep.label, dep.url
                             ),
-                            None => format!(
+                            false => format!(
                                 "depends-on '{}' is a {kind} ({}), and SQL query terminology \
                                  dependencies are expanded by the terminology server, which is \
                                  not configured (HFS_TERMINOLOGY_SERVER)",
@@ -233,17 +247,14 @@ where
     {
         return Ok(Some(relation));
     }
-    let relation = match state.terminology_server_url() {
-        Some(base) => {
-            let client = TerminologyServiceClient::new(base.to_string());
-            fetch_relation(
-                &client,
-                url,
-                state.config().sof_sqlquery_max_source_rows_per_vd,
-            )
-            .await
-            .map_err(|e| e.into_rest(url, url))?
-        }
+    let relation = match sof_client(state) {
+        Some(client) => fetch_relation(
+            &client,
+            url,
+            state.config().sof_sqlquery_max_source_rows_per_vd,
+        )
+        .await
+        .map_err(|e| e.into_rest(url, url))?,
         None => None,
     };
     if store.is_none() {

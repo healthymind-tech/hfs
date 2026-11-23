@@ -108,7 +108,7 @@ Known limits: `$validate-code` on a VCL set expands it fully, so large sets (e.g
 Set `HFS_TERMINOLOGY_SERVER=http://localhost:8090` on HFS to enable:
 
 - FHIR search `:in` modifier, using ValueSet expansion to filter by code.
-- FHIRPath `memberOf()` and `subsumes()` delegation through `FHIRPATH_TERMINOLOGY_SERVER`.
+- FHIRPath `memberOf()` and `subsumes()` delegation through the server's terminology service (embedded or remote; `FHIRPATH_TERMINOLOGY_SERVER` only for the standalone CLIs).
 
 ## Bulk Import CLI
 

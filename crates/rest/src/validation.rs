@@ -208,15 +208,20 @@ fn build_terminology_provider(
     timeout: Duration,
     version: helios_fhir::FhirVersion,
 ) -> Option<Arc<dyn TerminologyProvider>> {
-    match (mode, server) {
-        ("remote", Some(base)) => Some(Arc::new(CompositeTerminologyProvider::new(
+    // `server` names a remote server; `None` is the server's own
+    // terminology service (embedded or remote) when one is installed.
+    let service =
+        crate::terminology::terminology_for(server, crate::terminology::TxCaller::Validator);
+    match (mode, service) {
+        ("remote", Some((label, service))) => Some(Arc::new(CompositeTerminologyProvider::new(
             helios_fhir_validator::core_terminology(version),
-            Arc::new(RemoteTerminologyProvider::new(base.to_string(), timeout)),
+            Arc::new(RemoteTerminologyProvider::from_service(
+                label, service, timeout,
+            )),
         ))),
-        ("remote-only", Some(base)) => Some(Arc::new(RemoteTerminologyProvider::new(
-            base.to_string(),
-            timeout,
-        ))),
+        ("remote-only", Some((label, service))) => Some(Arc::new(
+            RemoteTerminologyProvider::from_service(label, service, timeout),
+        )),
         // `remote` without a server degrades to the embedded value sets.
         ("embedded", _) | ("remote", None) => {
             let provider: Arc<dyn TerminologyProvider> =
@@ -285,30 +290,18 @@ impl ValidationService {
             "ignore" => UnknownProfilePolicy::Ignore,
             _ => UnknownProfilePolicy::Warn,
         };
-        let terminology: Option<Arc<dyn TerminologyProvider>> =
-            match (config.terminology.as_str(), terminology_server) {
-                // Embedded core value sets answer the FHIR base bindings
-                // offline; everything they cannot judge goes to the server.
-                ("remote", Some(base)) => Some(Arc::new(CompositeTerminologyProvider::new(
-                    helios_fhir_validator::core_terminology(version),
-                    Arc::new(RemoteTerminologyProvider::new(
-                        base.to_string(),
-                        Duration::from_millis(config.terminology_timeout_ms),
-                    )),
-                ))),
-                ("remote-only", Some(base)) => Some(Arc::new(RemoteTerminologyProvider::new(
-                    base.to_string(),
-                    Duration::from_millis(config.terminology_timeout_ms),
-                ))),
-                // Offline required-binding checks against the FHIR core value
-                // sets embedded in helios-fhir-validator (no server needed).
-                ("embedded", _) => {
-                    let provider: Arc<dyn TerminologyProvider> =
-                        helios_fhir_validator::core_terminology(version);
-                    Some(provider)
-                }
-                _ => None,
-            };
+        // `HFS_VALIDATION_TERMINOLOGY=remote` keeps its meaning ("core first,
+        // then the terminology service") whether the service is embedded or
+        // a remote `HFS_TERMINOLOGY_SERVER` (design §4.3).
+        let terminology: Option<Arc<dyn TerminologyProvider>> = match config.terminology.as_str() {
+            "remote" | "remote-only" if !Self::service_available(terminology_server) => None,
+            mode => build_terminology_provider(
+                mode,
+                terminology_server,
+                Duration::from_millis(config.terminology_timeout_ms),
+                version,
+            ),
+        };
         let terminology_fail = match config.terminology_fail.as_str() {
             "closed" => TerminologyFailMode::Closed,
             "closed-required" => TerminologyFailMode::ClosedRequired,
@@ -504,12 +497,19 @@ impl ValidationService {
         })
     }
 
+    /// Whether `remote` terminology checking has a service to call.
+    fn service_available(server: Option<&str>) -> bool {
+        server.is_some() || crate::terminology::server_terminology().is_some()
+    }
+
     /// The environment terminology mode, reconstructed from the provider the
     /// service was built with (used when an endpoint binds only a server).
     fn terminology_mode_name(&self) -> &'static str {
         match &self.terminology {
             None => "off",
-            Some(_) if self.env_terminology_server.is_none() => "embedded",
+            Some(_) if !Self::service_available(self.env_terminology_server.as_deref()) => {
+                "embedded"
+            }
             Some(_) => "remote",
         }
     }
@@ -1766,8 +1766,13 @@ fn prepare_stored_profiles(
 /// `ValueSet/$validate-code`, with a small in-memory TTL cache (neither the
 /// fhirpath nor the search terminology clients cache).
 pub struct RemoteTerminologyProvider {
+    /// The terminology server's base URL, or a label for the embedded service.
     base_url: String,
-    client: reqwest::Client,
+    /// The server's terminology service (embedded in-process, or remote).
+    service: Arc<dyn helios_terminology::TerminologyService>,
+    /// Its change feed (embedded): every cached answer is dropped as soon
+    /// as the terminology changes, here or on another instance (design §4.5).
+    changes: Option<std::sync::Mutex<tokio::sync::watch::Receiver<u64>>>,
     /// The per-check timeout; a batch of n checks gets n times it (capped
     /// at [`MAX_BATCH_TIMEOUT`]).
     timeout: Duration,
@@ -1790,6 +1795,27 @@ pub struct RemoteTerminologyProvider {
     /// using such a system does not cost a round trip on every validation.
     unverifiable: DashMap<String, (String, Instant)>,
 }
+
+/// Upper bound on the entries of each answer cache (design §8.2 measure 4).
+/// A full cache drops its expired entries, then (still full) everything:
+/// cheap, and a terminology server answers a refill quickly.
+pub const CACHE_MAX_ENTRIES: usize = 50_000;
+
+/// Make room in `map` before an insert (see [`CACHE_MAX_ENTRIES`]).
+fn make_room<V>(map: &DashMap<String, V>, fresh: impl Fn(&V) -> bool) {
+    if map.len() < CACHE_MAX_ENTRIES {
+        return;
+    }
+    map.retain(|_, v| fresh(v));
+    if map.len() >= CACHE_MAX_ENTRIES {
+        map.clear();
+    }
+}
+
+/// The ServiceTerminologyProvider name for the provider over the
+/// [`helios_terminology::TerminologyService`] (design §4.3): the same type,
+/// which serves the embedded service and remote servers alike.
+pub type ServiceTerminologyProvider = RemoteTerminologyProvider;
 
 /// How long `$validate-code` verdicts are cached.
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -1819,51 +1845,79 @@ const SINGLE_CONCURRENCY: usize = 8;
 /// Upper bound of a batch request's timeout.
 const MAX_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A reqwest error with its source chain (`error sending request` alone
-/// does not say whether the connection was refused, reset or closed).
-fn error_chain(e: &reqwest::Error) -> String {
-    let mut out = e.to_string();
-    let mut source = std::error::Error::source(e);
-    while let Some(cause) = source {
-        out.push_str(": ");
-        out.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    out
-}
-
-/// Send a request, retrying once when it never reached the server or the
-/// pooled connection broke before an answer (`error sending request`: a
-/// keep-alive connection the server had already closed). Not retried on a
-/// timeout — the server may still be working on it.
-async fn send_retrying(
-    build: impl Fn() -> reqwest::RequestBuilder,
-) -> Result<reqwest::Response, reqwest::Error> {
-    match build().send().await {
-        Err(e) if !e.is_timeout() && (e.is_connect() || e.is_request()) => {
-            debug!(error = %error_chain(&e), "terminology request failed before an answer; retrying once");
-            build().send().await
-        }
-        other => other,
-    }
-}
-
 impl RemoteTerminologyProvider {
     /// `base_url` is the terminology server root (e.g. `http://hts:8090`).
     pub fn new(base_url: String, timeout: Duration) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let service = crate::terminology::remote_service(&base_url, None);
+        Self::from_service(base_url, service, timeout)
+    }
+
+    /// A provider over `service` (the server's embedded or remote
+    /// terminology); `label` names it in messages.
+    pub fn from_service(
+        label: String,
+        service: Arc<dyn helios_terminology::TerminologyService>,
+        timeout: Duration,
+    ) -> Self {
+        let changes = service.changes().map(std::sync::Mutex::new);
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: label,
             timeout,
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("reqwest client builds"),
+            service,
+            changes,
             cache: DashMap::new(),
             unknown_value_sets: DashMap::new(),
             contentless_systems: DashMap::new(),
             value_set_composes: DashMap::new(),
             unverifiable: DashMap::new(),
         }
+    }
+
+    /// Run one request, retrying once when it never reached the server
+    /// (a broken pooled connection). Not retried on a timeout — the server
+    /// may still be working on it.
+    async fn send(
+        &self,
+        request: helios_terminology::TxRequest,
+    ) -> Result<helios_terminology::TxResponse, helios_terminology::TxError> {
+        match self.service.call(request.clone()).await {
+            Err(helios_terminology::TxError::Unavailable(e)) => {
+                debug!(error = %redact_urls_in(&e), "terminology request failed before an answer; retrying once");
+                self.service.call(request).await
+            }
+            other => other,
+        }
+    }
+
+    /// Drop everything when the terminology changed since the last look.
+    fn sync_changes(&self) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let mut rx = changes.lock().unwrap_or_else(|e| e.into_inner());
+        if rx.has_changed().unwrap_or(false) {
+            rx.borrow_and_update();
+            drop(rx);
+            self.clear_all();
+        }
+    }
+
+    fn clear_all(&self) {
+        self.cache.clear();
+        self.unknown_value_sets.clear();
+        self.contentless_systems.clear();
+        self.value_set_composes.clear();
+        self.unverifiable.clear();
+    }
+
+    /// Cached entries across the five answer caches (tests, metrics).
+    pub fn cached_entries(&self) -> usize {
+        self.cache.len()
+            + self.unknown_value_sets.len()
+            + self.contentless_systems.len()
+            + self.value_set_composes.len()
+            + self.unverifiable.len()
     }
 
     /// The code systems a coded value names (none for a bare `code`).
@@ -1919,20 +1973,20 @@ impl RemoteTerminologyProvider {
         {
             return Some(entry.0);
         }
-        let url = format!("{}/CodeSystem", self.base_url);
-        let response = send_retrying(|| {
-            self.client.get(&url).query(&[
-                ("url", system),
-                ("_elements", "url,version,content"),
-                ("_count", "50"),
-            ])
-        })
-        .await
-        .ok()?;
-        if !response.status().is_success() {
+        let response = self
+            .send(
+                helios_terminology::TxRequest::get("CodeSystem")
+                    .with_query_param("url", system)
+                    .with_query_param("_elements", "url,version,content")
+                    .with_query_param("_count", "50")
+                    .with_timeout(self.timeout),
+            )
+            .await
+            .ok()?;
+        if !response.is_success() {
             return None;
         }
-        let bundle: Value = response.json().await.ok()?;
+        let bundle: Value = serde_json::from_slice(&response.body).ok()?;
         if bundle.get("resourceType").and_then(Value::as_str) != Some("Bundle") {
             return None;
         }
@@ -1953,6 +2007,7 @@ impl RemoteTerminologyProvider {
         let complete = entries
             .iter()
             .any(|e| content(e).as_deref() == Some("complete"));
+        make_room(&self.contentless_systems, |v| v.1.elapsed() < CACHE_TTL);
         self.contentless_systems.insert(
             system.to_string(),
             ((contentless, complete), Instant::now()),
@@ -1969,18 +2024,19 @@ impl RemoteTerminologyProvider {
             return Some(entry.0.clone());
         }
         let (canonical, version) = split_canonical(value_set);
-        let url = format!("{}/ValueSet", self.base_url);
-        let response = send_retrying(|| {
-            self.client
-                .get(&url)
-                .query(&[("url", canonical), ("_count", "50")])
-        })
-        .await
-        .ok()?;
-        if !response.status().is_success() {
+        let response = self
+            .send(
+                helios_terminology::TxRequest::get("ValueSet")
+                    .with_query_param("url", canonical)
+                    .with_query_param("_count", "50")
+                    .with_timeout(self.timeout),
+            )
+            .await
+            .ok()?;
+        if !response.is_success() {
             return None;
         }
-        let bundle: Value = response.json().await.ok()?;
+        let bundle: Value = serde_json::from_slice(&response.body).ok()?;
         let entries = bundle.get("entry").and_then(Value::as_array)?;
         let pick = entries
             .iter()
@@ -1993,6 +2049,7 @@ impl RemoteTerminologyProvider {
             .and_then(|e| e.pointer("/resource/compose"))
             .cloned()
             .unwrap_or(Value::Null);
+        make_room(&self.value_set_composes, |v| v.1.elapsed() < CACHE_TTL);
         self.value_set_composes
             .insert(value_set.to_string(), (compose.clone(), Instant::now()));
         Some(compose)
@@ -2178,6 +2235,7 @@ impl RemoteTerminologyProvider {
         check: &TxCheck<'_>,
         key: &str,
     ) -> Option<Result<TxVerdict, TerminologyError>> {
+        self.sync_changes();
         if let Some(entry) = self.cache.get(key) {
             let (verdict, at) = &*entry;
             if at.elapsed() < CACHE_TTL {
@@ -2336,7 +2394,7 @@ impl RemoteTerminologyProvider {
         // every validation.
         if matches!(check, TxCheck::Coding(_)) && status.is_client_error() {
             let verdict = TxVerdict::valid();
-            self.cache.insert(key, (verdict.clone(), Instant::now()));
+            self.remember(key, verdict.clone());
             return Ok(verdict);
         }
         if !status.is_success() {
@@ -2344,14 +2402,23 @@ impl RemoteTerminologyProvider {
             if let TxCheck::InValueSet(value_set, _) = check
                 && error.kind() == helios_fhir_validator::TerminologyErrorKind::UnknownValueSet
             {
+                make_room(&self.unknown_value_sets, |at| {
+                    at.elapsed() < UNKNOWN_VALUE_SET_TTL
+                });
                 self.unknown_value_sets
                     .insert(value_set.to_string(), Instant::now());
             }
             return Err(error);
         }
         let verdict = Self::read_verdict(check, body.unwrap_or(&Value::Null))?;
-        self.cache.insert(key, (verdict.clone(), Instant::now()));
+        self.remember(key, verdict.clone());
         Ok(verdict)
+    }
+
+    /// Cache a verdict (bounded, see [`CACHE_MAX_ENTRIES`]).
+    fn remember(&self, key: String, verdict: TxVerdict) {
+        make_room(&self.cache, |v| v.1.elapsed() < CACHE_TTL);
+        self.cache.insert(key, (verdict, Instant::now()));
     }
 
     /// One check, one request.
@@ -2367,21 +2434,26 @@ impl RemoteTerminologyProvider {
         let (op, payload) = Self::request(check, language);
         let url = format!("{}/{op}", self.base_url);
         let started = Instant::now();
-        let response = send_retrying(|| self.client.post(&url).json(&payload))
+        let response = self
+            .send(
+                helios_terminology::TxRequest::post_json(op.to_string(), &payload)
+                    .with_timeout(self.timeout),
+            )
             .await
             .map_err(|e| {
-                let detail = redact_urls_in(&error_chain(&e));
+                let detail = redact_urls_in(&crate::terminology::tx_error_text(&e));
                 let url = redact_url(&url);
                 warn!(url = %url, elapsed_ms = started.elapsed().as_millis() as u64, error = %detail,
                       "terminology request failed");
                 TerminologyError::new(format!("request to {url} failed: {detail}"))
             })?;
-        let status = response.status();
+        let status = reqwest::StatusCode::from_u16(response.status)
+            .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&response.body).into_owned();
             return self.settle(check, key, &url, status, None, &body);
         }
-        let body: Value = response.json().await.map_err(|e| {
+        let body: Value = serde_json::from_slice(&response.body).map_err(|e| {
             TerminologyError::new(format!(
                 "invalid $validate-code response: {}",
                 redact_urls_in(&e.to_string())
@@ -2419,15 +2491,16 @@ impl RemoteTerminologyProvider {
             .saturating_mul(checks.len().max(1) as u32)
             .min(MAX_BATCH_TIMEOUT)
             .max(self.timeout);
-        let response = match send_retrying(|| self.client.post(&url).json(&bundle).timeout(timeout))
+        let response = match self
+            .send(helios_terminology::TxRequest::post_json("", &bundle).with_timeout(timeout))
             .await
         {
             Ok(r) => r,
-            Err(e) if e.is_timeout() => {
+            Err(e @ helios_terminology::TxError::Timeout(_)) => {
                 // The server is overloaded or slow on these checks: asking
                 // them again one by one would only add to its load. Each
                 // check is reported as not performed.
-                let detail = redact_urls_in(&error_chain(&e));
+                let detail = redact_urls_in(&crate::terminology::tx_error_text(&e));
                 let url = redact_url(&url);
                 warn!(entries = checks.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                       error = %detail, "terminology batch timed out");
@@ -2446,18 +2519,21 @@ impl RemoteTerminologyProvider {
             }
             Err(e) => {
                 warn!(entries = checks.len(), elapsed_ms = started.elapsed().as_millis() as u64,
-                      error = %redact_urls_in(&error_chain(&e)), "terminology batch failed; checking one by one");
+                      error = %redact_urls_in(&crate::terminology::tx_error_text(&e)), "terminology batch failed; checking one by one");
                 return None;
             }
         };
-        if !response.status().is_success() {
-            debug!(status = %response.status(), "terminology server refused a batch; checking one by one");
+        if !response.is_success() {
+            debug!(
+                status = response.status,
+                "terminology server refused a batch; checking one by one"
+            );
             return None;
         }
-        let body: Value = match response.json().await {
+        let body: Value = match serde_json::from_slice(&response.body) {
             Ok(b) => b,
             Err(e) => {
-                warn!(entries = checks.len(), error = %error_chain(&e), "unreadable terminology batch answer; checking one by one");
+                warn!(entries = checks.len(), error = %e, "unreadable terminology batch answer; checking one by one");
                 return None;
             }
         };
@@ -2547,10 +2623,7 @@ impl RemoteTerminologyProvider {
             if self.system_is_complete(system).await != Some(true) {
                 let mut v = v.clone();
                 v.unknown_code = None;
-                self.cache.insert(
-                    Self::cache_key(check, language),
-                    (v.clone(), Instant::now()),
-                );
+                self.remember(Self::cache_key(check, language), v.clone());
                 return Ok(v);
             }
             return verdict;
@@ -2567,6 +2640,7 @@ impl RemoteTerminologyProvider {
                 "code system '{system}' has no content on the terminology server \
                  (unknown, or a content=not-present stub), so the code cannot be checked"
             );
+            make_room(&self.unverifiable, |v| v.1.elapsed() < CACHE_TTL);
             self.unverifiable
                 .insert(key, (message.clone(), Instant::now()));
             return Err(TerminologyError::unknown_code_system(message));
@@ -2582,11 +2656,7 @@ impl TerminologyProvider for RemoteTerminologyProvider {
     /// answered minutes ago may be wrong now (mCODE's
     /// us-core-observation-category arrives with US Core 5.0.1).
     fn invalidate(&self) {
-        self.cache.clear();
-        self.unknown_value_sets.clear();
-        self.contentless_systems.clear();
-        self.value_set_composes.clear();
-        self.unverifiable.clear();
+        self.clear_all();
     }
 
     async fn validate_code(

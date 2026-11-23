@@ -1,0 +1,32 @@
+[package]
+name = "helios-terminology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/terminology"
+description = "Unified server foundation: the TerminologyService contract (in-process and remote), unified terminology configuration with HTS_* aliases, and the one-database schema plan"
+keywords = ["helios-software", "fhir", "terminology"]
+
+# Package 0 of docs/design/unified-server.md. Deliberately light: no axum, no
+# helios-hts, no helios-fhir, no persistence. helios-rest, helios-ui,
+# helios-hts-ui and the hfs wiring depend on this crate; it depends on none
+# of them (helios-endpoints only, for ConsoleRole). Every dependency below is
+# already in the workspace lock.
+[dependencies]
+serde_json.workspace = true
+thiserror = "2"
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+url = "2.5"
+tokio = { version = "1", features = ["time", "sync"] }
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

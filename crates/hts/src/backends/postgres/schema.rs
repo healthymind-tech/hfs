@@ -74,6 +74,7 @@ BEGIN
         SELECT conname FROM pg_constraint c
         JOIN pg_class t ON t.oid = c.conrelid
         WHERE t.relname = 'code_systems'
+          AND t.relnamespace = to_regnamespace(current_schema())
           AND c.contype = 'u'
           AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
     LOOP
@@ -189,6 +190,7 @@ BEGIN
         SELECT conname FROM pg_constraint c
         JOIN pg_class t ON t.oid = c.conrelid
         WHERE t.relname = 'value_sets'
+          AND t.relnamespace = to_regnamespace(current_schema())
           AND c.contype = 'u'
           AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
     LOOP
@@ -255,6 +257,7 @@ BEGIN
         SELECT conname FROM pg_constraint c
         JOIN pg_class t ON t.oid = c.conrelid
         WHERE t.relname = 'concept_maps'
+          AND t.relnamespace = to_regnamespace(current_schema())
           AND c.contype = 'u'
           AND pg_get_constraintdef(c.oid) = 'UNIQUE (url)'
     LOOP
@@ -407,7 +410,7 @@ DECLARE
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_attribute
-        WHERE attrelid = 'code_systems'::regclass
+        WHERE attrelid = to_regclass(format('%I.%I', current_schema(), 'code_systems'))
           AND attname = 'authority_rank' AND NOT attisdropped
     ) THEN
         ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER;
@@ -416,7 +419,7 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM pg_attribute
-        WHERE attrelid = 'value_sets'::regclass
+        WHERE attrelid = to_regclass(format('%I.%I', current_schema(), 'value_sets'))
           AND attname = 'authority_rank' AND NOT attisdropped
     ) THEN
         ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER;
@@ -548,7 +551,8 @@ BEGIN
                 ('concept_maps', 'version'),
                 ('concept_maps', 'version_sort')
              ) AS want(tbl, col)
-          ON a.attrelid = to_regclass(want.tbl) AND a.attname = want.col
+          ON a.attrelid = to_regclass(format('%I.%I', current_schema(), want.tbl))
+         AND a.attname = want.col
         WHERE NOT a.attisdropped AND a.attcollation <> c_coll
         GROUP BY a.attrelid
     LOOP
@@ -643,6 +647,83 @@ where
 /// `CREATE EXTENSION IF NOT EXISTS pg_trgm` calls cannot collide on
 /// `pg_extension_name_index` (Postgres's `IF NOT EXISTS` guard is not
 /// transactional with concurrent writers).
+/// Makes sure the schema the connection's `search_path` names first exists
+/// and is the one unqualified DDL resolves to (docs/design/unified-server.md
+/// §5.3). The unified server connects with `search_path=terminology,public`;
+/// if `terminology` were missing PostgreSQL would skip it silently,
+/// `current_schema()` would be `public`, and this DDL would create the HTS
+/// tables next to HFS's. The schema is created when missing; startup fails
+/// if connections still do not resolve to it. Connections whose first entry
+/// is `"$user"`/`public` (standalone HTS) are left alone. Returns the schema
+/// in use.
+pub async fn ensure_store_schema(
+    client: &tokio_postgres::Client,
+) -> Result<String, crate::error::HtsError> {
+    use crate::error::HtsError;
+    let db = |e: tokio_postgres::Error| HtsError::StorageError(e.to_string());
+    let row = client
+        .query_one(
+            "SELECT current_setting('search_path'), current_schema()::text",
+            &[],
+        )
+        .await
+        .map_err(db)?;
+    let path: String = row.get(0);
+    let current: Option<String> = row.get(1);
+    let Some(wanted) = first_explicit_schema(&path) else {
+        return current.ok_or_else(|| {
+            HtsError::StorageError(format!("search_path {path:?} names no existing schema"))
+        });
+    };
+    if current.as_deref() == Some(wanted.as_str()) {
+        return Ok(wanted);
+    }
+    let valid = wanted
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && wanted.len() <= 63
+        && wanted
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !valid {
+        return Err(HtsError::StorageError(format!(
+            "search_path names schema {wanted:?}, which does not exist and is not a valid schema name"
+        )));
+    }
+    client
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {wanted}"))
+        .await
+        .map_err(|e| {
+            HtsError::StorageError(format!(
+                "search_path names schema {wanted}, which does not exist, and creating it failed: {e}"
+            ))
+        })?;
+    let now: Option<String> = client
+        .query_one("SELECT current_schema()::text", &[])
+        .await
+        .map_err(db)?
+        .get(0);
+    if now.as_deref() == Some(wanted.as_str()) {
+        Ok(wanted)
+    } else {
+        Err(HtsError::StorageError(format!(
+            "search_path names schema {wanted} first but connections resolve to {now:?}"
+        )))
+    }
+}
+
+/// First explicitly named schema of a `search_path` (not `"$user"`,
+/// `public` or `pg_*`), unquoted.
+pub(crate) fn first_explicit_schema(search_path: &str) -> Option<String> {
+    let first = search_path.split(',').next()?.trim().trim_matches('"');
+    if first.is_empty() || first == "$user" || first == "public" || first.starts_with("pg_") {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
 pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     // Arbitrary constant — must match across all callers that apply this
     // schema. Use an application-scoped value that won't collide with
@@ -1139,4 +1220,20 @@ pub async fn migrate_concept_closure_pg(
         build_concept_closure_pg(client, sid).await?;
     }
     Ok(systems_needing_closure.len())
+}
+
+#[cfg(test)]
+mod store_schema_tests {
+    use super::first_explicit_schema;
+
+    #[test]
+    fn first_explicit_schema_of_a_search_path() {
+        assert_eq!(
+            first_explicit_schema("terminology, public").as_deref(),
+            Some("terminology")
+        );
+        assert_eq!(first_explicit_schema("\"$user\", public"), None);
+        assert_eq!(first_explicit_schema("public"), None);
+        assert_eq!(first_explicit_schema(""), None);
+    }
 }

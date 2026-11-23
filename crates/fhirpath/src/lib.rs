@@ -301,6 +301,12 @@ pub mod semantic_check;
 mod set_operations;
 mod subset_functions;
 mod terminology_client;
+/// The host's terminology service seam (`hfs` installs its embedded or
+/// remote terminology as the default for every evaluation).
+pub use terminology_client::{
+    TerminologyTransport, TransportRequest, TransportResponse, default_transport,
+    set_default_transport,
+};
 mod terminology_functions;
 #[cfg(test)]
 mod terminology_stub;

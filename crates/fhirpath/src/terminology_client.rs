@@ -131,6 +131,31 @@ async fn read_response(response: Response, failure: &str) -> RequestResult<Value
     }
 }
 
+/// [`read_response`] for a [`TerminologyTransport`] answer.
+fn read_transport_response(response: TransportResponse, failure: &str) -> RequestResult<Value> {
+    if (200..300).contains(&response.status) {
+        return Ok(serde_json::from_slice(&response.body)
+            .map_err(|e| FhirPathError::ParseError(e.to_string()))?);
+    }
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let retry_after = if matches!(response.status, 429 | 503) {
+        response
+            .retry_after
+            .as_deref()
+            .and_then(|v| parse_retry_after(v, SystemTime::now()))
+    } else {
+        None
+    };
+    let body = String::from_utf8_lossy(&response.body);
+    Err(RequestError {
+        error: FhirPathError::TerminologyHttpError {
+            status: response.status,
+            message: format!("{failure} with status {status}: {body}"),
+        },
+        retry_after,
+    })
+}
+
 /// Renders a reqwest error with its URL passed through [`redact_url`].
 ///
 /// reqwest ends its message with `for url (...)`, query included, and the
@@ -163,10 +188,72 @@ pub(crate) fn is_transient(error: &FhirPathError) -> bool {
     }
 }
 
+/// One terminology request handed to a [`TerminologyTransport`]: a path
+/// relative to the terminology base, query parameters, and a JSON body for
+/// `POST` (`None` = `GET`).
+#[derive(Debug, Clone)]
+pub struct TransportRequest {
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub body: Option<Value>,
+    pub timeout: Option<Duration>,
+}
+
+/// What a [`TerminologyTransport`] answered.
+#[derive(Debug, Clone)]
+pub struct TransportResponse {
+    pub status: u16,
+    /// The `Retry-After` header, when the transport has one.
+    pub retry_after: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// A terminology service reached without HTTP from this crate — the host
+/// process's own service (the `hfs` server's embedded terminology, design
+/// `docs/design/unified-server.md` §4.3). `Err` is a transport failure.
+pub trait TerminologyTransport: Send + Sync {
+    /// What error messages and the session cache key call this service.
+    fn label(&self) -> &str;
+    /// Run one request.
+    fn send(
+        &self,
+        request: TransportRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TransportResponse, String>> + Send + '_>,
+    >;
+}
+
+static DEFAULT_TRANSPORT: std::sync::RwLock<Option<std::sync::Arc<dyn TerminologyTransport>>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or with `None` remove) the process's default terminology: the
+/// service evaluations use when the context names no server
+/// ([`crate::EvaluationContext::get_terminology_server_url`]). The `hfs`
+/// server installs its terminology service here at startup, which replaces
+/// setting `FHIRPATH_TERMINOLOGY_SERVER` in its own environment. The
+/// environment variable keeps working for the standalone CLIs.
+pub fn set_default_transport(transport: Option<std::sync::Arc<dyn TerminologyTransport>>) {
+    *DEFAULT_TRANSPORT.write().unwrap_or_else(|e| e.into_inner()) = transport;
+}
+
+/// The installed default terminology, if any.
+pub fn default_transport() -> Option<std::sync::Arc<dyn TerminologyTransport>> {
+    DEFAULT_TRANSPORT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[derive(Clone)]
+enum Transport {
+    Http(Client),
+    Service(std::sync::Arc<dyn TerminologyTransport>),
+}
+
 /// Terminology client for making requests to a FHIR terminology server
 #[derive(Clone)]
 pub struct TerminologyClient {
-    client: Client,
+    transport: Transport,
     base_url: String,
     #[allow(dead_code)]
     fhir_version: FhirVersion,
@@ -176,10 +263,7 @@ impl TerminologyClient {
     /// These terminology operations only read data, including those sent as POST.
     /// Retry transient gateway/service failures, but preserve transport, parsing and
     /// other HTTP errors. Each attempt retains the configured HTTP client timeout.
-    async fn send_with_retry(
-        &self,
-        request: impl Fn() -> RequestBuilder,
-    ) -> FhirPathResult<Response> {
+    async fn send_with_retry(request: impl Fn() -> RequestBuilder) -> FhirPathResult<Response> {
         let mut delays = GATEWAY_RETRY_DELAYS.into_iter();
         loop {
             let response = request().send().await.map_err(|e| {
@@ -232,9 +316,83 @@ impl TerminologyClient {
             .expect("failed to build terminology HTTP client");
 
         Self {
-            client,
+            transport: Transport::Http(client),
             base_url: base_url.trim_end_matches('/').to_string(),
             fhir_version,
+        }
+    }
+
+    /// A client over a [`TerminologyTransport`] (the host's own terminology
+    /// service) instead of HTTP. Requests, retries and response handling are
+    /// the same.
+    pub fn with_transport(
+        transport: std::sync::Arc<dyn TerminologyTransport>,
+        fhir_version: FhirVersion,
+    ) -> Self {
+        Self {
+            base_url: transport.label().to_string(),
+            transport: Transport::Service(transport),
+            fhir_version,
+        }
+    }
+
+    /// Run one request (`body` → `POST`, else `GET` with `query`), retrying
+    /// transient gateway failures, and read the JSON answer.
+    async fn execute(
+        &self,
+        path: &str,
+        query: Vec<(String, String)>,
+        body: Option<Value>,
+        failure: &str,
+    ) -> RequestResult<Value> {
+        match &self.transport {
+            Transport::Http(client) => {
+                let url = format!("{}/{path}", self.base_url);
+                let response = Self::send_with_retry(|| {
+                    let request = match &body {
+                        Some(body) => client
+                            .post(&url)
+                            .json(body)
+                            .header("Content-Type", "application/fhir+json"),
+                        None => client.get(&url),
+                    };
+                    let request = if query.is_empty() {
+                        request
+                    } else {
+                        request.query(
+                            &query
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_str()))
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    request.header("Accept", "application/fhir+json")
+                })
+                .await?;
+                read_response(response, failure).await
+            }
+            Transport::Service(transport) => {
+                let mut delays = GATEWAY_RETRY_DELAYS.into_iter();
+                let response = loop {
+                    let response = transport
+                        .send(TransportRequest {
+                            path: path.to_string(),
+                            query: query.clone(),
+                            body: body.clone(),
+                            timeout: request_timeout(),
+                        })
+                        .await
+                        .map_err(FhirPathError::NetworkError)?;
+                    if !matches!(response.status, 502 | 503 | 504 | 530) {
+                        break response;
+                    }
+                    let Some(delay) = delays.next() else {
+                        break response;
+                    };
+                    tokio::time::sleep(delay).await;
+                };
+                read_transport_response(response, failure)
+            }
         }
     }
 
@@ -248,7 +406,7 @@ impl TerminologyClient {
     #[allow(dead_code)]
     pub fn with_client(client: Client, base_url: String, fhir_version: FhirVersion) -> Self {
         Self {
-            client,
+            transport: Transport::Http(client),
             base_url: base_url.trim_end_matches('/').to_string(),
             fhir_version,
         }
@@ -265,8 +423,6 @@ impl TerminologyClient {
         value_set_url: &str,
         params: Option<HashMap<String, String>>,
     ) -> RequestResult<Value> {
-        let url = format!("{}/ValueSet/$expand", self.base_url);
-
         // Build query parameters
         let mut query_params = vec![("url".to_string(), value_set_url.to_string())];
 
@@ -276,21 +432,13 @@ impl TerminologyClient {
             }
         }
 
-        let response = self
-            .send_with_retry(|| {
-                self.client
-                    .get(&url)
-                    .query(
-                        &query_params
-                            .iter()
-                            .map(|(k, v)| (k.as_str(), v.as_str()))
-                            .collect::<Vec<_>>(),
-                    )
-                    .header("Accept", "application/fhir+json")
-            })
-            .await?;
-
-        read_response(response, "ValueSet expansion failed").await
+        self.execute(
+            "ValueSet/$expand",
+            query_params,
+            None,
+            "ValueSet expansion failed",
+        )
+        .await
     }
 
     /// Looks up details for a code
@@ -306,8 +454,6 @@ impl TerminologyClient {
         code: &str,
         params: Option<HashMap<String, String>>,
     ) -> RequestResult<Value> {
-        let url = format!("{}/CodeSystem/$lookup", self.base_url);
-
         let mut body = json!({
             "resourceType": "Parameters",
             "parameter": [
@@ -334,17 +480,13 @@ impl TerminologyClient {
             }
         }
 
-        let response = self
-            .send_with_retry(|| {
-                self.client
-                    .post(&url)
-                    .json(&body)
-                    .header("Content-Type", "application/fhir+json")
-                    .header("Accept", "application/fhir+json")
-            })
-            .await?;
-
-        read_response(response, "Code lookup failed").await
+        self.execute(
+            "CodeSystem/$lookup",
+            Vec::new(),
+            Some(body),
+            "Code lookup failed",
+        )
+        .await
     }
 
     /// Validates a code against a ValueSet
@@ -364,8 +506,6 @@ impl TerminologyClient {
         display: Option<&str>,
         params: Option<HashMap<String, String>>,
     ) -> RequestResult<Value> {
-        let url = format!("{}/ValueSet/$validate-code", self.base_url);
-
         let mut parameters = vec![json!({
             "name": "url",
             "valueUri": value_set_url
@@ -418,17 +558,13 @@ impl TerminologyClient {
             "parameter": parameters
         });
 
-        let response = self
-            .send_with_retry(|| {
-                self.client
-                    .post(&url)
-                    .json(&body)
-                    .header("Content-Type", "application/fhir+json")
-                    .header("Accept", "application/fhir+json")
-            })
-            .await?;
-
-        read_response(response, "ValueSet validation failed").await
+        self.execute(
+            "ValueSet/$validate-code",
+            Vec::new(),
+            Some(body),
+            "ValueSet validation failed",
+        )
+        .await
     }
 
     /// Validates a code against a CodeSystem
@@ -446,8 +582,6 @@ impl TerminologyClient {
         display: Option<&str>,
         params: Option<HashMap<String, String>>,
     ) -> RequestResult<Value> {
-        let url = format!("{}/CodeSystem/$validate-code", self.base_url);
-
         let mut parameters = vec![
             json!({
                 "name": "url",
@@ -481,17 +615,13 @@ impl TerminologyClient {
             "parameter": parameters
         });
 
-        let response = self
-            .send_with_retry(|| {
-                self.client
-                    .post(&url)
-                    .json(&body)
-                    .header("Content-Type", "application/fhir+json")
-                    .header("Accept", "application/fhir+json")
-            })
-            .await?;
-
-        read_response(response, "CodeSystem validation failed").await
+        self.execute(
+            "CodeSystem/$validate-code",
+            Vec::new(),
+            Some(body),
+            "CodeSystem validation failed",
+        )
+        .await
     }
 
     /// Checks if one code subsumes another
@@ -509,8 +639,6 @@ impl TerminologyClient {
         code_b: &str,
         params: Option<HashMap<String, String>>,
     ) -> RequestResult<Value> {
-        let url = format!("{}/CodeSystem/$subsumes", self.base_url);
-
         let mut parameters = vec![
             json!({
                 "name": "system",
@@ -541,17 +669,13 @@ impl TerminologyClient {
             "parameter": parameters
         });
 
-        let response = self
-            .send_with_retry(|| {
-                self.client
-                    .post(&url)
-                    .json(&body)
-                    .header("Content-Type", "application/fhir+json")
-                    .header("Accept", "application/fhir+json")
-            })
-            .await?;
-
-        read_response(response, "Subsumes check failed").await
+        self.execute(
+            "CodeSystem/$subsumes",
+            Vec::new(),
+            Some(body),
+            "Subsumes check failed",
+        )
+        .await
     }
 
     /// Translates a code using a ConceptMap
@@ -571,21 +695,15 @@ impl TerminologyClient {
         target_system: Option<&str>,
         params: Option<HashMap<String, String>>,
     ) -> RequestResult<Value> {
-        let url = format!("{}/ConceptMap/$translate", self.base_url);
-
         let body = build_translate_body(concept_map_url, system, code, target_system, params);
 
-        let response = self
-            .send_with_retry(|| {
-                self.client
-                    .post(&url)
-                    .json(&body)
-                    .header("Content-Type", "application/fhir+json")
-                    .header("Accept", "application/fhir+json")
-            })
-            .await?;
-
-        read_response(response, "Translation failed").await
+        self.execute(
+            "ConceptMap/$translate",
+            Vec::new(),
+            Some(body),
+            "Translation failed",
+        )
+        .await
     }
 }
 

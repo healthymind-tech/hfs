@@ -2442,7 +2442,10 @@ impl ResourceStorage for PostgresBackend {
             "search_parameter_epochs",
         ] {
             let exists: bool = tx
-                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .query_one(
+                    "SELECT to_regclass(format('%I.%I', current_schema(), $1::text)) IS NOT NULL",
+                    &[&table],
+                )
                 .await
                 .or_query_error("purge fork state")?
                 .get(0);
@@ -3335,7 +3338,7 @@ impl PostgresBackend {
         }
         let exists = client
             .query_opt(
-                "SELECT 1 FROM information_schema.tables WHERE table_name = 'resource_fts'",
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'resource_fts'",
                 &[],
             )
             .await

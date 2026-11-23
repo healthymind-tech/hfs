@@ -128,6 +128,9 @@ helios-ui-chrome = { path = "../ui-chrome", version = "0.2.9" }
 # snapshot/registry, store traits, console roles and sync job model. The
 # manager console (src/manager) reads endpoints only through these types.
 helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+# The server's terminology service for the editor's `$expand` picker and the
+# health probe (docs/design/unified-server.md U2).
+helios-terminology = { path = "../terminology", version = "0.2.9" }
 
 # Administrator sign-in for the console's admin pages (`/ui/admin/login`, the
 # guard on IG Packages, Tenants, Bulk and SQL export), shared with HTS.

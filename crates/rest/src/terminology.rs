@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use helios_persistence::error::TerminologyFailureKind;
-use reqwest::Client;
+use helios_terminology::remote::{HttpTransport, OutboundRequest, RemoteTerminology};
+use helios_terminology::{TerminologyService, TxError, TxRequest, TxResponse};
 use serde_json::{Value, json};
 use tracing::debug;
 
@@ -229,10 +230,15 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// `excludeNested` and `valueSetVersion` parameters.
 #[derive(Clone)]
 pub struct TerminologyServiceClient {
-    client: Client,
-    /// Base URL of the terminology server (no trailing slash).
+    /// The terminology service the requests go to: the server's embedded
+    /// service, or a remote server over HTTP (design §4).
+    service: Arc<dyn TerminologyService>,
+    /// Base URL of the terminology server (no trailing slash), or a label
+    /// for the embedded service.
     base_url: String,
     limits: ExpansionLimits,
+    /// Per-request deadline.
+    timeout: Duration,
 }
 
 impl TerminologyServiceClient {
@@ -268,18 +274,42 @@ impl TerminologyServiceClient {
         limits: ExpansionLimits,
         timeout: Duration,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(timeout)
-            .connect_timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()
-            .expect("terminology HTTP client");
-
+        let base_url = base_url.trim_end_matches('/').to_string();
         Self {
-            client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            service: remote_service(&base_url, None),
+            base_url,
             limits,
+            timeout,
         }
+    }
+
+    /// A client over an existing [`TerminologyService`] (the server's
+    /// embedded or remote service); `label` is what [`Self::base_url`] reports.
+    pub fn from_service(
+        label: impl Into<String>,
+        service: Arc<dyn TerminologyService>,
+        limits: ExpansionLimits,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            service,
+            base_url: label.into(),
+            limits,
+            timeout,
+        }
+    }
+
+    /// The service behind this client.
+    pub fn service(&self) -> &Arc<dyn TerminologyService> {
+        &self.service
+    }
+
+    /// Runs one request; a transport failure becomes [`TerminologyError::Network`].
+    async fn send(&self, request: TxRequest) -> Result<TxResponse, TerminologyError> {
+        self.service
+            .call(request.with_timeout(self.timeout))
+            .await
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&tx_error_text(&e))))
     }
 
     /// Returns the configured base URL.
@@ -402,37 +432,17 @@ impl TerminologyServiceClient {
     /// Sends one `POST /ValueSet/$expand` with the given parameters and
     /// returns the response body as JSON.
     async fn post_expand(&self, params: Vec<Value>) -> Result<Value, TerminologyError> {
-        let endpoint = format!("{}/ValueSet/$expand", self.base_url);
         let body = json!({ "resourceType": "Parameters", "parameter": params });
-
         let response = self
-            .client
-            .post(&endpoint)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(512)
-                .collect::<String>();
+            .send(TxRequest::post_json("ValueSet/$expand", &body))
+            .await?;
+        if !response.is_success() {
             return Err(TerminologyError::ServerError {
-                status,
-                body: body_text,
+                status: response.status,
+                body: truncated_body(&response),
             });
         }
-
-        response
-            .json()
-            .await
+        serde_json::from_slice(&response.body)
             .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))
     }
 
@@ -456,12 +466,8 @@ impl TerminologyServiceClient {
                 {"name": "count", "valueInteger": count}
             ]
         });
-        let request = self
-            .client
-            .post(format!("{}/ValueSet/$expand", self.base_url))
-            .json(&body)
-            .header("Content-Type", "application/fhir+json");
-        self.send_optional(request).await
+        self.send_optional(TxRequest::post_json("ValueSet/$expand", &body))
+            .await
     }
 
     /// Looks up a ConceptMap by canonical (`url`, or `url|version`) with
@@ -478,14 +484,10 @@ impl TerminologyServiceClient {
             Some((url, version)) => (url, Some(version)),
             None => (canonical, None),
         };
-        let mut query = vec![("url", url)];
+        let mut request = TxRequest::get("ConceptMap").with_query_param("url", url);
         if let Some(version) = version {
-            query.push(("version", version));
+            request = request.with_query_param("version", version);
         }
-        let request = self
-            .client
-            .get(format!("{}/ConceptMap", self.base_url))
-            .query(&query);
         let Some(bundle) = self.send_optional(request).await? else {
             return Ok(None);
         };
@@ -500,32 +502,18 @@ impl TerminologyServiceClient {
     }
 
     /// Sends `request` expecting a FHIR JSON body; `404` becomes `Ok(None)`.
-    async fn send_optional(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<Option<Value>, TerminologyError> {
-        let response = request
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+    async fn send_optional(&self, request: TxRequest) -> Result<Option<Value>, TerminologyError> {
+        let response = self.send(request).await?;
+        if response.status == 404 {
             return Ok(None);
         }
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(512)
-                .collect::<String>();
-            return Err(TerminologyError::ServerError { status, body });
+        if !response.is_success() {
+            return Err(TerminologyError::ServerError {
+                status: response.status,
+                body: truncated_body(&response),
+            });
         }
-        response
-            .json()
-            .await
+        serde_json::from_slice(&response.body)
             .map(Some)
             .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))
     }
@@ -635,6 +623,10 @@ pub struct SearchTerminology {
     client: TerminologyServiceClient,
     ttl: Duration,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// The service's change feed (embedded service): a terminology write
+    /// here or on another instance empties the cache at once instead of
+    /// after the TTL (design §4.5).
+    changes: Option<Mutex<tokio::sync::watch::Receiver<u64>>>,
 }
 
 struct CacheEntry {
@@ -648,10 +640,46 @@ pub const CACHE_MAX_ENTRIES: usize = 512;
 impl SearchTerminology {
     /// Wraps `client`; `ttl` of zero disables the cache.
     pub fn new(client: TerminologyServiceClient, ttl: Duration) -> Self {
+        let changes = client.service().changes().map(Mutex::new);
         Self {
             client,
             ttl,
             cache: Mutex::new(HashMap::new()),
+            changes,
+        }
+    }
+
+    /// The search service over the server's terminology `service`
+    /// (embedded or remote), configured like [`Self::from_config`].
+    pub fn from_service(
+        label: &str,
+        service: Arc<dyn TerminologyService>,
+        config: &crate::config::SearchTerminologyConfig,
+    ) -> Self {
+        let limits = ExpansionLimits {
+            page_size: config.expansion_page_size,
+            max_codes: config.expansion_max_codes,
+        };
+        Self::new(
+            TerminologyServiceClient::from_service(
+                label,
+                service,
+                limits,
+                Duration::from_secs(config.timeout_secs.max(1)),
+            ),
+            Duration::from_secs(config.expansion_cache_ttl_secs),
+        )
+    }
+
+    /// Empty the cache when the terminology changed since the last look.
+    fn sync_changes(&self) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let mut rx = changes.lock().unwrap_or_else(|e| e.into_inner());
+        if rx.has_changed().unwrap_or(false) {
+            rx.borrow_and_update();
+            self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
     }
 
@@ -711,6 +739,7 @@ impl SearchTerminology {
         if self.ttl.is_zero() {
             return None;
         }
+        self.sync_changes();
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache
             .get(key)
@@ -747,6 +776,454 @@ impl SearchTerminology {
     /// Number of cached expansions (expired ones included until evicted).
     pub fn cache_len(&self) -> usize {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+// ─── TerminologyService wiring (design §4, package U2) ────────────────────────
+
+/// Text of a [`TxError`] as the old reqwest clients reported it.
+pub fn tx_error_text(error: &TxError) -> String {
+    match error {
+        TxError::Unavailable(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn truncated_body(response: &TxResponse) -> String {
+    String::from_utf8_lossy(&response.body)
+        .chars()
+        .take(512)
+        .collect()
+}
+
+/// [`HttpTransport`] over reqwest for [`RemoteTerminology`]: a 2 s connect
+/// timeout, the request's own deadline, and no proxy (the terminology server
+/// is a configured internal endpoint; see [`TerminologyServiceClient::new`]).
+pub struct ReqwestTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestTransport {
+    /// A transport with the 2 s connect timeout and no proxy.
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .no_proxy()
+                .build()
+                .expect("terminology HTTP client"),
+        }
+    }
+}
+
+impl Default for ReqwestTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reqwest error with its source chain (`error sending request` alone
+/// does not say whether the connection was refused, reset or closed).
+fn reqwest_error_chain(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+#[async_trait::async_trait]
+impl HttpTransport for ReqwestTransport {
+    async fn send(&self, request: OutboundRequest) -> Result<TxResponse, TxError> {
+        let mut builder = self
+            .client
+            .request(request.method, &request.url)
+            .timeout(request.timeout);
+        for (name, value) in &request.headers {
+            if name == "authorization" {
+                let mut v = reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|e| TxError::Unavailable(e.to_string()))?;
+                v.set_sensitive(true);
+                builder = builder.header(reqwest::header::AUTHORIZATION, v);
+            } else {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        }
+        if let Some(body) = request.body {
+            builder = builder.body(body);
+        }
+        let response = builder.send().await.map_err(|e| {
+            if e.is_timeout() {
+                TxError::Timeout(request.timeout)
+            } else {
+                TxError::Unavailable(reqwest_error_chain(&e))
+            }
+        })?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = response.bytes().await.map_err(|e| {
+            if e.is_timeout() {
+                TxError::Timeout(request.timeout)
+            } else {
+                TxError::Unavailable(reqwest_error_chain(&e))
+            }
+        })?;
+        Ok(TxResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
+}
+
+fn shared_transport() -> Arc<dyn HttpTransport> {
+    static TRANSPORT: std::sync::OnceLock<Arc<ReqwestTransport>> = std::sync::OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| Arc::new(ReqwestTransport::new()))
+        .clone()
+}
+
+/// A remote terminology service for `base` (an endpoint's own server, or
+/// the server's when nothing is installed). `token` is sent only for
+/// [`helios_terminology::TxPrincipal::System`] requests.
+pub fn remote_service(base: &str, token: Option<String>) -> Arc<dyn TerminologyService> {
+    match RemoteTerminology::new(base, token, DEFAULT_REQUEST_TIMEOUT, shared_transport()) {
+        Ok(remote) => Arc::new(remote),
+        // Not http(s): every call fails the way an unreachable server does.
+        Err(e) => Arc::new(Unreachable(tx_error_text(&e))),
+    }
+}
+
+/// A service whose every call fails with `Unavailable` (invalid base URL).
+struct Unreachable(String);
+
+#[async_trait::async_trait]
+impl TerminologyService for Unreachable {
+    fn kind(&self) -> helios_terminology::ServiceKind {
+        helios_terminology::ServiceKind::Remote
+    }
+    async fn call(&self, _request: TxRequest) -> Result<TxResponse, TxError> {
+        Err(TxError::Unavailable(self.0.clone()))
+    }
+}
+
+/// Who is calling terminology (`terminology_calls_total{caller}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxCaller {
+    /// Resource validation (terminology bindings).
+    Validator,
+    /// `:in` / `:not-in` / `:above` / `:below` search expansion.
+    Search,
+    /// SQL-on-FHIR terminology dependencies.
+    Sof,
+    /// FHIRPath `memberOf()` / `%terminologies`.
+    Fhirpath,
+    /// IG package terminology installs.
+    Packages,
+    /// Console pages.
+    Console,
+}
+
+impl TxCaller {
+    /// The metrics label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TxCaller::Validator => "validator",
+            TxCaller::Search => "search",
+            TxCaller::Sof => "sof",
+            TxCaller::Fhirpath => "fhirpath",
+            TxCaller::Packages => "packages",
+            TxCaller::Console => "console",
+        }
+    }
+
+    /// FHIR request paths take operation permits (design §8.2); the package
+    /// manager and the console do not.
+    fn permitted(self) -> bool {
+        matches!(
+            self,
+            TxCaller::Validator | TxCaller::Search | TxCaller::Sof | TxCaller::Fhirpath
+        )
+    }
+}
+
+/// The operation label of a request path (`$expand`, `batch`, `read`, ...).
+fn op_label(request: &TxRequest) -> &'static str {
+    let last = request.path.rsplit('/').next().unwrap_or("");
+    match last {
+        "$expand" => "expand",
+        "$validate-code" => "validate-code",
+        "$lookup" => "lookup",
+        "$subsumes" => "subsumes",
+        "$translate" => "translate",
+        "$batch-validate-code" => "batch-validate-code",
+        "$closure" => "closure",
+        "" => "batch",
+        "import" => "import",
+        "health" => "health",
+        _ if request.method == helios_terminology::service::TxMethod::Delete => "delete",
+        _ => "read",
+    }
+}
+
+/// Records `terminology_calls_total` and `terminology_call_duration_seconds`.
+struct Instrumented {
+    inner: Arc<dyn TerminologyService>,
+    caller: TxCaller,
+}
+
+#[async_trait::async_trait]
+impl TerminologyService for Instrumented {
+    fn kind(&self) -> helios_terminology::ServiceKind {
+        self.inner.kind()
+    }
+
+    async fn call(&self, request: TxRequest) -> Result<TxResponse, TxError> {
+        let op = op_label(&request);
+        let started = Instant::now();
+        let result = self.inner.call(request).await;
+        let outcome = match &result {
+            Ok(r) if r.is_success() => "ok",
+            Ok(r) if r.status == 404 => "not-found",
+            Ok(r) if r.status < 500 => "client-error",
+            Ok(_) => "server-error",
+            Err(TxError::Timeout(_)) => "timeout",
+            Err(TxError::Disabled) => "disabled",
+            Err(_) => "unavailable",
+        };
+        let caller = self.caller.as_str();
+        metrics::counter!("terminology_calls_total", "caller" => caller, "op" => op, "outcome" => outcome)
+            .increment(1);
+        metrics::histogram!("terminology_call_duration_seconds", "caller" => caller, "op" => op)
+            .record(started.elapsed().as_secs_f64());
+        result
+    }
+
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.inner.changes()
+    }
+
+    async fn health(&self) -> helios_terminology::TerminologyHealth {
+        self.inner.health().await
+    }
+}
+
+/// The server's terminology service (`HFS_TERMINOLOGY`), installed once by
+/// the `hfs` binary at startup.
+struct ServerTerminology {
+    /// The service as built (embedded loopback or remote).
+    service: Arc<dyn TerminologyService>,
+    /// The same behind the operation-permit semaphore (FHIR request paths).
+    permitted: Arc<helios_terminology::PermittedTerminology<dyn TerminologyService>>,
+    /// `HFS_TERMINOLOGY_SERVER` in remote mode (an endpoint binding naming
+    /// the same URL shares this service); `None` when embedded.
+    url: Option<String>,
+    /// Label reported as the "base URL" (the remote URL, or `embedded`).
+    label: String,
+}
+
+static SERVER_TERMINOLOGY: std::sync::RwLock<Option<Arc<ServerTerminology>>> =
+    std::sync::RwLock::new(None);
+
+/// Install the server's terminology service. `url` is the remote base in
+/// remote mode (`None` embedded); `permits` caps concurrent calls from FHIR
+/// request paths (0 = unlimited). Also makes it the default terminology of
+/// FHIRPath evaluations (`memberOf()`, `%terminologies`), replacing the old
+/// `FHIRPATH_TERMINOLOGY_SERVER` environment hand-off.
+pub fn install_server_terminology(
+    service: Arc<dyn TerminologyService>,
+    url: Option<String>,
+    permits: usize,
+    timeout: Duration,
+) {
+    let label = url.clone().unwrap_or_else(|| "embedded".to_string());
+    let permitted = Arc::new(helios_terminology::PermittedTerminology::new(
+        Arc::clone(&service),
+        permits,
+        timeout,
+    ));
+    let installed = Arc::new(ServerTerminology {
+        service,
+        permitted,
+        url,
+        label,
+    });
+    helios_fhirpath::set_default_transport(Some(Arc::new(FhirpathTransport {
+        service: instrumented(installed.permitted.clone(), TxCaller::Fhirpath),
+        label: installed.label.clone(),
+    })));
+    *SERVER_TERMINOLOGY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(installed);
+}
+
+/// Remove the installed service (tests).
+pub fn uninstall_server_terminology() {
+    helios_fhirpath::set_default_transport(None);
+    *SERVER_TERMINOLOGY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn installed() -> Option<Arc<ServerTerminology>> {
+    SERVER_TERMINOLOGY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn instrumented(
+    inner: Arc<dyn TerminologyService>,
+    caller: TxCaller,
+) -> Arc<dyn TerminologyService> {
+    Arc::new(Instrumented { inner, caller })
+}
+
+/// Operation permits currently free (`terminology_permits_available`);
+/// `None` without an installed service.
+pub fn permits_available() -> Option<usize> {
+    installed().map(|s| s.permitted.available())
+}
+
+/// The raw installed service (health probe, `/tx` mount).
+pub fn server_terminology() -> Option<Arc<dyn TerminologyService>> {
+    installed().map(|s| Arc::clone(&s.service))
+}
+
+/// The remote URL of the installed service (`None` embedded or not installed).
+pub fn server_terminology_url() -> Option<String> {
+    installed().and_then(|s| s.url.clone())
+}
+
+/// Whether the installed service is the embedded one.
+pub fn server_terminology_is_embedded() -> bool {
+    installed().is_some_and(|s| s.url.is_none())
+}
+
+/// The terminology service a caller should use for `url`:
+///
+/// * `None` — the server's service (embedded or remote), when installed;
+/// * the installed remote URL — the server's service;
+/// * any other URL (an endpoint's own binding, or no service installed —
+///   tests and other embedders) — a remote service for that URL, without a
+///   token, as before.
+///
+/// Returns `(label, service)`; the label is the URL or `embedded`.
+pub fn terminology_for(
+    url: Option<&str>,
+    caller: TxCaller,
+) -> Option<(String, Arc<dyn TerminologyService>)> {
+    let server = installed();
+    let pick = |s: &Arc<ServerTerminology>| {
+        let inner: Arc<dyn TerminologyService> = if caller.permitted() {
+            s.permitted.clone()
+        } else {
+            Arc::clone(&s.service)
+        };
+        (s.label.clone(), instrumented(inner, caller))
+    };
+    match (url.map(|u| u.trim_end_matches('/')), &server) {
+        (None, Some(s)) => Some(pick(s)),
+        (None, None) => None,
+        (Some(u), Some(s)) if s.url.as_deref().map(|x| x.trim_end_matches('/')) == Some(u) => {
+            Some(pick(s))
+        }
+        (Some(u), _) => Some((u.to_string(), instrumented(remote_service(u, None), caller))),
+    }
+}
+
+/// Last terminology health seen by the background probe (`hfs`).
+static LAST_HEALTH: std::sync::RwLock<Option<helios_terminology::TerminologyHealth>> =
+    std::sync::RwLock::new(None);
+
+/// Record a health probe result (`/health` `components.terminology`,
+/// `hfs_terminology_up`).
+pub fn record_health(health: helios_terminology::TerminologyHealth) {
+    use helios_terminology::service::HealthState;
+    let up = matches!(health.state, HealthState::Ok | HealthState::Degraded(_));
+    metrics::gauge!("hfs_terminology_up").set(if up { 1.0 } else { 0.0 });
+    *LAST_HEALTH.write().unwrap_or_else(|e| e.into_inner()) = Some(health);
+}
+
+/// `{mode, state[, detail]}` for `/health`; `None` before the first probe.
+pub fn health_component() -> Option<Value> {
+    use helios_terminology::service::HealthState;
+    let health = LAST_HEALTH
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let (state, detail) = match &health.state {
+        HealthState::Ok => ("ok", None),
+        HealthState::Degraded(d) => ("degraded", Some(d.clone())),
+        HealthState::Down(d) => ("down", Some(d.clone())),
+    };
+    let mut v = json!({"mode": health.kind.to_string(), "state": state});
+    if let Some(d) = detail {
+        v["detail"] = json!(redact_urls_in(&d));
+    }
+    Some(v)
+}
+
+/// Whether the last probe found the terminology service down.
+pub fn terminology_down() -> bool {
+    matches!(
+        LAST_HEALTH
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| &h.state),
+        Some(helios_terminology::service::HealthState::Down(_))
+    )
+}
+
+/// Bridges the server's service into FHIRPath's terminology client.
+struct FhirpathTransport {
+    service: Arc<dyn TerminologyService>,
+    label: String,
+}
+
+impl helios_fhirpath::TerminologyTransport for FhirpathTransport {
+    fn label(&self) -> &str {
+        &self.label
+    }
+
+    fn send(
+        &self,
+        request: helios_fhirpath::TransportRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<helios_fhirpath::TransportResponse, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let mut tx = match request.body {
+                Some(body) => TxRequest::post_json(request.path.clone(), &body),
+                None => TxRequest::get(request.path.clone()),
+            };
+            for (k, v) in &request.query {
+                tx = tx.with_query_param(k, v);
+            }
+            if let Some(timeout) = request.timeout {
+                tx = tx.with_timeout(timeout);
+            }
+            match self.service.call(tx).await {
+                Ok(response) => Ok(helios_fhirpath::TransportResponse {
+                    status: response.status,
+                    retry_after: None,
+                    body: response.body.to_vec(),
+                }),
+                Err(e) => Err(tx_error_text(&e)),
+            }
+        })
     }
 }
 

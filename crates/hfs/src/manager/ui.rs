@@ -239,7 +239,16 @@ impl ManagerBackend for AdminApiBackend {
         health.key_ring = self.key_ring;
         // A configured terminology server is probed (the store knows
         // nothing about it); none configured stays "not reported".
-        if let Some(url) = &self.terminology {
+        // The server's own terminology service (embedded or remote) answers
+        // for itself; design §4.3.
+        if let Some(service) = helios_rest::terminology::server_terminology() {
+            use helios_terminology::service::HealthState as Tx;
+            health.terminology = match service.health().await.state {
+                Tx::Ok => helios_ui::manager::HealthState::Ok,
+                Tx::Degraded(_) => helios_ui::manager::HealthState::Degraded,
+                Tx::Down(_) => helios_ui::manager::HealthState::Down,
+            };
+        } else if let Some(url) = &self.terminology {
             health.terminology = helios_ui::manager::probe_terminology(url).await;
         }
         // The live console sign-in mode (the store's view has none).

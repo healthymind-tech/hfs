@@ -3550,14 +3550,18 @@ dependencies = [
  "helios-auth",
  "helios-endpoints",
  "helios-fhir",
+ "helios-hts",
  "helios-observability",
  "helios-persistence",
  "helios-rest",
  "helios-sof",
  "helios-subscriptions",
  "helios-sync",
+ "helios-terminology",
  "helios-ui",
  "http-body-util",
+ "libc",
+ "metrics",
  "mimalloc",
  "openssl",
  "parking_lot 0.12.5",
@@ -3569,6 +3573,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -3594,10 +3599,13 @@ dependencies = [
  "helios-admin-auth",
  "helios-audit",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-hts-ui",
  "helios-observability",
  "helios-persistence",
+ "helios-terminology",
+ "http-body-util",
  "libc",
  "octofhir-ucum",
  "r2d2",
@@ -3622,6 +3630,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
  "uuid",
  "zip",
 ]
@@ -3766,12 +3775,14 @@ dependencies = [
  "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
+ "helios-fhirpath",
  "helios-observability",
  "helios-persistence",
  "helios-serde",
  "helios-sof",
  "helios-subscriptions",
  "helios-sync",
+ "helios-terminology",
  "hmac 0.12.1",
  "http 1.5.0",
  "http-body 1.1.0",
@@ -3936,6 +3947,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-terminology"
+version = "0.2.9"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "helios-endpoints",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "url",
+]
+
+[[package]]
 name = "helios-ui"
 version = "0.2.9"
 dependencies = [
@@ -3961,6 +3989,7 @@ dependencies = [
  "helios-persistence",
  "helios-sof",
  "helios-sync",
+ "helios-terminology",
  "helios-ui-chrome",
  "http-body-util",
  "json-patch",
