@@ -340,7 +340,14 @@
   // <body>, and htmx reads `history.type` back after it.
   document.body.addEventListener("htmx:beforeHistoryUpdate", function (event) {
     var detail = event.detail || {};
-    if (detail.elt && !detail.elt.isConnected && detail.history) detail.history.type = "";
+    var cfg = detail.requestConfig || {};
+    var gone = function (el) { return el && el.isConnected === false; };
+    if (detail.history && (gone(detail.elt) || gone(cfg.elt) || gone(detail.target))) {
+      // htmx then pushes or replaces `history.path`: make it a no-op
+      // replace of the current entry.
+      detail.history.type = "replace";
+      detail.history.path = location.pathname + location.search + location.hash;
+    }
   });
 
   document.addEventListener("htmx:beforeSwap", function (event) {
