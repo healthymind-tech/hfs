@@ -1318,6 +1318,11 @@ fn terminology_service() -> Option<Arc<dyn helios_terminology::TerminologyServic
         .clone()
 }
 
+/// Whether the server's terminology service is the embedded one.
+pub(crate) fn terminology_is_embedded() -> bool {
+    terminology_service().is_some_and(|s| s.kind() == helios_terminology::ServiceKind::Embedded)
+}
+
 /// Whether the console has a terminology service to call: an installed one,
 /// or `HFS_TERMINOLOGY_SERVER` (`base`).
 pub(crate) fn has_terminology(base: Option<&str>) -> bool {

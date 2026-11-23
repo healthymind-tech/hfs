@@ -994,7 +994,19 @@ impl EnvView {
             auth_audience: env.auth_audience.clone().unwrap_or_default(),
             auth_jwks: env.auth_jwks_url.clone().unwrap_or_default(),
             validation_key: view::validation_badge(None, env).key,
-            terminology_server: env.terminology_server.clone().unwrap_or_default(),
+            terminology_server: env
+                .terminology_server
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| {
+                    // Embedded terminology has no URL: say what inheriting
+                    // means (the server's own /tx).
+                    if crate::editor::terminology_is_embedded() {
+                        "/tx".into()
+                    } else {
+                        String::new()
+                    }
+                }),
             cors_origins: env.cors_origins.clone().unwrap_or_else(|| "*".into()),
             rate_limit: format!(
                 "{} / {}",
