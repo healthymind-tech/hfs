@@ -552,6 +552,12 @@ a.nav-item:hover {
   color: var(--text-strong);
 }
 
+/* A visible hover target (text colour alone was easy to miss next to the
+   highlighted current page); same tone as table-row hovers. */
+a.nav-item:not([aria-current]):hover {
+  background: var(--input-bg);
+}
+
 .nav-item[aria-current="page"],
 .nav-item[aria-current="true"] {
   background: var(--surface);
@@ -10942,7 +10948,11 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   }
 }
 /* Wide screens: the sidebar is pinned open with its labels — no
-   hover-to-discover rail where there is room for words. */
+   hover-to-discover rail where there is room for words.
+   Every rule applies with AND without the pointer on the rail (`.sidebar X`
+   next to `.sidebar:not(:hover):not(:focus-within) X`): pinning only the
+   resting state made entering the rail switch items back to the base padding
+   and section margins, so the menu jumped up to 16px under the cursor. */
 @media (min-width: 1280px) {
   body {
     grid-template-columns: 264px 1fr;
@@ -10958,6 +10968,7 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
     box-shadow: 1px 0 0 var(--divider-glint);
   }
 
+  .sidebar .nav__section,
   .sidebar:not(:hover):not(:focus-within) .nav__section {
     height: auto;
     margin: 14px 8px 4px;
@@ -10966,18 +10977,23 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
     border-top: 0;
   }
 
+  .sidebar .nav-item,
   .sidebar:not(:hover):not(:focus-within) .nav-item {
     width: auto;
     padding: 0 12px;
     justify-content: flex-start;
   }
 
+  .sidebar .selector,
   .sidebar:not(:hover):not(:focus-within) .selector {
     width: auto;
     padding: 8px 10px;
     justify-content: flex-start;
   }
 
+  .sidebar .nav-item__label,
+  .sidebar .selector__label,
+  .sidebar .selector__chevrons,
   .sidebar:not(:hover):not(:focus-within) .nav-item__label,
   .sidebar:not(:hover):not(:focus-within) .selector__label,
   .sidebar:not(:hover):not(:focus-within) .selector__chevrons {
