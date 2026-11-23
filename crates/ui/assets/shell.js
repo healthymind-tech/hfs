@@ -594,11 +594,124 @@
 
   window.addEventListener("pagehide", saveSidebarScroll);
 
+  /* ---- shared page components (console redesign §6, §7) ---------------- */
+
+  // In-page tabs ([data-page-tabs]): one panel visible at a time; without
+  // JavaScript every panel shows. The active tab survives in the hash.
+  function initPageTabs(root) {
+    var lists = (root || document).querySelectorAll("[data-page-tabs]");
+    for (var i = 0; i < lists.length; i++) {
+      var list = lists[i];
+      if (list.__hmTabs) continue;
+      list.__hmTabs = true;
+      var tabs = list.querySelectorAll("[role=tab]");
+      var want = location.hash.slice(1);
+      var pick = null;
+      for (var t = 0; t < tabs.length; t++) {
+        if (want && tabs[t].getAttribute("aria-controls") === want) pick = tabs[t];
+      }
+      selectTab(list, pick || list.querySelector('[role=tab][aria-selected="true"]') || tabs[0], false);
+    }
+  }
+  function selectTab(list, tab, animate) {
+    var tabs = list.querySelectorAll("[role=tab]");
+    for (var k = 0; k < tabs.length; k++) {
+      var on = tabs[k] === tab;
+      tabs[k].setAttribute("aria-selected", on ? "true" : "false");
+      tabs[k].tabIndex = on ? 0 : -1;
+      var panel = document.getElementById(tabs[k].getAttribute("aria-controls"));
+      if (!panel) continue;
+      panel.hidden = !on;
+      if (on && animate && !REDUCED) {
+        panel.classList.remove("page-enter");
+        void panel.offsetWidth;
+        panel.classList.add("page-enter");
+      }
+    }
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest && e.target.closest("[data-page-tabs] [role=tab]");
+    if (tab) {
+      selectTab(tab.closest("[data-page-tabs]"), tab, true);
+      try {
+        history.replaceState(history.state, "", "#" + tab.getAttribute("aria-controls"));
+      } catch (err) {}
+      return;
+    }
+    // Type rails: types without data stay folded until asked for.
+    var empty = e.target.closest && e.target.closest("[data-rail-empty-toggle]");
+    if (empty) {
+      var rail = empty.closest(".filter-rail");
+      var on = empty.getAttribute("aria-pressed") !== "true";
+      empty.setAttribute("aria-pressed", on ? "true" : "false");
+      if (rail) rail.classList.toggle("show-empty", on);
+      return;
+    }
+    // Grouped versions: "+N older" folds the older rows of one system.
+    var tog = e.target.closest && e.target.closest("[data-versions-toggle]");
+    if (tog) {
+      var row = tog.closest("tr");
+      var open = tog.getAttribute("aria-expanded") !== "true";
+      tog.setAttribute("aria-expanded", open ? "true" : "false");
+      var n = 0;
+      for (var r = row.nextElementSibling; r && r.hasAttribute("data-older"); r = r.nextElementSibling) {
+        r.classList.toggle("is-open", open);
+        if (open && !REDUCED) {
+          r.style.animationDelay = Math.min(n, 14) * 30 + "ms";
+          r.classList.remove("row-in");
+          void r.offsetWidth;
+          r.classList.add("row-in");
+        }
+        n++;
+      }
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    var tab = e.target.closest && e.target.closest("[data-page-tabs] [role=tab]");
+    if (!tab || (e.key !== "ArrowRight" && e.key !== "ArrowLeft")) return;
+    var list = tab.closest("[data-page-tabs]");
+    var tabs = Array.prototype.slice.call(list.querySelectorAll("[role=tab]"));
+    var i = tabs.indexOf(tab) + (e.key === "ArrowRight" ? 1 : -1);
+    var next = tabs[(i + tabs.length) % tabs.length];
+    selectTab(list, next, true);
+    next.focus();
+    e.preventDefault();
+  });
+  // Table rows rise in, staggered, on first render and after a filter swap.
+  function staggerRows(root) {
+    if (REDUCED) return;
+    var bodies = (root || document).querySelectorAll("table.data-table > tbody");
+    for (var b = 0; b < bodies.length; b++) {
+      var rows = bodies[b].rows;
+      if (rows.length > 400) continue;
+      for (var i = 0; i < rows.length && i < 40; i++) {
+        rows[i].style.animationDelay = Math.min(i, 14) * 18 + "ms";
+        rows[i].classList.add("row-in");
+      }
+    }
+  }
+  document.addEventListener("hm:navigated", function (e) {
+    var main = e.detail && e.detail.main;
+    initPageTabs(main);
+    staggerRows(main);
+  });
+  document.addEventListener("htmx:afterSwap", function (e) {
+    var t = e.detail && e.detail.target;
+    if (t && t.id !== "main" && t.querySelector) {
+      // An outerHTML swap leaves `target` detached: use its replacement.
+      var live = (t.id && document.getElementById(t.id)) || t;
+      initPageTabs(live);
+      staggerRows(live);
+    }
+  });
+
   function start() {
     rememberPage();
     restoreSidebarScroll();
     markActive();
     initPages(document.getElementById("main"));
+    initPageTabs(document.getElementById("main"));
+    staggerRows(document.getElementById("main"));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
   else start();

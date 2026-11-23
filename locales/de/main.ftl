@@ -1765,3 +1765,4 @@ sql-library-unavailable-lede = Die verfügbaren Abfragen und Ansichten konnten n
 
 # Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
 nav-route-tabs = Seiten dieses Bereichs
+rail-show-empty = Leere zeigen

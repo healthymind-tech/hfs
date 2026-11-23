@@ -1882,3 +1882,4 @@ sql-library-unavailable-lede = The available queries and views could not be veri
 
 # Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
 nav-route-tabs = Pages in this section
+rail-show-empty = Show empty

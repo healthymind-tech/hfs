@@ -21,7 +21,6 @@
   </div>
   <div class="page-head__actions">
     <a class="btn btn--primary" href="{{ crate::paths::ui() }}/import">{{ chrome.i18n.t("hts-term-import-action") }}</a>
-    <a class="btn" href="{{ crate::paths::ui() }}/jobs">{{ chrome.i18n.t("hts-nav-jobs") }}</a>
   </div>
 </section>
 
@@ -35,27 +34,32 @@
 {% if let Some(u) = unavailable %}
   {% include "partials/hts-admin-unavailable.html" %}
 {% else %}
+<div class="page-tabs" role="tablist" aria-label="{{ chrome.i18n.t("hts-term-title") }}" data-page-tabs>
+  <button type="button" class="page-tab" role="tab" id="hts-tab-loaded" aria-controls="hts-panel-loaded" aria-selected="true">{{ chrome.i18n.t("hts-term-tab-loaded") }}</button>
+  <button type="button" class="page-tab" role="tab" id="hts-tab-maint" aria-controls="hts-panel-maint" aria-selected="false">{{ chrome.i18n.t("hts-term-tab-maint") }}</button>
+</div>
+<div class="page-tabpanel" id="hts-panel-loaded" role="tabpanel" aria-labelledby="hts-tab-loaded">
 <div id="hts-term-body"
      {% if stats_pending || counts_pending %}hx-get="{{ refresh_url }}" hx-trigger="load delay:3s" hx-select="#hts-term-body" hx-swap="outerHTML"{% endif %}>
-  <section class="stat-grid" aria-label="{{ chrome.i18n.t("hts-term-summary") }}">
-    <article class="card stat">
+  <section class="stat-grid stats" aria-label="{{ chrome.i18n.t("hts-term-summary") }}">
+    <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-db") }}</span>
       <span class="stat__value">{% if let Some(s) = db_size %}{{ s }}{% else %}&mdash;{% endif %}</span>
       {% if let Some(r) = db_reclaimable %}<span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-reclaimable", "size", r.to_string()) }}</span>{% endif %}
     </article>
-    <article class="card stat">
+    <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-systems") }}</span>
       <span class="stat__value" data-stat="systems">{{ systems }}</span>
       <span class="stat__sub">{% if show_all %}{{ chrome.i18n.t("hts-term-stat-systems-all") }}{% else if counts_pending %}{{ chrome.i18n.t("hts-term-stat-systems-counting") }}{% else %}{{ chrome.i18n.t("hts-term-stat-systems-populated") }}{% endif %}</span>
     </article>
-    <article class="card stat">
+    <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-concepts") }}</span>
       <span class="stat__value" data-stat="concepts">{% if let Some(c) = concepts %}{{ c }}{% else %}<span class="spinner" aria-hidden="true"></span>{% endif %}</span>
       {% if let Some(at) = stats_at %}<span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-counted", "when", at.to_string()) }}</span>
       {% else if counts_pending %}<span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-concepts-counting") }}</span>
       {% else if !show_all %}<span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-concepts-shown") }}</span>{% endif %}
     </article>
-    <article class="card stat">
+    <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-other") }}</span>
       <span class="stat__value">{{ value_sets }} / {{ concept_maps }}</span>
       <span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-other-sub") }}</span>
@@ -102,64 +106,68 @@
             <th scope="col" class="col-num">{{ chrome.i18n.t("hts-term-col-concepts") }}</th>
             <th scope="col" class="col-num">{{ chrome.i18n.t("hts-term-col-size") }}</th>
             <th scope="col">{{ chrome.i18n.t("hts-term-col-imported") }}</th>
-            <th scope="col">{{ chrome.i18n.t("hts-term-col-source") }}</th>
-            <th scope="col">{{ chrome.i18n.t("hts-term-col-current") }}</th>
-            <th scope="col" class="col-actions">{{ chrome.i18n.t("hts-term-col-actions") }}</th>
+            <th scope="col" class="col-actions"><span class="visually-hidden">{{ chrome.i18n.t("hts-term-col-actions") }}</span></th>
           </tr>
         </thead>
         <tbody>
           {% if rows.is_empty() %}
-          <tr class="data-table__empty"><td colspan="8">{{ chrome.i18n.t("hts-term-empty") }}</td></tr>
+          <tr class="data-table__empty"><td colspan="6">{{ chrome.i18n.t("hts-term-empty") }}</td></tr>
           {% endif %}
           {% for r in rows %}
-          <tr data-system="{{ r.url }}" data-version="{{ r.version_param }}"{% if r.current %} data-current="true"{% endif %}>
-            {#- Title, then the canonical URL with its status/supplement tags
-                on one flex row: the URL truncates (full value in its title)
-                and the tags keep their own box, so a long URL can never run
-                underneath a tag. -#}
+          {#- Versions grouped under their code system (console redesign §6
+              tables): the first row is the system, older versions follow it
+              and fold away behind "+N older" (expanded in place). Row
+              actions live in a ⋯ menu; Explore stays one click away. -#}
+          <tr data-system="{{ r.url }}" data-version="{{ r.version_param }}"{% if r.current %} data-current="true"{% endif %}{% if !r.first_of_system %} data-older{% endif %}>
             <td class="col-name">
-              {% if !r.title.is_empty() %}<span class="col-name__title" title="{{ r.title }}">{% if r.first_of_system %}<strong>{{ r.title }}</strong>{% else %}{{ r.title }}{% endif %}</span>{% endif %}
+              {% if r.first_of_system %}
+              {% if !r.title.is_empty() %}<span class="col-name__title" title="{{ r.title }}"><strong>{{ r.title }}</strong></span>{% endif %}
               <span class="col-name__line">
                 <span class="url" title="{{ r.url }}">{{ r.url }}</span>
                 {%- if r.status != "active" %}<span class="tag tag--retired">{{ r.status }}</span>{% endif %}
                 {%- if r.is_supplement %}<span class="tag tag--muted">{{ chrome.i18n.t("hts-term-supplement") }}</span>{% endif %}
               </span>
+              {% if r.version_count > 1 %}<button type="button" class="versions-toggle" data-versions-toggle aria-expanded="false">{{ chrome.i18n.t_arg("hts-term-older", "count", (r.version_count - 1).to_string()) }}</button>{% endif %}
+              {% else %}
+              <span class="col-name__older" title="{{ r.url }}">{{ chrome.i18n.t("hts-term-older-version") }}</span>
+              {% endif %}
             </td>
-            <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}"><code>{{ r.version }}</code>{% if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}</td>
+            <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}">
+              <code>{{ r.version }}</code>
+              {%- if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}
+              {%- if r.version_count > 1 && r.current %} <span class="status status--ok">{{ chrome.i18n.t("hts-term-current") }}</span>{% endif %}
+              {%- if r.pinned %} <span class="tag tag--config">{{ chrome.i18n.t("hts-term-pinned") }}</span>{% endif %}
+            </td>
             <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-concepts") }}">{% if let Some(c) = r.concepts %}{{ c }}{% else %}&mdash;{% endif %}</td>
             <td class="col-num" style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-size") }}">{% if let Some(s) = r.size %}{% if !r.size_measured %}≈ {% endif %}{{ s }}{% else %}&mdash;{% endif %}</td>
-            <td style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-imported") }}">{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="{{ crate::paths::ui() }}/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
-            <td data-label="{{ chrome.i18n.t("hts-term-col-source") }}">{% if let Some(s) = r.source %}<span class="url url--clip" title="{{ s }}">{{ s }}</span>{% if let Some(h) = r.sha_short %}<br><small title="SHA-256">{{ h }}…</small>{% endif %}{% else %}&mdash;{% endif %}</td>
-            {#- Current-version controls live with the Current flag; the
-                Actions column holds only Delete, so the eight-column table
-                fits at 1440 px without pushing Delete off screen. -#}
-            <td data-label="{{ chrome.i18n.t("hts-term-col-current") }}">
-              <div class="row-actions row-actions--start">
-              {% if r.current %}<span class="tag tag--active">{{ chrome.i18n.t("hts-term-current") }}</span>{% endif %}
-              {% if r.pinned %}<span class="tag tag--config">{{ chrome.i18n.t("hts-term-pinned") }}</span>{% endif %}
-              {% if !r.is_supplement %}
-                {% if r.pinned %}
-                <form method="post" action="{{ crate::paths::manage() }}/current">
-                  <input type="hidden" name="url" value="{{ r.url }}">
-                  <input type="hidden" name="version" value="{{ r.version_param }}">
-                  <input type="hidden" name="back" value="{{ back }}">
-                  <button class="btn" type="submit" name="action" value="clear">{{ chrome.i18n.t("hts-term-unpin") }}</button>
-                </form>
-                {% else if !r.current && r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
-                <form method="post" action="{{ crate::paths::manage() }}/current">
-                  <input type="hidden" name="url" value="{{ r.url }}">
-                  <input type="hidden" name="version" value="{{ r.version_param }}">
-                  <input type="hidden" name="back" value="{{ back }}">
-                  <button class="btn" type="submit" name="action" value="pin">{{ chrome.i18n.t("hts-term-set-current") }}</button>
-                </form>
-                {% endif %}
-              {% endif %}
-              </div>
-            </td>
+            <td style="white-space:nowrap" data-label="{{ chrome.i18n.t("hts-term-col-imported") }}"{% if let Some(src) = r.source %} title="{{ chrome.i18n.t("hts-term-col-source") }}: {{ src }}{% if let Some(h) = r.sha_short %} · SHA-256 {{ h }}…{% endif %}"{% endif %}>{% if let Some(t) = r.imported_at %}{% if let Some(j) = r.job_id %}<a href="{{ crate::paths::ui() }}/jobs/{{ j|urlencode_strict }}">{{ t }}</a>{% else %}{{ t }}{% endif %}{% else %}&mdash;{% endif %}</td>
             <td class="col-actions" data-label="{{ chrome.i18n.t("hts-term-col-actions") }}">
               <div class="row-actions">
-                {% if r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}<a class="btn" href="{{ crate::paths::ui() }}/explore?system={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}" title="{{ chrome.i18n.t("tx-explore-action-hint") }}">{{ chrome.i18n.t("tx-explore-action") }}</a>{% endif %}
-                <a class="btn btn--danger" href="{{ crate::paths::manage() }}/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}">{{ chrome.i18n.t("hts-term-delete") }}</a>
+                {% if r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}<a class="btn btn--ghost btn--small" href="{{ crate::paths::ui() }}/explore?system={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}" title="{{ chrome.i18n.t("tx-explore-action-hint") }}">{{ chrome.i18n.t("tx-explore-action") }}</a>{% endif %}
+                <details class="menu menu--actions row-menu">
+                  <summary class="btn btn--ghost btn--icon btn--small" aria-label="{{ chrome.i18n.t_arg("hts-term-row-actions", "system", r.title.clone()) }} {{ r.version }}" title="{{ chrome.i18n.t("hts-term-col-actions") }}">⋯</summary>
+                  <div class="menu__panel">
+                    {% if !r.is_supplement %}
+                    {% if r.pinned %}
+                    <form method="post" action="{{ crate::paths::manage() }}/current">
+                      <input type="hidden" name="url" value="{{ r.url }}">
+                      <input type="hidden" name="version" value="{{ r.version_param }}">
+                      <input type="hidden" name="back" value="{{ back }}">
+                      <button class="menu__option" type="submit" name="action" value="clear"><span class="menu__option-text">{{ chrome.i18n.t("hts-term-unpin") }}</span></button>
+                    </form>
+                    {% else if !r.current && r.version_count > 1 && r.concepts.is_some() && r.concepts.as_deref() != Some("0") %}
+                    <form method="post" action="{{ crate::paths::manage() }}/current">
+                      <input type="hidden" name="url" value="{{ r.url }}">
+                      <input type="hidden" name="version" value="{{ r.version_param }}">
+                      <input type="hidden" name="back" value="{{ back }}">
+                      <button class="menu__option" type="submit" name="action" value="pin"><span class="menu__option-text">{{ chrome.i18n.t("hts-term-set-current") }}</span></button>
+                    </form>
+                    {% endif %}
+                    {% endif %}
+                    {% if let Some(src) = r.source %}<span class="menu__note" title="{{ src }}">{{ chrome.i18n.t("hts-term-col-source") }}: {{ src }}</span>{% endif %}
+                    <a class="menu__option menu__option--danger" href="{{ crate::paths::manage() }}/delete?url={{ r.url|urlencode_strict }}&amp;version={{ r.version_param|urlencode_strict }}"><span class="menu__option-text">{{ chrome.i18n.t("hts-term-delete") }}</span></a>
+                  </div>
+                </details>
               </div>
             </td>
           </tr>
@@ -173,6 +181,8 @@
   </section>
 </div>
 
+</div>
+<div class="page-tabpanel" id="hts-panel-maint" role="tabpanel" aria-labelledby="hts-tab-maint" data-tab-hidden>
 <section class="card" aria-labelledby="hts-term-other-heading">
   <div class="card-head"><h3 id="hts-term-other-heading">{{ chrome.i18n.t("hts-term-other-heading") }}</h3></div>
   <form class="panel" method="post" action="{{ crate::paths::manage() }}/delete-resource">
@@ -210,5 +220,6 @@
     </div>
   </form>
 </section>
+</div>
 {% endif %}
 {% endblock %}

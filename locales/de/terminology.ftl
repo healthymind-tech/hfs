@@ -695,3 +695,10 @@ tx-searching = Searching…
 hts-nav-overview = Übersicht
 hts-nav-group-browse = Durchsuchen
 hts-nav-group-loaded = Geladen & Importe
+
+# Console redesign: grouped versions, row menu, Maintenance tab
+hts-term-tab-loaded = Geladen
+hts-term-tab-maint = Wartung
+hts-term-older = +{ $count } ältere
+hts-term-older-version = ältere Version
+hts-term-row-actions = Aktionen für { $system }

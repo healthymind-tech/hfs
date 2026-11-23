@@ -1868,3 +1868,4 @@ sql-library-unavailable-lede = 無法確認可用的查詢與檢視。
 
 # Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
 nav-route-tabs = 本區頁面
+rail-show-empty = 顯示無資料類型

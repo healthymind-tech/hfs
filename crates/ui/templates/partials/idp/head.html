@@ -5,11 +5,11 @@
   <div class="page-head__text">
     <p class="page-head__back"><a href="/ui/idp">← {{ i18n.t("idpc-title") }}</a></p>
     <h1 class="page-head__title">{{ head.display_name }}
-      {% if head.draft_step.is_some() %}<span class="status-pill status-pill--accent">{% call ui::icon("pencil") %}{% endcall %}<span>{{ i18n.t("idpc-status-draft-short") }}</span></span>
-      {% else if head.enabled %}<span class="status-pill status-pill--ok">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("idpc-status-enabled") }}</span></span>
-      {% else %}<span class="status-pill status-pill--muted">{% call ui::icon("power") %}{% endcall %}<span>{{ i18n.t("idpc-status-disabled") }}</span></span>{% endif %}
+      {% if head.draft_step.is_some() %}<span class="status status--info"><span class="dot dot--info" aria-hidden="true"></span>{{ i18n.t("idpc-status-draft-short") }}</span>
+      {% else if head.enabled %}<span class="status status--ok"><span class="dot dot--ok" aria-hidden="true"></span>{{ i18n.t("idpc-status-enabled") }}</span>
+      {% else %}<span class="status status--muted"><span class="dot dot--muted" aria-hidden="true"></span>{{ i18n.t("idpc-status-disabled") }}</span>{% endif %}
     </h1>
-    <div class="idp-head__issuer"><span class="idp-head__label">{{ i18n.t("idpc-issuer") }}</span>{% call ui::copy_field(head.issuer, i18n.t("idpc-copy-issuer")) %}{% endcall %}</div>
+    <p class="meta-line idp-head__issuer"><span class="idp-head__label">{{ i18n.t("idpc-issuer") }}</span><span class="copy" title="{{ head.issuer }}"><code class="copy__value">{{ head.issuer }}</code><button type="button" class="copy__btn" data-copy="{{ head.issuer }}" aria-label="{{ i18n.t("idpc-copy-issuer") }}" title="{{ i18n.t("idpc-copy-issuer") }}">{% call ui::icon("copy") %}{% endcall %}</button></span></p>
   </div>
   <div class="page-head__actions">
     <a class="btn btn--primary" href="/ui/idp/{{ head.name }}/test">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("idpc-test-run") }}</a>

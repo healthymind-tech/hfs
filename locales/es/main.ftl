@@ -1761,3 +1761,4 @@ sql-library-unavailable-lede = No se pudieron verificar las consultas y vistas d
 
 # Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
 nav-route-tabs = Páginas de esta sección
+rail-show-empty = Mostrar vacíos

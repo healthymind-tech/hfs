@@ -64,7 +64,12 @@
     </div>
     {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, rail_counts_approximate) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
-    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
+    <div class="filter-rail__heading filter-rail__heading--group">
+      <span>{{ i18n.t("rail-all-types-heading") }}</span>
+      {#- Console redesign §6: types with data by default; the empty ones
+          are one click away (and always listed without JavaScript). -#}
+      <button type="button" class="rail-empty-toggle" data-rail-empty-toggle aria-pressed="false">{{ i18n.t("rail-show-empty") }}</button>
+    </div>
     <div class="filter-rail__list" id="type-rail-list">
       {% call rail::rail_items(rail_entries, rail_counts_approximate) %}{% endcall %}
     </div>

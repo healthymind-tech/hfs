@@ -696,3 +696,10 @@ tx-searching = Searching…
 hts-nav-overview = Overview
 hts-nav-group-browse = Browse
 hts-nav-group-loaded = Loaded & imports
+
+# Console redesign: grouped versions, row menu, Maintenance tab
+hts-term-tab-loaded = Loaded
+hts-term-tab-maint = Maintenance
+hts-term-older = +{ $count } older
+hts-term-older-version = older version
+hts-term-row-actions = Actions for { $system }

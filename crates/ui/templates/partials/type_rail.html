@@ -7,7 +7,7 @@
 {% macro rail_items(entries, approximate) %}
 {% for e in entries %}
 <a class="filter-rail__item" data-type="{{ e.name }}" data-full-name="{{ e.name }}"
-   href="{{ e.href }}" title="{{ e.name }}"{% if e.current %} aria-current="true"{% endif %}>
+   href="{{ e.href }}" title="{{ e.name }}"{% if e.current %} aria-current="true"{% endif %}{% if e.count.as_deref() == Some("0") %} data-empty{% endif %}>
   <span class="filter-rail__label">{{ e.name }}</span>
   {% if let Some(c) = e.count %}{% if approximate %}<span class="count count--approximate" title="{{ i18n.t("rail-count-approximate") }}">≈{{ c }}<span class="visually-hidden"> {{ i18n.t("rail-count-approximate") }}</span></span>{% else %}<span class="count">{{ c }}</span>{% endif %}{% endif %}
 </a>

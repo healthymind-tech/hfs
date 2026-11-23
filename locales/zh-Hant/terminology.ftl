@@ -695,3 +695,10 @@ tx-searching = 搜尋中…
 hts-nav-overview = 總覽
 hts-nav-group-browse = 瀏覽
 hts-nav-group-loaded = 已載入與匯入
+
+# Console redesign: grouped versions, row menu, Maintenance tab
+hts-term-tab-loaded = 已載入
+hts-term-tab-maint = 維護
+hts-term-older = 另 { $count } 個舊版本
+hts-term-older-version = 舊版本
+hts-term-row-actions = { $system } 的動作

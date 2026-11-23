@@ -15366,3 +15366,371 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     }
   }
 }
+
+/* ==========================================================================
+   Console redesign — tables and lists (REDESIGN.md §6, Phase 4): stat strip,
+   in-page tabs, grouped versions, row menus, row entrance.
+   ========================================================================== */
+@layer pages {
+  /* Stat strip: one surface with dividers, not four cards. */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
+    margin: 0 0 var(--s5);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface);
+  }
+
+  .stats > .stat {
+    min-height: 0;
+    padding: var(--s4) var(--s5);
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+  }
+
+  .stats > .stat + .stat {
+    border-left: 1px solid var(--border);
+  }
+
+  .stats .stat__label {
+    font-size: var(--fs-sm);
+    font-weight: 400;
+    color: var(--text-2);
+  }
+
+  .stats .stat__value {
+    margin-top: 2px;
+    font-size: var(--fs-2xl);
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stats .stat__sub {
+    margin-top: 2px;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  @media (max-width: 1100px) {
+    .stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .stats > .stat:nth-child(3) {
+      border-left: 0;
+    }
+
+    .stats > .stat:nth-child(n + 3) {
+      border-top: 1px solid var(--border);
+    }
+  }
+
+  @media (max-width: 1024px) {
+    .stats > .stat {
+      padding: var(--s3) var(--s4);
+    }
+
+    .stats .stat__value {
+      font-size: var(--fs-xl);
+    }
+  }
+
+  /* In-page tabs: text only, one 2px accent ink. */
+  .page-tabs {
+    display: flex;
+    gap: var(--s1);
+    margin: 0 0 var(--s5);
+    overflow-x: auto;
+    border-bottom: 1px solid var(--border);
+    scrollbar-width: none;
+  }
+
+  html:not(.js) .page-tabs {
+    display: none;
+  }
+
+  .page-tab {
+    position: relative;
+    flex: none;
+    height: 38px;
+    padding: 0 var(--s3);
+    border: 0;
+    border-radius: var(--r-sm) var(--r-sm) 0 0;
+    background: none;
+    color: var(--text-2);
+    font: inherit;
+    font-size: var(--fs-md);
+    font-weight: 500;
+    cursor: pointer;
+    transition: color var(--dur-1) var(--ease-std), background-color var(--dur-1) var(--ease-std);
+  }
+
+  .page-tab:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .page-tab[aria-selected="true"] {
+    color: var(--text);
+  }
+
+  .page-tab[aria-selected="true"]::after {
+    content: "";
+    position: absolute;
+    left: var(--s2);
+    right: var(--s2);
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--accent);
+    animation: hm-ink var(--dur-3) var(--ease-out) both;
+  }
+
+  .page-tab:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: -2px;
+  }
+
+  .page-tabpanel.page-enter {
+    animation: hm-page-in var(--dur-3) var(--ease-out) backwards;
+  }
+
+  /* Grouped versions under their code system. */
+  html.js tr[data-older]:not(.is-open) {
+    display: none;
+  }
+
+  .versions-toggle {
+    display: inline-flex;
+    align-items: center;
+    margin-top: 4px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent-text);
+    font: inherit;
+    font-size: var(--fs-xs);
+    cursor: pointer;
+  }
+
+  html:not(.js) .versions-toggle {
+    display: none;
+  }
+
+  .versions-toggle:hover {
+    text-decoration: underline;
+  }
+
+  .col-name__older {
+    padding-left: var(--s4);
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  tr[data-older] > td {
+    background: color-mix(in srgb, var(--surface-2) 55%, transparent);
+  }
+
+  /* Row actions: a ⋯ menu, visible on row hover or focus. */
+  .data-table .row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+  }
+
+  @media (hover: hover) {
+    .data-table tbody tr:not(:hover):not(:focus-within) .row-actions > .btn--ghost:not(:focus-visible),
+    .data-table tbody tr:not(:hover):not(:focus-within) .row-menu:not([open]) > summary {
+      opacity: 0;
+    }
+  }
+
+  .row-menu > summary {
+    font-size: var(--fs-lg);
+    line-height: 1;
+    transition: opacity var(--dur-1) var(--ease-std);
+  }
+
+  .row-menu > .menu__panel {
+    min-width: 220px;
+    max-width: 320px;
+    text-align: left;
+  }
+
+  .data-table tr:has(.row-menu[open]) {
+    position: relative;
+    z-index: 5;
+  }
+
+  .menu__note {
+    display: block;
+    overflow: hidden;
+    padding: 6px 8px;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Rows rise in (stagger set by shell.js); `backwards` so a finished row
+     keeps no transform (a transform would trap its row menu). */
+  @keyframes hm-row-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+  }
+
+  tr.row-in {
+    animation: hm-row-in var(--dur-3) var(--ease-out) backwards;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    tr.row-in,
+    .page-tabpanel.page-enter,
+    .page-tab[aria-selected="true"]::after {
+      animation: none;
+    }
+  }
+}
+
+/* IdP realm pages: the realm tabs look like every other tab strip; the
+   counts are one stat strip. */
+@layer pages {
+  .idp-tabs.tabs {
+    flex-wrap: nowrap;
+    gap: var(--s1);
+    margin: 0 0 var(--s5);
+    padding: 0;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--border);
+    scrollbar-width: none;
+  }
+
+  .idp-tabs .tab {
+    position: relative;
+    flex: none;
+    height: 38px;
+    display: inline-flex;
+    align-items: center;
+    margin: 0;
+    padding: 0 var(--s3);
+    border: 0;
+    border-radius: var(--r-sm) var(--r-sm) 0 0;
+    background: none;
+    color: var(--text-2);
+    font-size: var(--fs-md);
+    font-weight: 500;
+    box-shadow: none;
+  }
+
+  .idp-tabs .tab:hover {
+    background: var(--surface-2);
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  .idp-tabs .tab--on,
+  .idp-tabs .tab[aria-current="page"] {
+    background: none;
+    color: var(--text);
+  }
+
+  .idp-tabs .tab[aria-current="page"]::after {
+    content: "";
+    position: absolute;
+    left: var(--s2);
+    right: var(--s2);
+    bottom: 0;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--accent);
+    animation: hm-ink var(--dur-3) var(--ease-out) both;
+  }
+
+  .stat--link {
+    color: inherit;
+    text-decoration: none;
+    transition: background-color var(--dur-1) var(--ease-std);
+  }
+
+  .stats > .stat--link:hover {
+    background: var(--surface-2);
+    text-decoration: none;
+  }
+
+  .stats > .stat--link:first-child {
+    border-radius: var(--r-md) 0 0 var(--r-md);
+  }
+
+  .stats > .stat--link:last-child {
+    border-radius: 0 var(--r-md) var(--r-md) 0;
+  }
+
+  .stat__value--danger {
+    color: var(--danger);
+  }
+
+  .idp-head__issuer {
+    margin-top: 6px;
+  }
+
+  .idp-head__label {
+    color: var(--text-3);
+  }
+
+  .idp-head .page-head__title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .idp-head .page-head__title .status {
+    font-size: var(--fs-sm);
+  }
+}
+
+/* Type rails: types with data first; the empty ones behind a toggle. */
+@layer pages {
+  html.js .filter-rail:has([data-rail-empty-toggle]):not(.show-empty) .filter-rail__list > .filter-rail__item[data-empty]:not([aria-current]) {
+    display: none;
+  }
+
+  .filter-rail__heading--group {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s2);
+  }
+
+  .rail-empty-toggle {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent-text);
+    font: inherit;
+    font-size: var(--fs-xs);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  html:not(.js) .rail-empty-toggle {
+    display: none;
+  }
+
+  .rail-empty-toggle[aria-pressed="true"] {
+    color: var(--text-2);
+  }
+
+  .filter-rail__item[data-empty] .count {
+    color: var(--text-3);
+  }
+}
