@@ -334,6 +334,15 @@
     if (xhr) xhr.addEventListener("loadend", stopProgress);
   });
 
+  // The answer to a request whose element has left the page (a filter that
+  // fired on blur as the user clicked a link) must not touch the history:
+  // its own events no longer reach this document, but this one is fired on
+  // <body>, and htmx reads `history.type` back after it.
+  document.body.addEventListener("htmx:beforeHistoryUpdate", function (event) {
+    var detail = event.detail || {};
+    if (detail.elt && !detail.elt.isConnected && detail.history) detail.history.type = "";
+  });
+
   document.addEventListener("htmx:beforeSwap", function (event) {
     var detail = event.detail || {};
     if (!isBoosted(detail)) {
