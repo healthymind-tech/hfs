@@ -14,20 +14,20 @@
 
   .gsearch {
     position: relative;
-    flex: 0 1 460px;
+    flex: 0 1 360px;
     min-width: 0;
     margin-right: auto;
-    margin-left: 4px;
+    margin-left: 0;
   }
 
   .gsearch__open {
     display: none;
     place-items: center;
-    width: 40px;
-    height: 40px;
+    width: 34px;
+    height: 34px;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 12px;
+    border-radius: var(--r-md);
     background: transparent;
     color: var(--text);
     cursor: pointer;
@@ -37,7 +37,7 @@
     height: 20px;
   }
   .gsearch__open:hover {
-    background: var(--accent-soft);
+    background: var(--surface-2);
   }
   .gsearch__open:focus-visible,
   .gsearch__close:focus-visible,
@@ -51,14 +51,17 @@
     position: relative;
     display: flex;
     align-items: center;
-    height: 38px;
+    height: 34px;
     margin: 0;
     padding: 0 8px 0 10px;
-    border: 1px solid var(--outline);
-    border-radius: 10px;
-    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface);
     color: var(--text);
-    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+    transition: border-color var(--dur-1) var(--ease-std), box-shadow var(--dur-1) var(--ease-std);
+  }
+  .gsearch__form:hover {
+    border-color: var(--border-strong);
   }
   .gsearch__form:focus-within {
     border-color: var(--accent);
@@ -71,8 +74,8 @@
     color: var(--muted);
   }
   .gsearch__icon svg {
-    width: 17px;
-    height: 17px;
+    width: 16px;
+    height: 16px;
   }
   .gsearch__input {
     flex: 1 1 auto;
@@ -85,10 +88,10 @@
     background: transparent;
     color: var(--text-strong);
     font: inherit;
-    font-size: 14px;
+    font-size: var(--fs-sm);
   }
   .gsearch__input::placeholder {
-    color: var(--muted);
+    color: var(--text-3);
     opacity: 1;
   }
   .gsearch__input::-webkit-search-cancel-button {
@@ -97,13 +100,13 @@
   .gsearch__kbd,
   .gsearch__foot kbd {
     flex: none;
-    padding: 1px 6px;
-    border: 1px solid var(--outline);
+    padding: 1px 5px;
+    border: 1px solid var(--border);
     border-bottom-width: 2px;
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--muted);
-    font: 600 11px/1.5 inherit;
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--text-3);
+    font: 500 11px/1.5 inherit;
     font-family: inherit;
     white-space: nowrap;
   }
@@ -118,7 +121,7 @@
     height: 28px;
     padding: 0;
     border: 0;
-    border-radius: 8px;
+    border-radius: var(--r-md);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -175,10 +178,8 @@
   .gs-group__title {
     padding: 8px 10px 4px;
     color: var(--muted);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: var(--fs-xs);
+    font-weight: 600;
   }
 
   .gs-hit {
@@ -187,7 +188,7 @@
     align-items: center;
     gap: 10px;
     padding: 7px 10px;
-    border-radius: 9px;
+    border-radius: var(--r-md);
     color: var(--text);
     text-decoration: none;
     cursor: pointer;
@@ -206,7 +207,7 @@
     width: 30px;
     height: 30px;
     border: 1px solid var(--surface-border);
-    border-radius: 8px;
+    border-radius: var(--r-md);
     background: var(--surface);
     color: var(--accent-text);
   }
@@ -223,7 +224,7 @@
   .gs-hit__label {
     overflow: hidden;
     color: var(--text-strong);
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -237,7 +238,7 @@
   .gs-hit__path {
     overflow: hidden;
     color: var(--muted);
-    font-size: 12px;
+    font-size: var(--fs-xs);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -247,7 +248,7 @@
   }
   .gs-hit__note {
     color: var(--muted);
-    font-size: 11.5px;
+    font-size: var(--fs-xs);
     font-style: italic;
   }
   .gs-hit__kind {
@@ -256,7 +257,7 @@
     border: 1px solid var(--surface-border);
     border-radius: 999px;
     color: var(--muted);
-    font-size: 11px;
+    font-size: var(--fs-xs);
     white-space: nowrap;
   }
 
@@ -273,13 +274,13 @@
   .gsearch__empty-title {
     margin: 0 0 4px;
     color: var(--text-strong);
-    font-size: 14px;
-    font-weight: 700;
+    font-size: var(--fs-md);
+    font-weight: 600;
   }
   .gsearch__empty-text {
     margin: 0 0 12px;
     color: var(--muted);
-    font-size: 13px;
+    font-size: var(--fs-sm);
     line-height: 1.45;
   }
   .gsearch__subhead {
@@ -288,10 +289,8 @@
     justify-content: space-between;
     margin: 10px 0 6px;
     color: var(--muted);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: var(--fs-xs);
+    font-weight: 600;
   }
   .gsearch__chips {
     display: flex;
@@ -307,7 +306,7 @@
     background: var(--surface);
     color: var(--text);
     font: inherit;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     text-overflow: ellipsis;
     white-space: nowrap;
     cursor: pointer;
@@ -322,7 +321,7 @@
     background: none;
     color: var(--accent-text);
     font: inherit;
-    font-size: 12px;
+    font-size: var(--fs-xs);
     letter-spacing: normal;
     text-transform: none;
     cursor: pointer;
@@ -334,7 +333,7 @@
     padding: 8px 14px;
     border-top: 1px solid var(--divider);
     color: var(--muted);
-    font-size: 12px;
+    font-size: var(--fs-xs);
   }
   .gsearch__foot kbd {
     margin-right: 2px;

@@ -52,10 +52,10 @@
 .idp-verify__summary--ok .idp-verify__icon { color: var(--ok); }
 .idp-verify__summary--warn .idp-verify__icon { color: var(--warn); }
 .idp-verify__summary--danger .idp-verify__icon { color: var(--danger); }
-.idp-verify__headline { font-weight: 700; margin: 0; }
+.idp-verify__headline { font-weight: 600; margin: 0; }
 .idp-verify__detail, .idp-verify__when { margin: 2px 0 0; font-size: 13px; color: var(--muted-text); }
 .idp-verify__first { border-left: 3px solid var(--danger); padding: 8px 12px; margin: 0 0 12px; background: var(--surface); }
-.idp-verify__first-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--danger); margin: 0 0 4px; font-weight: 700; }
+.idp-verify__first-label { font-size: 12px; color: var(--danger); margin: 0 0 4px; font-weight: 600; }
 .idp-verify__first p { margin: 0 0 6px; overflow-wrap: anywhere; }
 .idp-verify__steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .idp-verify__step > details { border: 1px solid var(--surface-border); border-radius: var(--radius); background: var(--surface); }

@@ -223,7 +223,46 @@
       if (links[j] === chosen) links[j].setAttribute("aria-current", "page");
       else if (links[j].getAttribute("aria-current") === "page") links[j].removeAttribute("aria-current");
     }
+    placeIndicator(true);
   }
+
+  /* ---- the sliding current-entry fill (REDESIGN.md §5.2, §7) ----------- */
+
+  var REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // One element under the entries of the sidebar's <nav>, moved to the
+  // current entry: it slides (240 ms) on in-place navigation instead of the
+  // highlight jumping. Entries outside the <nav> (the sidebar foot) and
+  // pages without JavaScript fill the entry itself (app.css).
+  function placeIndicator(animate) {
+    var nav = document.querySelector("#sidebar-nav .nav");
+    if (!nav) return;
+    var ind = nav.querySelector(":scope > .nav__indicator");
+    if (!ind) {
+      ind = document.createElement("div");
+      ind.className = "nav__indicator";
+      ind.setAttribute("aria-hidden", "true");
+      nav.insertBefore(ind, nav.firstChild);
+      animate = false;
+    }
+    var cur = nav.querySelector('a.nav-item[aria-current="page"]');
+    if (!cur || !cur.offsetHeight) {
+      ind.classList.remove("is-placed");
+      return;
+    }
+    var move = animate && !REDUCED && ind.classList.contains("is-placed");
+    if (!move) ind.style.transition = "none";
+    ind.style.height = cur.offsetHeight + "px";
+    ind.style.transform = "translateY(" + cur.offsetTop + "px)";
+    ind.classList.add("is-placed");
+    if (!move) {
+      void ind.offsetWidth;
+      ind.style.transition = "";
+    }
+  }
+  window.addEventListener("resize", function () {
+    placeIndicator(false);
+  });
 
   /* ---- sidebar scroll across full loads --------------------------------- */
 
@@ -247,6 +286,7 @@
   /* ---- swap handling ---------------------------------------------------- */
 
   var parser = new DOMParser();
+  var viewTransition = false;
   var nextNav = null;
   var navigated = false;
 
@@ -401,7 +441,12 @@
     detail.isError = false;
     detail.target = document.getElementById("main");
     detail.selectOverride = "#main";
-    detail.swapOverride = "outerHTML show:window:top";
+    // The content column rises in (REDESIGN.md §7): a view transition
+    // around the swap where the browser has one (app.css animates the
+    // `hm-main` snapshot only — the sidebar and topbar hold still), else a
+    // CSS entrance on the new #main after the swap.
+    viewTransition = !REDUCED && typeof document.startViewTransition === "function";
+    detail.swapOverride = "outerHTML show:window:top" + (viewTransition ? " transition:true" : "");
     navigated = {
       title: doc.title,
       bodyClass: doc.body ? doc.body.getAttribute("class") || "" : "",
@@ -431,6 +476,16 @@
     var keep = document.body.classList.contains("nav-open") ? " nav-open" : "";
     document.body.setAttribute("class", (info.bodyClass + keep).trim());
     markActive();
+    if (main && !viewTransition && !REDUCED) {
+      main.classList.remove("page-enter");
+      void main.offsetWidth;
+      main.classList.add("page-enter");
+      main.addEventListener("animationend", function done(e) {
+        if (e.target !== main) return;
+        main.classList.remove("page-enter");
+        main.removeEventListener("animationend", done);
+      });
+    }
     initPages(main);
     var heading = main && main.querySelector("h1");
     if (heading) {
