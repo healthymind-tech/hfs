@@ -1,7 +1,7 @@
 /*
  * The persistent console shell (unified-server design §9.4).
  *
- * Every same-origin console link and GET form is boosted by htmx (`hx-boost`
+ * Every same-origin console link is boosted by htmx (`hx-boost`
  * on <body>). This script turns those boosted requests into an in-place
  * navigation that replaces only `#main`: the sidebar and topbar DOM — their
  * scroll position, open menus and listeners — stay exactly as they are, the
@@ -15,8 +15,8 @@
  * Chromium even those keep the shell on screen until the new page paints,
  * and the sidebar scroll position is carried over in sessionStorage.
  *
- * POST forms are always submitted natively (a full page load): saves,
- * deletes and downloads behave exactly as without JavaScript.
+ * Forms are never boosted (they submit natively, a full page load): saves,
+ * deletes, downloads and script-handled forms behave exactly as before.
  *
  * Page scripts can register with `HM.page(name, {init(root), destroy()})`;
  * `init` runs for every `[data-page=name]` element on load and after each
@@ -274,6 +274,20 @@
     main.appendChild(box);
     h.focus();
   }
+
+  // Forms are never boosted: their pages' scripts handle many of them
+  // (preventDefault + fetch), and a boosted submit would race those
+  // handlers. A form without its own hx-* submits natively (a full page,
+  // kept on screen by the view transition); links are what navigate in
+  // place.
+  document.addEventListener("htmx:beforeProcessNode", function (event) {
+    var elt = event.detail && event.detail.elt;
+    if (!elt || !elt.querySelectorAll) return;
+    var forms = elt.tagName === "FORM" ? [elt] : elt.querySelectorAll("form");
+    for (var i = 0; i < forms.length; i++) {
+      if (!forms[i].hasAttribute("hx-boost") && !explicitHx(forms[i])) forms[i].setAttribute("hx-boost", "false");
+    }
+  });
 
   document.addEventListener("htmx:configRequest", function (event) {
     var headers = event.detail && event.detail.headers;
