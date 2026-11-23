@@ -1995,7 +1995,7 @@
     ic.setAttribute("class", "tx-search__icon");
     append(fwrap, [ic, filter]);
     var groupsEl = el("div", { class: "tx-groups" });
-    var strip = el("div", { class: "tx-axisbar", "aria-label": t("tx-explore-ucum-dimension") });
+    var strip = el("div", { class: "tx-axisbar tx-axisbar--strip", "aria-label": t("tx-explore-ucum-dimension") });
     var shell = el("div", { class: "tx-shell" });
     shell.appendChild(el("div", { class: "tx-main" }, strip, groupsEl));
     var panel = Panel(shell, {});

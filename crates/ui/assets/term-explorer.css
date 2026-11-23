@@ -1646,6 +1646,9 @@
 }
 
 @media (max-width: 640px) {
+  /* The UCUM dimension index: one swipeable line instead of a wall of chips. */
+  .tx-axisbar--strip { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; }
+  .tx-axisbar--strip .tx-axis { flex: none; }
   .tx-graph { padding: 10px; }
   .tx-search { flex-basis: 100%; max-width: none; }
   .tx-cards { grid-template-columns: minmax(0, 1fr); padding: 8px; }
