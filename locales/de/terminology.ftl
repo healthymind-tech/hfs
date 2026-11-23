@@ -702,3 +702,5 @@ hts-term-tab-maint = Wartung
 hts-term-older = +{ $count } ältere
 hts-term-older-version = ältere Version
 hts-term-row-actions = Aktionen für { $system }
+hts-job-log-wrap = Umbrechen
+hts-job-log-copy = Kopieren

@@ -74,6 +74,7 @@
       var msg = document.body.getAttribute("data-msg-copied") || "Copied";
       live.textContent = msg;
       btn.classList.add("is-copied");
+      if (window.HM && window.HM.toast) window.HM.toast(msg);
       setTimeout(function () {
         btn.classList.remove("is-copied");
         live.textContent = "";

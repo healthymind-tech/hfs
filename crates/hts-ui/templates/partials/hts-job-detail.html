@@ -23,9 +23,14 @@
         {% else if job.active %}{{ chrome.i18n.t(job.phase_key.as_str()) }}{% if let Some(c) = job.counter %} · {{ c }}{% endif %}{% if let Some(c) = job.concepts %} · {{ chrome.i18n.t_arg("hts-job-concepts", "n", c.to_string()) }}{% endif %} · {{ job.percent }}%
         {% endif %}
       </p>
-      <ol class="facets facets--bare" aria-label="{{ chrome.i18n.t("hts-job-phases") }}">
+      {#- Phase stepper (console redesign §7): nodes pop in one after the
+          other and their connectors grow; the current phase pulses. -#}
+      <ol class="phases" aria-label="{{ chrome.i18n.t("hts-job-phases") }}">
         {% for ph in job.phases %}
-        <li class="tag {% if ph.state == "done" %}tag--complete{% else if ph.state == "current" %}tag--in-progress{% else %}tag--muted{% endif %}" data-phase-state="{{ ph.state }}"{% if ph.state == "current" %} aria-current="step"{% endif %}>{{ chrome.i18n.t(ph.key.as_str()) }}</li>
+        <li class="phase phase--{{ ph.state }}" data-phase-state="{{ ph.state }}" style="--i: {{ loop.index0 }}"{% if ph.state == "current" %} aria-current="step"{% endif %}>
+          <span class="phase__track" aria-hidden="true"><span class="phase__node"></span><span class="phase__line"></span></span>
+          <span class="phase__name">{{ chrome.i18n.t(ph.key.as_str()) }}</span>
+        </li>
         {% endfor %}
       </ol>
       {% if let Some(e) = job.error %}<p class="alert" role="alert">{{ e }}</p>{% endif %}
@@ -42,10 +47,17 @@
   </section>
 
   <section class="card">
-    <div class="card-head"><h3>{{ chrome.i18n.t("hts-job-log") }}</h3></div>
-    <div class="panel">
+    <div class="card-head"><h3>{{ chrome.i18n.t("hts-job-log") }}</h3>
+      {% if !log.is_empty() %}
+      <div class="card-head__tools log-tools">
+        <button type="button" class="btn btn--ghost btn--small" data-log-wrap aria-pressed="true" aria-controls="hts-job-log">{{ chrome.i18n.t("hts-job-log-wrap") }}</button>
+        <button type="button" class="btn btn--ghost btn--small" data-log-copy="hts-job-log">{{ chrome.i18n.t("hts-job-log-copy") }}</button>
+      </div>
+      {% endif %}
+    </div>
+    <div class="panel log-panel">
       {% if log.is_empty() %}<p class="query-empty">{{ chrome.i18n.t("hts-job-log-empty") }}</p>
-      {% else %}<pre class="detail__code" id="hts-job-log">{% for l in log %}{{ l }}
+      {% else %}<pre class="detail__code log" id="hts-job-log">{% for l in log %}{{ l }}
 {% endfor %}</pre>{% endif %}
     </div>
   </section>

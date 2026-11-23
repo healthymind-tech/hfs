@@ -702,3 +702,5 @@ hts-term-tab-maint = 維護
 hts-term-older = 另 { $count } 個舊版本
 hts-term-older-version = 舊版本
 hts-term-row-actions = { $system } 的動作
+hts-job-log-wrap = 自動換行
+hts-job-log-copy = 複製

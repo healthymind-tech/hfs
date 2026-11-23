@@ -596,6 +596,22 @@
 
   /* ---- shared page components (console redesign §6, §7) ---------------- */
 
+  // A short confirmation that rises in at the bottom right and leaves.
+  function toast(message) {
+    var t = document.createElement("div");
+    t.className = "toast";
+    t.setAttribute("role", "status");
+    t.textContent = message;
+    document.body.appendChild(t);
+    setTimeout(function () {
+      t.classList.add("is-leaving");
+      setTimeout(function () {
+        t.remove();
+      }, 200);
+    }, 2000);
+  }
+  window.HM.toast = toast;
+
   // In-page tabs ([data-page-tabs]): one panel visible at a time; without
   // JavaScript every panel shows. The active tab survives in the hash.
   function initPageTabs(root) {
@@ -636,6 +652,25 @@
       try {
         history.replaceState(history.state, "", "#" + tab.getAttribute("aria-controls"));
       } catch (err) {}
+      return;
+    }
+    // Log viewer: wrap toggle and copy.
+    var wrap = e.target.closest && e.target.closest("[data-log-wrap]");
+    if (wrap) {
+      var log = document.getElementById(wrap.getAttribute("aria-controls"));
+      var wrapped = wrap.getAttribute("aria-pressed") !== "true";
+      wrap.setAttribute("aria-pressed", wrapped ? "true" : "false");
+      if (log) log.classList.toggle("log--nowrap", !wrapped);
+      return;
+    }
+    var copyLog = e.target.closest && e.target.closest("[data-log-copy]");
+    if (copyLog) {
+      var src = document.getElementById(copyLog.getAttribute("data-log-copy"));
+      if (src && navigator.clipboard) {
+        navigator.clipboard.writeText(src.textContent || "").then(function () {
+          toast(document.body.getAttribute("data-msg-copied") || "Copied");
+        }, function () {});
+      }
       return;
     }
     // Type rails: types without data stay folded until asked for.

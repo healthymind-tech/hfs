@@ -15734,3 +15734,284 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     color: var(--text-3);
   }
 }
+
+/* ==========================================================================
+   Console redesign — motion and polish (REDESIGN.md §7, Phase 5): animated
+   disclosures, phase stepper, log viewer, toast, live dots, press states.
+   ========================================================================== */
+@layer pages {
+  /* Disclosures open and close with their height (Chromium; elsewhere they
+     snap as before). Menus are excluded: their panel floats. */
+  :root {
+    interpolate-size: allow-keywords;
+  }
+
+  details.disclosure::details-content,
+  details.card::details-content,
+  .verify__token::details-content {
+    block-size: 0;
+    overflow: hidden;
+    transition: block-size var(--dur-2) var(--ease-in), content-visibility var(--dur-2) allow-discrete;
+  }
+
+  details.disclosure[open]::details-content,
+  details.card[open]::details-content,
+  .verify__token[open]::details-content {
+    block-size: auto;
+    overflow: visible;
+    transition-duration: var(--dur-3);
+    transition-timing-function: var(--ease-out);
+  }
+
+  /* Phase stepper. */
+  .phases {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+    gap: var(--s3) 0;
+    margin: var(--s4) 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .phase {
+    min-width: 0;
+    padding-right: var(--s2);
+  }
+
+  .phase__track {
+    display: flex;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+
+  .phase__node {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border-strong);
+    border-radius: 50%;
+    background: var(--surface);
+    animation: hm-node-pop 360ms var(--ease-out) backwards;
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+
+  .phase--done .phase__node {
+    border-color: var(--ok);
+    background: var(--ok);
+  }
+
+  .phase--current .phase__node {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+
+  .phase__line {
+    flex: 1;
+    height: 2px;
+    margin: 0 6px;
+    border-radius: 2px;
+    background: var(--border);
+    transform-origin: left;
+    animation: hm-grow 420ms var(--ease-out) backwards;
+    animation-delay: calc(var(--i, 0) * 70ms + 120ms);
+  }
+
+  .phase--done .phase__line {
+    background: color-mix(in srgb, var(--ok) 45%, transparent);
+  }
+
+  .phase:last-child .phase__line {
+    display: none;
+  }
+
+  .phase__name {
+    display: block;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  .phase--done .phase__name,
+  .phase--current .phase__name {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  @keyframes hm-node-pop {
+    from {
+      transform: scale(0.4);
+      opacity: 0;
+    }
+    70% {
+      transform: scale(1.08);
+      opacity: 1;
+    }
+  }
+
+  @keyframes hm-grow {
+    from {
+      transform: scaleX(0);
+    }
+  }
+
+  /* Log viewer. */
+  .log-panel {
+    padding: 0;
+  }
+
+  pre.log {
+    max-height: 420px;
+    margin: 0;
+    padding: var(--s3) var(--s5);
+    overflow: auto;
+    border: 0;
+    border-radius: 0 0 var(--r-md) var(--r-md);
+    background: var(--bg-content);
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    line-height: 1.7;
+    color: var(--text-2);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  pre.log.log--nowrap {
+    white-space: pre;
+    overflow-wrap: normal;
+  }
+
+  .log-tools {
+    display: flex;
+    gap: 2px;
+  }
+
+  .log-tools [aria-pressed="true"] {
+    color: var(--text);
+    background: var(--surface-2);
+  }
+
+  /* Toast. */
+  .toast {
+    position: fixed;
+    right: var(--s5);
+    bottom: var(--s5);
+    z-index: 120;
+    max-width: min(420px, calc(100vw - 32px));
+    padding: 10px 14px;
+    border-radius: var(--r-sm);
+    background: var(--popover);
+    box-shadow: var(--shadow-1);
+    color: var(--text);
+    font-size: var(--fs-sm);
+    animation: hm-toast-in var(--dur-3) var(--ease-out) both;
+  }
+
+  .toast.is-leaving {
+    animation: hm-toast-out var(--dur-2) var(--ease-in) both;
+  }
+
+  @keyframes hm-toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+    }
+  }
+
+  @keyframes hm-toast-out {
+    to {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+
+  /* Live state: the one thing that loops. */
+  .dot--live {
+    position: relative;
+  }
+
+  .dot--live::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: inherit;
+    animation: hm-pulse 1.6s ease-out infinite;
+  }
+
+  .phase--current .phase__node {
+    position: relative;
+  }
+
+  @keyframes hm-pulse {
+    from {
+      transform: scale(1);
+      opacity: 0.7;
+    }
+    to {
+      transform: scale(2.6);
+      opacity: 0;
+    }
+  }
+
+  /* Press feedback on every small control. */
+  .icon-button:active,
+  .copy__btn:active,
+  .theme-toggle:active,
+  .nav-toggle:active {
+    transform: scale(0.94);
+  }
+
+  @media (max-width: 1024px) {
+    .phases {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 6px;
+    }
+
+    .phase {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .phase__track {
+      margin: 0;
+    }
+
+    .phase__line {
+      display: none;
+    }
+
+    .toast {
+      left: var(--s3);
+      right: var(--s3);
+      bottom: var(--s3);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .phase__node,
+    .phase__line,
+    .toast,
+    .toast.is-leaving,
+    .dot--live::after {
+      animation: none;
+    }
+
+    details.disclosure::details-content,
+    details.card::details-content,
+    .verify__token::details-content {
+      transition: none;
+    }
+  }
+}
+
+/* A global reduced-motion kill switch (REDESIGN.md §7). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}
