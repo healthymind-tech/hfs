@@ -118,7 +118,10 @@ fn step_view(i18n: &I18n, step: &VerifyStep, fields: FieldMap, report: &VerifyRe
     if let Some(f) = step.field.as_deref()
         && let Some(value) = report.suggestions.get(f)
         && let Some(id) = field_id.clone()
-        && matches!(step.status, VerifyStatus::Fail | VerifyStatus::Warn | VerifyStatus::Pass)
+        // Only where it fixes something: a failed or warned step, or the
+        // empty JWKS URL the issuer's own one can fill.
+        && (matches!(step.status, VerifyStatus::Fail | VerifyStatus::Warn)
+            || step.code == "jwks-url-from-discovery")
     {
         suggestions.push(SuggestionView {
             field_id: id,
