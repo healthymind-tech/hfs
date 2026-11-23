@@ -57,6 +57,10 @@ pub struct Theme {
     pub muted_pill: (&'static str, &'static str),
     /// Focus ring (`--color-focus-ring`).
     pub focus: &'static str,
+    /// Inset / hover surface (`--surface-2`, console redesign §4.1).
+    pub surface_2: &'static str,
+    /// Captions, table headers, meta (`--text-3`).
+    pub text_3: &'static str,
 }
 
 /// Light theme.
@@ -80,6 +84,8 @@ pub const LIGHT: Theme = Theme {
     info_pill: ("#e3f1f9", "#07618f"),
     muted_pill: ("#e9edf4", "#4a5568"),
     focus: "#1a8cff",
+    surface_2: "#f1f4f9",
+    text_3: "#5f6b7d",
 };
 
 /// Dark theme.
@@ -103,7 +109,36 @@ pub const DARK: Theme = Theme {
     info_pill: ("#12293d", "#7dd6ff"),
     muted_pill: ("#222d42", "#b4bfd0"),
     focus: "#49c6ff",
+    surface_2: "#162133",
+    text_3: "#8592a7",
 };
+
+/// The console redesign's scale (REDESIGN.md §4): every value below must be
+/// declared in the stylesheet under the given custom property, so the
+/// layout auditor's design-scale rule and the CSS agree.
+pub const SCALE: &[(&str, &str)] = &[
+    ("--fs-xs", "12px"),
+    ("--fs-sm", "13px"),
+    ("--fs-md", "14px"),
+    ("--fs-lg", "16px"),
+    ("--fs-xl", "22px"),
+    ("--fs-2xl", "28px"),
+    ("--s1", "4px"),
+    ("--s2", "8px"),
+    ("--s3", "12px"),
+    ("--s4", "16px"),
+    ("--s5", "24px"),
+    ("--s6", "32px"),
+    ("--s7", "48px"),
+    ("--r-sm", "6px"),
+    ("--r-md", "10px"),
+    ("--r-full", "999px"),
+    ("--dur-1", "120ms"),
+    ("--dur-2", "180ms"),
+    ("--dur-3", "240ms"),
+    ("--dur-4", "420ms"),
+    ("--sidebar-w", "248px"),
+];
 
 /// Both themes.
 pub const THEMES: [Theme; 2] = [LIGHT, DARK];
@@ -140,6 +175,18 @@ pub fn text_pairs(t: &Theme) -> Vec<(&'static str, &'static str, &'static str)> 
         v.push(("primary", t.primary, bg));
         v.push(("accent", t.accent, bg));
         v.push(("danger", t.danger, bg));
+    }
+    for (label, fg) in [
+        ("text", t.text),
+        ("muted", t.muted),
+        ("text-3", t.text_3),
+        ("primary", t.primary),
+        ("danger", t.danger),
+    ] {
+        v.push((label, fg, t.surface_2));
+    }
+    for bg in [t.surface, t.bg, t.frame] {
+        v.push(("text-3", t.text_3, bg));
     }
     v.push(("info", t.info, t.surface));
     v.push(("ok", t.ok, t.surface));
@@ -205,6 +252,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_type_scale_has_six_steps_and_radii_three() {
+        let fs = SCALE.iter().filter(|(k, _)| k.starts_with("--fs-")).count();
+        let r = SCALE.iter().filter(|(k, _)| k.starts_with("--r-")).count();
+        assert_eq!((fs, r), (6, 3));
     }
 
     #[test]

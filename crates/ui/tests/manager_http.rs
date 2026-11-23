@@ -619,6 +619,8 @@ fn design_tokens_in_the_stylesheet_match_the_asserted_ones() {
             theme.muted_pill.0,
             theme.muted_pill.1,
             theme.focus,
+            theme.surface_2,
+            theme.text_3,
         ] {
             assert!(
                 css.contains(value),
@@ -628,6 +630,12 @@ fn design_tokens_in_the_stylesheet_match_the_asserted_ones() {
         }
     }
     assert!(css.contains(helios_ui_chrome::tokens::BRAND_GRADIENT));
+    for (name, value) in helios_ui_chrome::tokens::SCALE {
+        assert!(
+            css.contains(&format!("{name}: {value};")),
+            "scale token {name}: {value} missing from app.css"
+        );
+    }
 }
 
 /// Every `mgr-*` key a template or the manager code uses exists in the

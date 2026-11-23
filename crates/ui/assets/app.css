@@ -311,6 +311,46 @@
   --space-5: 24px;
   --space-6: 32px;
   --topbar-h: 56px;
+  /* ---- Console redesign scale (hfs-eval results-redesign/REDESIGN.md §4,
+     mirrored in crates/ui-chrome/src/tokens.rs). Three surface levels, three
+     text levels, one border colour, a 6-step type scale, a 4-pt space scale,
+     three radii, three elevations and four durations: anything off these is
+     what the layout auditor's design-scale rule reports. ---- */
+  --bg-frame: #ffffff;
+  --surface-2: #f1f4f9;
+  --border: #e2e7ef;
+  --border-strong: #cfd6e2;
+  --text-2: #4a5568;
+  --text-3: #5f6b7d;
+  --on-accent: #ffffff;
+  --accent-hover: #2650c9;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, monospace;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-full: 999px;
+  --shadow-1: 0 8px 24px -6px rgb(14 23 38 / 14%), 0 2px 6px rgb(14 23 38 / 6%);
+  --shadow-2: 0 24px 60px -12px rgb(14 23 38 / 28%);
+  --dur-1: 120ms;
+  --dur-2: 180ms;
+  --dur-3: 240ms;
+  --dur-4: 420ms;
+  --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-std: cubic-bezier(0.4, 0, 0.2, 1);
+  --sidebar-w: 248px;
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
   background: var(--bg);
   color: var(--text);
@@ -397,6 +437,17 @@
   --warn-text: #f5c66a;
   --danger-text: #ff9696;
   --color-focus-ring: #49c6ff;
+  /* Console redesign scale, dark cast (see the light block). */
+  --bg-frame: #0a111c;
+  --surface-2: #162133;
+  --border: rgb(148 163 184 / 14%);
+  --border-strong: rgb(148 163 184 / 26%);
+  --text-2: #a3b0c3;
+  --text-3: #8592a7;
+  --on-accent: #0b1320;
+  --accent-hover: #7cc6ff;
+  --shadow-1: 0 12px 32px -8px rgb(0 0 0 / 60%), 0 0 0 1px rgb(148 163 184 / 14%);
+  --shadow-2: 0 28px 70px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(148 163 184 / 16%);
 }
 }
 
