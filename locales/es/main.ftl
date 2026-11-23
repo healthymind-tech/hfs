@@ -1758,3 +1758,6 @@ sql-library-select-lede = Elige un elemento de la lista o crea uno nuevo.
 sql-library-unavailable-title = La selección no está disponible
 sql-library-unavailable-lede = No se pudieron verificar las consultas y vistas disponibles.
 
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+nav-route-tabs = Páginas de esta sección

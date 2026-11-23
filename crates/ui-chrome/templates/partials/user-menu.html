@@ -51,6 +51,13 @@
               <div class="user-menu__name">{% if let Some(name) = user.display %}{{ name }}{% else %}{{ i18n.t("user-anonymous") }}{% endif %}</div>
               <div class="user-menu__hint">{% if let Some(secondary) = user.secondary %}{{ secondary }}{% else %}{{ i18n.t("user-local-hint") }}{% endif %}</div>
             </div>
+            {% if !user.links.is_empty() %}
+            <div class="user-menu__links">
+              {% for link in user.links %}
+              <a class="user-menu__link" href="{{ link.href }}"><span class="icon">{% if link.icon == "users" %}{% include "icons/users.svg" %}{% else if link.icon == "info" %}{% include "icons/info.svg" %}{% else %}{% include "icons/user.svg" %}{% endif %}</span>{{ link.label }}</a>
+              {% endfor %}
+            </div>
+            {% endif %}
             <div class="menu__heading">{{ i18n.t("language-label") }}</div>
             <div class="user-menu__seg">
               <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-en") }}">EN</a>

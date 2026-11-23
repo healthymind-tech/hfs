@@ -60,23 +60,39 @@ pub enum NavScope {
 /// Where an item lives in the sidebar. Sections render in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NavSection {
-    /// Server-wide pages above the endpoint block (Overview).
+    /// Server-wide pages at the top of the sidebar (Overview).
     Manager,
+    /// Built-in authorization servers (line IdP; hidden unless registered).
+    /// Shown in the sidebar's top group, under Overview.
+    AuthorizationServers,
+    /// Server-wide operations (sync jobs of every endpoint, …), in the
+    /// sidebar's top group.
+    Server,
     /// The current endpoint: home and data pages. `href` may contain
     /// `{ep}`, replaced by the endpoint name.
     EndpointData,
-    /// The current endpoint: configuration.
-    EndpointConfigure,
     /// The current endpoint: operations (sync, audit, history).
     EndpointOperate,
+    /// The current endpoint: configuration.
+    EndpointConfigure,
     /// The terminology service (code systems, value sets, …).
     Terminology,
-    /// Built-in authorization servers (line IdP; hidden unless registered).
-    AuthorizationServers,
-    /// Server-wide operations (sync jobs of every endpoint, packages, …).
-    Server,
-    /// Console settings (users, sign-in, about).
+    /// Console settings (users, sign-in, tenants): the sidebar foot.
     Settings,
+}
+
+/// The visual groups of the sidebar (console redesign §5.1): the sections
+/// above collapse into four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NavBlock {
+    /// Overview, Authorization servers, Sync jobs — no heading.
+    Top,
+    /// The current endpoint, headed by the endpoint switcher.
+    Endpoint,
+    /// The terminology service.
+    Terminology,
+    /// Console settings, in the sidebar foot.
+    Foot,
 }
 
 impl NavSection {
@@ -91,6 +107,20 @@ impl NavSection {
             NavSection::AuthorizationServers => "mgr-nav-section-idp",
             NavSection::Server => "mgr-nav-section-server",
             NavSection::Settings => "mgr-nav-section-settings",
+        }
+    }
+
+    /// The sidebar block this section is drawn in.
+    pub fn block(self) -> NavBlock {
+        match self {
+            NavSection::Manager | NavSection::AuthorizationServers | NavSection::Server => {
+                NavBlock::Top
+            }
+            NavSection::EndpointData | NavSection::EndpointOperate | NavSection::EndpointConfigure => {
+                NavBlock::Endpoint
+            }
+            NavSection::Terminology => NavBlock::Terminology,
+            NavSection::Settings => NavBlock::Foot,
         }
     }
 
@@ -143,6 +173,14 @@ pub struct NavItem {
     /// `false` for pages whose scripts are not lifecycle-clean yet; those
     /// load as a full document (with a cross-document view transition).
     pub boost: bool,
+    /// The sidebar entry this page shares with its siblings (console
+    /// redesign §5.3): `(id, label key, icon)`. Items of one section with the
+    /// same group id become ONE sidebar link (to the first one the requester
+    /// may open) and a row of route tabs on each of their pages.
+    pub group: Option<(&'static str, &'static str, &'static str)>,
+    /// `false`: reachable (search, account menu, links) but not drawn in the
+    /// sidebar.
+    pub sidebar: bool,
 }
 
 impl NavItem {
@@ -164,7 +202,22 @@ impl NavItem {
             order: 0,
             match_prefix: None,
             boost: true,
+            group: None,
+            sidebar: true,
         }
+    }
+
+    /// Puts the item in a sidebar group (`id`, label key, icon); see
+    /// [`NavItem::group`].
+    pub const fn group(mut self, id: &'static str, label_key: &'static str, icon: &'static str) -> Self {
+        self.group = Some((id, label_key, icon));
+        self
+    }
+
+    /// Keeps the item out of the sidebar (still searchable and linkable).
+    pub const fn hidden(mut self) -> Self {
+        self.sidebar = false;
+        self
     }
 
     /// Sets the icon.
@@ -225,38 +278,86 @@ pub fn registered() -> Vec<NavItem> {
     REGISTERED.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
-/// One rendered entry.
+/// One rendered entry: a page, or a group of sibling pages (route tabs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavLink {
-    /// `active_page` id.
+    /// `active_page` id (a group's own id for a group).
     pub id: &'static str,
     /// Fluent key.
     pub label_key: &'static str,
-    /// Resolved href.
+    /// Resolved href (a group: its first page).
     pub href: String,
     /// Icon name.
     pub icon: &'static str,
-    /// Resolved active-state prefix.
+    /// Resolved active-state prefix(es), space-separated (a group: one per
+    /// page).
     pub match_prefix: String,
     /// In-place navigation allowed.
     pub boost: bool,
+    /// The `active_page` ids that make this entry current, space-separated.
+    pub ids: String,
+    /// A group's pages, in order (empty for a single page).
+    pub children: Vec<NavLink>,
 }
 
-/// One rendered section.
+impl NavLink {
+    /// Whether `active` (an `active_page` id) is this entry or one of its
+    /// pages.
+    pub fn covers(&self, active: &str) -> bool {
+        !active.is_empty() && self.ids.split(' ').any(|i| i == active)
+    }
+}
+
+/// One rendered block of the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavGroup {
-    /// Section.
+    /// The first section of the block.
     pub section: NavSection,
-    /// Fluent key of the heading.
+    /// The block.
+    pub block: NavBlock,
+    /// Fluent key of the heading ("" = no heading).
     pub label_key: &'static str,
     /// Entries.
     pub links: Vec<NavLink>,
 }
 
+impl NavBlock {
+    /// The sidebar foot (Console settings).
+    pub fn is_foot(self) -> bool {
+        self == NavBlock::Foot
+    }
+
+    /// The current endpoint's block (headed by the switcher).
+    pub fn is_endpoint(self) -> bool {
+        self == NavBlock::Endpoint
+    }
+
+    /// Fluent key of the block heading ("" for the top block and the foot).
+    pub fn label_key(self) -> &'static str {
+        match self {
+            NavBlock::Top | NavBlock::Foot => "",
+            NavBlock::Endpoint => "mgr-nav-section-endpoint",
+            NavBlock::Terminology => "mgr-nav-section-terminology",
+        }
+    }
+
+    /// Stable id, used in `data-nav-section` (the endpoint block keeps the
+    /// former `data`).
+    pub fn id(self) -> &'static str {
+        match self {
+            NavBlock::Top => "manager",
+            NavBlock::Endpoint => "data",
+            NavBlock::Terminology => "terminology",
+            NavBlock::Foot => "settings",
+        }
+    }
+}
+
 /// The sidebar of a request: `items` (built-ins of the host merged with
 /// [`registered`] ones — a registered id replaces a built-in one), the
 /// per-endpoint sections only with an `endpoint`, entries `allow` refuses
-/// hidden, sorted by section then order.
+/// hidden, sorted by section then order, sibling pages of one group folded
+/// into one entry, sections folded into the four [`NavBlock`]s.
 pub fn build(
     builtin: Vec<NavItem>,
     endpoint: Option<&str>,
@@ -267,37 +368,88 @@ pub fn build(
         items.retain(|i| i.id != extra.id);
         items.push(extra);
     }
-    items.retain(|i| (endpoint.is_some() || !i.section.per_endpoint()) && allow(i));
+    items.retain(|i| i.sidebar && (endpoint.is_some() || !i.section.per_endpoint()) && allow(i));
     items.sort_by_key(|i| (i.section, i.order));
     let resolve = |s: &str| match endpoint {
         Some(ep) => s.replace("{ep}", ep),
         None => s.to_string(),
     };
-    let mut groups: Vec<NavGroup> = Vec::new();
-    for i in items {
+    let page = |i: &NavItem| {
         let href = resolve(i.href);
         let match_prefix = i
             .match_prefix
             .map(resolve)
             .unwrap_or_else(|| href.split('?').next().unwrap_or("").to_string());
-        let link = NavLink {
+        NavLink {
             id: i.id,
             label_key: i.label_key,
             href,
             icon: i.icon,
             match_prefix,
             boost: i.boost,
-        };
-        match groups.last_mut() {
-            Some(g) if g.section == i.section => g.links.push(link),
-            _ => groups.push(NavGroup {
+            ids: i.id.to_string(),
+            children: Vec::new(),
+        }
+    };
+    let mut groups: Vec<NavGroup> = Vec::new();
+    for i in &items {
+        let block = i.section.block();
+        if groups.last().is_none_or(|g| g.block != block) {
+            groups.push(NavGroup {
                 section: i.section,
-                label_key: i.section.label_key(),
-                links: vec![link],
-            }),
+                block,
+                label_key: block.label_key(),
+                links: Vec::new(),
+            });
+        }
+        let links = &mut groups.last_mut().expect("pushed above").links;
+        let link = page(i);
+        match i.group {
+            Some((gid, label, icon)) => {
+                if let Some(g) = links.iter_mut().find(|l| l.id == gid) {
+                    g.match_prefix = format!("{} {}", g.match_prefix, link.match_prefix);
+                    g.ids = format!("{} {}", g.ids, link.ids);
+                    g.children.push(link);
+                } else {
+                    links.push(NavLink {
+                        id: gid,
+                        label_key: label,
+                        href: link.href.clone(),
+                        icon,
+                        match_prefix: link.match_prefix.clone(),
+                        boost: link.boost,
+                        ids: format!("{gid} {}", link.ids),
+                        children: vec![link],
+                    });
+                }
+            }
+            None => links.push(link),
+        }
+    }
+    // A group the requester can open one page of is that page under the
+    // group's label: it keeps the page's id (bookmarked selectors, the
+    // server-side current mark) and has no tabs.
+    for g in &mut groups {
+        for l in &mut g.links {
+            if l.children.len() == 1 {
+                let only = l.children.pop().expect("one child");
+                l.id = only.id;
+                l.ids = format!("{} {}", only.ids, l.ids);
+            }
         }
     }
     groups
+}
+
+/// The route tabs of the page `active` (console redesign §5.1): the pages
+/// of the sidebar group it belongs to, when that group has more than one
+/// the requester may open.
+pub fn tabs<'a>(groups: &'a [NavGroup], active: &str) -> Option<&'a [NavLink]> {
+    groups
+        .iter()
+        .flat_map(|g| &g.links)
+        .find(|l| l.children.len() > 1 && l.children.iter().any(|c| c.id == active))
+        .map(|l| l.children.as_slice())
 }
 
 /// The navigation context key (§9.4 item 3): when it differs between the
@@ -383,21 +535,57 @@ mod tests {
             .min_role(NavRole::Admin),
         );
         let admin = build(builtin(), None, |_| true);
-        let idp = admin
-            .iter()
-            .position(|g| g.section == NavSection::AuthorizationServers)
-            .expect("registered section shows");
-        let settings = admin
-            .iter()
-            .position(|g| g.section == NavSection::Settings)
-            .unwrap();
-        assert!(idp < settings, "IdP sits above Server/Settings");
+        let top = &admin[0];
+        assert_eq!(top.block, NavBlock::Top);
+        let ids: Vec<_> = top.links.iter().map(|l| l.id).collect();
+        assert_eq!(ids, ["overview", "test-idp-realms"], "IdP sits in the top block, under Overview");
+        assert_eq!(admin.last().unwrap().block, NavBlock::Foot);
         assert!(nav_key(None, NavRole::Admin, "").contains("idp"));
         unregister_section(NavSection::AuthorizationServers);
         assert!(
             build(builtin(), None, |_| true)
                 .iter()
-                .all(|g| g.section != NavSection::AuthorizationServers)
+                .flat_map(|g| &g.links)
+                .all(|l| l.id != "test-idp-realms")
         );
+    }
+
+    #[test]
+    fn sibling_pages_fold_into_one_entry_with_route_tabs() {
+        let items = vec![
+            NavItem::new(NavSection::EndpointData, "batch", "b", "/ui/e/{ep}/data/batch")
+                .group("data-tools", "dt", "tool")
+                .order(20),
+            NavItem::new(NavSection::EndpointData, "validate", "v", "/ui/e/{ep}/data/validate")
+                .group("data-tools", "dt", "tool")
+                .order(30)
+                .full_load(),
+            NavItem::new(NavSection::EndpointData, "subs", "s", "/ui/e/{ep}/data/subs").order(40),
+            NavItem::new(NavSection::EndpointConfigure, "cfg", "c", "/ui/e/{ep}/config")
+                .group("settings", "st", "sliders"),
+            NavItem::new(NavSection::EndpointConfigure, "sec", "sc", "/ui/e/{ep}/security")
+                .group("settings", "st", "sliders")
+                .min_role(NavRole::Admin)
+                .order(10),
+            NavItem::new(NavSection::Settings, "about", "a", "/ui/about").hidden(),
+        ];
+        // (another test registers an IdP entry in the shared registry meanwhile)
+        let all = build(items.clone(), Some("x"), |i| i.section.per_endpoint() || i.id == "about");
+        assert_eq!(all.len(), 1, "one endpoint block; hidden items draw nothing");
+        let links = &all[0].links;
+        assert_eq!(links.len(), 3);
+        let tools = &links[0];
+        assert_eq!((tools.id, tools.label_key, tools.icon), ("data-tools", "dt", "tool"));
+        assert_eq!(tools.href, "/ui/e/x/data/batch");
+        assert_eq!(tools.match_prefix, "/ui/e/x/data/batch /ui/e/x/data/validate");
+        assert!(tools.covers("validate") && tools.covers("data-tools") && !tools.covers("subs"));
+        assert_eq!(tabs(&all, "validate").unwrap().len(), 2);
+        assert!(tabs(&all, "subs").is_none());
+        // Without the Admin page the settings group has one page: no tabs.
+        let viewer = build(items, Some("x"), |i| {
+            i.section.per_endpoint() && i.min_role == NavRole::Viewer
+        });
+        assert!(tabs(&viewer, "cfg").is_none());
+        assert_eq!(viewer[0].links[2].href, "/ui/e/x/config");
     }
 }

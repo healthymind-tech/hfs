@@ -14331,3 +14331,301 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     white-space: nowrap;
   }
 }
+
+/* ==========================================================================
+   Console redesign — navigation (REDESIGN.md §5): sidebar blocks, the
+   endpoint switcher chip, route tabs, the account menu's console links.
+   ========================================================================== */
+@layer pages {
+  .nav__group {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .nav__group + .nav__group {
+    margin-top: var(--s4);
+  }
+
+  .nav__label > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* State dots: colour only for state. */
+  .dot {
+    display: inline-block;
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-3);
+  }
+
+  .dot--ok { background: var(--ok); }
+  .dot--warn { background: var(--warn); }
+  .dot--danger { background: var(--danger); }
+  .dot--info { background: var(--accent); }
+
+  /* The endpoint switcher: a 24px chip in the Endpoint heading. */
+  .nav__label .endpoint-switch {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .ep-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 150px;
+    height: 24px;
+    padding: 0 6px 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-full);
+    background: var(--surface);
+    color: var(--text);
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    cursor: pointer;
+    transition: border-color var(--dur-1) var(--ease-std);
+  }
+
+  .ep-chip:hover,
+  .endpoint-switch[open] > .ep-chip {
+    border-color: var(--border-strong);
+  }
+
+  .ep-chip:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .ep-chip .endpoint-switch__name {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text);
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ep-chip .icon,
+  .ep-chip .icon svg {
+    width: 14px;
+    height: 14px;
+    color: var(--text-3);
+  }
+
+  .endpoint-switch > .menu__panel {
+    left: auto;
+    right: 0;
+    top: calc(100% + 6px);
+    width: 216px;
+    padding: var(--s1);
+    font-size: var(--fs-sm);
+    font-weight: 400;
+    color: var(--text);
+    transform-origin: top right;
+    animation: hm-pop var(--dur-2) var(--ease-out) both;
+  }
+
+  .menu__panel .menu__heading {
+    margin: 6px 8px 4px;
+  }
+
+  .menu__panel .menu__option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 32px;
+    padding: 0 8px;
+    border-radius: 5px;
+    color: var(--text);
+    font-size: var(--fs-sm);
+    font-weight: 400;
+  }
+
+  .menu__panel .menu__option:hover {
+    background: var(--surface-2);
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  .menu__panel .menu__option[aria-current="true"] {
+    background: var(--accent-soft);
+    font-weight: 500;
+  }
+
+  .menu__option-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .menu__option-meta {
+    margin-left: auto;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+  }
+
+  .menu__option .icon,
+  .menu__option .icon svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+  }
+
+  .menu__sep {
+    height: 0;
+    margin: 4px 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  @keyframes hm-pop {
+    from {
+      opacity: 0;
+      transform: scale(0.96) translateY(-4px);
+    }
+  }
+
+  .topbar .menu__panel {
+    animation: hm-pop var(--dur-2) var(--ease-out) both;
+    transform-origin: top right;
+  }
+
+  /* Account menu: console pages above the language row. */
+  .user-menu__links {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 4px 0;
+    padding: 4px 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .user-menu__link {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 34px;
+    padding: 0 8px;
+    border-radius: 5px;
+    color: var(--text);
+    font-size: var(--fs-sm);
+    text-decoration: none;
+  }
+
+  .user-menu__link:hover {
+    background: var(--surface-2);
+    text-decoration: none;
+  }
+
+  .user-menu__link .icon,
+  .user-menu__link .icon svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+  }
+
+  /* Route tabs: text only, one 2px accent ink under the current page. */
+  .route-tabs {
+    display: flex;
+    gap: var(--s1);
+    margin: 0 0 var(--s5);
+    overflow-x: auto;
+    border-bottom: 1px solid var(--border);
+    scrollbar-width: none;
+  }
+
+  .route-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .route-tab {
+    position: relative;
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    height: 38px;
+    padding: 0 var(--s3);
+    color: var(--text-2);
+    font-size: var(--fs-md);
+    font-weight: 500;
+    white-space: nowrap;
+    text-decoration: none;
+    border-radius: var(--r-sm) var(--r-sm) 0 0;
+    transition: color var(--dur-1) var(--ease-std), background-color var(--dur-1) var(--ease-std);
+  }
+
+  .route-tab:hover {
+    color: var(--text);
+    background: var(--surface-2);
+    text-decoration: none;
+  }
+
+  .route-tab[aria-current="page"] {
+    color: var(--text);
+  }
+
+  .route-tab[aria-current="page"]::after {
+    content: "";
+    position: absolute;
+    left: var(--s2);
+    right: var(--s2);
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--accent);
+    animation: hm-ink var(--dur-3) var(--ease-out) both;
+  }
+
+  .route-tab:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: -2px;
+  }
+
+  @keyframes hm-ink {
+    from {
+      transform: scaleX(0.4);
+      opacity: 0;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    .route-tabs {
+      margin-bottom: var(--s4);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .endpoint-switch > .menu__panel,
+    .topbar .menu__panel,
+    .route-tab[aria-current="page"]::after {
+      animation: none;
+    }
+  }
+}
+
+/* Consoles without the manager sidebar (stand-alone HTS, legacy HFS): their
+   <nav> sits straight in the sidebar. */
+@layer pages {
+  .sidebar > .nav {
+    padding: var(--s1) var(--s3) var(--s4);
+    overflow-y: auto;
+  }
+
+  .sidebar > .nav .nav__section:first-child {
+    margin-top: 0;
+  }
+
+  .sidebar > .sidebar__foot .selector {
+    height: 36px;
+    border-color: var(--border);
+    border-radius: var(--r-sm);
+  }
+}

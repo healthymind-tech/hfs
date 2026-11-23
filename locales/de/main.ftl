@@ -1762,3 +1762,6 @@ sql-library-select-lede = Wähle einen Eintrag aus der Liste oder erstelle einen
 sql-library-unavailable-title = Die Auswahl ist nicht verfügbar
 sql-library-unavailable-lede = Die verfügbaren Abfragen und Ansichten konnten nicht überprüft werden.
 
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+nav-route-tabs = Seiten dieses Bereichs

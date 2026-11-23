@@ -20,7 +20,7 @@
 use helios_endpoints::ConsoleRole;
 
 pub use helios_ui_chrome::nav::{
-    NavGroup, NavItem, NavLink, NavRole, NavScope, NavSection, nav_key, register,
+    NavBlock, NavGroup, NavItem, NavLink, NavRole, NavScope, NavSection, nav_key, register, tabs,
 };
 
 /// The registry's role for a console role.
@@ -255,6 +255,38 @@ fn builtin() -> Vec<NavItem> {
     for i in v.iter_mut() {
         if matches!(i.id, "tenants" | "settings-auth" | "settings-users") {
             i.min_role = NavRole::Admin;
+        }
+        // The console redesign's sidebar (§5.1): sibling pages share one
+        // entry and become route tabs; account and About live in the
+        // account menu.
+        i.group = match i.id {
+            "overview" => Some(("overview", "mgr-nav-home", "grid")),
+            "ep-home" => Some(("ep-home", "mgr-nav-ep-home", "home")),
+            "batch" | "validate" | "bulk-import" | "bulk-export" => {
+                Some(("data-tools", "mgr-nav-group-data-tools", "tool"))
+            }
+            "sql-view-definitions" | "sql-queries" | "sql-views" | "sql-export" => {
+                Some(("sql", "mgr-nav-group-sql", "database"))
+            }
+            "capability-statement" | "search-parameters" | "compartments" => {
+                Some(("conformance", "mgr-nav-group-conformance", "badge"))
+            }
+            "ep-sync" | "ep-audit" | "ep-history" => {
+                Some(("activity", "mgr-nav-group-activity", "activity"))
+            }
+            "ep-config" | "ep-security" | "ep-validation" | "ep-terminology" => {
+                Some(("ep-settings", "mgr-nav-group-settings", "sliders"))
+            }
+            "settings-auth" | "settings-users" | "tenants" => {
+                Some(("console-settings", "mgr-nav-group-console", "users"))
+            }
+            _ => None,
+        };
+        if i.id == "subscriptions" {
+            i.icon = "bell";
+        }
+        if matches!(i.id, "account" | "about") {
+            i.sidebar = false;
         }
         // Pages whose own scripts are not lifecycle-clean yet load as a full
         // document (persistent-shell spec §9.4 item 1); every other page is

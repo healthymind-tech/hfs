@@ -497,3 +497,14 @@ verify-block-create-anyway = 仍要建立
 verify-block-anyway-hint = 與其他變更一樣，會記錄在設定歷程中。
 mgr-copy = 複製
 mgr-review-edit = 修改
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+mgr-nav-section-endpoint = 端點
+mgr-nav-home = 總覽
+mgr-nav-ep-home = 首頁
+mgr-nav-group-data-tools = 資料工具
+mgr-nav-group-sql = SQL on FHIR
+mgr-nav-group-conformance = 一致性與規格
+mgr-nav-group-activity = 活動紀錄
+mgr-nav-group-settings = 端點設定
+mgr-nav-group-console = 主控台設定

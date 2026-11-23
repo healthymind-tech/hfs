@@ -1656,6 +1656,15 @@ impl Builder<'_> {
         }
     }
 
+    /// The sidebar entry a page sits under when it is one of a group's
+    /// route tabs (console redesign §5.1), as one more breadcrumb step.
+    fn group_crumb(&self, item: &NavItem) -> Option<String> {
+        match item.group {
+            Some((gid, label, _)) if gid != item.id && item.sidebar => Some(self.t(label)),
+            _ => None,
+        }
+    }
+
     fn build(&mut self) {
         let items = std::mem::take(&mut self.items);
         let root = self.t("gs-root-endpoints");
@@ -1686,7 +1695,11 @@ impl Builder<'_> {
                         item.label_key,
                         item.icon,
                         href,
-                        vec![root.clone(), display.clone()],
+                        {
+                            let mut c = vec![root.clone(), display.clone()];
+                            c.extend(self.group_crumb(item));
+                            c
+                        },
                         &format!("{name} {path}"),
                         keywords,
                         !item.boost,
@@ -1698,10 +1711,11 @@ impl Builder<'_> {
                 if !self.access.nav_ok(item, None) || !self.access.can_open(item.href) {
                     continue;
                 }
-                let crumbs = match item.section {
+                let mut crumbs = match item.section {
                     NavSection::Manager => vec![],
                     s => vec![self.t(s.label_key())],
                 };
+                crumbs.extend(self.group_crumb(item));
                 self.page_and_spots(
                     item.id,
                     item.label_key,

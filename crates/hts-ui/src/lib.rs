@@ -222,6 +222,22 @@ pub fn register_nav(admin: bool) {
             .order(order)
             .scope(NavScope::Terminology)
     };
+    // The console redesign's sidebar (§5.1): Overview, Browse (route tabs:
+    // code systems, value sets, concept maps, capability) and Loaded &
+    // imports (loaded terminologies, import, jobs).
+    const BROWSE: (&str, &str, &str) = ("tx-browse", "hts-nav-group-browse", "bookopen");
+    const LOADED: (&str, &str, &str) = ("tx-loaded", "hts-nav-group-loaded", "package");
+    let item = |id: &'static str, label: &'static str, href: String, icon: &'static str, order: u16| {
+        let it: NavItem = item(id, label, href, icon, order);
+        match id {
+            "tx-home" => it.group("tx-home", "hts-nav-overview", "book"),
+            "tx-code-systems" | "tx-value-sets" | "tx-concept-maps" | "tx-capability" => {
+                it.group(BROWSE.0, BROWSE.1, BROWSE.2)
+            }
+            "tx-manage" | "tx-import" | "tx-jobs" => it.group(LOADED.0, LOADED.1, LOADED.2),
+            _ => it,
+        }
+    };
     register(item("tx-home", "hts-nav-home", p.ui.to_string(), "home", 0));
     register(item(
         "tx-code-systems",

@@ -228,6 +228,21 @@ pub struct UserIdentity<'a> {
     /// [`can_logout`](Self::can_logout) is true, which is why the default
     /// empty string is harmless.
     pub logout_href: &'a str,
+
+    /// Console pages reached from the account menu (console redesign §5.1:
+    /// My account, Console settings, About), above the language row.
+    pub links: &'a [MenuLink<'a>],
+}
+
+/// One entry of the account menu.
+#[derive(Clone, Copy, Debug)]
+pub struct MenuLink<'a> {
+    /// Target.
+    pub href: &'a str,
+    /// Label, already translated.
+    pub label: &'a str,
+    /// Icon name: `user`, `users` or `info`.
+    pub icon: &'a str,
 }
 
 /// The shared account menu: avatar `<summary>`, account card, language

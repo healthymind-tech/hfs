@@ -196,6 +196,9 @@
 
   var ALIASES = { editor: "resources", history: "resources", queries: "resources", search: "resources", home: "ep-home" };
 
+  // Sidebar entries may stand for several pages (a group whose pages are
+  // route tabs): `data-nav-ids` lists their active-page ids and
+  // `data-match` their path prefixes, space-separated.
   function markActive() {
     var nav = document.getElementById("sidebar-nav");
     if (!nav) return;
@@ -204,18 +207,25 @@
     var active = main ? main.getAttribute("data-active-page") || "" : "";
     var chosen = null;
     if (active) {
-      chosen = nav.querySelector('a.nav-item[data-nav-id="' + (ALIASES[active] || active) + '"]');
+      var want = ALIASES[active] || active;
+      for (var a = 0; a < links.length && !chosen; a++) {
+        var ids = (links[a].getAttribute("data-nav-ids") || links[a].getAttribute("data-nav-id") || "").split(" ");
+        if (ids.indexOf(want) >= 0) chosen = links[a];
+      }
     }
     if (!chosen) {
       var path = location.pathname.replace(/\/$/, "") || "/ui";
       var best = -1;
       for (var i = 0; i < links.length; i++) {
-        var m = links[i].getAttribute("data-match");
-        if (!m) continue;
-        var hit = m === "/ui" ? path === "/ui" : path === m || path.indexOf(m + "/") === 0;
-        if (hit && m.length > best) {
-          best = m.length;
-          chosen = links[i];
+        var ms = (links[i].getAttribute("data-match") || "").split(" ");
+        for (var k = 0; k < ms.length; k++) {
+          var m = ms[k];
+          if (!m) continue;
+          var hit = m === "/ui" ? path === "/ui" : path === m || path.indexOf(m + "/") === 0;
+          if (hit && m.length > best) {
+            best = m.length;
+            chosen = links[i];
+          }
         }
       }
     }

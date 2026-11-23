@@ -691,3 +691,8 @@ hts-term-stat-concepts-shown = across all matching code systems
 
 tx-denied-current-role = You are signed in with the { $role } role.
 tx-searching = Searching…
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+hts-nav-overview = Overview
+hts-nav-group-browse = Browse
+hts-nav-group-loaded = Loaded & imports

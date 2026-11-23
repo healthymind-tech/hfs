@@ -690,3 +690,8 @@ hts-term-stat-concepts-shown = 所有符合的代碼系統合計
 
 tx-denied-current-role = 您目前的角色是 { $role }。
 tx-searching = 搜尋中…
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+hts-nav-overview = 總覽
+hts-nav-group-browse = 瀏覽
+hts-nav-group-loaded = 已載入與匯入

@@ -1865,3 +1865,6 @@ sql-library-select-lede = 從清單中選擇一個項目，或建立新的項目
 sql-library-unavailable-title = 無法使用此選取項目
 sql-library-unavailable-lede = 無法確認可用的查詢與檢視。
 
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+nav-route-tabs = 本區頁面
