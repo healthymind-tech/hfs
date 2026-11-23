@@ -13751,6 +13751,13 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     color: var(--text);
   }
 
+  /* The endpoint switcher card keeps its two lines inside its border at the
+     calmer line height. */
+  .sidebar .selector {
+    height: auto;
+    min-height: 48px;
+  }
+
   .sidebar-nav {
     display: flex;
     flex: 1;

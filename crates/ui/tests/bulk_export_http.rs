@@ -1197,27 +1197,26 @@ async fn the_export_builder_uses_the_localized_shared_back_link() {
     let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
     assert_eq!(status, 200);
 
-    let assert_back_link =
-        |localized_html: &str, label: &str| {
-            let marker = r#"<a class="back-link" href="/ui/bulk-export">"#;
-            let start = localized_html.find(marker).expect("shared back link");
-            let end = start
-                + localized_html[start..]
-                    .find("</a>")
-                    .expect("back link closing tag")
-                + "</a>".len();
-            let back_link = &localized_html[start..end];
+    let assert_back_link = |localized_html: &str, label: &str| {
+        let marker = r#"<a class="back-link" href="/ui/bulk-export">"#;
+        let start = localized_html.find(marker).expect("shared back link");
+        let end = start
+            + localized_html[start..]
+                .find("</a>")
+                .expect("back link closing tag")
+            + "</a>".len();
+        let back_link = &localized_html[start..end];
 
-            assert!(back_link.contains(
-                r#"<span aria-hidden="true"><svg class="i" width="16" height="16" viewBox="0 0 24 24""#
-            ));
-            assert!(back_link.contains(&format!("<span>{label}</span>")));
-            assert_eq!(back_link.matches("<span").count(), 2);
-            assert!(
-                !back_link.contains('‹'),
-                "spacing must come from CSS, not the former literal chevron and space"
-            );
-        };
+        assert!(back_link.contains(
+            r#"<span aria-hidden="true"><svg class="i" width="16" height="16" viewBox="0 0 24 24""#
+        ));
+        assert!(back_link.contains(&format!("<span>{label}</span>")));
+        assert_eq!(back_link.matches("<span").count(), 2);
+        assert!(
+            !back_link.contains('‹'),
+            "spacing must come from CSS, not the former literal chevron and space"
+        );
+    };
     assert_back_link(&html, "Exports");
     let header_start = html
         .find(r#"<header class="page-head page-head--back-link">"#)
