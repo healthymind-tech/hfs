@@ -1098,7 +1098,7 @@ async fn registry_responses_return_while_the_count_is_held() {
     );
     let poller = dom.one("[data-counts-poll]");
     assert_eq!(poller.attr("hx-trigger"), Some("every 2s"));
-    assert_eq!(poller.attr("hx-include"), Some("[name='q']"));
+    assert_eq!(poller.attr("hx-include"), Some("#main [name='q']"));
     // No figure is claimed for the resources card.
     assert_eq!(dom.count("#tenant-stats .stat__value--unavailable"), 1);
     gated.wait_until_waiting(1).await;
@@ -1436,7 +1436,7 @@ async fn mutation_responses_keep_the_search_term() {
     let (_, page) = get(&router, "/ui/tenants?q=acme").await;
     let dom = Dom::page(&page);
     let form = dom.one("form[hx-post='/ui/tenants']");
-    assert_eq!(form.attr("hx-include"), Some("[name='q']"));
+    assert_eq!(form.attr("hx-include"), Some("#main [name='q']"));
     assert_eq!(form.attr("hx-sync"), Some("closest .table-card:queue all"));
     assert_eq!(
         dom.one("input[name=q]").attr("hx-sync"),
@@ -1452,7 +1452,7 @@ async fn mutation_responses_keep_the_search_term() {
     assert_eq!(delete.attr("hx-delete"), None);
     assert_eq!(delete.attr("hx-sync"), None);
     let issuer = dom.one(".table-card [data-tenant-mutations]");
-    assert_eq!(issuer.attr("hx-include"), Some("[name='q']"));
+    assert_eq!(issuer.attr("hx-include"), Some("#main [name='q']"));
     assert_eq!(issuer.attr("hx-target"), Some("#tenant-rows"));
     assert_eq!(issuer.attr("hx-swap"), Some("innerHTML"));
     assert_eq!(

@@ -5,7 +5,7 @@
 {% if polling %}
 <div
   hx-get="/ui/tenants/rows"
-  hx-include="[name='q']"
+  hx-include="#main [name='q']"
   hx-target="#tenant-rows"
   hx-swap="innerHTML"
   hx-trigger="every 3s"
@@ -22,7 +22,7 @@
 <div
   data-counts-poll
   hx-get="/ui/tenants/rows"
-  hx-include="[name='q']"
+  hx-include="#main [name='q']"
   hx-vals='{"poll": "{{ poll.next }}"}'
   hx-target="#tenant-rows"
   hx-swap="innerHTML"
