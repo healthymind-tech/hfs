@@ -65,7 +65,7 @@
                 <td class="col-name">
                   {#- CodeSystem ids carry a version pipe (`icd9cm|2015`),
                       so the path segment must be percent-encoded. -#}
-                  <a href="{{ crate::paths::ui() }}/code-systems/{{ row.id|urlencode_strict }}">
+                  <a href="{{ crate::paths::ui() }}/code-systems/{{ row.id|urlencode_strict }}" title="{% if !row.name.is_empty() %}{{ row.name }}{% else %}{{ row.id }}{% endif %}">
                     {% if !row.name.is_empty() %}{{ row.name }}
                     {%- else %}{{ row.id }}
                     {%- endif %}

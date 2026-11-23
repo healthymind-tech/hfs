@@ -63,7 +63,7 @@
     <ul class="bar-list" role="list">
       {% for t in top_types %}
       <li class="bar-list__row">
-        <a class="bar-list__name" href="{{ t.href }}">{{ t.name }}</a>
+        <a class="bar-list__name" href="{{ t.href }}" title="{{ t.name }}">{{ t.name }}</a>
         <span class="bar-list__track" aria-hidden="true"><span class="bar-list__bar" style="width: {{ t.percent }}%"></span></span>
         <span class="bar-list__value">{{ i18n.num(t.total) }}</span>
       </li>

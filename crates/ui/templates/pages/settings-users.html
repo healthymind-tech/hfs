@@ -42,7 +42,7 @@
     <tbody>
     {% for u in users %}
     <tr data-user="{{ u.username }}">
-      <td class="col-name">{{ u.username }}</td>
+      <td class="col-name" title="{{ u.username }}">{{ u.username }}</td>
       <td data-label="{{ i18n.t("console-users-name") }}">{{ u.display }}</td>
       <td colspan="2" data-label="{{ i18n.t("console-users-role") }}">
         <form method="post" action="/ui/settings/users/{{ u.id }}" class="row-form">
@@ -127,7 +127,7 @@
     <thead><tr><th>{{ i18n.t("console-users-name") }}</th><th>{{ i18n.t("console-users-role") }}</th><th>{{ i18n.t("console-sessions-via") }}</th><th>{{ i18n.t("console-sessions-client") }}</th><th>{{ i18n.t("console-sessions-last-seen") }}</th><th></th></tr></thead>
     <tbody>
     {% for s in sessions %}
-    <tr><td class="col-name">{{ s.display }} <code class="mono muted">{{ s.subject }}</code></td><td data-label="{{ i18n.t("console-users-role") }}">{{ s.role }}</td><td data-label="{{ i18n.t("console-sessions-via") }}">{{ i18n.t(s.via) }}</td><td data-label="{{ i18n.t("console-sessions-client") }}">{{ s.client }}</td><td data-label="{{ i18n.t("console-sessions-last-seen") }}">{{ s.last_seen }}</td>
+    <tr><td class="col-name" title="{{ s.display }} ({{ s.subject }})">{{ s.display }} <code class="mono muted">{{ s.subject }}</code></td><td data-label="{{ i18n.t("console-users-role") }}">{{ s.role }}</td><td data-label="{{ i18n.t("console-sessions-via") }}">{{ i18n.t(s.via) }}</td><td data-label="{{ i18n.t("console-sessions-client") }}">{{ s.client }}</td><td data-label="{{ i18n.t("console-sessions-last-seen") }}">{{ s.last_seen }}</td>
       <td class="data-table__actions">{% if s.current %}<span class="status-pill status-pill--ok status-pill--sm">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("console-sessions-current") }}</span></span>{% else %}<form method="post" action="/ui/settings/sessions/{{ s.key }}/revoke" class="inline-form">{{ csrf_html|safe }}<button class="btn btn--small" type="submit">{{ i18n.t("console-sessions-revoke") }}</button></form>{% endif %}</td></tr>
     {% endfor %}
     </tbody>

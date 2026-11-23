@@ -284,8 +284,8 @@
         rows.appendChild(
           h("tr", null, [
             h("td", { class: "col-name", "data-label": M("col-name") }, [
-              h("a", { href: packageHref(p.name, p.version), text: p.name }),
-              p.title ? h("div", { class: "muted pkg-subtitle", text: p.title }) : null,
+              h("a", { href: packageHref(p.name, p.version), title: p.name, text: p.name }),
+              p.title ? h("div", { class: "muted pkg-subtitle", title: p.title, text: p.title }) : null,
             ]),
             h("td", { "data-label": M("col-version") }, [h("code", { text: p.version })]),
             h("td", { "data-label": M("col-fhir"), text: (p.fhirVersions || []).join(", ") }),

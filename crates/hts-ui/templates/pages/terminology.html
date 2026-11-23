@@ -113,11 +113,17 @@
           {% endif %}
           {% for r in rows %}
           <tr data-system="{{ r.url }}" data-version="{{ r.version_param }}"{% if r.current %} data-current="true"{% endif %}>
+            {#- Title, then the canonical URL with its status/supplement tags
+                on one flex row: the URL truncates (full value in its title)
+                and the tags keep their own box, so a long URL can never run
+                underneath a tag. -#}
             <td class="col-name">
-              {% if !r.title.is_empty() %}{% if r.first_of_system %}<strong>{{ r.title }}</strong>{% else %}{{ r.title }}{% endif %}<br>{% endif %}
-              <span class="url">{{ r.url }}</span>
-              {% if r.status != "active" %} <span class="tag tag--retired">{{ r.status }}</span>{% endif %}
-              {% if r.is_supplement %} <span class="tag tag--muted">{{ chrome.i18n.t("hts-term-supplement") }}</span>{% endif %}
+              {% if !r.title.is_empty() %}<span class="col-name__title" title="{{ r.title }}">{% if r.first_of_system %}<strong>{{ r.title }}</strong>{% else %}{{ r.title }}{% endif %}</span>{% endif %}
+              <span class="col-name__line">
+                <span class="url" title="{{ r.url }}">{{ r.url }}</span>
+                {%- if r.status != "active" %}<span class="tag tag--retired">{{ r.status }}</span>{% endif %}
+                {%- if r.is_supplement %}<span class="tag tag--muted">{{ chrome.i18n.t("hts-term-supplement") }}</span>{% endif %}
+              </span>
             </td>
             <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}"><code>{{ r.version }}</code>{% if r.content != "complete" && !r.is_supplement %} <span class="tag tag--muted">{{ r.content }}</span>{% endif %}</td>
             <td class="col-num" data-label="{{ chrome.i18n.t("hts-term-col-concepts") }}">{% if let Some(c) = r.concepts %}{{ c }}{% else %}&mdash;{% endif %}</td>

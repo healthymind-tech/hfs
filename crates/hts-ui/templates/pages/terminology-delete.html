@@ -53,7 +53,7 @@
         {% for d in deps %}
         <tr>
           <td data-label="{{ chrome.i18n.t("hts-del-dep-type") }}">{{ d.kind }}</td>
-          <td class="col-name"><span class="url">{{ d.url }}</span></td>
+          <td class="col-name"><span class="url" title="{{ d.url }}">{{ d.url }}</span></td>
           <td data-label="{{ chrome.i18n.t("hts-term-col-version") }}">{% if d.version.is_empty() %}&mdash;{% else %}<code>{{ d.version }}</code>{% endif %}</td>
           <td data-label="{{ chrome.i18n.t("hts-del-dep-binding") }}">{% if d.pins %}<span class="tag tag--danger">{{ chrome.i18n.t("hts-del-dep-pinned") }}</span>{% else %}<span class="tag tag--muted">{{ chrome.i18n.t("hts-del-dep-floating") }}</span>{% endif %}</td>
         </tr>
