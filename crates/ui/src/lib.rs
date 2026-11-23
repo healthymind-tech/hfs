@@ -453,13 +453,22 @@ async fn resolve_prefs(
         }
         (None, None) => None,
     };
+    let mut roles = manager::nav_roles(
+        request.extensions(),
+        matches!(state.admin_gate, helios_admin_auth::AdminGate::Open),
+        admin_user.is_some(),
+        nav_endpoint.as_deref(),
+    );
+    // A terminology-scope binding (hm-0012) raises the Terminology section only.
+    if let (Some(store), Some(principal)) = (
+        terminology_console::scope_bindings(),
+        request.extensions().get::<helios_endpoints::ConsolePrincipal>(),
+    ) && let Some(bound) = store.role(&principal.subject).await
+    {
+        roles.terminology = roles.terminology.max(bound);
+    }
     let nav = NavCtx {
-        roles: manager::nav_roles(
-            request.extensions(),
-            matches!(state.admin_gate, helios_admin_auth::AdminGate::Open),
-            admin_user.is_some(),
-            nav_endpoint.as_deref(),
-        ),
+        roles,
         endpoint: nav_endpoint,
         key_extra: terminology_console::nav_key_extra(),
     };

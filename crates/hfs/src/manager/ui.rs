@@ -51,6 +51,115 @@ pub fn install_ui(ctx: &ManagerContext) {
         ManagerRuntime::new(Arc::new(backend), ctx.registry.clone())
             .with_routing(EndpointRouting::Dispatcher),
     );
+    // Terminology-scope role bindings (hm-0012, `hfs_console_scope_bindings`).
+    #[cfg(feature = "postgres")]
+    if let Some(pool) = ctx.pool.clone() {
+        helios_ui::terminology_console::set_scope_bindings(Arc::new(PgScopeBindings {
+            pool,
+            cache: Default::default(),
+        }));
+    }
+}
+
+/// [`helios_ui::terminology_console::ScopeBindings`] over the U1 table
+/// `hfs_console_scope_bindings(subject, scope, role)`. Lookups are cached
+/// for a few seconds (one per page otherwise); writes clear the cache.
+/// Before the unified migrations have run the table is absent: lookups
+/// answer "no binding" and writes report the error.
+#[cfg(feature = "postgres")]
+struct PgScopeBindings {
+    pool: helios_endpoints::pg::deadpool_postgres::Pool,
+    cache: std::sync::Mutex<
+        std::collections::HashMap<String, (std::time::Instant, Option<helios_endpoints::ConsoleRole>)>,
+    >,
+}
+
+#[cfg(feature = "postgres")]
+const SCOPE: &str = helios_ui::terminology_console::TERMINOLOGY_SCOPE;
+
+#[cfg(feature = "postgres")]
+fn parse_role(s: &str) -> Option<helios_endpoints::ConsoleRole> {
+    helios_endpoints::ConsoleRole::parse(s)
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl helios_ui::terminology_console::ScopeBindings for PgScopeBindings {
+    async fn role(&self, subject: &str) -> Option<helios_endpoints::ConsoleRole> {
+        if let Some((at, role)) = self.cache.lock().ok()?.get(subject).cloned()
+            && at.elapsed() < std::time::Duration::from_secs(5)
+        {
+            return role;
+        }
+        let role = async {
+            let client = self.pool.get().await.ok()?;
+            let row = client
+                .query_opt(
+                    "SELECT role FROM hfs_console_scope_bindings WHERE subject = $1 AND scope = $2",
+                    &[&subject, &SCOPE],
+                )
+                .await
+                .ok()??;
+            parse_role(row.get::<_, &str>(0))
+        }
+        .await;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(subject.to_string(), (std::time::Instant::now(), role));
+        }
+        role
+    }
+
+    async fn list(&self) -> Result<Vec<(String, helios_endpoints::ConsoleRole)>, String> {
+        let client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let rows = client
+            .query(
+                "SELECT subject, role FROM hfs_console_scope_bindings WHERE scope = $1 ORDER BY subject",
+                &[&SCOPE],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Some((r.get::<_, String>(0), parse_role(r.get::<_, &str>(1))?)))
+            .collect())
+    }
+
+    async fn set(
+        &self,
+        subject: &str,
+        role: helios_endpoints::ConsoleRole,
+        actor: &str,
+    ) -> Result<(), String> {
+        let client = self.pool.get().await.map_err(|e| e.to_string())?;
+        client
+            .execute(
+                "INSERT INTO hfs_console_scope_bindings (subject, scope, role, created_by) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (subject, scope) DO UPDATE SET role = EXCLUDED.role, created_by = EXCLUDED.created_by",
+                &[&subject, &SCOPE, &role.as_str(), &actor],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(subject);
+        }
+        Ok(())
+    }
+
+    async fn remove(&self, subject: &str) -> Result<(), String> {
+        let client = self.pool.get().await.map_err(|e| e.to_string())?;
+        client
+            .execute(
+                "DELETE FROM hfs_console_scope_bindings WHERE subject = $1",
+                &[&subject],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(subject);
+        }
+        Ok(())
+    }
 }
 
 /// [`ManagerBackend`] over P4's admin service.

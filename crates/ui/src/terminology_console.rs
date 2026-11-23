@@ -54,6 +54,44 @@ pub struct TerminologyConsoleConfig {
     pub version: &'static str,
 }
 
+/// Terminology-scope role bindings (hm-0012, the U1 table
+/// `hfs_console_scope_bindings(subject, scope, role)`): a role on the
+/// Terminology section only. The effective terminology role is
+/// max(global role, this binding). The server installs the store; without
+/// one the section uses the global role.
+#[async_trait::async_trait]
+pub trait ScopeBindings: Send + Sync {
+    /// The `terminology` binding of `subject` (`local:{user}`, `oidc:…`).
+    async fn role(&self, subject: &str) -> Option<helios_endpoints::ConsoleRole>;
+    /// Every `terminology` binding.
+    async fn list(&self) -> Result<Vec<(String, helios_endpoints::ConsoleRole)>, String>;
+    /// Creates or replaces the binding of `subject`.
+    async fn set(
+        &self,
+        subject: &str,
+        role: helios_endpoints::ConsoleRole,
+        actor: &str,
+    ) -> Result<(), String>;
+    /// Removes every scope binding of `subject` (also when the user is deleted).
+    async fn remove(&self, subject: &str) -> Result<(), String>;
+}
+
+static SCOPE_BINDINGS: OnceLock<Arc<dyn ScopeBindings>> = OnceLock::new();
+
+/// Installs the terminology-scope binding store (once, at startup).
+pub fn set_scope_bindings(store: Arc<dyn ScopeBindings>) -> bool {
+    SCOPE_BINDINGS.set(store).is_ok()
+}
+
+/// The installed scope-binding store.
+pub(crate) fn scope_bindings() -> Option<&'static Arc<dyn ScopeBindings>> {
+    SCOPE_BINDINGS.get()
+}
+
+/// The binding scope name (also what the Users page's binding form takes
+/// in its "endpoint" field for a terminology binding).
+pub const TERMINOLOGY_SCOPE: &str = "terminology";
+
 struct Installed {
     router: Router,
     admin: bool,
