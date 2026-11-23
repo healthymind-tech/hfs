@@ -216,7 +216,7 @@ async fn data_forwards_only_explore_parameters() {
 }
 
 #[tokio::test]
-async fn concept_json_has_designations_relatives_and_mappings() {
+async fn concept_json_has_designations_and_relatives_without_translate() {
     let (base, _) = start_mock().await;
     let app = app(&base);
     let (status, ct, body) = get_text(
@@ -230,9 +230,9 @@ async fn concept_json_has_designations_relatives_and_mappings() {
     assert_eq!(v["display"], "Type 2 diabetes mellitus");
     assert_eq!(v["designations"][0]["language"], "zh-Hant");
     assert_eq!(v["parents"][0]["code"], "73211009");
-    assert_eq!(v["mappings"][0]["code"], "E11.9");
-    assert_eq!(v["mappings"][0]["direction"], "forward");
-    assert_eq!(v["mappings"][0]["map"], "http://example.org/cm/sct-icd");
+    // Mappings are a separate, lazy request (`explore/data?mode=mappings`):
+    // the identity never waits for `$translate`.
+    assert!(v.get("mappings").is_none(), "{v}");
     assert!(v["permalink"].as_str().unwrap().contains("code=44054006"));
     let (status, _, _) = get_text(&app, "/ui/hts/explore/concept?code=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

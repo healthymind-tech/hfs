@@ -13,8 +13,9 @@
 //! The page is a shell; the browser script (`term-explorer.js`) reads two
 //! JSON routes of this module: `explore/data` (a whitelisted pass-through to
 //! the terminology server's `$hm-explore`, which pages and caps every read)
-//! and `explore/concept` (`$lookup` and the `$translate` mappings of one
-//! concept, for the side panel). Nothing loads a whole system.
+//! and `explore/concept` (`$lookup` of one concept, for the side panel; its
+//! mappings come from `explore/data?mode=mappings`). Nothing loads a whole
+//! system.
 //!
 //! The kind follows the system URL ([`kind_for`]); `HTS_UI_EXPLORER_KINDS`
 //! (`url=kind;url=kind`) adds or overrides entries, and `?kind=` overrides
@@ -33,7 +34,7 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::upstream::{ConceptRef, MappingDirection, OutcomeView, UpstreamError};
+use crate::upstream::{ConceptRef, OutcomeView, UpstreamError};
 use crate::{Chrome, HtsUiState};
 
 pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
@@ -295,9 +296,11 @@ async fn explore_data(State(state): State<Arc<HtsUiState>>, RawQuery(raw): RawQu
     }
 }
 
-/// `GET explore/concept?system&code[&version][&lang]` — the side panel:
-/// `$lookup` (every property) and the forward and reverse `$translate`
-/// matches across all stored ConceptMaps.
+/// `GET explore/concept?system&code[&version][&lang]` — the side panel's
+/// identity: `$lookup` with every property. Mappings are not here: the panel
+/// asks `explore/data?mode=mappings` afterwards, which reads the ConceptMap
+/// element index directly (a server-wide `$translate` loads every candidate
+/// map of the system and took seconds for SNOMED CT).
 async fn explore_concept(
     State(state): State<Arc<HtsUiState>>,
     RawQuery(raw): RawQuery,
@@ -315,38 +318,11 @@ async fn explore_concept(
         version: first(&p, "version").map(str::to_string),
         display_language: first(&p, "lang").map(str::to_string),
     };
-    let (identity, forward, reverse) = tokio::join!(
-        state.upstream.concept_identity(&reference),
-        state
-            .upstream
-            .concept_mappings(&reference, MappingDirection::Forward),
-        state
-            .upstream
-            .concept_mappings(&reference, MappingDirection::Reverse),
-    );
-    let identity = match identity {
+    let identity = match state.upstream.concept_identity(&reference).await {
         Ok(i) => i,
         Err(e) => return error_json(&e),
     };
     let rel = |r: &crate::upstream::ConceptRelative| json!({"code": r.code, "display": r.display});
-    let mut mappings = Vec::new();
-    for (dir, result) in [("forward", forward), ("reverse", reverse)] {
-        if let Ok(m) = result {
-            for g in &m.groups {
-                for row in &g.rows {
-                    mappings.push(json!({
-                        "direction": dir,
-                        "map": g.origin,
-                        "system": row.system,
-                        "code": row.code,
-                        "display": row.display,
-                        "relationship": row.mapping_value,
-                    }));
-                }
-            }
-        }
-    }
-    mappings.truncate(60);
     let body = json!({
         "system": identity.system,
         "code": identity.code,
@@ -366,7 +342,6 @@ async fn explore_concept(
             "code": pr.code, "value": pr.value,
         })).collect::<Vec<_>>(),
         "supplements": identity.used_supplements,
-        "mappings": mappings,
         "permalink": reference.permalink(),
     });
     json_response(StatusCode::OK, body)

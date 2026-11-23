@@ -238,6 +238,10 @@
     if (!system || system === cfg.system) base.version = cfg.version;
     return getJSON(cfg.dataUrl + "?" + qs(Object.assign(base, params)));
   }
+  // The ConceptMap elements of a concept, both directions (cached by getJSON).
+  function mappingsOf(system, code) {
+    return api({ mode: "mappings", code: code, count: 60 }, system).then(function (r) { return r.items || []; });
+  }
   function conceptDetail(system, code, version) {
     var p = { system: system, code: code, version: version };
     if (zhUi) p.lang = "zh-Hant";
@@ -513,16 +517,33 @@
           return el("span", { class: "tx-prop" }, el("b", null, p.code), el("span", null, p.value));
         }))));
       }
-      var maps = (d.mappings || []).filter(function (m) {
-        return !(m.code === (d.code || c.code) && m.system === (d.system || c.system));
+      // Mappings load after the identity (ConceptMap element index).
+      var mapBox = el("div", { class: "tx-maps", "aria-busy": "true" },
+        el("span", { class: "tx-ex-skel", style: { width: "60%" } }));
+      body.appendChild(section(t("tx-explore-mappings"), mapBox));
+      var mySys = d.system || c.system || cfg.system;
+      var myToken = token;
+      mappingsOf(mySys, d.code || c.code).then(function (maps) {
+        if (myToken !== token) return;
+        mapBox.removeAttribute("aria-busy");
+        clear(mapBox);
+        if (!maps.length) {
+          mapBox.appendChild(el("p", { class: "tx-def", style: { color: "var(--muted)" } }, t("tx-explore-mappings-none")));
+          return;
+        }
+        maps.forEach(function (m) {
+          mapBox.appendChild(el("div", { class: "tx-map", "data-dir": m.direction },
+            el("span", { class: "tx-map__rel" }, (m.direction === "reverse" ? t("tx-explore-mapped-from") : t("tx-explore-maps-to")) +
+              (m.relationship ? " · " + m.relationship : "")),
+            el("span", null, el("span", { class: "tx-map__code" }, m.code), " ", m.display || ""),
+            el("span", { class: "tx-map__sys" }, m.system + (m.map ? " — " + (m.mapTitle || m.map) : ""))));
+        });
+      }, function () {
+        if (myToken !== token) return;
+        mapBox.removeAttribute("aria-busy");
+        clear(mapBox);
+        mapBox.appendChild(el("p", { class: "tx-def", style: { color: "var(--muted)" } }, t("tx-explore-error")));
       });
-      body.appendChild(section(t("tx-explore-mappings"), maps.length ? el("div", { class: "tx-maps" }, maps.map(function (m) {
-        return el("div", { class: "tx-map", "data-dir": m.direction },
-          el("span", { class: "tx-map__rel" }, (m.direction === "reverse" ? t("tx-explore-mapped-from") : t("tx-explore-maps-to")) +
-            (m.relationship ? " · " + m.relationship : "")),
-          el("span", null, el("span", { class: "tx-map__code" }, m.code), " ", m.display || ""),
-          el("span", { class: "tx-map__sys" }, m.system + (m.map ? " — " + m.map : "")));
-      })) : el("p", { class: "tx-def", style: { color: "var(--muted)" } }, t("tx-explore-mappings-none"))));
       if (opts.onDetail) opts.onDetail(d);
     }
     return { show: show, close: close, isOpen: function () { return !!card; } };
@@ -1082,11 +1103,9 @@
       var row = el("div", { class: "tx-focusrow" }, left, focusCard, right);
       graph.appendChild(row);
       // Mappings (from the concept detail) arrive later.
-      conceptDetail(cfg.system, n.code, cfg.version).then(function (d) {
+      mappingsOf(cfg.system, n.code).then(function (all) {
         if (!current || current.code !== n.code) return;
-        var maps = (d.mappings || []).filter(function (m) {
-          return !(m.code === n.code && m.system === cfg.system);
-        }).slice(0, 6);
+        var maps = all.slice(0, 6);
         maps.forEach(function (m, i) {
           var g = el("div", { class: "tx-gnode", style: { "--accent-c": "var(--tx-c3)", "--d": (reduced ? 0 : i * 60) + "ms", cursor: "default" }, title: m.system },
             el("span", { class: "tx-gnode__label", style: { color: "var(--tx-c3)" } }, (m.direction === "reverse" ? t("tx-explore-mapped-from") : t("tx-explore-maps-to"))),

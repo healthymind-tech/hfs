@@ -12,6 +12,7 @@ use crate::error::HtsError;
 use crate::explore::{
     COUNT_CAP, ExploreMode, ExploreRequest, MAX_DEPTH, PROPS_CENSUS_MAX, like_escape,
 };
+use crate::explore::{MapRow, dedupe_maps, map_rows_json};
 
 fn err(e: rusqlite::Error) -> HtsError {
     HtsError::StorageError(e.to_string())
@@ -235,6 +236,7 @@ impl SqliteTerminologyBackend {
                 ExploreMode::Members => members(&conn, &sid, &req)?,
                 ExploreMode::Search => search(&conn, &sid, &req)?,
                 ExploreMode::Node => node(&conn, &sid, &req)?,
+                ExploreMode::Mappings => mappings(&conn, &req)?,
             };
             out["system"] = json!(req.system);
             out["version"] = json!(version);
@@ -778,4 +780,65 @@ fn node(conn: &Connection, sid: &str, req: &ExploreRequest) -> Result<Value, Hts
         }
     }
     Ok(out)
+}
+
+/// See the PostgreSQL twin: the element rows of `code`, both directions.
+fn mappings(conn: &Connection, req: &ExploreRequest) -> Result<Value, HtsError> {
+    let code = req.code.clone().unwrap_or_default();
+    let limit = req.count as i64;
+    let raw = query(
+        conn,
+        "SELECT * FROM (SELECT 'forward', cm.url, cm.version, COALESCE(cm.title, cm.name), cme.target_system, \
+                 cme.target_code, cme.equivalence \
+          FROM concept_map_elements cme JOIN concept_maps cm ON cm.id = cme.map_id \
+          WHERE cme.source_code = ?2 AND cme.source_system = ?1 LIMIT ?3) \
+         UNION ALL \
+         SELECT * FROM (SELECT 'reverse', cm.url, cm.version, COALESCE(cm.title, cm.name), cme.source_system, \
+                 cme.source_code, cme.equivalence \
+          FROM concept_map_elements cme JOIN concept_maps cm ON cm.id = cme.map_id \
+          WHERE cme.target_code = ?2 AND cme.target_system = ?1 LIMIT ?3)",
+        &[t(&req.system), t(&code), i(limit)],
+        |r| {
+            Ok(MapRow {
+                direction: r.get(0)?,
+                map: r.get(1)?,
+                map_version: r.get(2)?,
+                map_title: r.get(3)?,
+                system: r.get(4)?,
+                code: r.get(5)?,
+                relationship: r.get(6)?,
+                display: String::new(),
+            })
+        },
+    )?;
+    let mut items = dedupe_maps(raw, req.system.as_str(), &code);
+    let mut systems: Vec<String> = items.iter().map(|m| m.system.clone()).collect();
+    systems.sort();
+    systems.dedup();
+    let mut names = HashMap::new();
+    for sys in systems.into_iter().take(8) {
+        let Some((sid, _)) = resolve(conn, &sys, None)? else {
+            continue;
+        };
+        let codes: Vec<String> = items
+            .iter()
+            .filter(|m| m.system == sys)
+            .map(|m| m.code.clone())
+            .collect();
+        let sql = format!(
+            "SELECT code, display FROM concepts WHERE system_id = ?1 AND code IN ({})",
+            list(2, codes.len())
+        );
+        for (c, d) in query(conn, &sql, &with_codes(vec![t(&sid)], &codes), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })? {
+            names.insert((sys.clone(), c), d.unwrap_or_default());
+        }
+    }
+    for m in items.iter_mut() {
+        if let Some(d) = names.get(&(m.system.clone(), m.code.clone())) {
+            m.display = d.clone();
+        }
+    }
+    Ok(map_rows_json(&code, items))
 }
