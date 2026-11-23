@@ -356,40 +356,135 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_SLOW: Duration = Duration::from_millis(120);
 const CACHE_MAX: usize = 512;
 
-type Cache = Mutex<HashMap<String, (Instant, Value)>>;
+type Cache = Mutex<HashMap<String, (Instant, Duration, Value)>>;
 
 fn cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// `stats` (concept counts, metadata) changes only with an import: kept longer.
-const STATS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Overviews — `stats` (concept counts, metadata) and the facet counts with
+/// at most one filter (the first two levels of a LOINC drill-down) — change
+/// only with an import and are what every visitor opens first: kept longer.
+const OVERVIEW_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
-fn ttl_of(key: &str) -> Duration {
-    if key.starts_with("stats|") {
-        STATS_TTL
-    } else {
-        CACHE_TTL
+fn ttl_of(req: &ExploreRequest) -> Duration {
+    match req.mode {
+        ExploreMode::Stats => OVERVIEW_TTL,
+        ExploreMode::Facets if req.filters.len() <= 1 && req.q.is_none() => OVERVIEW_TTL,
+        _ => CACHE_TTL,
     }
 }
 
 fn cache_get(key: &str) -> Option<Value> {
     let guard = cache().lock().ok()?;
-    let (at, v) = guard.get(key)?;
-    (at.elapsed() < ttl_of(key)).then(|| v.clone())
+    let (at, ttl, v) = guard.get(key)?;
+    (at.elapsed() < *ttl).then(|| v.clone())
 }
 
-fn cache_put(key: String, value: &Value) {
+fn cache_put(key: String, ttl: Duration, value: &Value) {
     if let Ok(mut guard) = cache().lock() {
         if guard.len() >= CACHE_MAX {
-            guard.retain(|k, (at, _)| at.elapsed() < ttl_of(k));
+            guard.retain(|_, (at, ttl, _)| at.elapsed() < *ttl);
             if guard.len() >= CACHE_MAX {
                 guard.clear();
             }
         }
-        guard.insert(key, (Instant::now(), value.clone()));
+        guard.insert(key, (Instant::now(), ttl, value.clone()));
     }
+}
+
+// ── Warm-up ──────────────────────────────────────────────────────────────────
+
+/// Warm what the explorers open first, in the background, so the first
+/// visitor after a restart does not wait: the SNOMED CT concept model (built
+/// on first use, 5–15 s on a full edition) and the LOINC overview counts
+/// (class types, and the classes of each class type). Repeated every five
+/// hours, inside the six-hour life of those cache entries. Never blocks
+/// start-up; `HTS_EXPLORE_WARMUP=false` turns it off.
+pub fn spawn_warmup<B: TerminologyBackend + Clone + 'static>(state: AppState<B>) {
+    if std::env::var("HTS_EXPLORE_WARMUP").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        )
+    }) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        loop {
+            warm(&state).await;
+            tokio::time::sleep(Duration::from_secs(5 * 60 * 60)).await;
+        }
+    });
+}
+
+fn request(pairs: &[(&str, &str)]) -> Option<ExploreRequest> {
+    let owned: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    ExploreRequest::from_pairs(&owned).ok()
+}
+
+async fn warm<B: TerminologyBackend>(state: &AppState<B>) {
+    let started = Instant::now();
+    let ctx = TenantContext::system();
+    let snomed = matches!(
+        state
+            .backend()
+            .snomed_model(&ctx, crate::snomed::SNOMED_URL, None)
+            .await,
+        Ok(Some(_))
+    );
+    // LOINC, as the explorer asks for it (the version it shows is pinned).
+    let mut loinc = 0usize;
+    if let Some(req) = request(&[("mode", "stats"), ("system", "http://loinc.org")])
+        && let Ok(stats) = explore(state, &req).await
+        && let Some(version) = stats["version"].as_str().map(str::to_string)
+    {
+        let base = [
+            ("mode", "facets"),
+            ("system", "http://loinc.org"),
+            ("version", version.as_str()),
+            ("count", "32"),
+        ];
+        let mut top = base.to_vec();
+        top.push(("property", "CLASSTYPE"));
+        if let Some(req) = request(&top)
+            && let Ok(types) = explore(state, &req).await
+        {
+            loinc += 1;
+            let values: Vec<String> = types["values"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v["value"].as_str().map(|s| format!("CLASSTYPE={s}")))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for filter in values {
+                let mut q = base.to_vec();
+                q.push(("property", "CLASS"));
+                q.push(("filter", filter.as_str()));
+                if let Some(req) = request(&q)
+                    && explore(state, &req).await.is_ok()
+                {
+                    loinc += 1;
+                }
+            }
+        }
+    }
+    tracing::info!(
+        snomed_model = snomed,
+        loinc_overviews = loinc,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "terminology explorer warm-up done"
+    );
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
@@ -444,7 +539,7 @@ pub async fn explore<B: TerminologyBackend>(
         annotate_ucum(&mut value);
     }
     if started.elapsed() >= CACHE_SLOW {
-        cache_put(key, &value);
+        cache_put(key, ttl_of(req), &value);
     }
     Ok(value)
 }

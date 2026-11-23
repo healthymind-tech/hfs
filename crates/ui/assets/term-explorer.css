@@ -382,6 +382,8 @@
 .tx-shell--sn > .tx-card--tree .tx-card__body {
   max-height: min(72vh, 760px);
   overflow: auto;
+  /* A hairline of air between the head's rule and rows scrolled under it. */
+  border-top: 3px solid transparent;
 }
 
 .tx-note {
@@ -443,6 +445,8 @@
 .tx-tree__wrap {
   margin-top: 2px;
   display: grid;
+  /* Without this the level grows to its longest label and nothing ellipsizes. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: 0fr;
   transition: grid-template-rows 220ms var(--tx-ease-std);
 }
@@ -451,7 +455,11 @@
 
 .tx-tree__wrap > ul {
   min-height: 0;
-  overflow: hidden;
+  min-width: 0;
+  /* Hide the folded rows vertically only: a deep row may be wider than its
+     level and must stay reachable through the card's sideways scroll. */
+  overflow-x: visible;
+  overflow-y: clip;
   position: relative;
   margin-left: 12px;
   padding-left: 4px;
@@ -533,10 +541,16 @@
   flex: 1;
 }
 
-/* Deep hierarchies scroll sideways instead of squeezing the labels. */
-.tx-card--tree .tx-tree { min-width: 100%; width: max-content; max-width: 760px; }
-.tx-shell .tx-main > .tx-card--tree .tx-tree,
-.tx-ex .tx-card--tree .tx-tree--bilingual { width: auto; max-width: none; }
+/* The narrow SNOMED CT side tree: one line per concept, ellipsis, the full
+   label in the row's tooltip; very deep levels scroll sideways. */
+.tx-shell--sn .tx-row__text { flex-wrap: nowrap; min-width: 90px; }
+.tx-shell--sn .tx-tree__wrap > ul { margin-left: 9px; padding-left: 1px; }
+.tx-shell--sn .tx-row__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .tx-row__label {
   min-width: 0;
@@ -1059,22 +1073,28 @@
 }
 
 .tx-clusters {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   align-items: center;
   gap: 10px;
-  padding: 16px 12px 18px;
-  min-height: 140px;
+  min-height: 160px;
+  padding: 12px;
+  transition: height 260ms var(--tx-ease-std);
 }
 
 .tx-clusters.is-leaving > * {
-  animation: tx-cluster-out 200ms ease-in both;
+  animation: tx-cluster-out 180ms ease-in both;
 }
+
+.tx-clusters__note:empty { display: none; }
+.tx-clusters__note { margin: 8px 12px 12px; text-align: center; }
 
 .tx-cluster {
   --c: var(--tx-c1);
-  --s: 90px;
+  --s: 96px;
+  position: absolute;
   display: grid;
   place-content: center;
   justify-items: center;
@@ -1082,63 +1102,74 @@
   width: var(--s);
   height: var(--s);
   padding: 8px;
-  border: 1.5px solid color-mix(in srgb, var(--c) 55%, transparent);
+  border: 1.5px solid var(--c);
   border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--c) var(--mix, 22%), var(--surface)), color-mix(in srgb, var(--c) 7%, var(--surface)) 72%);
-  color: var(--text);
+  /* Solid tint, not a gradient: the label must keep AA contrast. */
+  background: color-mix(in srgb, var(--c) 22%, var(--surface));
+  color: var(--text-strong);
   font: inherit;
   text-align: center;
   cursor: pointer;
-  transition: transform 180ms var(--tx-ease), box-shadow 180ms ease;
-  animation: tx-cluster-in 420ms var(--tx-ease) both;
+  transition: transform 160ms var(--tx-ease), box-shadow 160ms ease, background-color 160ms ease;
+  animation: tx-cluster-in 320ms var(--tx-ease) both;
   animation-delay: var(--d, 0ms);
 }
 
+.tx-cluster[data-anim="0"] { animation: none; }
+
 .tx-cluster:hover,
 .tx-cluster:focus-visible {
-  transform: scale(1.06);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--c) 20%, transparent);
+  z-index: 2;
+  transform: scale(1.05);
+  background: color-mix(in srgb, var(--c) 32%, var(--surface));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--c) 25%, transparent), 0 8px 20px rgb(0 0 0 / 18%);
   outline: none;
 }
 
 .tx-cluster.is-chosen {
-  animation: tx-cluster-zoom 320ms var(--tx-ease) both;
-  z-index: 2;
+  animation: tx-cluster-zoom 300ms var(--tx-ease) both;
+  z-index: 3;
 }
 
 .tx-cluster__name {
-  max-width: calc(var(--s) - 18px);
-  font-size: clamp(11px, calc(var(--s) / 10), 14.5px);
-  font-weight: 650;
+  max-width: calc(var(--s) - 20px);
+  font-size: clamp(11.5px, calc(var(--s) / 11), 15px);
+  font-weight: 700;
   line-height: 1.2;
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
-  overflow-wrap: break-word;
-  hyphens: auto;
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: manual;
 }
 
+/* Words longer than the bubble at its smallest readable size may break. */
+.tx-cluster__name[data-break] { overflow-wrap: anywhere; }
+
 .tx-cluster__n {
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
 
 @keyframes tx-cluster-in { from { opacity: 0; transform: scale(.6); } }
+@keyframes tx-cluster-out { to { opacity: 0; transform: scale(.85); } }
+@keyframes tx-cluster-zoom { to { opacity: 0; transform: scale(1.8); } }
 
 .tx-cluster--skel {
+  position: static;
   border-style: dashed;
   border-color: var(--outline);
   background: var(--muted-soft);
   cursor: default;
-  animation: tx-cluster-in 420ms var(--tx-ease) both, tx-breathe 1.4s ease-in-out infinite alternate;
+  animation: tx-cluster-in 320ms var(--tx-ease) both, tx-breathe 1.4s ease-in-out infinite alternate;
   animation-delay: var(--d, 0ms);
 }
 
 @keyframes tx-breathe { to { opacity: .45; } }
-@keyframes tx-cluster-out { to { opacity: 0; transform: scale(.85); } }
-@keyframes tx-cluster-zoom { to { opacity: 0; transform: scale(1.8); } }
 
 .tx-valuesearch {
   display: flex;

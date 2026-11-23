@@ -469,6 +469,7 @@ const CLIENT_KEYS: &[&str] = &[
     "tx-explore-ndc-labeler",
     "tx-explore-ndc-products",
     "tx-explore-ndc-packages",
+    "tx-explore-ndc-package",
     "tx-explore-ndc-unclassified",
     "tx-explore-ndc-sample",
     "tx-explore-ucum-dimension",

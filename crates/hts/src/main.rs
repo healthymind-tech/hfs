@@ -211,6 +211,7 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     audit_startup(&audit, "sqlite").await;
     let state = state.with_audit(audit.clone());
 
+    helios_hts::explore::spawn_warmup(state.clone());
     let app = helios_hts::server::create_app(&config, state);
 
     let addr = config.socket_addr();
@@ -347,6 +348,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
         }
     }
 
+    helios_hts::explore::spawn_warmup(state.clone());
     let app = helios_hts::server::create_app(&config, state);
 
     let addr = config.socket_addr();

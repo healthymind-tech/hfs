@@ -108,3 +108,4 @@ tx-explore-roots-truncated = Nur die ersten 500 obersten Konzepte werden geliste
 tx-explore-select-hint = Ein Konzept wählen, um Details zu sehen.
 tx-explore-descendants = Nachfahren
 tx-explore-pick-cluster = Einen Cluster wählen, um seine Begriffe aufzulisten.
+tx-explore-ndc-package = Packung

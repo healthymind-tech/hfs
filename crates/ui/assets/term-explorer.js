@@ -166,6 +166,36 @@
   function palette(i) {
     return "var(--tx-c" + ((((i % 12) + 12) % 12) + 1) + ")";
   }
+  // Greedy circle packing: largest first, each circle at the first free spot
+  // on an outward elliptical spiral (wider than tall, `aspect` = width/height).
+  function packCircles(circles, aspect) {
+    var gap = 6;
+    var ax = Math.max(1, Math.min(2.4, aspect || 1.6));
+    var placed = [];
+    circles.forEach(function (c) {
+      if (!placed.length) {
+        c.x = 0; c.y = 0;
+        placed.push(c);
+        return;
+      }
+      for (var k = 0; k < 6000; k++) {
+        var th = k * 0.18;
+        var d = 1.4 * th;
+        var x = d * Math.cos(th) * ax;
+        var y = d * Math.sin(th);
+        var ok = true;
+        for (var j = 0; j < placed.length; j++) {
+          var p = placed[j];
+          var dx = p.x - x, dy = p.y - y, m = p.r + c.r + gap;
+          if (dx * dx + dy * dy < m * m) { ok = false; break; }
+        }
+        if (ok) { c.x = x; c.y = y; break; }
+      }
+      if (c.x === undefined) { c.x = 0; c.y = d + c.r; }
+      placed.push(c);
+    });
+    return circles;
+  }
   function hashIndex(s) {
     var h = 0;
     for (var i = 0; i < (s || "").length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
@@ -534,7 +564,7 @@
         onclick: function (e) { e.stopPropagation(); toggle(li); }
       }, icon("chev"));
       var text = el("span", { class: "tx-row__text" },
-        el("span", { class: "tx-row__label" }, r.label),
+        el("span", { class: "tx-row__label", title: r.label || null }, r.label),
         r.alt ? el("span", { class: "tx-row__alt" + (r.altPlain ? " tx-row__alt--plain" : ""), lang: r.altPlain ? null : "zh-Hant" }, r.alt)
           : r.altMissing ? el("span", { class: "tx-row__alt tx-row__alt--missing" }, r.altMissing) : null);
       var row = el("div", {
@@ -748,7 +778,8 @@
     var rb = box.getBoundingClientRect();
     var rr = row.getBoundingClientRect();
     var top = box.scrollTop + (rr.top - rb.top) - box.clientHeight / 2 + rr.height / 2;
-    var left = box.scrollLeft + (rr.left - rb.left) - 24;
+    // Sideways only when the row starts past the middle of the box.
+    var left = rr.left - rb.left > box.clientWidth / 2 ? box.scrollLeft + (rr.left - rb.left) - 24 : box.scrollLeft;
     box.scrollTo({ top: Math.max(0, top), left: Math.max(0, left), behavior: reduced ? "auto" : "smooth" });
   }
   function isWide() {
@@ -1374,9 +1405,11 @@
     var filterbar = el("div", { class: "tx-filters", "aria-label": t("tx-explore-filters") });
     var clusters = el("div", { class: "tx-clusters" });
     var valueInput = el("input", { type: "search", placeholder: t("tx-explore-filter-values"), "aria-label": t("tx-explore-filter-values") });
-    var clusterCard = card(t("tx-explore-clusters"), "", clusters);
+    var clusterNote = el("div", { class: "tx-note tx-clusters__note" });
+    var clusterCard = card(t("tx-explore-clusters"), "", el("div", null, clusters));
     clusterCard.querySelector(".tx-card__head").appendChild(el("span", { class: "tx-valuesearch" }, valueInput));
     clusterCard._body.style.padding = "0";
+    clusterCard._body.firstChild.appendChild(clusterNote);
     var terms = el("div", { class: "tx-terms" });
     var pager = el("div", { class: "tx-pager" });
     var termsCard = card(t("tx-explore-terms"), "", el("div", null, terms, pager));
@@ -1482,6 +1515,85 @@
     function filterParams() {
       return filters.map(function (f) { return f.p + "=" + f.v; });
     }
+    // Packed bubbles: area follows the term count, every bubble at least big
+    // enough for a readable two-line label, the set packed to fill the card.
+    var lastValues = [];
+    function drawBubbles(values, animate) {
+      clear(clusters);
+      if (!values.length) return;
+      var W = Math.max(280, clusters.clientWidth - 24);
+      var phone = W < 520;
+      var H = Math.max(240, Math.min(phone ? 560 : 440, W * (phone ? 1.3 : 0.42)));
+      var total = values.reduce(function (a, v) { return a + v.count; }, 0) || 1;
+      var rMin = phone ? 44 : 52;
+      var rMax = Math.min(H * 0.42, W * 0.3);
+      var area = W * H * 0.52;
+      var circles = values.map(function (v, i) {
+        var r = Math.sqrt(area * (v.count / total) / Math.PI);
+        return { v: v, i: i, r: Math.max(rMin, Math.min(rMax, r)) };
+      });
+      packCircles(circles, W / H);
+      var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      circles.forEach(function (c) {
+        minX = Math.min(minX, c.x - c.r); maxX = Math.max(maxX, c.x + c.r);
+        minY = Math.min(minY, c.y - c.r); maxY = Math.max(maxY, c.y + c.r);
+      });
+      var scale = Math.min(1, W / (maxX - minX));
+      var height = (maxY - minY) * scale;
+      clusters.style.height = Math.ceil(height + 24) + "px";
+      var offX = 12 + (W - (maxX - minX) * scale) / 2;
+      circles.forEach(function (c) {
+        var v = c.v;
+        var r = c.r * scale;
+        var label = valueLabel(groupBy, v);
+        var x = offX + (c.x - minX) * scale - r;
+        var y = 12 + (c.y - minY) * scale - r;
+        clusters.appendChild(el("button", {
+          type: "button",
+          class: "tx-cluster",
+          title: label + " — " + fmt(v.count),
+          style: {
+            "--c": groupBy === "CLASSTYPE" ? palette(c.i) : AXIS_COLOR[groupBy],
+            "--s": Math.round(r * 2) + "px",
+            left: Math.round(x) + "px",
+            top: Math.round(y) + "px",
+            "--d": (reduced || !animate ? 0 : Math.min(c.i, 20) * 12) + "ms"
+          },
+          "data-anim": animate ? null : "0",
+          onclick: function (e) {
+            filters.push({ p: groupBy, v: v.value, label: label });
+            var nx = nextAxis();
+            if (nx) groupBy = nx;
+            valueQ = "";
+            valueInput.value = "";
+            refresh(e.currentTarget);
+          }
+        }, nameSpan(label, r * 2), el("span", { class: "tx-cluster__n" }, fmt(v.count))));
+      });
+    }
+    // The label's font shrinks until its longest word fits the bubble.
+    function nameSpan(label, diameter) {
+      var inner = diameter - 22;
+      var longest = String(label).split(/\s+/).reduce(function (m, w) { return Math.max(m, w.length); }, 1);
+      var size = Math.max(9.5, Math.min(15, diameter / 10, inner / (longest * 0.62)));
+      return el("span", {
+        class: "tx-cluster__name",
+        style: { "font-size": size.toFixed(1) + "px" },
+        "data-break": inner / (longest * 0.62) < 9.5 ? "1" : null
+      }, label);
+    }
+    if (window.ResizeObserver) {
+      var lastW = 0;
+      var rt = null;
+      new ResizeObserver(function () {
+        var w = clusters.clientWidth;
+        if (Math.abs(w - lastW) < 8 || !lastValues.length || !clusters.querySelector(".tx-cluster:not(.tx-cluster--skel)")) { lastW = w; return; }
+        lastW = w;
+        clearTimeout(rt);
+        rt = setTimeout(function () { drawBubbles(lastValues, false); }, 120);
+      }).observe(clusters);
+    }
+
     var clusterToken = 0;
     function loadClusters(chosen) {
       var my = ++clusterToken;
@@ -1498,6 +1610,7 @@
         if (my !== clusterToken) return;
         clusters.classList.remove("is-leaving");
         clear(clusters);
+        clusters.style.height = "";
         for (var i = 0; i < 6; i++) {
           clusters.appendChild(el("span", { class: "tx-cluster tx-cluster--skel", "aria-hidden": "true", style: { "--s": (150 - i * 14) + "px", "--d": i * 60 + "ms" } }));
         }
@@ -1513,30 +1626,15 @@
           var values = r.values || [];
           clusterCard._meta.textContent = countLabel(r.matched, r.capped) + " " + t("tx-explore-terms").toLowerCase();
           if (!values.length) {
+            lastValues = [];
+            clusterNote.textContent = "";
+            clusters.style.height = "";
             clusters.appendChild(el("div", { class: "tx-empty" }, t("tx-explore-no-results")));
             return;
           }
-          var max = values[0].count || 1;
-          values.forEach(function (v, i) {
-            var ratio = Math.sqrt(v.count / max);
-            var size = Math.round(78 + 82 * ratio);
-            var label = valueLabel(groupBy, v);
-            clusters.appendChild(el("button", {
-              type: "button",
-              class: "tx-cluster",
-              title: label + " — " + fmt(v.count),
-              style: { "--c": groupBy === "CLASSTYPE" ? palette(i) : AXIS_COLOR[groupBy], "--s": size + "px", "--mix": Math.round(10 + 26 * ratio) + "%", "--d": (reduced ? 0 : Math.min(i, 30) * 18) + "ms" },
-              onclick: function (e) {
-                filters.push({ p: groupBy, v: v.value, label: label });
-                var nx = nextAxis();
-                if (nx) groupBy = nx;
-                valueQ = "";
-                valueInput.value = "";
-                refresh(e.currentTarget);
-              }
-            }, el("span", { class: "tx-cluster__name" }, label), el("span", { class: "tx-cluster__n" }, fmt(v.count))));
-          });
-          if (r.truncated) clusters.appendChild(el("div", { class: "tx-note", style: { width: "100%", "text-align": "center" } }, t("tx-explore-values-truncated")));
+          lastValues = values;
+          drawBubbles(values, true);
+          clusterNote.textContent = r.truncated ? t("tx-explore-values-truncated") : "";
         }, wait);
       }, function () {
         clearTimeout(slow);
@@ -1566,7 +1664,7 @@
           var chips = AXES.slice(2).map(function (a) {
             var pv = it.props && it.props[a];
             if (!pv) return null;
-            return el("span", { style: { "--c": AXIS_COLOR[a] }, title: axisLabel(a) }, pv.display || pv.value);
+            return el("span", { style: { "--c": AXIS_COLOR[a] }, title: axisLabel(a) + ": " + (pv.display || pv.value) }, pv.display || pv.value);
           }).filter(Boolean);
           terms.appendChild(el("button", {
             type: "button",
@@ -1737,7 +1835,7 @@
           var first = true;
           var max = 1;
           var page = function () {
-            api({ mode: "buckets", code: parent, sep: "-", count: 60, offset: offset }).then(function (r) {
+            api({ mode: "buckets", code: parent, sep: "-", count: 48, offset: offset }).then(function (r) {
               if (first) { clear(cards); animate(back, fromEl); first = false; }
               var items = r.items || [];
               if (offset === 0) max = items.length ? items[0].count : 1;
@@ -1745,13 +1843,13 @@
                 cards.appendChild(el("button", {
                   type: "button",
                   class: "tx-ccard",
-                  style: { "--c": palette(hashIndex(b.key)), "--d": (reduced ? 0 : Math.min(i, 30) * 18) + "ms" },
+                  style: { "--c": palette(hashIndex(b.key)), "--d": (reduced ? 0 : Math.min(i, 16) * 14) + "ms" },
                   onclick: function (e) { push(productsLevel(parent, b.key, b.sample && b.sample.display), e.currentTarget); }
                 },
                 el("span", { class: "tx-ccard__kicker" }, t("tx-explore-ndc-labeler")),
                 el("span", { class: "tx-ccard__title" }, b.key),
                 b.sample ? el("span", { class: "tx-ccard__sub" }, t("tx-explore-ndc-sample") + " " + productName(b.sample.display) + " · " + b.sample.code) : null,
-                el("span", { class: "tx-ccard__bar" }, el("i", { style: { "--w": Math.max(3, Math.round(b.count / max * 100)) + "%", "--d": (reduced ? 0 : Math.min(i, 30) * 18 + 100) + "ms" } })),
+                el("span", { class: "tx-ccard__bar" }, el("i", { style: { "--w": Math.max(3, Math.round(b.count / max * 100)) + "%", "--d": (reduced ? 0 : Math.min(i, 16) * 14 + 100) + "ms" } })),
                 el("span", { class: "tx-ccard__n" }, fmt(b.count) + " " + t("tx-explore-ndc-products").toLowerCase())));
               });
               offset += items.length;
@@ -1776,13 +1874,13 @@
           var offset = 0;
           var first = true;
           var page = function () {
-            api({ mode: "children", code: parent, prefix: labeler + "-", order: "display", count: 60, offset: offset }).then(function (r) {
+            api({ mode: "children", code: parent, prefix: labeler + "-", order: "display", count: 48, offset: offset }).then(function (r) {
               if (first) { clear(cards); animate(back, fromEl); first = false; }
               (r.items || []).forEach(function (it, i) {
                 cards.appendChild(el("button", {
                   type: "button",
                   class: "tx-ccard",
-                  style: { "--c": palette(hashIndex(productName(it.display))), "--d": (reduced ? 0 : Math.min(i, 30) * 18) + "ms" },
+                  style: { "--c": palette(hashIndex(productName(it.display))), "--d": (reduced ? 0 : Math.min(i, 16) * 14) + "ms" },
                   onclick: function (e) {
                     panel.show({ system: cfg.system, code: it.code, display: it.display });
                     if (it.children) push(packagesLevel(it), e.currentTarget);
@@ -1791,7 +1889,7 @@
                 el("span", { class: "tx-ccard__kicker" }, it.code),
                 el("span", { class: "tx-ccard__title" }, productName(it.display)),
                 el("span", { class: "tx-ccard__sub" }, (it.display || "").replace(productName(it.display), "").trim()),
-                el("span", { class: "tx-ccard__n" }, fmt(it.children || 0) + " " + t("tx-explore-ndc-packages").toLowerCase())));
+                el("span", { class: "tx-ccard__n" }, fmt(it.children || 0) + " " + (it.children === 1 ? t("tx-explore-ndc-package") : t("tx-explore-ndc-packages")).toLowerCase())));
               });
               offset += (r.items || []).length;
               stage._meta.textContent = fmt(r.total) + " " + t("tx-explore-ndc-products").toLowerCase();
@@ -1857,10 +1955,14 @@
       }, function () { toast(t("tx-explore-no-results")); });
     }
     stack = [rootLevel];
+    // ?at=TYPE|LABELER|PRODUCT restores the drill-down.
     var at = getParam("at");
     if (at) {
-      var keys = at.split("|");
-      openPath(keys[keys.length - 1]);
+      var k = at.split("|");
+      if (k[0]) stack.push(labelersLevel(k[0], k[0] === ROOT ? t("tx-explore-ndc-unclassified") : titleCase(k[0])));
+      if (k[0] && k[1]) stack.push(productsLevel(k[0], k[1]));
+      if (k[0] && k[1] && k[2]) stack.push(packagesLevel({ code: k[2], display: k[2] }));
+      show(stack[stack.length - 1], false);
     } else show(rootLevel, false);
   }
 

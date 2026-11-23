@@ -108,3 +108,4 @@ tx-explore-roots-truncated = Solo se listan los primeros 500 conceptos superiore
 tx-explore-select-hint = Seleccione un concepto para ver sus detalles.
 tx-explore-descendants = descendientes
 tx-explore-pick-cluster = Elija un clúster para listar sus términos.
+tx-explore-ndc-package = Envase

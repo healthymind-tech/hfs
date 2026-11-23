@@ -492,6 +492,7 @@ pub fn assemble<B>(
 where
     B: TerminologyBackend + BundleImportBackend + crate::admin::TerminologyAdmin + Clone + 'static,
 {
+    crate::explore::spawn_warmup(state.clone());
     let config = &options.config;
     let gate = crate::server::writes_gate(
         &options.write_gate,

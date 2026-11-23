@@ -108,3 +108,4 @@ tx-explore-roots-truncated = 只列出前 500 個頂層概念；其他請用搜�
 tx-explore-select-hint = 選取一個概念以查看詳細資料。
 tx-explore-descendants = 個後代
 tx-explore-pick-cluster = 點選一個叢集以列出其中的術語。
+tx-explore-ndc-package = 包裝
