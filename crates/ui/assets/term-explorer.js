@@ -158,6 +158,7 @@
     var ta = el("textarea", { style: { position: "fixed", opacity: "0" } });
     ta.value = text;
     document.body.appendChild(ta);
+    ta.focus();
     ta.select();
     try { document.execCommand("copy"); } catch (e) { /* ignore */ }
     ta.remove();
@@ -1285,7 +1286,10 @@
     // Overview: the root's children are the chapters.
     chapters.appendChild(el("div", { class: "tx-ex__boot", style: { border: "0", width: "100%" } },
       el("span", { class: "tx-ex-skel", style: { width: "70%" } }), el("span", { class: "tx-ex-skel", style: { width: "40%" } })));
-    api({ mode: "children", count: 50 }, sys).then(function (roots) {
+    var rootsP = cfg.root
+      ? Promise.resolve({ items: [{ code: cfg.root, children: 1 }] })
+      : api({ mode: "children", count: 50 }, sys);
+    rootsP.then(function (roots) {
       var top = roots.items || [];
       if (top.length === 1 && top[0].children) {
         rootCode = top[0].code;
@@ -1721,7 +1725,7 @@
         el("span", { class: "tx-ccard__n" }, (label || fmt(n)) + " " + t("tx-explore-ndc-products").toLowerCase()));
     }
     function titleCase(s) {
-      return /^[A-Z0-9 \-]+$/.test(s) ? s.toLowerCase().replace(/(^|\s)\S/g, function (c) { return c.toUpperCase(); }) : s;
+      return /^[A-Z0-9 \-]+$/.test(s) ? s.toLowerCase().replace(/(^|\s)\S/g, function (c) { return c.toUpperCase(); }).replace(/\bOtc\b/, "OTC") : s;
     }
     function labelersLevel(parent, label) {
       return {

@@ -374,9 +374,14 @@
 .tx-card__body { padding: 10px; }
 
 .tx-card--tree .tx-card__body {
+  overflow-x: auto;
+  padding: 6px;
+}
+
+/* The SNOMED CT side tree scrolls on its own beside the focus graph. */
+.tx-shell--sn > .tx-card--tree .tx-card__body {
   max-height: min(72vh, 760px);
   overflow: auto;
-  padding: 6px;
 }
 
 .tx-note {
@@ -436,6 +441,7 @@
 .tx-tree:focus { outline: none; }
 
 .tx-tree__wrap {
+  margin-top: 2px;
   display: grid;
   grid-template-rows: 0fr;
   transition: grid-template-rows 220ms var(--tx-ease-std);

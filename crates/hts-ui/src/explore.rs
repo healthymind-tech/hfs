@@ -4,7 +4,7 @@
 //! | Kind | Systems | Shape |
 //! |---|---|---|
 //! | `snomed` | SNOMED CT | is-a tree + focus graph (parents above, children below, attribute groups beside) |
-//! | `icd` | ICD-10-CM / PCS / ICD-9-CM, the Taiwan editions and zh-Hant supplements | chapter overview sized by code count, chapter → block → category → code tree, English and Chinese side by side |
+//! | `icd` | ICD-10-CM / PCS, the Taiwan editions and zh-Hant supplements | chapter overview sized by code count, chapter → block → category → code tree, English and Chinese side by side |
 //! | `loinc` | LOINC | clusters by axis (class type, class, component, system, …) with drill-down and part chips |
 //! | `ndc` | NDC | product type → labeler → product → package cluster cards |
 //! | `ucum` | UCUM | units grouped by dimension |
@@ -98,6 +98,8 @@ pub struct KindConfig {
     /// edition next to the English one, or the explored edition itself when
     /// the tree comes from `structure`.
     pub alt: Option<String>,
+    /// The hierarchy's single root, when known (saves the root scan).
+    pub root: Option<&'static str>,
 }
 
 pub const SNOMED: &str = "http://snomed.info/sct";
@@ -107,6 +109,10 @@ pub const UCUM: &str = "http://unitsofmeasure.org";
 pub const ICD10CM: &str = "http://hl7.org/fhir/sid/icd-10-cm";
 pub const ICD10PCS: &str = "http://www.cms.gov/Medicare/Coding/ICD10";
 pub const ICD9CM: &str = "http://hl7.org/fhir/sid/icd-9-cm";
+/// The root concept of the stored ICD-10-CM hierarchy (chapters hang under it).
+const ICD10CM_ROOT: &str = "ICD-10-CM";
+/// The root concept of the stored ICD-10-PCS hierarchy (sections).
+const ICD10PCS_ROOT: &str = "ICD-10-PCS";
 const TW_IG: &str = "https://twcore.mohw.gov.tw/ig/twcore/CodeSystem/";
 const HM_CS: &str = "https://terminology.healthymind.tw/CodeSystem/";
 
@@ -116,11 +122,13 @@ pub fn builtin_kind(url: &str) -> KindConfig {
         kind,
         structure: None,
         alt: None,
+        root: None,
     };
-    let edition_of = |base: &str| KindConfig {
+    let edition_of = |base: &str, root| KindConfig {
         kind: Kind::Icd,
         structure: Some(base.to_string()),
         alt: Some(url.to_string()),
+        root: Some(root),
     };
     match url {
         SNOMED => plain(Kind::Snomed),
@@ -131,22 +139,26 @@ pub fn builtin_kind(url: &str) -> KindConfig {
             kind: Kind::Icd,
             structure: None,
             alt: Some(format!("{TW_IG}icd-10-cm-2023-tw")),
+            root: Some(ICD10CM_ROOT),
         },
         ICD10PCS => KindConfig {
             kind: Kind::Icd,
             structure: None,
             alt: Some(format!("{TW_IG}icd-10-pcs-2023-tw")),
+            root: Some(ICD10PCS_ROOT),
         },
-        ICD9CM => plain(Kind::Icd),
+        // ICD-9-CM is stored without chapters (hundreds of category roots):
+        // the generic tree suits it better than chapter tiles.
+        ICD9CM => plain(Kind::Auto),
         _ => {
             let tail = url
                 .strip_prefix(TW_IG)
                 .or_else(|| url.strip_prefix(HM_CS))
                 .unwrap_or("");
             if tail.starts_with("icd-10-cm-") {
-                edition_of(ICD10CM)
+                edition_of(ICD10CM, ICD10CM_ROOT)
             } else if tail.starts_with("icd-10-pcs-") {
-                edition_of(ICD10PCS)
+                edition_of(ICD10PCS, ICD10PCS_ROOT)
             } else {
                 plain(Kind::Auto)
             }
@@ -186,6 +198,7 @@ pub fn kind_for(url: &str, requested: Option<Kind>, table: &[(String, Kind)]) ->
             kind,
             structure: None,
             alt: None,
+            root: None,
         };
     }
     cfg
@@ -585,6 +598,7 @@ async fn explore_page(
         "kind": kind.as_str(),
         "structure": cfg.structure,
         "alt": cfg.alt,
+        "root": cfg.root,
         "title": page.title,
         "concepts": page.concepts,
         "hierarchy": stats["hierarchy"],
@@ -627,6 +641,8 @@ mod tests {
         );
         let zh = builtin_kind("https://terminology.healthymind.tw/CodeSystem/icd-10-pcs-zh-hant");
         assert_eq!(zh.structure.as_deref(), Some(ICD10PCS));
+        assert_eq!(builtin_kind(ICD9CM).kind, Kind::Auto);
+        assert_eq!(cm.root, Some("ICD-10-CM"));
         assert_eq!(builtin_kind("http://example.org/cs").kind, Kind::Auto);
         assert_eq!(
             builtin_kind("https://twcore.mohw.gov.tw/ig/twcore/CodeSystem/marital-status-tw").kind,
