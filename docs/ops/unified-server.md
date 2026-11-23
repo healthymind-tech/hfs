@@ -106,6 +106,35 @@ Failure handling:
 `unify-db.sh verify` re-runs the verification at any time while the stage
 exists.
 
+### Freeze and switch with the embedded service (U2)
+
+`HFS_TERMINOLOGY_READONLY=true` is implemented by the embedded terminology
+service: every terminology write answers `503` with `Retry-After: 60` (`/tx`
+CRUD, `/tx/import`, write batches, `/admin/terminology` changes, package
+terminology installs, in-process `System` writes included); reads, read-only
+batches (the validator's) and FHIR are untouched; bootstrap sync is skipped
+while it is set. With the Stage 1 overlay
+(`hfs-eval/deploy/unify/docker-compose.stage1.yml`) the hooks are:
+
+```bash
+cd /home/brian/projects/hfs-workspace/hfs-eval
+C="docker compose -f docker-compose.yml -f deploy/unify/docker-compose.stage1.yml"
+U='set -a; . ./.env; set +a; export HFS_TERMINOLOGY_DATABASE_URL="postgres://hfs:$HFS_PG_PASSWORD@hfs-pg:5432/hfs?options=-c%20search_path%3Dterminology%2Cpublic"'
+deploy/unify-db.sh run --yes \
+  --freeze-cmd   "HFS_TERMINOLOGY_READONLY=true $C up -d hfs" \
+  --switch-cmd   "$U; HFS_TERMINOLOGY_READONLY=true $C up -d hfs" \
+  --unfreeze-cmd "$U; $C up -d hfs"
+```
+
+(the overlay passes `HFS_TERMINOLOGY_READONLY: ${HFS_TERMINOLOGY_READONLY:-false}`
+and `HFS_TERMINOLOGY_DATABASE_URL: ${HFS_TERMINOLOGY_DATABASE_URL:-<hts db>}`
+through, so the hooks only set shell variables). After `done`, make the switch
+permanent by writing that URL into the overlay's default (a later plain
+`docker compose up` would otherwise fall back to the `hts` database). Check the freeze took:
+`curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/fhir+json' -d '{}' http://hfs:8080/tx/import` → `503`.
+When terminology is embedded on PostgreSQL, hfs applies `hm-0011`/`hm-0012`
+itself after `init_schema` (`PostgresBackend::apply_unified_migrations`).
+
 ## 4. Rehearsal results (2026-11-23)
 
 Remote test host (NVMe, 48 cores, shared and busy: a release build ran

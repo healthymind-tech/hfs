@@ -228,6 +228,7 @@ where
             gate: writes_gate,
             max_body_size: config.max_body_size,
             bearer,
+            readonly: false,
         },
     );
 

@@ -232,6 +232,28 @@ pub struct WriteGuard {
     /// SMART/OIDC bearer validation (`HTS_AUTH_*`), accepted besides the
     /// administrator credential.
     pub bearer: Option<Arc<dyn AuthProvider>>,
+    /// Terminology frozen (`HFS_TERMINOLOGY_READONLY`, the data move's
+    /// freeze step): every write answers 503, whoever sends it.
+    pub readonly: bool,
+}
+
+/// 503 for a write while terminology is frozen.
+pub fn readonly_refusal() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/fhir+json")],
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "transient",
+                "diagnostics": "terminology is read-only for maintenance (HFS_TERMINOLOGY_READONLY); retry later"}],
+        })
+        .to_string(),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    response
 }
 
 /// The console role a terminology write needs (design §7.2/§7.4): one
@@ -272,6 +294,21 @@ fn principal_decision(request: &Request) -> Option<bool> {
 pub async fn guard(State(state): State<WriteGuard>, request: Request, next: Next) -> Response {
     if !is_terminology_write(request.method(), request.uri().path()) {
         return next.run(request).await;
+    }
+    if state.readonly {
+        // A read-only batch is still a read (validator batches go on).
+        if request.method() == Method::POST && request.uri().path() == "/" {
+            let (parts, body) = request.into_parts();
+            let Ok(bytes) = axum::body::to_bytes(body, state.max_body_size).await else {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+            };
+            if is_read_only_bundle(&bytes) {
+                return next
+                    .run(Request::from_parts(parts, Body::from(bytes)))
+                    .await;
+            }
+        }
+        return readonly_refusal();
     }
     match principal_decision(&request) {
         Some(true) => return next.run(request).await,
@@ -358,6 +395,7 @@ mod tests {
                     gate: AdminGate::Locked(Arc::from("locked")),
                     max_body_size: 1024,
                     bearer: None,
+                    readonly: false,
                 },
                 guard,
             ));
@@ -408,6 +446,34 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         // Anonymous, or no principal at all: the (locked) credential gate.
+        let frozen = axum::Router::new()
+            .route("/import", post(|| async { "imported" }))
+            .route("/CodeSystem/$validate-code", post(|| async { "read" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                WriteGuard {
+                    gate: AdminGate::Open,
+                    max_body_size: 1024,
+                    bearer: None,
+                    readonly: true,
+                },
+                guard,
+            ));
+        for (path, want) in [
+            ("/import", StatusCode::SERVICE_UNAVAILABLE),
+            ("/CodeSystem/$validate-code", StatusCode::OK),
+        ] {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(TxPrincipal::System);
+            assert_eq!(
+                frozen.clone().oneshot(req).await.unwrap().status(),
+                want,
+                "{path}"
+            );
+        }
         assert_ne!(
             call("POST", "/import", Some(TxPrincipal::Anonymous)).await,
             StatusCode::OK

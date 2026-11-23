@@ -47,7 +47,13 @@ pub struct Resolved {
 /// clears `terminology_server` (callers then use the installed service) and
 /// sets `terminology_embedded`; remote keeps the server URL.
 pub fn resolve(config: &mut ServerConfig) -> Result<Resolved, ConfigError> {
-    resolve_from(config, EnvView::from_vars(std::env::vars()))
+    // The store derived from `HFS_DATABASE_URL` is worked out when the
+    // embedded service starts ([`derived_store`]), so a FHIR URL the schema
+    // helper cannot rewrite never fails configuration here.
+    resolve_from(
+        config,
+        EnvView::from_vars(std::env::vars().filter(|(k, _)| k != "HFS_DATABASE_URL")),
+    )
 }
 
 /// [`resolve`] over an explicit environment (tests).
@@ -60,6 +66,7 @@ pub fn resolve_from(config: &mut ServerConfig, view: EnvView) -> Result<Resolved
         TerminologyMode::Embedded => {
             config.terminology_embedded = true;
             config.terminology_server = None;
+            let _ = EMBEDDED_SCHEMA.set(settings.embedded.schema.clone());
         }
         TerminologyMode::Remote => {
             config.terminology_embedded = false;
@@ -78,6 +85,49 @@ pub fn log_deprecations(view: &EnvView) {
     for deprecation in &view.deprecations {
         warn!("{}", deprecation.message());
     }
+}
+
+/// Schema of the embedded terminology store when terminology is embedded
+/// (set by [`resolve`]); drives the unified fork migrations.
+static EMBEDDED_SCHEMA: OnceLock<String> = OnceLock::new();
+
+/// Whether `HFS_TERMINOLOGY_READONLY` is on: every terminology write — `/tx`
+/// CRUD, `/import`, write batches, admin imports and deletes, package
+/// terminology installs — answers 503; reads keep being served. The freeze
+/// step of `unify-db.sh` (docs/ops/unified-server.md).
+pub fn readonly(view: &EnvView) -> bool {
+    view.get("HFS_TERMINOLOGY_READONLY").is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Apply the unified server's fork migrations (`hm-0011`: terminology schema
+/// and `hfs_terminology_state`; `hm-0012`: console scope bindings) to the
+/// HFS PostgreSQL database. Only when terminology is embedded (U1 contract:
+/// not part of `init_schema`).
+#[cfg(feature = "postgres")]
+pub async fn apply_unified_migrations(
+    backend: &helios_persistence::backends::postgres::PostgresBackend,
+) -> anyhow::Result<()> {
+    let Some(schema) = EMBEDDED_SCHEMA.get() else {
+        return Ok(());
+    };
+    let applied = backend
+        .apply_unified_migrations(schema)
+        .await
+        .map_err(|e| anyhow::anyhow!("unified fork migrations: {e}"))?;
+    if !applied.is_empty() {
+        info!(?applied, schema = %schema, "applied unified-server fork migrations");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "postgres"))]
+pub async fn apply_unified_migrations<B>(_backend: &B) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// The embedded routers, mounted by [`attach`].
@@ -131,9 +181,24 @@ pub async fn start(
             Arc::new(remote)
         }
         TerminologyMode::Embedded => {
-            match start_embedded(config, resolved, audit, admin_gate).await? {
-                Some(service) => service,
-                None => return Ok(()),
+            match start_embedded(config, resolved, audit, admin_gate).await {
+                Ok(Some(service)) => service,
+                Ok(None) => return Ok(()),
+                // FHIR comes first: a terminology store that cannot be
+                // opened leaves terminology down (health, readiness with
+                // HFS_READINESS_REQUIRE_TERMINOLOGY) instead of the server.
+                Err(e) => {
+                    tracing::error!(error = %e, "embedded terminology failed to start; terminology is unavailable");
+                    helios_rest::terminology::record_health(
+                        helios_terminology::TerminologyHealth {
+                            kind: helios_terminology::ServiceKind::Embedded,
+                            state: helios_terminology::service::HealthState::Down(format!(
+                                "embedded terminology failed to start: {e}"
+                            )),
+                        },
+                    );
+                    return Ok(());
+                }
             }
         }
     };
@@ -231,12 +296,19 @@ async fn start_embedded(
         write_gate: admin_gate,
         bearer,
         call_timeout: settings.timeout,
+        readonly: readonly(view),
         import_pool_size: view
             .get("HFS_TERMINOLOGY_IMPORT_PG_POOL_SIZE")
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(4),
     })
     .await?;
+    if readonly(view) {
+        warn!(
+            "HFS_TERMINOLOGY_READONLY=true: terminology writes (CRUD, /import, write batches, \
+             admin imports) answer 503 until it is unset"
+        );
+    }
     info!(
         storage = hts.storage,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -669,10 +741,20 @@ mod tests {
     }
 
     #[test]
+    fn readonly_flag() {
+        assert!(readonly(&view(&[("HFS_TERMINOLOGY_READONLY", "true")])));
+        assert!(!readonly(&view(&[("HFS_TERMINOLOGY_READONLY", "false")])));
+        assert!(!readonly(&view(&[])));
+    }
+
+    #[test]
     fn store_is_derived_from_the_fhir_store() {
         let mut c = config();
         c.database_url = None;
-        assert_eq!(derived_store(&c, "terminology").as_deref(), Some("terminology.db"));
+        assert_eq!(
+            derived_store(&c, "terminology").as_deref(),
+            Some("terminology.db")
+        );
         c.database_url = Some("./data/fhir.db".into());
         assert_eq!(
             derived_store(&c, "terminology").as_deref(),
@@ -681,7 +763,11 @@ mod tests {
         c.database_url = Some(":memory:".into());
         assert!(derived_store(&c, "terminology").is_none());
         c.database_url = Some("postgres://hfs@db/hfs".into());
-        assert!(derived_store(&c, "terminology").unwrap().contains("search_path"));
+        assert!(
+            derived_store(&c, "terminology")
+                .unwrap()
+                .contains("search_path")
+        );
     }
 
     #[test]

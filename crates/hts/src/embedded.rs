@@ -71,6 +71,9 @@ pub struct EmbeddedOptions {
     pub bearer: Option<Arc<dyn helios_auth::AuthProvider>>,
     /// Default deadline of in-process calls (`HFS_TERMINOLOGY_TIMEOUT_SECS`).
     pub call_timeout: Duration,
+    /// Terminology frozen (`HFS_TERMINOLOGY_READONLY`): writes answer 503,
+    /// the admin API refuses changes, bootstrap sync is skipped.
+    pub readonly: bool,
     /// Connections of the separate import pool (design §8.2 measure 2;
     /// `HFS_TERMINOLOGY_IMPORT_PG_POOL_SIZE`, default 4). 0: imports share
     /// the serving pool.
@@ -197,8 +200,11 @@ async fn start_postgres(options: EmbeddedOptions) -> anyhow::Result<EmbeddedHts>
     {
         let backend = backend.clone();
         let config = config.clone();
+        let readonly = options.readonly;
         on(&options.import_runtime, async move {
-            crate::bootstrap::bootstrap_sync_postgres(&backend, &config).await?;
+            if !readonly {
+                crate::bootstrap::bootstrap_sync_postgres(&backend, &config).await?;
+            }
             let rebuilt = backend
                 .rebuild_missing_closures()
                 .await
@@ -310,7 +316,9 @@ async fn start_sqlite(options: EmbeddedOptions) -> anyhow::Result<EmbeddedHts> {
     let backend = SqliteTerminologyBackend::new_without_fts_prebuild(&config.database_url)
         .map_err(|e| anyhow::anyhow!("terminology store: {e}"))?;
     let hts_pool = backend.pool().clone();
-    crate::bootstrap::bootstrap_sync_sqlite(&backend, &config).await?;
+    if !options.readonly {
+        crate::bootstrap::bootstrap_sync_sqlite(&backend, &config).await?;
+    }
     let backend = {
         let handle = options.import_runtime.clone();
         on(&handle, async move {
@@ -378,6 +386,21 @@ pub fn nest_at(outer: Router, prefix: &str, api: Router) -> Router {
         .nest(prefix, api)
 }
 
+/// The admin API while frozen: reads only.
+async fn admin_readonly(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if matches!(
+        request.method(),
+        &axum::http::Method::GET | &axum::http::Method::HEAD
+    ) {
+        next.run(request).await
+    } else {
+        crate::write_guard::readonly_refusal()
+    }
+}
+
 /// Build the API and admin routers over `state` and the loopback service.
 pub fn assemble<B>(
     options: &EmbeddedOptions,
@@ -400,6 +423,7 @@ where
             gate,
             max_body_size: config.max_body_size,
             bearer: options.bearer.clone(),
+            readonly: options.readonly,
         },
     );
     let api = match &state.audit {
@@ -417,8 +441,14 @@ where
             Duration::from_secs(config.request_timeout.max(1)),
         ));
     let admin = if config.admin_ui {
-        crate::server::build_admin(config, &state)
-            .map(|router| router.layer(axum::middleware::from_fn(crate::audit::capture_admin_user)))
+        crate::server::build_admin(config, &state).map(|router| {
+            let router = router.layer(axum::middleware::from_fn(crate::audit::capture_admin_user));
+            if options.readonly {
+                router.layer(axum::middleware::from_fn(admin_readonly))
+            } else {
+                router
+            }
+        })
     } else {
         None
     };
@@ -458,6 +488,7 @@ mod tests {
             write_gate: helios_admin_auth::AdminGate::Locked(Arc::from("no password")),
             bearer: None,
             call_timeout: Duration::from_secs(30),
+            readonly: false,
             import_pool_size: 0,
         }
     }
@@ -720,6 +751,7 @@ mod tests {
             let bytes = resp.into_body().collect().await.unwrap().to_bytes();
             (status, ctype, bytes)
         };
+        let volatile = regex::Regex::new(r#""(id|lastUpdated|timestamp)":"[^"]*""#).unwrap();
         for (method, path, body) in corpus {
             let (sa, ca, a) = call(
                 standalone.clone(),
@@ -741,14 +773,54 @@ mod tests {
             )
             .await;
             let b = String::from_utf8_lossy(&b).to_string();
-            let scrub = |s: &str| {
-                // Search Bundles carry a fresh id and timestamp per response.
-                let re = regex::Regex::new(r#""(id|lastUpdated|timestamp)":"[^"]*""#).unwrap();
-                re.replace_all(s, "\"$1\":\"*\"").to_string()
-            };
+            // Search Bundles carry a fresh id and timestamp per response.
+            let scrub = |s: &str| volatile.replace_all(s, "\"$1\":\"*\"").to_string();
             assert_eq!(sa, sb, "{method} {path}");
             assert_eq!(ca, cb, "{method} {path}");
             assert_eq!(scrub(&a), scrub(&b), "{method} {path}");
         }
+    }
+
+    /// `HFS_TERMINOLOGY_READONLY`: writes (even `System`) and admin changes
+    /// answer 503; reads and admin reads keep working.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readonly_freezes_writes_and_admin_changes() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.readonly = true;
+        opts.config.admin_ui = true;
+        opts.config.admin_data_dir = dir.path().join("admin").display().to_string();
+        let hts = start(opts).await.unwrap();
+        let err = hts.service.import_bundle(&code_system()).await.unwrap_err();
+        assert!(
+            matches!(err, TxError::Status { status: 503, .. }),
+            "{err:?}"
+        );
+        let ok = hts.service.call(TxRequest::get("metadata")).await.unwrap();
+        assert!(ok.is_success());
+        let admin = hts.admin.clone().expect("admin router");
+        let get = axum::http::Request::builder()
+            .uri("/jobs")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            admin
+                .clone()
+                .oneshot(get)
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        let post = axum::http::Request::builder()
+            .method("POST")
+            .uri("/maintenance/compact")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            admin.oneshot(post).await.unwrap().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

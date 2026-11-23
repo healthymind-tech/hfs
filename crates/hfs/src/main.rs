@@ -4434,6 +4434,7 @@ async fn start_postgres(
     );
 
     backend.init_schema().await?;
+    terminology::apply_unified_migrations(&backend).await?;
     let backend = Arc::new(backend);
     register_pg_pool_metrics("primary", backend.clone());
     attach_login_sessions(auth_state.as_ref(), backend.clone());
@@ -4554,6 +4555,7 @@ async fn start_postgres_elasticsearch(
     // PostgreSQL even when search is offloaded (#1663).
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
+    terminology::apply_unified_migrations(&backend).await?;
     open_admin_session_store(&backend).await;
 
     // Offload search to Elasticsearch
