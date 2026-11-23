@@ -131,7 +131,10 @@ impl PostgresBackend {
 
         for (table, excluded, extra, typed) in plan {
             let exists: bool = tx
-                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .query_one(
+                    "SELECT to_regclass(format('%I.%I', current_schema(), $1::text)) IS NOT NULL",
+                    &[&table],
+                )
                 .await
                 .map_err(|e| err(format!("tenant copy: {e}")))?
                 .get(0);
@@ -190,7 +193,10 @@ impl PostgresBackend {
 
         // The tenant registry row (display name carried over when present).
         let registered = tx
-            .query_one("SELECT to_regclass('tenants') IS NOT NULL", &[])
+            .query_one(
+                "SELECT to_regclass(format('%I.%I', current_schema(), 'tenants')) IS NOT NULL",
+                &[],
+            )
             .await
             .map_err(|e| err(format!("tenant copy: {e}")))?
             .get::<_, bool>(0);

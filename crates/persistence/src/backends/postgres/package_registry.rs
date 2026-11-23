@@ -62,7 +62,7 @@ impl PostgresBackend {
         let mut client = self.get_client().await?;
         let present: bool = client
             .query_one(
-                "SELECT to_regclass('hfs_package_resources') IS NOT NULL",
+                "SELECT to_regclass(format('%I.%I', current_schema(), 'hfs_package_resources')) IS NOT NULL",
                 &[],
             )
             .await

@@ -2,7 +2,7 @@
 # Logical backup of the HFS and HTS PostgreSQL databases (pg_dump custom format).
 #
 # Usage: pg-backup.sh [-o OUT_DIR] [-k KEEP_DAYS] [-j JOBS] [DB ...]
-#   DB defaults to "hfs hts". OUT_DIR defaults to $BACKUP_DIR or ./backups.
+#   DB defaults to "hfs hts" (those that exist). OUT_DIR defaults to $BACKUP_DIR or ./backups.
 #
 # Connection: either set PG_CONTAINER (run pg_dump inside that docker container,
 # the docker compose layout) or the usual libpq variables (PGHOST, PGPORT,
@@ -32,7 +32,7 @@ while getopts "o:k:j:h" opt; do
   esac
 done
 shift $((OPTIND - 1))
-DBS=("$@"); [ ${#DBS[@]} -gt 0 ] || DBS=(hfs hts)
+DBS=("$@"); DEFAULT_DBS=0; [ ${#DBS[@]} -gt 0 ] || { DBS=(hfs hts); DEFAULT_DBS=1; }
 mkdir -p "$OUT"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 PGU=${PGUSER:-hfs}
@@ -58,6 +58,21 @@ metric() {  # metric <db> <status> <duration> <size>
     [ -n "$prev" ] && PROM+="$prev"$'\n'
   fi
 }
+if [ "$DEFAULT_DBS" = 1 ]; then
+  # One database (unified server, docs/ops/unified-server.md): after the move
+  # and its cleanup there is no `hts` database; terminology is schema
+  # `terminology` inside the `hfs` dump. Skip default databases that are gone.
+  present=()
+  for db in "${DBS[@]}"; do
+    # only a definite "0" skips; a failed query keeps it (and fails loudly below)
+    if [ "$(run psql -X -U "$PGU" -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname = '$db'" 2>/dev/null)" = 0 ]; then
+      log "skip $db (no such database)"
+    else
+      present+=("$db")
+    fi
+  done
+  DBS=("${present[@]}")
+fi
 for db in "${DBS[@]}"; do
   f="$OUT/$db-$STAMP.dump"
   t0=$(date +%s)

@@ -580,6 +580,14 @@ impl PostgresTerminologyBackend {
                 ))
             })?;
 
+            // A store in its own schema (`search_path=terminology,public`,
+            // the unified server) must resolve to it before any DDL runs.
+            schema::ensure_store_schema(&client).await.map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to resolve the HTS schema: {}",
+                    error_chain(&e)
+                ))
+            })?;
             schema::apply(&client).await.map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
             })?;
@@ -949,9 +957,26 @@ impl PoolTuning {
         if let Some(ms) = self.statement_timeout_ms {
             // Startup-packet option, so every connection the pool opens later
             // carries it too (a post-connect SET binds one session only).
-            cfg.options = Some(format!("-c statement_timeout={ms}"));
+            // Appended to the URL's own `options` (the unified server's
+            // `-c search_path=terminology,public`): deadpool's `options`
+            // field replaces the URL's, which would put the store in `public`.
+            let timeout = format!("-c statement_timeout={ms}");
+            cfg.options = Some(match url_options(cfg.url.as_deref()) {
+                Some(existing) => format!("{existing} {timeout}"),
+                None => timeout,
+            });
         }
     }
+}
+
+/// The `options` startup parameter a connection string carries, if any.
+fn url_options(url: Option<&str>) -> Option<String> {
+    let parsed: tokio_postgres::Config = url?.parse().ok()?;
+    parsed
+        .get_options()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(str::to_owned)
 }
 
 fn build_pool(database_url: &str, size: usize) -> Result<Pool, HtsError> {
@@ -2475,6 +2500,28 @@ mod pool_tuning_tests {
             Some(std::time::Duration::from_secs(5))
         );
         assert_eq!(cfg.options.as_deref(), Some("-c statement_timeout=60000"));
+    }
+
+    #[test]
+    fn statement_timeout_keeps_the_url_search_path() {
+        let t = PoolTuning::from_lookup(lookup(&[("HTS_PG_STATEMENT_TIMEOUT_MS", "60000")]));
+        let mut cfg = Config::new();
+        cfg.url = Some(
+            "postgres://hfs:pw@db:5432/hfs?options=-c%20search_path%3Dterminology%2Cpublic"
+                .to_string(),
+        );
+        t.apply(&mut cfg, 4);
+        assert_eq!(
+            cfg.options.as_deref(),
+            Some("-c search_path=terminology,public -c statement_timeout=60000")
+        );
+        // Without the timeout the URL's options are left to the URL.
+        let mut cfg = Config::new();
+        cfg.url = Some("postgres://db/hfs?options=-c%20search_path%3Dterminology%2Cpublic".into());
+        PoolTuning::default().apply(&mut cfg, 4);
+        assert_eq!(cfg.options, None);
+        let pg = cfg.get_pg_config().unwrap();
+        assert_eq!(pg.get_options(), Some("-c search_path=terminology,public"));
     }
 
     #[test]

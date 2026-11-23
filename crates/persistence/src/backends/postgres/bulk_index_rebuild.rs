@@ -78,7 +78,7 @@ const DEFERRED_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS search_index_deferr
 /// a constraint, not the per-resource lookup index.
 const DROPPABLE_INDEXES_SQL: &str = "SELECT c.relname::text, pg_get_indexdef(c.oid)
     FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
-    WHERE i.indrelid = to_regclass('search_index')
+    WHERE i.indrelid = to_regclass(format('%I.%I', current_schema(), 'search_index'))
       AND NOT i.indisunique AND NOT i.indisprimary
       AND c.relname <> $1
       AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = c.oid)
@@ -219,7 +219,7 @@ impl PostgresBackend {
         let client = self.get_client().await?;
         let exists: bool = client
             .query_one(
-                "SELECT to_regclass('search_index_deferred_indexes') IS NOT NULL",
+                "SELECT to_regclass(format('%I.%I', current_schema(), 'search_index_deferred_indexes')) IS NOT NULL",
                 &[],
             )
             .await

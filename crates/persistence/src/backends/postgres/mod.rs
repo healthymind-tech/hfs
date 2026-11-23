@@ -108,6 +108,10 @@ pub use backend::{PostgresBackend, PostgresConfig};
 /// [`PostgresBackend::pool_status`], re-exported so callers need no direct
 /// deadpool dependency.
 pub use deadpool_postgres::Status as PoolStatus;
+pub use schema::{
+    FORK_CONSOLE_TERMINOLOGY_BINDINGS, FORK_TERMINOLOGY_SCHEMA, HM_0011_SQL, HM_0012_SQL,
+    TerminologyState, UNIFIED_FORK_MIGRATIONS, is_valid_store_schema_name,
+};
 
 pub use tenant_copy::{TenantCopyOptions, TenantCopyReport};
 pub use transaction::PostgresTransaction;
