@@ -4,12 +4,14 @@
     <legend class="visually-hidden">{{ i18n.t("mgr-sec-terminology") }}</legend>
     <div class="form-grid">
       {% call ui::field_text(i18n.t("mgr-term-server"), "term_server_url", v.term_server_url, self.err("terminology.serverUrl"), i18n.t("mgr-term-server-hint"), "url", false, "http://hts:8090", false, true) %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-term-public"), "term_public_url", v.term_public_url, self.err("terminology.publicUrl"), i18n.t("mgr-term-public-hint"), "url", false, "/ui/hts", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-term-public"), "term_public_url", v.term_public_url, self.err("terminology.publicUrl"), i18n.t("mgr-term-public-hint"), "url", false, "/ui/terminology", false, true) %}{% endcall %}
       {% call ui::field_text(i18n.t("mgr-term-timeout"), "term_timeout", v.term_timeout, self.err("terminology.timeoutSecs"), i18n.t("mgr-term-timeout-hint"), "number") %}{% endcall %}
     </div>
     {% call ui::secret_field(i18n.t("mgr-term-token"), "term_token", v.term_token_set, i18n.t("mgr-term-token-hint")) %}{% endcall %}
     {% if self.bad("terminology.token") %}<p class="mfield__error">{{ self.err("terminology.token") }}</p>{% endif %}
   </fieldset>
+  {#- UX-07: outside the fieldset, so it also checks the inherited server. -#}
+  {% call ui::verify_panel("verify-terminology", "/ui/e/" ~ head.name ~ "/terminology/verify", "term_inherit term_server_url term_token term_timeout", "verify-intro-terminology", "verify-run-terminology", false, false) %}{% endcall %}
 {% endcall %}
 
 <section class="card form-section" aria-labelledby="sec-hts-title">
@@ -18,6 +20,6 @@
     <p class="form-section__desc">{{ i18n.t("mgr-sec-hts-desc") }}</p>
   </header>
   <div class="form-section__body form-section__body--row">
-    <a class="btn" href="/ui/hts">{% call ui::icon("book") %}{% endcall %}{{ i18n.t("mgr-open-hts") }}</a>
+    <a class="btn" href="/ui/terminology">{% call ui::icon("book") %}{% endcall %}{{ i18n.t("mgr-open-hts") }}</a>
   </div>
 </section>

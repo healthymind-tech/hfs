@@ -1,0 +1,10 @@
+{#- Error summary: links to every field with an error (field-anchored). Needs `errors: Errors`. -#}
+{%- if !errors.is_empty() %}
+<div class="notice notice--danger idp-errors" role="alert" tabindex="-1" data-autofocus>
+  <p><strong>{{ i18n.t("idpc-errors-title") }}</strong></p>
+  {% if let Some(m) = errors.form %}{% if !m.is_empty() %}<p>{{ m }}</p>{% endif %}{% endif %}
+  {% if !errors.fields.is_empty() %}
+  <ul>{% for (id, msg) in errors.summary() %}<li><a href="#{{ id }}" data-idp-goto="{{ id }}">{{ msg }}</a></li>{% endfor %}</ul>
+  {% endif %}
+</div>
+{%- endif %}

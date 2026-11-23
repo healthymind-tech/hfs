@@ -1,4 +1,5 @@
-//! The console's navigation registry.
+//! The console's navigation registry (now `helios_ui_chrome::nav`, shared
+//! with the embedded terminology console and line IdP; re-exported here).
 //!
 //! The sidebar is built from [`NavItem`]s grouped by [`NavSection`]. The
 //! manager registers its own items; other packages add theirs with
@@ -7,90 +8,28 @@
 //! gain an entry.
 //!
 //! ```no_run
-//! use helios_ui::manager::nav::{register, NavItem, NavSection};
-//! use helios_endpoints::ConsoleRole;
-//! register(NavItem {
-//!     section: NavSection::Settings,
-//!     id: "settings-users",
-//!     label_key: "nav-settings-users",
-//!     href: "/ui/settings/users",
-//!     icon: "users",
-//!     min_role: ConsoleRole::Admin,
-//!     order: 20,
-//! });
+//! use helios_ui::manager::nav::{register, NavItem, NavRole, NavSection};
+//! register(
+//!     NavItem::new(NavSection::Settings, "settings-users", "nav-settings-users", "/ui/settings/users")
+//!         .icon("users")
+//!         .min_role(NavRole::Admin)
+//!         .order(20),
+//! );
 //! ```
-
-use std::sync::RwLock;
 
 use helios_endpoints::ConsoleRole;
 
-/// Where an item lives in the sidebar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum NavSection {
-    /// Server-wide pages above the endpoint block (Overview).
-    Manager,
-    /// The current endpoint: home and data pages. `href` may contain
-    /// `{ep}`, replaced by the endpoint name.
-    EndpointData,
-    /// The current endpoint: configuration.
-    EndpointConfigure,
-    /// The current endpoint: operations (sync, audit, history).
-    EndpointOperate,
-    /// Server-wide operations (sync jobs of every endpoint).
-    Server,
-    /// Console settings (users, sign-in, server).
-    Settings,
-}
+pub use helios_ui_chrome::nav::{
+    NavGroup, NavItem, NavLink, NavRole, NavScope, NavSection, nav_key, register,
+};
 
-impl NavSection {
-    /// Fluent key of the section heading.
-    pub fn label_key(self) -> &'static str {
-        match self {
-            NavSection::Manager => "mgr-nav-section-manager",
-            NavSection::EndpointData => "mgr-nav-section-data",
-            NavSection::EndpointConfigure => "mgr-nav-section-configure",
-            NavSection::EndpointOperate => "mgr-nav-section-operate",
-            NavSection::Server => "mgr-nav-section-server",
-            NavSection::Settings => "mgr-nav-section-settings",
-        }
+/// The registry's role for a console role.
+pub fn nav_role(role: ConsoleRole) -> NavRole {
+    match role {
+        ConsoleRole::Viewer => NavRole::Viewer,
+        ConsoleRole::Editor => NavRole::Editor,
+        ConsoleRole::Admin => NavRole::Admin,
     }
-
-    /// Whether items of this section need a current endpoint.
-    pub fn per_endpoint(self) -> bool {
-        matches!(
-            self,
-            NavSection::EndpointData | NavSection::EndpointConfigure | NavSection::EndpointOperate
-        )
-    }
-}
-
-/// One sidebar entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NavItem {
-    /// Section.
-    pub section: NavSection,
-    /// The page's `active_page` id (marks the entry current).
-    pub id: &'static str,
-    /// Fluent key of the label.
-    pub label_key: &'static str,
-    /// Target; `{ep}` = current endpoint name.
-    pub href: &'static str,
-    /// Icon name (see `templates/partials/nav/icon.html`).
-    pub icon: &'static str,
-    /// Hidden below this role.
-    pub min_role: ConsoleRole,
-    /// Sort key within the section.
-    pub order: u16,
-}
-
-static REGISTERED: RwLock<Vec<NavItem>> = RwLock::new(Vec::new());
-
-/// Adds an entry (idempotent per `id`: a second registration replaces the
-/// first).
-pub fn register(item: NavItem) {
-    let mut items = REGISTERED.write().unwrap_or_else(|p| p.into_inner());
-    items.retain(|i| i.id != item.id);
-    items.push(item);
 }
 
 const fn item(
@@ -101,15 +40,9 @@ const fn item(
     icon: &'static str,
     order: u16,
 ) -> NavItem {
-    NavItem {
-        section,
-        id,
-        label_key,
-        href,
-        icon,
-        min_role: ConsoleRole::Viewer,
-        order,
-    }
+    NavItem::new(section, id, label_key, href)
+        .icon(icon)
+        .order(order)
 }
 
 /// The manager's own entries.
@@ -319,68 +252,70 @@ fn builtin() -> Vec<NavItem> {
         ),
         item(Settings, "about", "mgr-nav-about", "/ui/about", "info", 90),
     ];
-    v.iter_mut()
-        .filter(|i| matches!(i.id, "tenants" | "settings-auth" | "settings-users"))
-        .for_each(|i| i.min_role = ConsoleRole::Admin);
+    for i in v.iter_mut() {
+        if matches!(i.id, "tenants" | "settings-auth" | "settings-users") {
+            i.min_role = NavRole::Admin;
+        }
+        // Pages whose own scripts are not lifecycle-clean yet load as a full
+        // document (persistent-shell spec §9.4 item 1); every other page is
+        // swapped in place.
+        if matches!(
+            i.id,
+            "resources"
+                | "batch"
+                | "validate"
+                | "bulk-import"
+                | "bulk-export"
+                | "sql-view-definitions"
+                | "sql-queries"
+                | "sql-views"
+                | "sql-export"
+                | "search-parameters"
+                | "compartments"
+                | "tenants"
+                | "account"
+        ) {
+            i.boost = false;
+        }
+    }
     v
 }
 
-/// One rendered entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NavLink {
-    /// `active_page` id.
-    pub id: &'static str,
-    /// Fluent key.
-    pub label_key: &'static str,
-    /// Resolved href.
-    pub href: String,
-    /// Icon name.
-    pub icon: &'static str,
+/// The roles that decide what the sidebar of one request shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavRoles {
+    /// Global console role (server sections, settings).
+    pub global: ConsoleRole,
+    /// Role on the sidebar's endpoint (per-endpoint sections).
+    pub endpoint: ConsoleRole,
+    /// Terminology role: max(global, `terminology` binding).
+    pub terminology: ConsoleRole,
 }
 
-/// One rendered section.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NavGroup {
-    /// Section.
-    pub section: NavSection,
-    /// Fluent key of the heading.
-    pub label_key: &'static str,
-    /// Entries.
-    pub links: Vec<NavLink>,
+impl NavRoles {
+    /// One role for everything.
+    pub fn uniform(role: ConsoleRole) -> Self {
+        Self {
+            global: role,
+            endpoint: role,
+            terminology: role,
+        }
+    }
+
+    fn allows(&self, item: &NavItem) -> bool {
+        let role = match (item.scope, item.section.per_endpoint()) {
+            (NavScope::Terminology, _) => self.terminology,
+            (NavScope::Console, true) => self.endpoint,
+            (NavScope::Console, false) => self.global,
+        };
+        nav_role(role) >= item.min_role
+    }
 }
 
 /// The sidebar for a request: per-endpoint sections only with an endpoint,
 /// entries above the role hidden, registered entries merged in.
-pub fn build(endpoint: Option<&str>, role: ConsoleRole) -> Vec<NavGroup> {
-    let mut items = builtin();
-    for extra in REGISTERED.read().unwrap_or_else(|p| p.into_inner()).iter() {
-        items.retain(|i| i.id != extra.id);
-        items.push(extra.clone());
-    }
-    items.retain(|i| role >= i.min_role && (endpoint.is_some() || !i.section.per_endpoint()));
-    items.sort_by_key(|i| (i.section, i.order));
-    let mut groups: Vec<NavGroup> = Vec::new();
-    for i in items {
-        let href = match endpoint {
-            Some(ep) => i.href.replace("{ep}", ep),
-            None => i.href.to_string(),
-        };
-        let link = NavLink {
-            id: i.id,
-            label_key: i.label_key,
-            href,
-            icon: i.icon,
-        };
-        match groups.last_mut() {
-            Some(g) if g.section == i.section => g.links.push(link),
-            _ => groups.push(NavGroup {
-                section: i.section,
-                label_key: i.section.label_key(),
-                links: vec![link],
-            }),
-        }
-    }
-    groups
+pub fn build(endpoint: Option<&str>, roles: NavRoles) -> Vec<NavGroup> {
+    helios_ui_chrome::nav::build(builtin(), endpoint, |i| roles.allows(i))
 }
 
 #[cfg(test)]
@@ -389,9 +324,9 @@ mod tests {
 
     #[test]
     fn endpoint_sections_need_an_endpoint() {
-        let without = build(None, ConsoleRole::Admin);
+        let without = build(None, NavRoles::uniform(ConsoleRole::Admin));
         assert!(without.iter().all(|g| !g.section.per_endpoint()));
-        let with = build(Some("twcore"), ConsoleRole::Admin);
+        let with = build(Some("twcore"), NavRoles::uniform(ConsoleRole::Admin));
         let data = with
             .iter()
             .find(|g| g.section == NavSection::EndpointData)
@@ -411,30 +346,32 @@ mod tests {
 
     #[test]
     fn roles_hide_entries_and_registration_merges() {
-        let viewer = build(None, ConsoleRole::Viewer);
+        let viewer = build(None, NavRoles::uniform(ConsoleRole::Viewer));
         assert!(
             viewer
                 .iter()
                 .flat_map(|g| &g.links)
                 .all(|l| l.id != "tenants")
         );
-        register(NavItem {
-            section: NavSection::Settings,
-            id: "test-settings-extra",
-            label_key: "mgr-nav-about",
-            href: "/ui/settings/extra",
-            icon: "users",
-            min_role: ConsoleRole::Admin,
-            order: 1,
-        });
-        let admin = build(None, ConsoleRole::Admin);
+        register(
+            NavItem::new(
+                NavSection::Settings,
+                "test-settings-extra",
+                "mgr-nav-about",
+                "/ui/settings/extra",
+            )
+            .icon("users")
+            .min_role(NavRole::Admin)
+            .order(1),
+        );
+        let admin = build(None, NavRoles::uniform(ConsoleRole::Admin));
         let settings = admin
             .iter()
             .find(|g| g.section == NavSection::Settings)
             .unwrap();
         assert_eq!(settings.links[0].id, "test-settings-extra");
         assert!(
-            build(None, ConsoleRole::Viewer)
+            build(None, NavRoles::uniform(ConsoleRole::Viewer))
                 .iter()
                 .flat_map(|g| &g.links)
                 .all(|l| l.id != "test-settings-extra")

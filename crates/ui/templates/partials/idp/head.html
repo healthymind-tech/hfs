@@ -1,0 +1,22 @@
+{#- Realm header + tabs of every /ui/idp/{realm} page. Needs `head: RealmHead`. -#}
+<link rel="stylesheet" href="/ui/assets/idp.css">
+<script src="/ui/assets/idp.js" defer></script>
+<header class="page-head page-head--row idp-head">
+  <div class="page-head__text">
+    <p class="page-head__back"><a href="/ui/idp">← {{ i18n.t("idpc-title") }}</a></p>
+    <h1 class="page-head__title">{{ head.display_name }}
+      {% if head.draft_step.is_some() %}<span class="status-pill status-pill--accent">{% call ui::icon("pencil") %}{% endcall %}<span>{{ i18n.t("idpc-status-draft-short") }}</span></span>
+      {% else if head.enabled %}<span class="status-pill status-pill--ok">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t("idpc-status-enabled") }}</span></span>
+      {% else %}<span class="status-pill status-pill--muted">{% call ui::icon("power") %}{% endcall %}<span>{{ i18n.t("idpc-status-disabled") }}</span></span>{% endif %}
+    </h1>
+    <div class="idp-head__issuer"><span class="idp-head__label">{{ i18n.t("idpc-issuer") }}</span>{% call ui::copy_field(head.issuer, i18n.t("idpc-copy-issuer")) %}{% endcall %}</div>
+  </div>
+  <div class="page-head__actions">
+    <a class="btn btn--primary" href="/ui/idp/{{ head.name }}/test">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("idpc-test-run") }}</a>
+  </div>
+</header>
+<nav class="tabs idp-tabs" aria-label="{{ i18n.t("idpc-tabs-label") }}">
+  {% for (id, key, suffix) in crate::idp::manage::TABS %}
+  <a class="tab{% if head.tab == id %} tab--on{% endif %}" href="/ui/idp/{{ head.name }}{{ suffix }}"{% if head.tab == id %} aria-current="page"{% endif %}>{{ i18n.t(key) }}</a>
+  {% endfor %}
+</nav>

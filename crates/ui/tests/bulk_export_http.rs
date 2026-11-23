@@ -4410,7 +4410,7 @@ async fn invalid_patient_input_fails_without_export_all_and_other_scopes_ignore_
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(!html.contains("valid logical Patient IDs"), "{html}");
     assert!(
-        !html.contains("Retry"),
+        !html.contains(">Retry<"),
         "invalid input must not create a card"
     );
     assert_no_default_user_jobs(&backend).await;

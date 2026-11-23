@@ -288,6 +288,28 @@ pub fn cache_dir(config: &ServerConfig) -> std::path::PathBuf {
         .join("packages")
 }
 
+/// The package manager's terminology client: the server's installed
+/// terminology service (embedded, or remote with its token), else the
+/// remote `HFS_TERMINOLOGY_SERVER` with `HFS_TERMINOLOGY_SERVER_TOKEN`.
+fn package_terminology(config: &ServerConfig) -> Option<HtsClient> {
+    let installed = crate::terminology::server_terminology().is_some();
+    crate::terminology::terminology_for(
+        config.terminology_server.as_deref(),
+        crate::terminology::TxCaller::Packages,
+    )
+    .map(|(label, service)| {
+        if installed
+            && (config.terminology_server.is_none()
+                || crate::terminology::server_terminology_url().as_deref()
+                    == config.terminology_server.as_deref())
+        {
+            HtsClient::from_service(label, service)
+        } else {
+            HtsClient::new(&label).with_token(config.packages.terminology_token.as_ref())
+        }
+    })
+}
+
 impl PackageManager {
     /// Builds the manager for a server configuration.
     pub fn new(config: &ServerConfig, deps: ManagerDeps) -> Self {
@@ -310,9 +332,7 @@ impl PackageManager {
                 cache_dir(config),
                 limits,
             ),
-            hts: config.terminology_server.as_deref().map(|base| {
-                HtsClient::new(base).with_token(config.packages.terminology_token.as_ref())
-            }),
+            hts: package_terminology(config),
             fhir_version: config.default_fhir_version,
             default_tenant: config.default_tenant.clone(),
             config: config.packages.clone(),

@@ -660,12 +660,27 @@ impl<S: ResourceStorage> AppState<S> {
     fn search_terminology_from(
         config: &ServerConfig,
     ) -> Option<Arc<crate::terminology::SearchTerminology>> {
-        config.terminology_server.as_deref().map(|url| {
-            Arc::new(crate::terminology::SearchTerminology::from_config(
-                url,
+        crate::terminology::terminology_for(
+            config.terminology_server.as_deref(),
+            crate::terminology::TxCaller::Search,
+        )
+        .map(|(label, service)| {
+            Arc::new(crate::terminology::SearchTerminology::from_service(
+                &label,
+                service,
                 &config.search_terminology,
             ))
         })
+    }
+
+    /// The server's terminology service (`HFS_TERMINOLOGY`: embedded, or the
+    /// remote `HFS_TERMINOLOGY_SERVER`) for `caller`; `None` when off.
+    pub fn terminology(
+        &self,
+        caller: crate::terminology::TxCaller,
+    ) -> Option<Arc<dyn helios_terminology::TerminologyService>> {
+        crate::terminology::terminology_for(self.config.terminology_server.as_deref(), caller)
+            .map(|(_, service)| service)
     }
 
     /// The search-time terminology service, when a terminology server is
@@ -686,7 +701,11 @@ impl<S: ResourceStorage> AppState<S> {
         let Some(binding) = binding else {
             return self.search_terminology.clone();
         };
-        let url = binding.server_url?;
+        // A binding without a URL means the server's own terminology service
+        // (embedded or remote), design §6.
+        let Some(url) = binding.server_url else {
+            return self.search_terminology.clone();
+        };
         if self.config.terminology_server.as_deref() == Some(url.as_str()) {
             return self.search_terminology.clone();
         }
@@ -736,6 +755,13 @@ impl<S: ResourceStorage> AppState<S> {
     /// for `:in` and `:not-in` search modifiers.
     pub fn terminology_server_url(&self) -> Option<&str> {
         self.config.terminology_server.as_deref()
+    }
+
+    /// Whether any terminology service is reachable: a remote server is
+    /// configured, or the server's embedded service is installed.
+    pub fn has_terminology(&self) -> bool {
+        self.config.terminology_server.is_some()
+            || crate::terminology::server_terminology().is_some()
     }
 
     /// Returns the audit sink for handler-level audit emission, if configured.

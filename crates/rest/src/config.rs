@@ -2526,6 +2526,22 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_TERMINOLOGY_PUBLIC_URL")]
     pub terminology_public_url: Option<String>,
 
+    /// `/_readiness` answers 503 while the terminology service is down
+    /// (`HFS_READINESS_REQUIRE_TERMINOLOGY`). Off by default: FHIR must not
+    /// go unready because terminology is degraded (design §10).
+    #[arg(
+        long,
+        env = "HFS_READINESS_REQUIRE_TERMINOLOGY",
+        default_value = "false"
+    )]
+    pub readiness_require_terminology: bool,
+
+    /// The terminology service is embedded in this process
+    /// (`HFS_TERMINOLOGY=embedded`, resolved by the `hfs` binary): remote
+    /// validation and `:in` search need no `HFS_TERMINOLOGY_SERVER`.
+    #[arg(skip)]
+    pub terminology_embedded: bool,
+
     /// Multitenancy configuration (loaded from environment variables).
     #[arg(skip)]
     pub multitenancy: MultitenancyConfig,
@@ -2657,6 +2673,8 @@ impl fmt::Debug for ServerConfig {
             subscriptions_fanout,
             reindex_concurrency,
             terminology_public_url,
+            readiness_require_terminology,
+            terminology_embedded,
             packages,
             search_terminology,
         } = self;
@@ -2798,6 +2816,11 @@ impl fmt::Debug for ServerConfig {
                 "terminology_public_url",
                 &terminology_public_url.as_deref().map(redact_url),
             )
+            .field(
+                "readiness_require_terminology",
+                readiness_require_terminology,
+            )
+            .field("terminology_embedded", terminology_embedded)
             .field("packages", packages)
             .field("search_terminology", search_terminology)
             .finish()
@@ -2869,6 +2892,11 @@ impl ServerConfig {
         config.validation = ValidationConfig::from_env();
         config.packages = PackageConfig::from_env();
         config.search_terminology = SearchTerminologyConfig::from_env();
+        // An explicit `HFS_TERMINOLOGY=embedded` satisfies the terminology
+        // requirements below; the `hfs` binary resolves the full mode
+        // (defaults, legacy `HTS_*`) afterwards.
+        config.terminology_embedded = std::env::var("HFS_TERMINOLOGY")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("embedded"));
         config.normalize_public_base_url().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
@@ -3025,6 +3053,8 @@ impl Default for ServerConfig {
             sof_runner_header: false,
             terminology_server: None,
             terminology_public_url: None,
+            readiness_require_terminology: false,
+            terminology_embedded: false,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
@@ -3310,9 +3340,10 @@ impl ServerConfig {
             self.validation.terminology.as_str(),
             "remote" | "remote-only"
         ) && self.terminology_server.is_none()
+            && !self.terminology_embedded
         {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY={} requires HFS_TERMINOLOGY_SERVER",
+                "HFS_VALIDATION_TERMINOLOGY={} requires HFS_TERMINOLOGY_SERVER or HFS_TERMINOLOGY=embedded",
                 self.validation.terminology
             ));
         }
@@ -3413,6 +3444,8 @@ impl ServerConfig {
             sof_runner_header: false,
             terminology_server: None,
             terminology_public_url: None,
+            readiness_require_terminology: false,
+            terminology_embedded: false,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),

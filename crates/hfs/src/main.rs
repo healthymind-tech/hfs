@@ -19,7 +19,11 @@
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 mod cluster;
+mod idp;
+mod idp_console;
 mod manager;
+mod terminology;
+mod terminology_runtime;
 
 use std::sync::Arc;
 
@@ -1650,8 +1654,24 @@ async fn serve(
         ui_bulk_provider,
         write_observer,
     );
+    // The embedded terminology API at `/tx` and its admin API at
+    // `/admin/terminology` (inside the admin guard below).
+    let app = terminology::attach(app);
     // The console admin API, inside the admin guard below.
     let app = manager::console_auth::routes(app, console.as_ref());
+    // Authorization-server admin API (`HFS_IDP=on`), inside the admin guard.
+    let app = idp_console::admin_routes(app, admin_gate.clone());
+    // Built-in authorization server (`HFS_IDP=on`): /idp/{realm}/… with its
+    // own CSRF, CSP and rate limits; outside the admin guard (public pages).
+    let app = idp::attach(
+        app,
+        config,
+        audit_state
+            .as_ref()
+            .map(|a| (Arc::clone(&a.sink), a.config.source_observer.clone())),
+        idp::PG_POOL.get().cloned(),
+    )
+    .await?;
     // Outermost of the application layers, so it sees `/admin/...` whether
     // the UI router or the FHIR router answers it.
     // Just inside the admin gate: the signed-in administrator becomes the
@@ -1841,6 +1861,7 @@ async fn open_admin_session_store(
     backend: &helios_persistence::backends::postgres::PostgresBackend,
 ) {
     manager::console_auth::record_pool(backend.shared_pool());
+    let _ = idp::PG_POOL.set(backend.shared_pool());
     match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
         backend.shared_pool(),
         "HFS",
@@ -2000,6 +2021,34 @@ fn mount_ui(
     // IG Packages page and nav entry follow the same switch as the
     // `/admin/packages` API (`HFS_ADMIN_UI`).
     helios_ui::set_package_admin(config.packages.admin_ui);
+    // The Terminology section of the console (`/ui/terminology`, one
+    // sign-in with the rest of it): in-process over the embedded
+    // terminology service, else over the configured terminology server.
+    if let Some(local) = terminology::console_upstream() {
+        helios_ui::terminology_console::install(
+            helios_ui::terminology_console::TerminologyConsoleConfig {
+                upstream_url: String::new(),
+                admin_token: None,
+                fhir_version: config.default_fhir_version.as_str(),
+                version: env!("CARGO_PKG_VERSION"),
+                in_process: Some(local),
+            },
+        );
+    } else if let Some(url) = config.terminology_server.clone() {
+        helios_ui::terminology_console::install(
+            helios_ui::terminology_console::TerminologyConsoleConfig {
+                upstream_url: url,
+                admin_token: config
+                    .packages
+                    .terminology_token
+                    .as_ref()
+                    .map(|t| t.expose().to_string()),
+                fhir_version: config.default_fhir_version.as_str(),
+                version: env!("CARGO_PKG_VERSION"),
+                in_process: None,
+            },
+        );
+    }
     helios_ui::mount_with_body_limit_and_tenant_routing(
         app,
         env!("CARGO_PKG_VERSION"),
@@ -2472,6 +2521,17 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // `HFS_TERMINOLOGY=embedded|remote|off` (legacy `HTS_*` folded in):
+    // aligns `terminology_server` with the mode before validation.
+    let terminology_settings = match terminology::resolve(&mut config) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("Configuration error: {}", error);
+            std::process::exit(1);
+        }
+    };
+    terminology::log_deprecations(&terminology_settings.view);
+
     if let Err(errors) = config.validate() {
         for error in &errors {
             eprintln!("Configuration error: {}", error);
@@ -2515,26 +2575,21 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
-    // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology
-    // operations (memberOf, subsumes) to the configured HTS instance.
-    if let Some(ref ts_url) = config.terminology_server {
-        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
-            // Safety: single-threaded at this point (before tokio runtime hands
-            // off to worker threads), so set_var is safe here.
-            // SAFETY: called before any threads are spawned by the tokio runtime.
-            unsafe {
-                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
-            }
-            info!(
-                url = %redact_url(ts_url),
-                "HFS_TERMINOLOGY_SERVER wired to FHIRPath context"
-            );
-        }
-    }
-
     // Initialize audit subsystem
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
+
+    // The terminology service (`HFS_TERMINOLOGY`): embedded HTS, a remote
+    // server or off, installed for validation, search, SoF, FHIRPath, the
+    // package manager and the console before any of them is built. FHIRPath
+    // gets it as its default terminology (no FHIRPATH_TERMINOLOGY_SERVER
+    // environment hand-off any more).
+    terminology::start(
+        &config,
+        &terminology_settings,
+        audit_state.as_ref(),
+        admin_gate(&config),
+    )
+    .await?;
 
     // The REST audit events carry the authenticated user and record the
     // requests auth refuses, so the auth layer's own per-request events are
@@ -4423,6 +4478,7 @@ async fn start_postgres(
     );
 
     backend.init_schema().await?;
+    terminology::apply_unified_migrations(&backend).await?;
     let backend = Arc::new(backend);
     register_pg_pool_metrics("primary", backend.clone());
     attach_login_sessions(auth_state.as_ref(), backend.clone());
@@ -4543,6 +4599,7 @@ async fn start_postgres_elasticsearch(
     // PostgreSQL even when search is offloaded (#1663).
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
+    terminology::apply_unified_migrations(&backend).await?;
     open_admin_session_store(&backend).await;
 
     // Offload search to Elasticsearch

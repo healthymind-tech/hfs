@@ -61,6 +61,8 @@
     var xhr = detail.xhr;
     var target = detail.target || elt;
     if (!elt || !xhr || !target || !userInitiated(detail)) return;
+    // In-place page navigations have their own progress (shell.js).
+    if (detail.requestConfig && detail.requestConfig.boosted) return;
     if (elt.closest('[data-busy="off"]') || target.closest('[data-busy="off"]')) return;
 
     var block = getComputedStyle(target).display !== "inline";

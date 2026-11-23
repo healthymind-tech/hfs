@@ -51,5 +51,9 @@ tracing = "0.1"
 thiserror = "2"
 
 [dev-dependencies]
+# Internal-realm tests mint real access tokens with the IdP core's signer
+# (docs/design/authorization-server.md §14: tokens signed by helios-idp
+# verify here). Dev-only: helios-auth itself never depends on the IdP.
+helios-idp = { path = "../idp", version = "0.2.9" }
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"

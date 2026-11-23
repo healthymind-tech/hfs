@@ -30,9 +30,9 @@
 -#}
 <form class="card"
       id="hts-import-form"
-      action="/ui/hts/import"
+      action="{{ crate::paths::ui() }}/import"
       method="post"
-      hx-post="/ui/hts/import"
+      hx-post="{{ crate::paths::ui() }}/import"
       hx-target="#hts-import-status"
       hx-swap="innerHTML"
       enctype="application/x-www-form-urlencoded">

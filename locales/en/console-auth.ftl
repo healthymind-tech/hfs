@@ -162,3 +162,7 @@ auth-pw-rule-common = Not a commonly used password (checked when you save)
 auth-pw-submit = Save password and continue
 auth-pw-later = Sign out and do this later
 auth-account-identity = Signed in as
+console-settings-register-title = Register these addresses in the identity provider's client:
+console-settings-redirect-uri = Redirect URI
+console-settings-post-logout-uri = Post-logout redirect URI
+console-settings-pinned-explain = Set by the environment variable { $var }. Change it in the deployment (docker-compose / .env) and restart the server.

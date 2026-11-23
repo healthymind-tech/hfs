@@ -1,0 +1,19 @@
+{% extends "layouts/base.html" %}
+{#
+  A terminology page the requester's role does not allow (unified-server
+  design §7.2, §9.4 item 10): the console's 403 panel inside the shell, so
+  the sidebar stays and the way back is one click.
+#}
+{% block title %}{{ i18n.t("console-forbidden-title") }} · {{ i18n.t("app-short-name") }}{% endblock %}
+
+{% block content %}
+<div class="error-page" id="denied-panel">
+  <p class="error-page__code" aria-hidden="true">403</p>
+  <h1 class="page-head__title" tabindex="-1">{{ i18n.t("console-forbidden-title") }}</h1>
+  <p class="error-page__text">{{ i18n.t_arg("console-forbidden-text", "role", need.to_string()) }}</p>
+  <p class="error-page__text muted">{{ i18n.t_arg("tx-denied-current-role", "role", have.to_string()) }}</p>
+  <div class="error-page__actions">
+    <a class="btn btn--primary" href="/ui/terminology">{{ i18n.t("hts-nav-home") }}</a>
+  </div>
+</div>
+{% endblock %}

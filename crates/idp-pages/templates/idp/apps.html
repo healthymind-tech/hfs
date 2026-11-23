@@ -1,0 +1,33 @@
+{% extends "idp/layout.html" %}
+{% block title %}{{ shell.i18n.t("idp-apps-title") }}{% endblock %}
+{% block card %}
+          <header class="auth-head">
+            <h1 class="auth-title" id="auth-title">{{ shell.i18n.t("idp-apps-title") }}</h1>
+            <p class="auth-lede">{{ lede }}</p>
+          </header>
+          {%- if let Some(b) = notice %}
+          {% include "idp/banner.html" %}
+          {%- endif %}
+          {%- if apps.is_empty() %}
+          <p class="idp-empty" id="idp-apps-empty">{{ shell.i18n.t("idp-apps-none") }}</p>
+          {%- else %}
+          <ul class="idp-apps" id="idp-apps">
+            {%- for a in apps %}
+            <li class="idp-app">
+              <div class="idp-app__body">
+                <span class="idp-app__name">{{ a.name }}</span>
+                <span class="idp-app__meta">{{ a.meta }}</span>
+                <span class="idp-app__scopes">{{ a.scopes }}</span>
+              </div>
+              <form method="post" action="{{ action }}">
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input type="hidden" name="client_id" value="{{ a.client_id }}">
+                <input type="hidden" name="endpoint" value="{{ a.endpoint }}">
+                <button class="btn btn--small btn--danger-outline" type="submit" data-app="{{ a.client_id }}">{{ shell.i18n.t("idp-apps-revoke") }}</button>
+              </form>
+            </li>
+            {%- endfor %}
+          </ul>
+          {%- endif %}
+          <p class="auth-aside"><a href="{{ logout_href }}" id="idp-apps-signout">{{ shell.i18n.t("idp-apps-signout") }}</a></p>
+{% endblock %}

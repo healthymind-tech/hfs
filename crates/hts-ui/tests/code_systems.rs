@@ -60,7 +60,7 @@ async fn browser_renders_full_page_with_translated_heading() {
         "hard nav must render a full HTML page",
     );
     assert!(
-        html.contains(">CodeSystems<"),
+        html.contains(">Code systems<"),
         "browser heading must be Fluent-resolved (en value: CodeSystems)",
     );
     assert!(

@@ -1,0 +1,48 @@
+{% import "partials/components.html" as ui %}
+{#-
+  The result of a Verify panel (UX-02/07/08): an ordered checklist, one row
+  per step — status in words and icon (never colour alone), the step, what
+  was found, how to fix it, the URL contacted, how long it took, and a link
+  that focuses the field the step checks. Rendered by
+  crates/ui/src/manager/verify.rs; behaviour (stale marking, Go to field,
+  Use suggested value) is assets/manager.js.
+-#}
+{%- if let Some(message) = r.unavailable %}
+<div class="verify__summary verify__summary--warn" role="status">
+  <span class="verify__badge">{{ i18n.t("verify-status-warn") }}</span>
+  <p>{{ message }}</p>
+</div>
+{%- else %}
+<div class="verify__summary verify__summary--{{ r.tone }}" role="status" tabindex="-1" data-verify-summary>
+  <span class="verify__badge">{{ r.badge }}</span>
+  <div>
+    <p class="verify__headline">{{ r.headline }}</p>
+    <p class="verify__meta">{{ r.checked_label }}<span class="verify__stale" data-verify-stale hidden> · {{ i18n.t("verify-stale") }}</span></p>
+  </div>
+</div>
+<ol class="verify__steps">
+  {%- for s in r.steps %}
+  <li class="verify-step verify-step--{{ s.status }}" data-step="{{ s.id }}"{% if let Some(f) = s.field_id %} data-field="{{ f }}"{% endif %}>
+    <span class="verify-step__icon" aria-hidden="true">{% if s.status == "pass" %}{% call ui::icon("check-circle") %}{% endcall %}{% else if s.status == "fail" %}{% call ui::icon("x") %}{% endcall %}{% else if s.status == "warn" %}{% call ui::icon("alert") %}{% endcall %}{% else %}{% call ui::icon("stop-circle") %}{% endcall %}{% endif %}</span>
+    <div class="verify-step__body">
+      <p class="verify-step__title"><span class="verify-step__status">{{ s.status_label }}</span> {{ s.title }}{% if s.elapsed_ms > 0 %} <span class="verify-step__time">{{ i18n.t_arg("verify-elapsed", "ms", s.elapsed_ms) }}</span>{% endif %}</p>
+      <p class="verify-step__message">{{ s.message }}</p>
+      {%- if let Some(fix) = s.fix %}
+      <p class="verify-step__fix"><strong>{{ i18n.t("verify-how-to-fix") }}</strong> {{ fix }}</p>
+      {%- endif %}
+      {%- if let Some(url) = s.url %}
+      <p class="verify-step__url"><span>{{ i18n.t("verify-contacted") }}</span> <code>{{ url }}</code></p>
+      {%- endif %}
+      <div class="verify-step__actions">
+        {%- if let Some(f) = s.field_id %}{% if s.status == "fail" || s.status == "warn" %}
+        <a class="btn btn--small btn--ghost" href="#{{ f }}" data-verify-goto="{{ f }}">{{ i18n.t("verify-go-to-field") }}</a>
+        {%- endif %}{% endif %}
+        {%- for sug in s.suggestions %}
+        <button type="button" class="btn btn--small" data-verify-fill="{{ sug.field_id }}" data-verify-value="{{ sug.value }}">{{ sug.label }}</button>
+        {%- endfor %}
+      </div>
+    </div>
+  </li>
+  {%- endfor %}
+</ol>
+{%- endif %}

@@ -58,12 +58,19 @@ pub const RESERVED_SEGMENTS: &[&str] = &[
     "callback",
     "oauth",
     "oidc",
+    // Built-in authorization server realms (`/idp/{realm}`,
+    // docs/design/authorization-server.md D-2).
+    "idp",
     "well-known",
     "system",
     "internal",
     "manager",
     "endpoints",
     "sync",
+    // Unified server (docs/design/unified-server.md §3.2): the terminology
+    // namespace and the built-in authorization servers (line IdP).
+    "terminology",
+    "idp",
 ];
 
 /// Why a name or path segment was refused.

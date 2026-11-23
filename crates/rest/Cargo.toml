@@ -67,6 +67,10 @@ helios-fhir-validator = { path = "../fhir-validator", version = "0.2.9", default
 helios-observability = { path = "../observability", version = "0.2.9" }
 # FHIR server manager contracts (endpoint model, routing snapshot, registry).
 helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+# One terminology contract for search, SoF, validation, FHIRPath and the
+# package manager (docs/design/unified-server.md U2).
+helios-terminology = { path = "../terminology", version = "0.2.9" }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.9", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -169,6 +173,9 @@ libc = "0.2"
 
 [dev-dependencies]
 http-body = "1"
+# Endpoints bound to an internal realm (docs/design/authorization-server.md
+# §5.2): tests mint access tokens with the IdP core's signer.
+helios-idp = { path = "../idp", version = "0.2.9" }
 wiremock = "0.6" # terminology server stub for SQL query terminology dependencies
 # HTTP testing
 axum-test = "18.0"

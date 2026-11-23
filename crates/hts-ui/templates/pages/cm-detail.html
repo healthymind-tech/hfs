@@ -44,7 +44,7 @@
 
   {% if let Some(summary) = self.summary() %}
     <header class="page-head page-head--back-link">
-      <a class="back-link" href="/ui/hts/concept-maps">
+      <a class="back-link" href="{{ crate::paths::ui() }}/concept-maps">
         <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
         <span>{{ chrome.i18n.t("hts-cm-browser-title") }}</span>
       </a>
@@ -171,8 +171,8 @@
          aria-selected="{% if tab == CmTab::Translate %}true{% else %}false{% endif %}"
          {% if tab == CmTab::Translate %}aria-current="true"{% endif %}
          aria-controls="hts-cm-workbench"
-         href="/ui/hts/concept-maps/{{ id }}/translate"
-         hx-get="/ui/hts/concept-maps/{{ id }}/translate"
+         href="{{ crate::paths::ui() }}/concept-maps/{{ id }}/translate"
+         hx-get="{{ crate::paths::ui() }}/concept-maps/{{ id }}/translate"
          hx-target="#hts-cm-detail-region"
          hx-select="#hts-cm-detail-region"
          hx-swap="outerHTML"

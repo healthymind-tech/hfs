@@ -44,11 +44,12 @@
 <div class="filter-center">
   <form id="hts-cs-filters"
         method="get"
-        action="/ui/hts/code-systems/rows"
-        hx-get="/ui/hts/code-systems/rows"
+        action="{{ crate::paths::ui() }}/code-systems/rows"
+        hx-get="{{ crate::paths::ui() }}/code-systems/rows"
         hx-target="#hts-cs-rows"
         hx-swap="outerHTML"
         hx-trigger="input changed delay:300ms, change, submit"
+        hx-sync="this:replace"
         aria-label="{{ chrome.i18n.t("hts-cs-browser-filter-legend") }}">
     <section class="card table-card">
       <div class="toolbar toolbar--filters">
@@ -93,7 +94,7 @@
             {% endfor %}
           </select>
         </label>
-        <a class="btn" href="/ui/hts/code-systems">{{ chrome.i18n.t("hts-cs-browser-filter-reset") }}</a>
+        <a class="btn" href="{{ crate::paths::ui() }}/code-systems">{{ chrome.i18n.t("hts-cs-browser-filter-reset") }}</a>
       </div>
 
       {#-

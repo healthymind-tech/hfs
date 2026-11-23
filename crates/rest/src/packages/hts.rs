@@ -7,7 +7,10 @@
 //! a different id than the package's, so terminology is always addressed by
 //! canonical here, never by id.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use helios_terminology::{ServiceKind, TerminologyService, TxPrincipal, TxRequest, TxResponse};
 
 use serde_json::{Value, json};
 
@@ -38,54 +41,62 @@ fn strings(doc: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// HTS client.
+/// The package manager's terminology client: the server's terminology
+/// service (embedded: in-process, no token) or a remote server over HTTP
+/// (`HFS_TERMINOLOGY_SERVER`, with `HFS_TERMINOLOGY_SERVER_TOKEN`).
+/// Writes and the `find` lookups run as the `System` principal: the
+/// embedded write guard trusts it, the remote service turns it into the
+/// bearer token, as before.
 #[derive(Clone)]
 pub struct HtsClient {
     base: String,
-    http: reqwest::Client,
-    /// `Authorization: Bearer` for the terminology server
-    /// (`HFS_TERMINOLOGY_SERVER_TOKEN`), marked sensitive.
-    authorization: Option<reqwest::header::HeaderValue>,
+    service: Arc<dyn TerminologyService>,
 }
 
 impl HtsClient {
-    /// A client for `base` (no trailing slash needed).
+    /// A client for the remote server at `base` (no trailing slash needed).
     pub fn new(base: &str) -> Self {
+        let base = base.trim_end_matches('/').to_string();
         Self {
-            base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::builder()
-                .use_rustls_tls()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(900))
-                .build()
-                .unwrap_or_default(),
-            authorization: None,
+            service: crate::terminology::remote_service(&base, None),
+            base,
         }
     }
 
-    /// The same client, sending `token` as `Authorization: Bearer` on every
-    /// call — HTS requires its administrator credential for `/import` and
-    /// deletes (`HTS_REQUIRE_AUTH_FOR_WRITES`).
+    /// A client over an existing service; `label` is what [`Self::base`] reports.
+    pub fn from_service(label: impl Into<String>, service: Arc<dyn TerminologyService>) -> Self {
+        Self {
+            base: label.into(),
+            service,
+        }
+    }
+
+    /// The same remote client, sending `token` as `Authorization: Bearer`
+    /// on its `System` calls — HTS requires its administrator credential for
+    /// `/import` and deletes (`HTS_REQUIRE_AUTH_FOR_WRITES`). A client over
+    /// the embedded service ignores it (no token is needed in-process).
     pub fn with_token(mut self, token: Option<&helios_admin_auth::Secret>) -> Self {
-        self.authorization = token.and_then(|t| {
-            let mut value =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", t.expose())).ok()?;
-            value.set_sensitive(true);
-            Some(value)
-        });
+        if self.service.kind() == ServiceKind::Remote {
+            self.service = crate::terminology::remote_service(
+                &self.base,
+                token.map(|t| t.expose().to_string()),
+            );
+        }
         self
     }
 
-    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.authorization {
-            Some(value) => request.header(reqwest::header::AUTHORIZATION, value.clone()),
-            None => request,
-        }
-    }
-
-    /// The base URL.
+    /// The base URL (or `embedded`).
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    async fn send(&self, request: TxRequest) -> Result<TxResponse, String> {
+        self.service.call(request).await.map_err(|e| {
+            format!(
+                "terminology server unreachable: {}",
+                crate::terminology::tx_error_text(&e)
+            )
+        })
     }
 
     /// Imports resources as one collection Bundle.
@@ -95,17 +106,15 @@ impl HtsClient {
             "type": "collection",
             "entry": resources.iter().map(|r| json!({"resource": r})).collect::<Vec<_>>(),
         });
-        let body = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
         let response = self
-            .authorized(self.http.post(format!("{}/import", self.base)))
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| format!("terminology server unreachable: {e}"))?;
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
+            .send(
+                TxRequest::post_json("import", &bundle)
+                    .as_principal(TxPrincipal::System)
+                    .with_timeout(Duration::from_secs(900)),
+            )
+            .await?;
+        let status = response.status;
+        let text = String::from_utf8_lossy(&response.body);
         let doc: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if !(200..300).contains(&status) {
             let detail = doc
@@ -132,24 +141,28 @@ impl HtsClient {
         url: &str,
         version: Option<&str>,
     ) -> Result<Vec<String>, String> {
-        let mut request = self
-            .authorized(self.http.get(format!("{}/{resource_type}", self.base)))
-            .header("Accept", "application/fhir+json")
-            .timeout(Duration::from_secs(60))
-            // The summary carries id, url and version without the concept
-            // list: 14 ms instead of 0.7 s (3.4 MB) for THO's v3-ActCode.
-            .query(&[("url", url), ("_summary", "true")]);
+        // The summary carries id, url and version without the concept
+        // list: 14 ms instead of 0.7 s (3.4 MB) for THO's v3-ActCode.
+        let mut request = TxRequest::get(resource_type)
+            .with_query_param("url", url)
+            .with_query_param("_summary", "true");
         if let Some(v) = version {
-            request = request.query(&[("version", v)]);
+            request = request.with_query_param("version", v);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("terminology server unreachable: {e}"))?;
-        if !response.status().is_success() {
-            return Err(format!("terminology search HTTP {}", response.status()));
+        let response = self
+            .send(
+                request
+                    .as_principal(TxPrincipal::System)
+                    .with_timeout(Duration::from_secs(60)),
+            )
+            .await?;
+        if !response.is_success() {
+            return Err(format!(
+                "terminology search HTTP {}",
+                status_text(response.status)
+            ));
         }
-        let bundle: Value = response.json().await.map_err(|e| e.to_string())?;
+        let bundle: Value = serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
         Ok(bundle
             .get("entry")
             .and_then(Value::as_array)
@@ -183,22 +196,22 @@ impl HtsClient {
         for page in 0..10_000 {
             let offset = (page * PAGE).to_string();
             let response = self
-                .http
-                .get(format!("{}/{resource_type}", self.base))
-                .header("Accept", "application/fhir+json")
-                .timeout(Duration::from_secs(120))
-                .query(&[
-                    ("_summary", "true"),
-                    ("_count", &PAGE.to_string()),
-                    ("_offset", &offset),
-                ])
-                .send()
-                .await
-                .map_err(|e| format!("terminology server unreachable: {e}"))?;
-            if !response.status().is_success() {
-                return Err(format!("terminology search HTTP {}", response.status()));
+                .send(
+                    TxRequest::get(resource_type)
+                        .with_query_param("_summary", "true")
+                        .with_query_param("_count", &PAGE.to_string())
+                        .with_query_param("_offset", &offset)
+                        .with_timeout(Duration::from_secs(120)),
+                )
+                .await?;
+            if !response.is_success() {
+                return Err(format!(
+                    "terminology search HTTP {}",
+                    status_text(response.status)
+                ));
             }
-            let bundle: Value = response.json().await.map_err(|e| e.to_string())?;
+            let bundle: Value =
+                serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
             let entries = bundle
                 .get("entry")
                 .and_then(Value::as_array)
@@ -232,18 +245,24 @@ impl HtsClient {
     /// Deletes one resource by id. A `404`/`410` counts as already gone.
     pub async fn delete(&self, resource_type: &str, id: &str) -> Result<(), String> {
         let response = self
-            .authorized(
-                self.http
-                    .delete(format!("{}/{resource_type}/{id}", self.base)),
+            .send(
+                TxRequest::delete(format!("{resource_type}/{id}"))
+                    .as_principal(TxPrincipal::System)
+                    .with_timeout(Duration::from_secs(120)),
             )
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await
-            .map_err(|e| format!("terminology server unreachable: {e}"))?;
-        match response.status().as_u16() {
+            .await?;
+        match response.status {
             200..=299 | 404 | 410 => Ok(()),
             status => Err(format!("terminology delete HTTP {status}")),
         }
+    }
+}
+
+/// `404 Not Found` style text, as reqwest's `StatusCode` printed it.
+fn status_text(status: u16) -> String {
+    match reqwest::StatusCode::from_u16(status) {
+        Ok(s) => s.to_string(),
+        Err(_) => status.to_string(),
     }
 }
 

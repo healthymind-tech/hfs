@@ -1,0 +1,40 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ i18n.t("idpc-tab-clients") }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% if let Some((cid, secret)) = new_secret %}{% include "partials/idp/secret-once.html" %}{% endif %}
+{% include "partials/idp/errors.html" %}
+<section class="card table-card">
+  {% if rows.is_empty() %}
+    {% call ui::empty_state("users", i18n.t("idpc-clients-none"), i18n.t("idpc-clients-none-detail")) %}{% endcall %}
+  {% else %}
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack">
+      <thead><tr><th scope="col">{{ i18n.t("idpc-client-name") }}</th><th scope="col">{{ i18n.t("idpc-client-id") }}</th><th scope="col">{{ i18n.t("idpc-client-kind") }}</th><th scope="col">{{ i18n.t("idpc-client-redirects") }}</th><th scope="col">{{ i18n.t("idpc-col-status") }}</th></tr></thead>
+      <tbody>
+      {% for c in rows %}
+        <tr>
+          <td data-label="{{ i18n.t("idpc-client-name") }}"><a href="/ui/idp/{{ head.name }}/clients/{{ c.client_id }}">{{ c.name }}</a></td>
+          <td data-label="{{ i18n.t("idpc-client-id") }}"><code>{{ c.client_id }}</code></td>
+          <td data-label="{{ i18n.t("idpc-client-kind") }}">{{ i18n.t(c.kind_key) }}</td>
+          <td data-label="{{ i18n.t("idpc-client-redirects") }}"><code class="idp-wrap">{{ c.redirects }}</code></td>
+          <td data-label="{{ i18n.t("idpc-col-status") }}">{% if c.disabled %}{% call ui::pill_raw("muted", "power", i18n.t("idpc-status-disabled")) %}{% endcall %}{% else %}{% call ui::pill_raw("ok", "check-circle", i18n.t("idpc-status-enabled")) %}{% endcall %}{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+<form method="post" action="/ui/idp/{{ head.name }}/clients" novalidate data-idp-track>
+  <details class="card disclosure idp-add"{% if open_form || rows.is_empty() %} open{% endif %}>
+    <summary class="disclosure__summary">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpc-client-add") }}</summary>
+    <div class="disclosure__body">
+      {% include "partials/idp/client-form.html" %}
+      <button type="submit" class="btn btn--primary">{{ i18n.t("idpc-client-add") }}</button>
+    </div>
+  </details>
+</form>
+{% endblock %}

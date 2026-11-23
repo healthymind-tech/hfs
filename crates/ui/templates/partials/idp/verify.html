@@ -1,0 +1,55 @@
+{#-
+  Verify panel (UX audit UX-02): ordered checklist, status in text + icon,
+  "How to fix", "Go to field", URL contacted. `verify: Option<VerifyView>`.
+-#}
+{%- import "partials/components.html" as ui -%}
+<div class="idp-verify" id="idp-verify" aria-live="polite">
+{% if let Some(v) = verify %}
+  <div class="idp-verify__summary idp-verify__summary--{{ v.status }}">
+    <span class="idp-verify__icon">{% call ui::icon(v.icon) %}{% endcall %}</span>
+    <div>
+      <p class="idp-verify__headline">{{ v.headline }}</p>
+      {% if !v.detail.is_empty() %}<p class="idp-verify__detail">{{ v.detail }}</p>{% endif %}
+      <p class="idp-verify__when">{{ i18n.t("idpc-verify-when") }} {{ v.when }}</p>
+    </div>
+  </div>
+  {% if let Some(p) = v.first_problem %}
+  <div class="idp-verify__first">
+    <p class="idp-verify__first-label">{{ i18n.t("idpc-verify-fix-first") }}</p>
+    <p>{{ p.message }}</p>
+    {% if !p.fix.is_empty() %}<p class="idp-verify__fix"><strong>{{ i18n.t("idpc-verify-how-to-fix") }}</strong> {{ p.fix }}</p>{% endif %}
+    {% if let Some(g) = p.goto %}<a class="btn btn--small" href="{{ g }}" data-idp-goto-href>{% call ui::icon("arrow-right") %}{% endcall %}{{ i18n.t("idpc-verify-goto") }}</a>{% endif %}
+  </div>
+  {% endif %}
+  <ol class="idp-verify__steps">
+  {% for s in v.steps %}
+    <li class="idp-verify__step idp-verify__step--{{ s.status }}">
+      <details{% if s.open %} open{% endif %}>
+        <summary>
+          <span class="idp-verify__num">{{ s.n }}</span>
+          <span class="idp-verify__title">{{ s.title }}</span>
+          <span class="status-pill status-pill--sm status-pill--{{ s.status }}">{% call ui::icon(s.icon) %}{% endcall %}<span>{{ s.status_label }}</span></span>
+          <span class="idp-verify__ms">{{ s.duration }}</span>
+        </summary>
+        <ul class="idp-verify__checks">
+        {% for c in s.checks %}
+          <li class="idp-verify__check idp-verify__check--{{ c.status }}">
+            <span class="idp-verify__check-icon" aria-hidden="true">{% call ui::icon(c.icon) %}{% endcall %}</span>
+            <div class="idp-verify__check-body">
+              <p><span class="visually-hidden">{{ c.status_label }}: </span>{{ c.message }}</p>
+              {% if !c.fix.is_empty() %}<p class="idp-verify__fix"><strong>{{ i18n.t("idpc-verify-how-to-fix") }}</strong> {{ c.fix }}</p>{% endif %}
+              <p class="idp-verify__meta">
+                {% if let Some(g) = c.goto %}<a href="{{ g }}" data-idp-goto-href>{{ i18n.t("idpc-verify-goto") }}</a>{% endif %}
+                {% if !c.url.is_empty() %}<code class="idp-verify__url">{{ c.url }}</code>{% endif %}
+                {% if !c.spec.is_empty() %}<span class="idp-verify__spec">{{ c.spec }}</span>{% endif %}
+              </p>
+            </div>
+          </li>
+        {% endfor %}
+        </ul>
+      </details>
+    </li>
+  {% endfor %}
+  </ol>
+{% endif %}
+</div>

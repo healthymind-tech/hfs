@@ -1,0 +1,24 @@
+{#-
+  A Save / Create stopped because the configuration fails verification
+  (UX-06): what is wrong, the full checklist, and an explicit way past it.
+  `form_id` is the form the "anyway" button submits.
+-#}
+{%- if let Some(r) = verify_block %}
+<section class="notice notice--danger verify-block" role="alert" tabindex="-1" data-autofocus aria-labelledby="verify-block-title">
+  {% call ui::icon("alert") %}{% endcall %}
+  <div class="verify-block__body">
+    <p class="verify-block__title" id="verify-block-title"><strong>{{ i18n.t("verify-block-title") }}</strong> {{ r.first_failure_message() }}</p>
+    <p>{{ i18n.t("verify-block-consequence") }}</p>
+    <details class="verify-block__details">
+      <summary>{{ i18n.t("verify-block-details") }}</summary>
+      <div class="verify verify--inline">
+        <div class="verify__result">{% include "partials/manager/verify-report.html" %}</div>
+      </div>
+    </details>
+    <div class="verify-block__actions">
+      <button type="submit" class="btn btn--danger-outline btn--small" form="{{ form_id }}" name="verify_override" value="1">{{ i18n.t(anyway_key) }}</button>
+      <span class="muted">{{ i18n.t("verify-block-anyway-hint") }}</span>
+    </div>
+  </div>
+</section>
+{%- endif %}

@@ -308,22 +308,58 @@ pub fn workbench_fragment_routes() -> Router<Arc<HtsUiState>> {
 // ── Fragment URL builders ───────────────────────────────────────────────
 
 // Concept Explorer fragment URL constants
-const IDENTITY_FRAGMENT_URL: &str = "/ui/hts/concepts/identity/json-fragment";
-const MAPPINGS_FRAGMENT_URL: &str = "/ui/hts/concepts/mappings/json-fragment";
+#[allow(non_snake_case)]
+fn IDENTITY_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/concepts/identity/json-fragment")
+}
+#[allow(non_snake_case)]
+fn MAPPINGS_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/concepts/mappings/json-fragment")
+}
 
 // Workbench fragment URL constants (#898)
-const CS_LOOKUP_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/lookup/json-fragment";
-const CS_VALIDATE_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/validate/json-fragment";
-const CS_SUBSUMES_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/subsumes/json-fragment";
-const VS_EXPAND_FRAGMENT_URL: &str = "/ui/hts/value-sets/workbench/expand/json-fragment";
-const CM_TRANSLATE_FRAGMENT_URL: &str = "/ui/hts/concept-maps/workbench/translate/json-fragment";
+#[allow(non_snake_case)]
+fn CS_LOOKUP_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/code-systems/workbench/lookup/json-fragment")
+}
+#[allow(non_snake_case)]
+fn CS_VALIDATE_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/code-systems/workbench/validate/json-fragment")
+}
+#[allow(non_snake_case)]
+fn CS_SUBSUMES_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/code-systems/workbench/subsumes/json-fragment")
+}
+#[allow(non_snake_case)]
+fn VS_EXPAND_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/value-sets/workbench/expand/json-fragment")
+}
+#[allow(non_snake_case)]
+fn CM_TRANSLATE_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/concept-maps/workbench/translate/json-fragment")
+}
 
 // Workbench expand-all URL constants (#898)
-const CS_LOOKUP_EXPAND_URL: &str = "/ui/hts/code-systems/workbench/lookup/json-expand";
-const CS_VALIDATE_EXPAND_URL: &str = "/ui/hts/code-systems/workbench/validate/json-expand";
-const CS_SUBSUMES_EXPAND_URL: &str = "/ui/hts/code-systems/workbench/subsumes/json-expand";
-const VS_EXPAND_EXPAND_URL: &str = "/ui/hts/value-sets/workbench/expand/json-expand";
-const CM_TRANSLATE_EXPAND_URL: &str = "/ui/hts/concept-maps/workbench/translate/json-expand";
+#[allow(non_snake_case)]
+fn CS_LOOKUP_EXPAND_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/code-systems/workbench/lookup/json-expand")
+}
+#[allow(non_snake_case)]
+fn CS_VALIDATE_EXPAND_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/code-systems/workbench/validate/json-expand")
+}
+#[allow(non_snake_case)]
+fn CS_SUBSUMES_EXPAND_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/code-systems/workbench/subsumes/json-expand")
+}
+#[allow(non_snake_case)]
+fn VS_EXPAND_EXPAND_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/value-sets/workbench/expand/json-expand")
+}
+#[allow(non_snake_case)]
+fn CM_TRANSLATE_EXPAND_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/concept-maps/workbench/translate/json-expand")
+}
 
 // ── Workbench fragment endpoints (#898) ──────────────────────────────────
 //
@@ -337,7 +373,7 @@ pub fn cs_lookup_fragment_endpoint<'a>(
     extra_query: &'a str,
 ) -> FragmentEndpoint<'a> {
     FragmentEndpoint {
-        base_path: CS_LOOKUP_FRAGMENT_URL,
+        base_path: CS_LOOKUP_FRAGMENT_URL(),
         version: fhir_version,
         extra_query,
     }
@@ -349,7 +385,7 @@ pub fn cs_validate_fragment_endpoint<'a>(
     extra_query: &'a str,
 ) -> FragmentEndpoint<'a> {
     FragmentEndpoint {
-        base_path: CS_VALIDATE_FRAGMENT_URL,
+        base_path: CS_VALIDATE_FRAGMENT_URL(),
         version: fhir_version,
         extra_query,
     }
@@ -361,7 +397,7 @@ pub fn cs_subsumes_fragment_endpoint<'a>(
     extra_query: &'a str,
 ) -> FragmentEndpoint<'a> {
     FragmentEndpoint {
-        base_path: CS_SUBSUMES_FRAGMENT_URL,
+        base_path: CS_SUBSUMES_FRAGMENT_URL(),
         version: fhir_version,
         extra_query,
     }
@@ -373,7 +409,7 @@ pub fn vs_expand_fragment_endpoint<'a>(
     extra_query: &'a str,
 ) -> FragmentEndpoint<'a> {
     FragmentEndpoint {
-        base_path: VS_EXPAND_FRAGMENT_URL,
+        base_path: VS_EXPAND_FRAGMENT_URL(),
         version: fhir_version,
         extra_query,
     }
@@ -385,7 +421,7 @@ pub fn cm_translate_fragment_endpoint<'a>(
     extra_query: &'a str,
 ) -> FragmentEndpoint<'a> {
     FragmentEndpoint {
-        base_path: CM_TRANSLATE_FRAGMENT_URL,
+        base_path: CM_TRANSLATE_FRAGMENT_URL(),
         version: fhir_version,
         extra_query,
     }
@@ -394,23 +430,23 @@ pub fn cm_translate_fragment_endpoint<'a>(
 // ── Workbench expand-all URLs (#898) ─────────────────────────────────────
 
 pub fn cs_lookup_expand_url(extra_query: &str) -> String {
-    format!("{CS_LOOKUP_EXPAND_URL}?{extra_query}")
+    format!("{}?{extra_query}", CS_LOOKUP_EXPAND_URL())
 }
 
 pub fn cs_validate_expand_url(extra_query: &str) -> String {
-    format!("{CS_VALIDATE_EXPAND_URL}?{extra_query}")
+    format!("{}?{extra_query}", CS_VALIDATE_EXPAND_URL())
 }
 
 pub fn cs_subsumes_expand_url(extra_query: &str) -> String {
-    format!("{CS_SUBSUMES_EXPAND_URL}?{extra_query}")
+    format!("{}?{extra_query}", CS_SUBSUMES_EXPAND_URL())
 }
 
 pub fn vs_expand_expand_url(extra_query: &str) -> String {
-    format!("{VS_EXPAND_EXPAND_URL}?{extra_query}")
+    format!("{}?{extra_query}", VS_EXPAND_EXPAND_URL())
 }
 
 pub fn cm_translate_expand_url(extra_query: &str) -> String {
-    format!("{CM_TRANSLATE_EXPAND_URL}?{extra_query}")
+    format!("{}?{extra_query}", CM_TRANSLATE_EXPAND_URL())
 }
 
 // ── Workbench extra-query builders (#898) ────────────────────────────────
@@ -606,7 +642,7 @@ async fn concept_identity_fragment(
         &query.path,
         query.offset,
         query.limit,
-        IDENTITY_FRAGMENT_URL,
+        IDENTITY_FRAGMENT_URL(),
         "",
     )
 }
@@ -675,7 +711,7 @@ async fn concept_mappings_fragment(
         &query.path,
         query.offset,
         query.limit,
-        MAPPINGS_FRAGMENT_URL,
+        MAPPINGS_FRAGMENT_URL(),
         "",
     )
 }
@@ -887,7 +923,7 @@ async fn cs_lookup_fragment(
             &path,
             offset,
             limit,
-            CS_LOOKUP_FRAGMENT_URL,
+            CS_LOOKUP_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -909,7 +945,7 @@ async fn cs_lookup_expand(
             &document,
             &headers,
             &body,
-            CS_LOOKUP_FRAGMENT_URL,
+            CS_LOOKUP_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -964,7 +1000,7 @@ async fn cs_validate_fragment(
             &path,
             offset,
             limit,
-            CS_VALIDATE_FRAGMENT_URL,
+            CS_VALIDATE_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -986,7 +1022,7 @@ async fn cs_validate_expand(
             &document,
             &headers,
             &body,
-            CS_VALIDATE_FRAGMENT_URL,
+            CS_VALIDATE_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -1039,7 +1075,7 @@ async fn cs_subsumes_fragment(
             &path,
             offset,
             limit,
-            CS_SUBSUMES_FRAGMENT_URL,
+            CS_SUBSUMES_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -1061,7 +1097,7 @@ async fn cs_subsumes_expand(
             &document,
             &headers,
             &body,
-            CS_SUBSUMES_FRAGMENT_URL,
+            CS_SUBSUMES_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -1119,7 +1155,7 @@ async fn vs_expand_fragment(
             &path,
             offset,
             limit,
-            VS_EXPAND_FRAGMENT_URL,
+            VS_EXPAND_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -1141,7 +1177,7 @@ async fn vs_expand_expand(
             &document,
             &headers,
             &body,
-            VS_EXPAND_FRAGMENT_URL,
+            VS_EXPAND_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -1200,7 +1236,7 @@ async fn cm_translate_fragment(
             &path,
             offset,
             limit,
-            CM_TRANSLATE_FRAGMENT_URL,
+            CM_TRANSLATE_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,
@@ -1222,7 +1258,7 @@ async fn cm_translate_expand(
             &document,
             &headers,
             &body,
-            CM_TRANSLATE_FRAGMENT_URL,
+            CM_TRANSLATE_FRAGMENT_URL(),
             &extra_query,
         ),
         Err(response) => *response,

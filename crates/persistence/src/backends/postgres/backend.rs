@@ -312,6 +312,16 @@ pub struct PostgresConfig {
     /// When true, search indexing is offloaded to a secondary backend.
     #[serde(default)]
     pub search_offloaded: bool,
+
+    /// Schema this store lives in (docs/design/unified-server.md §5). `None`
+    /// = the server default (`public` for HFS). `Some("terminology")` opens
+    /// every connection with `search_path=terminology,public`, creates the
+    /// schema at `init_schema` when missing, and refuses to start if
+    /// connections do not resolve to it. Read from a connection URL's
+    /// `options=-c search_path=<schema>,…` (what
+    /// `helios_terminology::schema::with_search_path` writes).
+    #[serde(default)]
+    pub schema: Option<String>,
 }
 
 /// SSL mode for PostgreSQL connections.
@@ -523,6 +533,7 @@ impl Debug for PostgresConfig {
             fhir_version,
             data_dir,
             search_offloaded,
+            schema,
         } = self;
         f.debug_struct("PostgresConfig")
             .field("host", host)
@@ -544,6 +555,7 @@ impl Debug for PostgresConfig {
             .field("fhir_version", fhir_version)
             .field("data_dir", data_dir)
             .field("search_offloaded", search_offloaded)
+            .field("schema", schema)
             .finish()
     }
 }
@@ -567,6 +579,7 @@ impl Default for PostgresConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
+            schema: None,
         }
     }
 }
@@ -642,11 +655,71 @@ impl PostgresConfig {
 /// policy that arrives after the first `prepare_cached` would apply to some
 /// statements and not others.
 fn startup_options(config: &PostgresConfig) -> String {
-    format!(
+    let mut options = format!(
         "-c statement_timeout={} -c plan_cache_mode={}",
         config.statement_timeout_ms,
         config.plan_cache_mode.as_guc()
-    )
+    );
+    // The store's schema rides in the startup packet too, so every pooled
+    // connection resolves unqualified names to it (a post-connect SET would
+    // bind one session only).
+    if let Some(schema) = config.schema.as_deref() {
+        options.push_str(&format!(" -c search_path={schema},public"));
+    }
+    options
+}
+
+/// The schema a connection URL's `options` parameter selects with
+/// `-c search_path=<schema>,…` (percent-decoded; `+` is a space), when its
+/// first entry names one explicitly. Other `-c` settings in `options` are not
+/// carried over: the pool sets its own.
+fn schema_from_url_query(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key != "options" {
+            continue;
+        }
+        let decoded = percent_decode(&value.replace('+', " "));
+        let mut words = decoded.split_whitespace().peekable();
+        while let Some(word) = words.next() {
+            let setting = if word == "-c" {
+                words.next().unwrap_or("")
+            } else if let Some(rest) = word.strip_prefix("-c") {
+                rest
+            } else if let Some(rest) = word.strip_prefix("--") {
+                rest
+            } else {
+                continue;
+            };
+            if let Some(path) = setting.strip_prefix("search_path=") {
+                return super::schema::first_explicit_schema(path);
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(b) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl PostgresBackend {
@@ -992,9 +1065,26 @@ impl PostgresBackend {
         // Strip any query string before splitting on '/', otherwise it lands in
         // `dbname` verbatim (`.../postgres?sslmode=require` → dbname
         // "postgres?sslmode=require", which no server will resolve).
-        let url = url.split('?').next().unwrap_or(url);
+        let (url, query) = url.split_once('?').unwrap_or((url, ""));
 
         let mut config = PostgresConfig::default();
+        // `options=-c search_path=terminology,public` (unified server): the
+        // store lives in that schema. Dropping it, as every other query
+        // parameter is dropped, would put the store's tables in `public`.
+        config.schema = schema_from_url_query(query);
+        if let Some(schema) = config.schema.as_deref() {
+            if !super::schema::is_valid_store_schema_name(schema) {
+                return Err(crate::error::StorageError::Backend(
+                    BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!(
+                            "connection URL selects schema {schema:?} in search_path, which is not a valid store schema name"
+                        ),
+                        source: None,
+                    },
+                ));
+            }
+        }
 
         // Split user:password@host:port/dbname
         if let Some((userinfo, rest)) = url.split_once('@') {
@@ -1133,9 +1223,60 @@ impl PostgresBackend {
         self.init_schema_with_patient_export_index(false).await
     }
 
+    /// The schema this store's connections resolve unqualified names to
+    /// (`public` for HFS, `terminology` for an embedded terminology store).
+    pub async fn current_schema(&self) -> StorageResult<String> {
+        let client = self.get_client().await?;
+        super::schema::ensure_store_schema(&client).await
+    }
+
+    /// Applies the unified server's fork migrations `hm-0011`/`hm-0012`
+    /// (terminology schema, `hfs_terminology_state`, console scope bindings)
+    /// to this — HFS's — database. Call after [`Self::init_schema`] and only
+    /// when terminology is embedded (docs/design/unified-server.md §5.4).
+    /// Returns the migrations applied by this call.
+    pub async fn apply_unified_migrations(
+        &self,
+        terminology_schema: &str,
+    ) -> StorageResult<Vec<&'static str>> {
+        let mut client = self.get_client().await?;
+        super::schema::apply_unified_fork_migrations(&mut client, terminology_schema).await
+    }
+
+    /// Applies only the console's `hm-0012` (remote terminology).
+    pub async fn apply_console_fork_migrations(&self) -> StorageResult<Vec<&'static str>> {
+        let mut client = self.get_client().await?;
+        super::schema::apply_console_fork_migrations(&mut client).await
+    }
+
+    /// `hfs_terminology_state` (hm-0011), `None` before the migration or
+    /// before anything recorded a row.
+    pub async fn terminology_state(
+        &self,
+    ) -> StorageResult<Option<super::schema::TerminologyState>> {
+        let client = self.get_client().await?;
+        super::schema::read_terminology_state(&client).await
+    }
+
+    /// Upserts `hfs_terminology_state` (hm-0011 must be applied).
+    pub async fn record_terminology_state(
+        &self,
+        state: &super::schema::TerminologyState,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        super::schema::write_terminology_state(&client, state).await
+    }
+
     async fn init_schema_with_patient_export_index(&self, build_index: bool) -> StorageResult<()> {
         self.patient_export_index_ready
             .store(false, Ordering::Release);
+        // A store in its own schema (`search_path=terminology,public`) must
+        // resolve to that schema before anything below looks a table up:
+        // otherwise unqualified names fall through to HFS's `public` tables.
+        {
+            let client = self.get_client().await?;
+            super::schema::ensure_store_schema(&client).await?;
+        }
         // A bulk index rebuild that died inside its window left value
         // indexes dropped and recorded; rebuild them before the migrations
         // look at `search_index` (a no-op unless such a record exists and no
@@ -2152,6 +2293,47 @@ mod tests {
     }
 
     // ── parse_connection_string ───────────────────────────────────
+
+    #[test]
+    fn url_search_path_selects_the_store_schema() {
+        // What helios_terminology::schema::with_search_path writes.
+        let cfg = PostgresBackend::config_from_connection_string(
+            "postgres://hfs:pw@hfs-pg:5432/hfs?options=-c%20search_path%3Dterminology%2Cpublic",
+        )
+        .unwrap();
+        assert_eq!(cfg.dbname, "hfs");
+        assert_eq!(cfg.schema.as_deref(), Some("terminology"));
+        let opts = startup_options(&cfg);
+        assert!(
+            opts.ends_with(" -c search_path=terminology,public"),
+            "{opts}"
+        );
+        assert!(opts.contains("-c statement_timeout="), "{opts}");
+
+        let cfg = PostgresBackend::config_from_connection_string(
+            "postgresql://h/hfs?sslmode=disable&options=-csearch_path%3Dtx_2,public",
+        )
+        .unwrap();
+        assert_eq!(cfg.schema.as_deref(), Some("tx_2"));
+
+        // No options, `$user` first, or another setting: HFS's default schema.
+        for url in [
+            "postgres://h/hfs",
+            "postgres://h/hfs?options=-c%20search_path%3D%22%24user%22%2Cpublic",
+            "postgres://h/hfs?options=-c%20work_mem%3D64MB",
+        ] {
+            let cfg = PostgresBackend::config_from_connection_string(url).unwrap();
+            assert_eq!(cfg.schema, None, "{url}");
+            assert!(!startup_options(&cfg).contains("search_path"), "{url}");
+        }
+        // An invalid schema name is refused rather than ignored.
+        assert!(
+            PostgresBackend::config_from_connection_string(
+                "postgres://h/hfs?options=-c%20search_path%3DBad%3Bdrop"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_full_url() {

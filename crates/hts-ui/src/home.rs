@@ -235,7 +235,11 @@ impl HomeQuery {
 /// options are real `<a href>`s pointing here, so both work with JavaScript
 /// off — a plain navigation re-renders the page with the new selection.
 fn page_href(window: ChartWindow, series: SeriesFilter) -> String {
-    format!("/ui/hts?window={}&series={}", window.code(), series.code())
+    crate::paths::link(&format!(
+        "/ui/hts?window={}&series={}",
+        window.code(),
+        series.code()
+    ))
 }
 
 /// The URL the cards region polls itself from.
@@ -251,11 +255,11 @@ fn page_href(window: ChartWindow, series: SeriesFilter) -> String {
 /// wrapper — could not do this: the wrapper survived every swap, so its
 /// frozen URL would revert any selection on the next 15 s tick.
 fn refresh_href(window: ChartWindow, series: SeriesFilter) -> String {
-    format!(
+    crate::paths::link(&format!(
         "/ui/hts/home/cards?window={}&series={}",
         window.code(),
         series.code()
-    )
+    ))
 }
 
 /// Seconds since the UNIX epoch, as an `f64`.
@@ -667,7 +671,10 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         // used by every internal link in the UI. `Redirect::permanent` emits
         // 308 (preserves method + body); safe here since GET is the only
         // Home verb.
-        .route("/hts/", get(|| async { Redirect::permanent("/ui/hts") }))
+        .route(
+            "/hts/",
+            get(|| async { Redirect::permanent(&crate::paths::link("/ui/hts")) }),
+        )
         .route("/hts/home/cards", get(home_cards_fragment))
 }
 

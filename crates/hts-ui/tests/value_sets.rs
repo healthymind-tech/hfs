@@ -449,7 +449,7 @@ async fn browser_renders_full_page_with_translated_heading() {
         "hard nav must render a full HTML page",
     );
     assert!(
-        html.contains(">ValueSets<"),
+        html.contains(">Value sets<"),
         "browser heading must be Fluent-resolved (en value: ValueSets)",
     );
     assert!(

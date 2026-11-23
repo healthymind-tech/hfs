@@ -11,8 +11,8 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Extension, Router, routing::get, routing::post};
 use chrono::Utc;
 use helios_endpoints::{
-    Actor, AuthMode, ConsolePrincipal, ConsoleRole, Endpoint, EndpointSpec, EndpointStatus,
-    FhirRelease, ManagedBy,
+    Actor, AuthMode, ConsolePrincipal, ConsoleRole, Endpoint, EndpointAuth, EndpointSpec,
+    EndpointStatus, FhirRelease, ManagedBy,
 };
 use serde::Deserialize;
 
@@ -42,7 +42,6 @@ pub(crate) fn routes() -> Router<WebState> {
         .route("/ui/e/{ep}/history", get(history_page))
         .route("/ui/e/{ep}/subscriptions", get(to_data))
         .route("/ui/e/{ep}/bulk", get(to_data))
-        .route("/ui/e/{ep}/security/test", post(test_auth))
         .route("/ui/e/{ep}/{section}/preview", post(preview_section))
         .route("/ui/e/{ep}/{section}", get(section_page).post(save_section))
         .route("/ui/about", get(about))
@@ -253,6 +252,14 @@ pub(crate) struct OverviewQuery {
     created: Option<String>,
     #[serde(default)]
     changed: Option<String>,
+    #[serde(default)]
+    deleted: Option<String>,
+    #[serde(default)]
+    enabled: Option<String>,
+    #[serde(default)]
+    disabled: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 /// One tile of the health strip.
@@ -346,6 +353,7 @@ struct OverviewPage {
     can_admin: bool,
     flash_key: &'static str,
     flash_arg: String,
+    flash_tenant: String,
 }
 
 /// Resource totals of a tenant from the dashboard provider, when known.
@@ -407,11 +415,21 @@ pub(crate) async fn overview(
     let enabled = cards.iter().filter(|c| c.status_slug == "enabled").count();
     let disabled = cards.iter().filter(|c| c.status_slug == "disabled").count();
     cards.retain(|card| card.matches(&q.q, &q.status));
-    let (flash_key, flash_arg) = match (&q.created, &q.changed) {
-        (Some(n), _) => ("mgr-flash-created", n.clone()),
-        (_, Some(n)) => ("mgr-flash-status", n.clone()),
-        _ => ("", String::new()),
+    // Each outcome says what happened (UX-14).
+    let (flash_key, flash_arg) = if let Some(n) = &q.created {
+        ("mgr-flash-created", n.clone())
+    } else if let Some(n) = &q.deleted {
+        ("mgr-flash-deleted", n.clone())
+    } else if let Some(n) = &q.disabled {
+        ("mgr-flash-disabled", n.clone())
+    } else if let Some(n) = &q.enabled {
+        ("mgr-flash-enabled", n.clone())
+    } else if let Some(n) = &q.changed {
+        ("mgr-flash-status", n.clone())
+    } else {
+        ("", String::new())
     };
+    let flash_tenant = q.tenant.clone().unwrap_or_default();
     let can_admin = c.can_admin();
     render(OverviewPage {
         status: c.status,
@@ -428,6 +446,7 @@ pub(crate) async fn overview(
         can_admin,
         flash_key,
         flash_arg,
+        flash_tenant,
     })
 }
 
@@ -958,6 +977,9 @@ impl FormValues {
 /// Inherited server values shown next to each "Inherit" toggle.
 pub(crate) struct EnvView {
     pub auth_mode_key: &'static str,
+    pub auth_issuer: String,
+    pub auth_audience: String,
+    pub auth_jwks: String,
     pub validation_key: &'static str,
     pub terminology_server: String,
     pub cors_origins: String,
@@ -968,8 +990,23 @@ impl EnvView {
     fn new(env: &EnvDefaults) -> Self {
         Self {
             auth_mode_key: view::auth_mode_key(env.auth_mode),
+            auth_issuer: env.auth_issuer.clone().unwrap_or_default(),
+            auth_audience: env.auth_audience.clone().unwrap_or_default(),
+            auth_jwks: env.auth_jwks_url.clone().unwrap_or_default(),
             validation_key: view::validation_badge(None, env).key,
-            terminology_server: env.terminology_server.clone().unwrap_or_default(),
+            terminology_server: env
+                .terminology_server
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| {
+                    // Embedded terminology has no URL: say what inheriting
+                    // means (the server's own /tx).
+                    if crate::editor::terminology_is_embedded() {
+                        "/tx".into()
+                    } else {
+                        String::new()
+                    }
+                }),
             cors_origins: env.cors_origins.clone().unwrap_or_else(|| "*".into()),
             rate_limit: format!(
                 "{} / {}",
@@ -1000,12 +1037,23 @@ struct SectionPage {
     warnings: Vec<&'static str>,
     versions: Vec<&'static str>,
     data_href: String,
+    /// The failed verification that stopped a Save (UX-06).
+    verify_block: Option<super::verify::ReportView>,
 }
 
 impl SectionPage {
     /// The error of a field path, or `""`.
-    fn err(&self, path: &str) -> &str {
-        self.errors.get(path).map(String::as_str).unwrap_or("")
+    fn err(&self, path: &str) -> String {
+        self.errors
+            .get(path)
+            .map(|m| forms::error_message(&self.i18n, m))
+            .unwrap_or_default()
+    }
+
+    /// The error summary: each problem with its field label and a link that
+    /// focuses the field (UX-21, UX-03).
+    fn error_links(&self) -> Vec<forms::ErrorLink> {
+        forms::error_links(&self.i18n, &self.errors)
     }
 
     /// Whether the field has an error (for `aria-invalid`).
@@ -1050,9 +1098,58 @@ fn section_response(
     conflict: Option<u64>,
     others: &[Endpoint],
 ) -> Response {
+    section_response_full(c, section, e, spec, errors, saved, conflict, others, None)
+}
+
+/// Runs the auth verification a Save needs (UX-06, UX-03): fills an empty
+/// JWKS URL from discovery, and answers the report when it has failures
+/// and the user did not choose "Save anyway". `None` = go ahead.
+async fn verify_before_save(
+    c: &Ctx,
+    endpoint: Option<&str>,
+    auth: Option<&mut EndpointAuth>,
+    overridden: bool,
+) -> Option<super::verify::ReportView> {
+    let auth = auth?;
+    if auth.mode == helios_endpoints::AuthMode::Off {
+        return None;
+    }
+    let report = c
+        .runtime
+        .backend
+        .verify_auth(endpoint, auth, None)
+        .await
+        .ok()?;
+    if auth.jwks_url.as_deref().is_none_or(|u| u.trim().is_empty())
+        && let Some(jwks) = report.suggestions.get("jwksUrl")
+    {
+        auth.jwks_url = Some(jwks.clone());
+    }
+    if report.failures() == 0 || overridden {
+        return None;
+    }
+    Some(super::verify::view(
+        &c.i18n,
+        &report,
+        super::verify::AUTH_FIELDS,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn section_response_full(
+    c: Ctx,
+    section: Section,
+    e: &Endpoint,
+    spec: &EndpointSpec,
+    errors: FieldErrors,
+    saved: bool,
+    conflict: Option<u64>,
+    others: &[Endpoint],
+    verify_block: Option<super::verify::ReportView>,
+) -> Response {
     let locked = locked_key(&c, e);
     let other_specs: Vec<&EndpointSpec> = others.iter().map(|o| &o.spec).collect();
-    let code = if !errors.is_empty() {
+    let code = if !errors.is_empty() || verify_block.is_some() {
         StatusCode::UNPROCESSABLE_ENTITY
     } else if conflict.is_some() {
         StatusCode::CONFLICT
@@ -1070,9 +1167,14 @@ fn section_response(
         saved,
         conflict,
         revision: e.revision,
-        warnings: forms::warnings(spec, &other_specs),
+        // Each warning on the section it is about (UX-15), not on all four.
+        warnings: forms::warnings(spec, &other_specs)
+            .into_iter()
+            .filter(|w| forms::warning_section(w) == section)
+            .collect(),
         versions: enabled_versions(),
         data_href: format!("/ui/e/{}/data", e.name()),
+        verify_block,
         title_key: match section {
             Section::General => "mgr-nav-config",
             Section::Security => "mgr-nav-security",
@@ -1150,6 +1252,40 @@ pub(crate) async fn save_section(
     if !errors.is_empty() {
         return section_response(c, section, &e, &spec, errors, false, None, &others);
     }
+    // Configure-then-verify on Save (UX-06): a token configuration that
+    // fails verification is not saved silently; the JWKS URL left empty is
+    // the one the issuer publishes (UX-03).
+    let blocked = if section == Section::Security {
+        verify_before_save(
+            &c,
+            Some(&ep),
+            spec.auth.as_mut(),
+            form.checked("verify_override"),
+        )
+        .await
+    } else {
+        None
+    };
+    // Field errors come first: they say exactly what to fill in.
+    if let Err(v) = spec.validate() {
+        for fe in v.0 {
+            errors.entry(fe.field).or_insert(fe.message);
+        }
+        return section_response(c, section, &e, &spec, errors, false, None, &others);
+    }
+    if let Some(blocked) = blocked {
+        return section_response_full(
+            c,
+            section,
+            &e,
+            &spec,
+            FieldErrors::new(),
+            false,
+            None,
+            &others,
+            Some(blocked),
+        );
+    }
     // "Overwrite" after a conflict posts the revision the user was shown.
     let expected = form.revision().unwrap_or(e.revision);
     let actor = actor(&rt, principal.as_ref().map(|p| &p.0));
@@ -1159,7 +1295,12 @@ pub(crate) async fn save_section(
         .update(&ep, expected, spec.clone(), secrets, &actor)
         .await
     {
-        Ok(_) => Redirect::to(&format!("/ui/e/{ep}/{}?saved=1", section.slug())).into_response(),
+        Ok(_) => {
+            if section == Section::Security {
+                crate::idp::security::after_save(&ep, &spec).await;
+            }
+            Redirect::to(&format!("/ui/e/{ep}/{}?saved=1", section.slug())).into_response()
+        }
         Err(BackendError::Conflict { current }) => {
             section_response(c, section, &e, &spec, errors, false, Some(current), &others)
         }
@@ -1232,38 +1373,6 @@ fn redacted_spec(spec: &EndpointSpec) -> serde_json::Value {
     v
 }
 
-#[derive(Template)]
-#[template(path = "partials/manager/probe.html")]
-struct ProbeFragment {
-    i18n: I18n,
-    lines: Vec<super::backend::ProbeLine>,
-    unavailable: bool,
-    error: String,
-}
-
-/// `POST /ui/e/{ep}/security/test` — "Test" next to the issuer.
-pub(crate) async fn test_auth(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    body: Bytes,
-) -> Response {
-    let i18n = I18n::new(locale);
-    let form = Form::parse(&body);
-    let mut errs = FieldErrors::new();
-    let auth = forms::parse_auth(&form, None, &mut errs);
-    let (lines, unavailable, error) = match runtime(&state).backend.test_auth(&auth).await {
-        Ok(lines) => (lines, false, String::new()),
-        Err(BackendError::NotImplemented) => (Vec::new(), true, String::new()),
-        Err(e) => (Vec::new(), false, format!("{:?}", e.field_errors())),
-    };
-    render(ProbeFragment {
-        i18n,
-        lines,
-        unavailable,
-        error,
-    })
-}
-
 #[derive(Deserialize)]
 pub(crate) struct StatusForm {
     action: String,
@@ -1324,12 +1433,20 @@ pub(crate) async fn set_status(
         .set_status(&ep, form.revision.unwrap_or(e.revision), status, &actor)
         .await
     {
-        Ok(_) if status == EndpointStatus::Deleted => {
-            Redirect::to(&format!("/ui?changed={ep}")).into_response()
-        }
+        Ok(_) if status == EndpointStatus::Deleted => Redirect::to(&format!(
+            "/ui?deleted={ep}&tenant={}",
+            form_urlencoded::byte_serialize(e.tenant_id().as_bytes()).collect::<String>()
+        ))
+        .into_response(),
         Ok(_) => {
             let back = crate::navigation::safe_ui_return(Some(&form.back))
                 .unwrap_or_else(|| format!("/ui/e/{ep}"));
+            let action = if status == EndpointStatus::Enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let back = back.replace(&format!("changed={ep}"), &format!("{action}={ep}"));
             Redirect::to(&back).into_response()
         }
         Err(BackendError::Conflict { current }) => {
@@ -1609,11 +1726,22 @@ struct NewPage {
     env: EnvView,
     versions: Vec<&'static str>,
     server_base: String,
+    /// The failed verification that stopped Create (UX-06).
+    verify_block: Option<super::verify::ReportView>,
 }
 
 impl NewPage {
-    fn err(&self, path: &str) -> &str {
-        self.errors.get(path).map(String::as_str).unwrap_or("")
+    fn err(&self, path: &str) -> String {
+        self.errors
+            .get(path)
+            .map(|m| forms::error_message(&self.i18n, m))
+            .unwrap_or_default()
+    }
+
+    /// The error summary: each problem with its field label and a link that
+    /// focuses the field (UX-21, UX-03).
+    fn error_links(&self) -> Vec<forms::ErrorLink> {
+        forms::error_links(&self.i18n, &self.errors)
     }
 
     fn bad(&self, path: &str) -> bool {
@@ -1645,9 +1773,19 @@ fn default_version_label(state: &WebState) -> &'static str {
 }
 
 async fn new_response(state: &WebState, c: Ctx, nv: NewValues, errors: FieldErrors) -> Response {
+    new_response_full(state, c, nv, errors, None).await
+}
+
+async fn new_response_full(
+    state: &WebState,
+    c: Ctx,
+    nv: NewValues,
+    errors: FieldErrors,
+    verify_block: Option<super::verify::ReportView>,
+) -> Response {
     let endpoints = c.runtime.backend.list().await.unwrap_or_default();
     let tenants = unbound_tenants(state, &endpoints).await;
-    let code = if errors.is_empty() {
+    let code = if errors.is_empty() && verify_block.is_none() {
         StatusCode::OK
     } else {
         StatusCode::UNPROCESSABLE_ENTITY
@@ -1655,6 +1793,7 @@ async fn new_response(state: &WebState, c: Ctx, nv: NewValues, errors: FieldErro
     let mut response = render(NewPage {
         nv,
         errors,
+        verify_block,
         endpoints: endpoints
             .iter()
             .map(|e| Choice {
@@ -1711,7 +1850,28 @@ pub(crate) async fn create(
     if !c.can_admin() {
         return forbidden(c);
     }
-    let form = Form::parse(&body);
+    let mut form = Form::parse(&body);
+    // Configure-then-verify on Create (UX-02/03/06): the JWKS URL comes from
+    // discovery when left empty; a failing token configuration needs an
+    // explicit "Create anyway".
+    if form.get("auth_choice") == "custom" && !form.get("auth_issuer").is_empty() {
+        let mut errs = FieldErrors::new();
+        let mut auth = forms::parse_auth(&form, None, &mut errs);
+        let blocked =
+            verify_before_save(&c, None, Some(&mut auth), form.checked("verify_override")).await;
+        if let Some(jwks) = auth.jwks_url.as_deref()
+            && form.get("auth_jwks_url").is_empty()
+        {
+            form.set("auth_jwks_url", jwks);
+        }
+        if let Some(block) = blocked {
+            let nv = NewValues::from_form(&form, default_version_label(&state));
+            if let Err(errors) = forms::parse_new(&form) {
+                return new_response(&state, c, nv, errors).await;
+            }
+            return new_response_full(&state, c, nv, FieldErrors::new(), Some(block)).await;
+        }
+    }
     let nv = NewValues::from_form(&form, default_version_label(&state));
     let actor = actor(&rt, principal.as_ref().map(|p| &p.0));
     let parsed = match forms::parse_new(&form) {
@@ -1811,6 +1971,13 @@ struct NewPreview {
     errors: FieldErrors,
     warnings: Vec<&'static str>,
     duplicate: bool,
+    summary: Vec<ReviewRow>,
+}
+
+impl NewPreview {
+    fn error_links(&self) -> Vec<forms::ErrorLink> {
+        forms::error_links(&self.i18n, &self.errors)
+    }
 }
 
 /// `POST /ui/endpoints/preview` — the wizard's review step.
@@ -1820,16 +1987,33 @@ pub(crate) async fn preview_new(
     body: Bytes,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let form = Form::parse(&body);
+    let mut form = Form::parse(&body);
+    // As Create does (UX-03): an empty JWKS URL is the one discovery names.
+    if form.get("auth_choice") == "custom"
+        && !form.get("auth_issuer").is_empty()
+        && form.get("auth_jwks_url").is_empty()
+    {
+        let mut errs = FieldErrors::new();
+        let auth = forms::parse_auth(&form, None, &mut errs);
+        if let Ok(report) = runtime(&state).backend.verify_auth(None, &auth, None).await
+            && let Some(jwks) = report.suggestions.get("jwksUrl")
+        {
+            form.set("auth_jwks_url", jwks);
+        }
+    }
     let others = runtime(&state).backend.list().await.unwrap_or_default();
     let other_specs: Vec<&EndpointSpec> = others.iter().map(|o| &o.spec).collect();
+    let mut summary = Vec::new();
     let (json, errors, warnings, duplicate) = match forms::parse_new(&form) {
-        Ok(NewEndpoint::Create(spec, _)) => (
-            serde_json::to_string_pretty(&redacted_spec(&spec)).unwrap_or_default(),
-            FieldErrors::new(),
-            forms::warnings(&spec, &other_specs),
-            false,
-        ),
+        Ok(NewEndpoint::Create(spec, _)) => {
+            summary = review_rows(&i18n, &spec);
+            (
+                serde_json::to_string_pretty(&redacted_spec(&spec)).unwrap_or_default(),
+                FieldErrors::new(),
+                forms::warnings(&spec, &other_specs),
+                false,
+            )
+        }
         Ok(NewEndpoint::Duplicate { source, request }) => (
             serde_json::to_string_pretty(&serde_json::json!({
                 "duplicateOf": source,
@@ -1848,7 +2032,86 @@ pub(crate) async fn preview_new(
         errors,
         warnings,
         duplicate,
+        summary,
     })
+}
+
+/// One line of the wizard's readable review (UX-22): step, label, value.
+pub(crate) struct ReviewRow {
+    pub step: usize,
+    pub label: String,
+    pub value: String,
+}
+
+fn review_rows(i18n: &I18n, spec: &EndpointSpec) -> Vec<ReviewRow> {
+    let row = |step: usize, key: &str, value: String| ReviewRow {
+        step,
+        label: i18n.t(key),
+        value,
+    };
+    let inherited = i18n.t("mgr-inherit-label");
+    let mut rows = vec![
+        row(0, "mgr-field-display-name", spec.display_name.clone()),
+        row(0, "mgr-field-name", spec.name.to_string()),
+        row(
+            0,
+            "mgr-field-path",
+            if spec.path.is_root() {
+                "/".into()
+            } else {
+                format!("/{}", spec.path.as_str())
+            },
+        ),
+        row(
+            1,
+            "mgr-field-fhir-version",
+            release_label(spec.fhir_version).to_string(),
+        ),
+    ];
+    match &spec.auth {
+        None => rows.push(row(2, "mgr-field-auth-mode", inherited.clone())),
+        Some(a) => {
+            rows.push(row(
+                2,
+                "mgr-field-auth-mode",
+                i18n.t(view::auth_mode_key(a.mode)),
+            ));
+            if a.mode != AuthMode::Off {
+                rows.push(row(
+                    2,
+                    "mgr-field-issuer",
+                    a.issuer.clone().unwrap_or_default(),
+                ));
+                rows.push(row(
+                    2,
+                    "mgr-field-audience",
+                    a.audience.clone().unwrap_or_else(|| "—".into()),
+                ));
+                rows.push(row(
+                    2,
+                    "mgr-field-jwks",
+                    a.jwks_url.clone().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    rows.push(row(
+        3,
+        "mgr-field-validation-mode",
+        match &spec.validation {
+            None => inherited.clone(),
+            Some(v) => format!("{:?}", v.mode).to_lowercase(),
+        },
+    ));
+    rows.push(row(
+        3,
+        "mgr-term-server",
+        match &spec.terminology {
+            None => inherited,
+            Some(t) => t.server_url.clone().unwrap_or_default(),
+        },
+    ));
+    rows
 }
 
 #[derive(Template)]
@@ -1865,8 +2128,11 @@ struct DuplicatePage {
 }
 
 impl DuplicatePage {
-    fn err(&self, path: &str) -> &str {
-        self.errors.get(path).map(String::as_str).unwrap_or("")
+    fn err(&self, path: &str) -> String {
+        self.errors
+            .get(path)
+            .map(|m| forms::error_message(&self.i18n, m))
+            .unwrap_or_default()
     }
 }
 

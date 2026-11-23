@@ -71,6 +71,6 @@ mod tests {
             assert!(js.contains(needle), "{needle}");
         }
         let layout = include_str!("../templates/layouts/base.html");
-        assert!(layout.contains("/ui/assets/csrf.js"));
+        assert!(layout.contains("/csrf.js\" defer"));
     }
 }

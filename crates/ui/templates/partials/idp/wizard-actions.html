@@ -1,0 +1,4 @@
+<div class="form-actions">
+  {% if step > 2 %}<button type="submit" class="btn" name="action" value="back" formnovalidate>{{ i18n.t("idpc-back") }}</button>{% endif %}
+  <button type="submit" class="btn btn--primary" name="action" value="next">{{ i18n.t("idpc-save-continue") }} {% call ui::icon("arrow-right") %}{% endcall %}</button>
+</div>

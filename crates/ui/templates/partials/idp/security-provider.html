@@ -1,0 +1,34 @@
+{#-
+  Endpoint Security → "Authorization server: External / Internal" (built-in
+  IdP, crate::idp::security). Rendered only when HFS_IDP=on. With Internal,
+  the issuer / JWKS / SMART fields are generated from the realm (idp.js hides
+  them); the auth mode radio above still applies.
+-#}
+{%- if crate::idp::security::available() %}
+{%- let current = crate::idp::security::endpoint_realm(head.name.as_str(), v.auth_issuer.as_str()) %}
+{%- let choices = crate::idp::security::realm_choices() %}
+<script src="/ui/assets/idp.js" defer></script>
+<fieldset class="idp-provider" data-idp-provider>
+  <legend class="mfield__label">{{ i18n.t("idpc-sec-provider") }}</legend>
+  <div class="radio-cards__grid">
+    <label class="radio-card">
+      <input type="radio" name="auth_provider" value="external"{% if current.is_empty() %} checked{% endif %}>
+      <span class="radio-card__title">{{ i18n.t("idpc-sec-provider-external") }}</span>
+      <span class="radio-card__desc">{{ i18n.t("idpc-sec-provider-external-desc") }}</span>
+    </label>
+    <label class="radio-card">
+      <input type="radio" name="auth_provider" value="internal"{% if !current.is_empty() %} checked{% endif %}{% if choices.is_empty() %} disabled{% endif %}>
+      <span class="radio-card__title">{{ i18n.t("idpc-sec-provider-internal") }}</span>
+      <span class="radio-card__desc">{% if choices.is_empty() %}{{ i18n.t("idpc-sec-provider-internal-none") }}{% else %}{{ i18n.t("idpc-sec-provider-internal-desc") }}{% endif %}</span>
+    </label>
+  </div>
+  <div class="mfield idp-provider__realm" data-idp-internal{% if current.is_empty() %} hidden{% endif %}>
+    <label class="mfield__label" for="f-auth_realm">{{ i18n.t("idpc-sec-realm") }}</label>
+    <select class="mfield__input" id="f-auth_realm" name="auth_realm">
+      {% for r in choices.iter() %}<option value="{{ r.name }}"{% if r.name == current %} selected{% endif %}>{{ r.display }} — {{ r.issuer }}</option>{% endfor %}
+    </select>
+    <p class="mfield__hint">{{ i18n.t("idpc-sec-realm-hint") }} <a href="/ui/idp">{{ i18n.t("idpc-sec-manage") }}</a></p>
+  </div>
+  {% if choices.is_empty() %}<p class="mfield__hint"><a href="/ui/idp/new">{{ i18n.t("idpc-new") }}</a></p>{% endif %}
+</fieldset>
+{%- endif %}

@@ -63,3 +63,20 @@ sync-overwrite = 覆寫
 sync-keep = 保留目標
 sync-log = 日誌
 sync-no-log = 沒有日誌。
+
+## Human option labels (UX-08)
+sync-auth-opt-none = 無（公開伺服器）
+sync-auth-opt-bearer = Bearer token
+sync-auth-opt-basic = 帳號密碼（Basic）
+sync-auth-opt-client-credentials = 用戶端憑證（OAuth 2.0）
+sync-load-opt-paged-read = 逐頁讀取
+sync-load-opt-storage-copy = 直接複製儲存（僅限同一伺服器）
+sync-load-opt-bulk-export = 大量匯出（$export）
+sync-load-opt-none = 不做初次載入（只同步之後的變更）
+sync-trigger-opt-manual = 手動
+sync-trigger-opt-interval = 定時
+sync-trigger-opt-continuous = 持續（輪詢變更）
+sync-trigger-opt-subscription = 收到通知時（Subscription）
+sync-conflict-opt-source-wins = 以來源為準
+sync-conflict-opt-skip-if-target-newer = 目標較新時保留目標
+sync-conflict-opt-fail = 停止並回報衝突

@@ -1,0 +1,49 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{% block title %}{{ client_id }} · {{ head.display_name }} — {{ i18n.t("idpc-title") }}{% endblock %}
+{% block content %}
+{% include "partials/idp/head.html" %}
+{% include "partials/idp/flash.html" %}
+{% if let Some(secret) = new_secret %}{% let cid = client_id.clone() %}{% include "partials/idp/secret-once.html" %}{% endif %}
+{% include "partials/idp/errors.html" %}
+<form method="post" action="/ui/idp/{{ head.name }}/clients/{{ client_id }}" novalidate data-idp-track>
+  <input type="hidden" name="revision" value="{{ revision }}">
+  {% call ui::form_section("client", client_id.clone(), i18n.t(kind_key)) %}
+    <div class="form-grid">
+      {% call ui::field_text(i18n.t("idpc-client-name"), "name", self.v("name"), self.err("name"), "", "text", true) %}{% endcall %}
+      <div class="mfield"><span class="mfield__label">{{ i18n.t("idpc-client-id") }}</span>{% call ui::copy_field(client_id, i18n.t("idpc-copy")) %}{% endcall %}</div>
+    </div>
+    {% call ui::field_area(i18n.t("idpc-client-redirects"), "redirectUris", self.v("redirectUris"), self.err("redirectUris"), i18n.t("idpc-client-redirects-hint"), 3, "https://app.example.org/callback") %}{% endcall %}
+    <fieldset class="checks" id="f-launchTypes">
+      <legend class="mfield__label">{{ i18n.t("idpc-client-launch") }}</legend>
+      <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-launch-standalone" name="launch" value="standalone"{% if launch_standalone %} checked{% endif %}><label class="mcheck__label" for="f-launch-standalone">{{ i18n.t("idpc-client-launch-standalone") }}</label></div>
+      <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-launch-ehr" name="launch" value="ehr"{% if launch_ehr %} checked{% endif %}><label class="mcheck__label" for="f-launch-ehr">{{ i18n.t("idpc-client-launch-ehr") }}</label></div>
+    </fieldset>
+    {% if uses_key %}
+      {% call ui::field_text(i18n.t("idpc-client-jwks-uri"), "jwks_uri", self.v("jwks_uri"), self.err("jwks_uri"), i18n.t("idpc-client-jwks-uri-hint"), "url", false, "", false, true) %}{% endcall %}
+      {% call ui::field_area(i18n.t("idpc-client-jwks"), "jwks", self.v("jwks"), self.err("jwks"), i18n.t("idpc-client-jwks-hint"), 4) %}{% endcall %}
+    {% endif %}
+    <fieldset class="checks">
+      <legend class="mfield__label">{{ i18n.t("idpc-client-scopes") }}</legend>
+      <div class="idp-scope-grid">{% for s in scope_presets %}<div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-scope-{{ loop.index }}" name="scope" value="{{ s.value }}"{% if s.checked %} checked{% endif %}><label class="mcheck__label" for="f-scope-{{ loop.index }}">{{ i18n.t(s.label_key) }} <code>{{ s.value }}</code></label></div>{% endfor %}</div>
+      {% call ui::field_text(i18n.t("idpc-client-scopes-custom"), "scopes_custom", self.v("scopes_custom"), self.err("scopes"), i18n.t("idpc-client-scopes-custom-hint"), "text", false, "", false, true) %}{% endcall %}
+    </fieldset>
+    {% call ui::checkbox(i18n.t("idpc-client-trusted"), "trusted", self.v("trusted") == "on", i18n.t("idpc-client-trusted-hint")) %}{% endcall %}
+    {% call ui::checkbox(i18n.t("idpc-client-disabled"), "disabled", self.v("disabled") == "on", i18n.t("idpc-client-disabled-hint")) %}{% endcall %}
+  {% endcall %}
+  <div class="form-actions"><a class="btn" href="/ui/idp/{{ head.name }}/clients">{{ i18n.t("idpc-cancel") }}</a><button type="submit" class="btn btn--primary">{{ i18n.t("idpc-save") }}</button></div>
+</form>
+<section class="card danger-zone">
+  <h2 class="danger-zone__heading">{{ i18n.t("idpc-danger") }}</h2>
+  {% if confidential_secret %}
+  <div class="danger-zone__row">
+    <div><strong>{{ i18n.t("idpc-client-reset-secret") }}</strong><p>{{ i18n.t("idpc-client-reset-secret-detail") }}</p></div>
+    <form method="post" action="/ui/idp/{{ head.name }}/clients/{{ client_id }}/reset-secret"><button type="submit" class="btn btn--danger-outline" data-confirm="{{ i18n.t("idpc-client-reset-secret-confirm") }}">{% call ui::icon("key") %}{% endcall %}{{ i18n.t("idpc-client-reset-secret") }}</button></form>
+  </div>
+  {% endif %}
+  <div class="danger-zone__row">
+    <div><strong>{{ i18n.t("idpc-client-delete") }}</strong><p>{{ i18n.t("idpc-client-delete-detail") }}</p></div>
+    <form method="post" action="/ui/idp/{{ head.name }}/clients/{{ client_id }}/delete"><button type="submit" class="btn btn--danger" data-confirm="{{ i18n.t_arg("idpc-client-delete-confirm", "client", client_id.clone()) }}">{% call ui::icon("trash") %}{% endcall %}{{ i18n.t("idpc-client-delete") }}</button></form>
+  </div>
+</section>
+{% endblock %}

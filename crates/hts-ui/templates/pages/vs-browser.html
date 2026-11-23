@@ -19,11 +19,12 @@
 <div class="filter-center">
   <form id="hts-vs-filters"
         method="get"
-        action="/ui/hts/value-sets/rows"
-        hx-get="/ui/hts/value-sets/rows"
+        action="{{ crate::paths::ui() }}/value-sets/rows"
+        hx-get="{{ crate::paths::ui() }}/value-sets/rows"
         hx-target="#hts-vs-rows"
         hx-swap="outerHTML"
         hx-trigger="input changed delay:300ms, change, submit"
+        hx-sync="this:replace"
         aria-label="{{ chrome.i18n.t("hts-vs-browser-filter-legend") }}">
     <section class="card table-card">
       <div class="toolbar toolbar--filters">
@@ -66,7 +67,7 @@
             {% endfor %}
           </select>
         </label>
-        <a class="btn" href="/ui/hts/value-sets">{{ chrome.i18n.t("hts-vs-browser-filter-reset") }}</a>
+        <a class="btn" href="{{ crate::paths::ui() }}/value-sets">{{ chrome.i18n.t("hts-vs-browser-filter-reset") }}</a>
       </div>
 
       {#- Counts omitted for the same reason as CS: each one would cost an

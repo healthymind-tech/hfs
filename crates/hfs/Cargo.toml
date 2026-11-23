@@ -16,20 +16,25 @@ name = "hfs"
 path = "src/main.rs"
 
 [features]
-default = ["R4", "sqlite", "ui", "mimalloc"]
+default = ["R4", "sqlite", "ui", "mimalloc", "terminology"]
 
 # mimalloc as the global allocator. glibc malloc held 4-6 GB RSS after a
 # 16-client bundle load and returned it only slowly; capping its arenas
 # (MALLOC_ARENA_MAX=2) halved that but cut load throughput 5x.
 mimalloc = ["dep:mimalloc"]
 
+# Embedded terminology service: HTS linked in, served at /tx and called
+# in-process by validation, search, SoF, FHIRPath, packages and the console
+# (`HFS_TERMINOLOGY=embedded`; docs/design/unified-server.md U-1).
+terminology = ["dep:helios-hts"]
+
 # FHIR version features. `helios-ui?/…` keeps the UI's viewers (search
 # parameters, compartments) scoped to the same versions as the server when
 # the optional `ui` feature is on.
-R4 = ["helios-fhir/R4", "helios-rest/R4", "helios-sync/R4", "helios-audit/R4", "helios-ui?/R4"]
-R4B = ["helios-fhir/R4B", "helios-rest/R4B", "helios-sync/R4B", "helios-audit/R4B", "helios-ui?/R4B"]
-R5 = ["helios-fhir/R5", "helios-rest/R5", "helios-sync/R5", "helios-audit/R5", "helios-ui?/R5"]
-R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-sync/R6", "helios-audit/R6", "helios-ui?/R6"]
+R4 = ["helios-fhir/R4", "helios-rest/R4", "helios-sync/R4", "helios-audit/R4", "helios-ui?/R4", "helios-hts?/R4"]
+R4B = ["helios-fhir/R4B", "helios-rest/R4B", "helios-sync/R4B", "helios-audit/R4B", "helios-ui?/R4B", "helios-hts?/R4B"]
+R5 = ["helios-fhir/R5", "helios-rest/R5", "helios-sync/R5", "helios-audit/R5", "helios-ui?/R5", "helios-hts?/R5"]
+R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-sync/R6", "helios-audit/R6", "helios-ui?/R6", "helios-hts?/R6"]
 
 # Build options
 skip-r6-download = []
@@ -44,8 +49,8 @@ xml = ["helios-rest/xml"]
 # negative feature here: `--all-features` cannot express mutual exclusion.
 
 # Database backends
-sqlite = ["helios-rest/sqlite"]
-postgres = ["helios-rest/postgres", "helios-admin-auth/postgres", "helios-endpoints/postgres", "helios-sync/postgres"]
+sqlite = ["helios-rest/sqlite", "helios-hts?/sqlite"]
+postgres = ["helios-rest/postgres", "helios-admin-auth/postgres", "helios-endpoints/postgres", "helios-sync/postgres", "helios-hts?/postgres", "helios-idp/postgres", "helios-idp-pages/postgres"]
 mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
@@ -60,7 +65,7 @@ bulk-submit-jwe = ["helios-rest/bulk-submit-jwe"]
 cloudwatch = ["helios-audit/cloudwatch"]
 
 # OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
-otel = ["helios-observability/otel"]
+otel = ["helios-observability/otel", "helios-hts?/otel"]
 
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
@@ -71,6 +76,12 @@ helios-rest = { path = "../rest", version = "0.2.9", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false }
 helios-sof = { path = "../sof", version = "0.2.9", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.9" }
+# Built-in authorization server (HFS_IDP, docs/design/authorization-server.md).
+helios-idp = { path = "../idp", version = "0.2.9" }
+helios-idp-server = { path = "../idp-server", version = "0.2.9" }
+helios-idp-pages = { path = "../idp-pages", version = "0.2.9" }
+# Console service + /admin/idp + the diagnostic (I6/I7).
+helios-idp-admin = { path = "../idp-admin", version = "0.2.9" }
 # Administrator sign-in for `/admin` and the console's admin pages
 # (`HFS_ADMIN_PASSWORD`).
 helios-admin-auth = { path = "../admin-auth", version = "0.2.9", features = ["console"] }
@@ -84,6 +95,13 @@ helios-observability = { path = "../observability", version = "0.2.9" }
 # (P1), the console sign-in stores and contracts (P3), the sync service (P6).
 helios-endpoints = { path = "../endpoints", version = "0.2.9" }
 helios-sync = { path = "../sync", version = "0.2.9", default-features = false }
+# Unified server (docs/design/unified-server.md): the terminology contract and
+# the embedded HTS (feature `terminology`).
+helios-terminology = { path = "../terminology", version = "0.2.9" }
+helios-hts = { path = "../hts", version = "0.2.9", optional = true, default-features = false }
+tower-http = { version = "0.6", features = ["compression-full", "cors"] }
+metrics = "0.24"
+libc = "0.2"
 
 # Global allocator (feature `mimalloc`)
 mimalloc = { version = "0.1.52", optional = true, default-features = false }
@@ -117,6 +135,7 @@ async-trait = "0.1"
 # Time (used by the bulk-export cleanup task)
 chrono = "0.4"
 serde_json = "1"
+serde.workspace = true
 
 
 [dev-dependencies]

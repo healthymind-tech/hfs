@@ -21,8 +21,14 @@
 
   // Inherit switches.
   function syncInherit(input) {
-    var target = document.getElementById(input.getAttribute("data-inherit-target"));
-    if (target) target.disabled = input.checked;
+    (input.getAttribute("data-inherit-target") || "").split(/\s+/).forEach(function (id) {
+      var target = id && document.getElementById(id);
+      if (target) target.disabled = input.checked;
+    });
+    // The read-only "what inheriting means" box (UX-11).
+    each('[data-inherit-shows="' + input.name + '"]', input.form || document, function (box) {
+      box.hidden = !input.checked;
+    });
   }
   document.addEventListener("change", function (e) {
     var t = e.target;
@@ -34,9 +40,11 @@
   var live = document.createElement("div");
   live.className = "visually-hidden";
   live.setAttribute("aria-live", "polite");
-  document.addEventListener("DOMContentLoaded", function () {
-    document.body.appendChild(live);
-  });
+  function attachLive() {
+    if (!live.isConnected) document.body.appendChild(live);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", attachLive);
+  else attachLive();
   document.addEventListener("click", function (e) {
     var btn = e.target.closest && e.target.closest("[data-copy]");
     if (!btn) return;
@@ -155,7 +163,8 @@
         heading.focus({ preventScroll: false });
       }
     }
-    nav.addEventListener("click", function (e) {
+    // The stepper, and the review's "Edit" links (UX-22), go to a step.
+    form.addEventListener("click", function (e) {
       var b = e.target.closest("[data-wizard-go]");
       if (b) show(parseInt(b.getAttribute("data-wizard-go"), 10), true);
     });
@@ -195,21 +204,163 @@
     if (form && form.querySelector("[data-show-when]")) syncShowWhen(form);
   });
 
+  // Unsaved-changes guard (UX-04) for every configuration form and the
+  // wizard: any navigation away from an edited form (sidebar, endpoint
+  // switcher, Back, in-page links, tab close) asks first; Save and Cancel
+  // do not.
+  function wireUnsaved(form) {
+    if (!window.HfsUnsaved || form.__hmUnsaved) return;
+    form.__hmUnsaved = true;
+    var cue = form.querySelector(".save-bar__actions, .save-bar") || form;
+    window.HfsUnsaved.track({ root: form, form: form, cue: cue });
+  }
+
+  // Verify panels (UX-02/07/08): stale marking when a checked field
+  // changes, "Go to field", "Use suggested value", automatic run.
+  function verifyPanels(form) {
+    var out = [];
+    if (!form) return out;
+    each("[data-verify]", form, function (p) {
+      out.push(p);
+    });
+    return out;
+  }
+  function watched(panel, name) {
+    var list = (panel.getAttribute("data-verify-watch") || "").split(/\s+/);
+    return list.indexOf(name) >= 0;
+  }
+  document.addEventListener("input", onVerifyEdit);
+  document.addEventListener("change", onVerifyEdit);
+  function onVerifyEdit(e) {
+    var t = e.target;
+    if (!t || !t.name || !t.form) return;
+    verifyPanels(t.form).forEach(function (panel) {
+      if (!watched(panel, t.name)) return;
+      if (panel.querySelector("[data-verify-summary]")) {
+        panel.classList.add("is-stale");
+        each("[data-verify-stale]", panel, function (s) {
+          s.hidden = false;
+        });
+      }
+      if (panel.hasAttribute("data-verify-auto") && e.type === "input") {
+        clearTimeout(panel.__hmAuto);
+        panel.__hmAuto = setTimeout(function () {
+          var run = panel.querySelector("[data-verify-run]");
+          if (run && !run.disabled && run.offsetParent !== null) run.click();
+        }, 600);
+      }
+    });
+  }
+  document.addEventListener("click", function (e) {
+    var go = e.target.closest && e.target.closest("[data-verify-goto]");
+    if (go) {
+      var input = document.getElementById(go.getAttribute("data-verify-goto"));
+      if (!input) return;
+      e.preventDefault();
+      // Reveal it: a wizard step, a closed disclosure, an inherit switch.
+      var step = input.closest("[data-wizard-step]");
+      if (step && step.hidden) {
+        var form = input.closest("form");
+        var steps = form ? form.querySelectorAll("[data-wizard-step]") : [];
+        for (var i = 0; i < steps.length; i++) {
+          if (steps[i] === step) {
+            var goBtn = form.querySelector('[data-wizard-go="' + i + '"]');
+            if (goBtn) goBtn.click();
+          }
+        }
+      }
+      var details = input.closest("details");
+      if (details) details.open = true;
+      input.scrollIntoView({ block: "center" });
+      input.focus({ preventScroll: true });
+      var field = input.closest(".mfield");
+      if (field) {
+        field.classList.add("is-verify-target");
+        setTimeout(function () {
+          field.classList.remove("is-verify-target");
+        }, 2500);
+      }
+      return;
+    }
+    var fill = e.target.closest && e.target.closest("[data-verify-fill]");
+    if (fill) {
+      var target = document.getElementById(fill.getAttribute("data-verify-fill"));
+      if (!target) return;
+      target.value = fill.getAttribute("data-verify-value") || "";
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      target.focus();
+    }
+  });
+  // A fresh result takes focus so screen readers hear the outcome.
+  document.addEventListener("htmx:afterSwap", function (e) {
+    var t = e.detail && e.detail.target;
+    if (!t || !t.matches || !t.matches("[data-verify-result]")) return;
+    var panel = t.closest("[data-verify]");
+    if (panel) panel.classList.remove("is-stale");
+    var summary = t.querySelector("[data-verify-summary]");
+    if (summary && !(panel && panel.hasAttribute("data-verify-auto"))) {
+      summary.focus({ preventScroll: true });
+      revealVerifyResult(t, summary);
+    }
+  });
+
+  // Bring the first failing step (else the summary) into view above the
+  // sticky save bar: its height becomes the steps' scroll margin, so the
+  // bar never covers what the check found.
+  function revealVerifyResult(result, summary) {
+    var bar = document.querySelector(".save-bar");
+    var barHeight = bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+    document.documentElement.style.setProperty("--save-bar-h", barHeight + "px");
+    var first = result.querySelector(".verify-step--fail") ||
+      result.querySelector(".verify-step--warn") || summary;
+    // Instant: a smooth scroll can still be under way when the reader (or
+    // a screenshot) looks, with the step half under the bar.
+    first.scrollIntoView({ block: "nearest", behavior: "auto" });
+  }
+
+  // Elements wired once each (pages swapped in place bring new elements).
+  function once(el, key) {
+    if (el["__hm" + key]) return false;
+    el["__hm" + key] = true;
+    return true;
+  }
+
+  // Absolute URLs on this origin (what to register at an IdP, UX-12).
+  function absolutize() {
+    each("[data-absolute]", document, function (el) {
+      el.textContent = location.origin + el.getAttribute("data-absolute");
+    });
+    each("[data-absolute-copy]", document, function (el) {
+      el.setAttribute("data-copy", location.origin + el.getAttribute("data-absolute-copy"));
+    });
+  }
+
   function init() {
+    absolutize();
     syncShowWhen(document);
     each("[data-inherit-target]", document, syncInherit);
-    each("form[data-typed-confirm]", document, wireTyped);
+    each("form[data-typed-confirm]", document, function (f) {
+      if (once(f, "Typed")) wireTyped(f);
+    });
+    each("form[data-unsaved-form], form[data-unsaved-form-auto]", document, wireUnsaved);
     var names = {};
     each("input[type=radio][data-reveal]", document, function (r) {
       names[r.name] = true;
     });
     Object.keys(names).forEach(syncReveal);
-    each("[data-slug-from]", document, wireSlug);
-    each("form[data-wizard]", document, wireWizard);
+    each("[data-slug-from]", document, function (i) {
+      if (once(i, "Slug")) wireSlug(i);
+    });
+    each("form[data-wizard]", document, function (f) {
+      if (once(f, "Wizard")) wireWizard(f);
+    });
     var focus = document.querySelector("[data-autofocus]");
-    if (focus) focus.focus();
+    if (focus && once(focus, "Focus")) focus.focus();
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
+  // Pages swapped in place by the shell (shell.js).
+  document.addEventListener("hm:navigated", init);
 })();

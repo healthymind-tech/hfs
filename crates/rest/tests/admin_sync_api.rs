@@ -50,6 +50,7 @@ async fn service() -> (Arc<SyncService>, Arc<SqliteBackend>) {
     let env = [
         ("HFS_SYNC_ENABLED", "false"),
         ("HFS_SYNC_SAFETY_LAG_MS", "0"),
+        ("HFS_OUTBOUND_ALLOW", "127.0.0.1"),
     ];
     let cfg = SyncConfig::from_lookup(&|k| {
         env.iter()
@@ -444,4 +445,113 @@ async fn admin_token_scope_is_required() {
         let (s, _, _) = call(&app, "GET", "/admin/sync/jobs", None, &[]).await;
         assert_eq!(s, expected, "{scopes}");
     }
+}
+
+/// `POST /admin/sync/$verify-peer`: a report per side; an existing job's
+/// stored secret fills an empty one (`jobId`).
+#[tokio::test]
+async fn verify_peer_reports_steps_and_reuses_stored_secrets() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let peer = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/r4/metadata"))
+        .and(header("authorization", "Bearer very-secret-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resourceType": "CapabilityStatement", "fhirVersion": "4.0.1",
+            "rest": [{"mode": "server", "resource": [{"type": "Patient",
+                "interaction": [{"code": "read"}, {"code": "history-type"}]}]}]
+        })))
+        .mount(&peer)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/r4/metadata"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&peer)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/r4/Patient"))
+        .and(header("authorization", "Bearer very-secret-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"resourceType": "Bundle", "total": 1204})),
+        )
+        .mount(&peer)
+        .await;
+    let base = format!("{}/r4", peer.uri());
+    let (svc, _) = service().await;
+    let app = app(&svc);
+    let (s, _, created) = call(
+        &app,
+        "POST",
+        "/admin/sync/jobs",
+        Some(json!({
+            "name": "pull",
+            "source": {"kind": "external", "baseUrl": base, "auth": {"type": "bearer"}},
+            "target": {"kind": "endpoint", "name": "lab"},
+            "initialLoad": "none",
+            "secrets": {"source.auth.token": {"set": "very-secret-token"}}
+        })),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{created}");
+    let id = created["job"]["id"].as_str().unwrap().to_string();
+
+    let body = |job: Option<&str>| {
+        let mut b = json!({"role": "source", "url": base, "auth": {"type": "bearer", "token": ""},
+                           "resourceTypes": ["Patient"], "fhirVersion": "R4"});
+        if let Some(j) = job {
+            b["jobId"] = json!(j);
+        }
+        b
+    };
+    // Without the job the empty token is an input failure.
+    let (s, _, r) = call(
+        &app,
+        "POST",
+        "/admin/sync/$verify-peer",
+        Some(body(None)),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!(r["kind"], "sync-source");
+    assert_eq!(r["steps"][0]["code"], "input-required", "{r}");
+    assert_eq!(r["steps"][0]["field"], "token");
+    // With it, the stored token is used.
+    let (s, _, r) = call(
+        &app,
+        "POST",
+        "/admin/sync/$verify-peer",
+        Some(body(Some(&id))),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!(r["ok"], true, "{r}");
+    let step = |id: &str| {
+        r["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(step("metadata")["code"], "metadata-ok");
+    assert_eq!(step("token")["code"], "token-accepted");
+    assert_eq!(step("counts")["params"]["summary"], "Patient 1,204");
+    assert_eq!(step("incremental")["code"], "incremental-ok");
+    assert!(!r.to_string().contains("very-secret-token"));
+
+    let (s, _, _) = call(
+        &app,
+        "POST",
+        "/admin/sync/$verify-peer",
+        Some(json!({"url": 5})),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
 }

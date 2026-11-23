@@ -103,6 +103,12 @@ pub mod number;
 
 pub mod navigation;
 
+/// The console navigation registry (one sidebar for every section).
+pub mod nav;
+
+/// The one console shell shared by the FHIR and terminology pages.
+pub mod shell;
+
 /// The HealthyMind brand chrome: sidebar brand, favicons, attribution footer.
 pub mod brand;
 

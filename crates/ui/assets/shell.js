@@ -1,0 +1,540 @@
+/*
+ * The persistent console shell (unified-server design §9.4).
+ *
+ * Every same-origin console link is boosted by htmx (`hx-boost`
+ * on <body>). This script turns those boosted requests into an in-place
+ * navigation that replaces only `#main`: the sidebar and topbar DOM — their
+ * scroll position, open menus and listeners — stay exactly as they are, the
+ * URL and title update, Back/Forward work (htmx history, snapshots of
+ * `#main` only), and a slow page shows a 2 px progress bar after 150 ms and
+ * dims the content after 400 ms instead of a blank frame.
+ *
+ * Pages whose own scripts are not lifecycle-clean yet (a `<script src>` in
+ * their content, or a nav entry marked `data-full-load`) load as a full
+ * document; `app.css` declares a cross-document view transition, so in
+ * Chromium even those keep the shell on screen until the new page paints,
+ * and the sidebar scroll position is carried over in sessionStorage.
+ *
+ * Forms are never boosted (they submit natively, a full page load): saves,
+ * deletes, downloads and script-handled forms behave exactly as before.
+ *
+ * Page scripts can register with `HM.page(name, {init(root), destroy()})`;
+ * `init` runs for every `[data-page=name]` element on load and after each
+ * swap, `destroy` before that element leaves the page. Global scripts that
+ * prefer an event listen for `hm:navigated` (detail: {main}).
+ */
+(function () {
+  "use strict";
+
+  var PROGRESS_DELAY = 150;
+  var SKELETON_DELAY = 400;
+  var FULL_LOAD_KEY = "hm-full-load";
+  var SIDEBAR_SCROLL_KEY = "hm-sidebar-scroll";
+
+  var buildMeta = document.querySelector('meta[name="hm-build"]');
+  var build = buildMeta ? buildMeta.getAttribute("content") : "";
+
+  /* ---- page-script registry ------------------------------------------- */
+
+  var pages = {};
+  var live = [];
+
+  function initPages(root) {
+    if (!root || !root.querySelectorAll) return;
+    var nodes = [];
+    if (root.matches && root.matches("[data-page]")) nodes.push(root);
+    var found = root.querySelectorAll("[data-page]");
+    for (var i = 0; i < found.length; i++) nodes.push(found[i]);
+    nodes.forEach(function (el) {
+      var def = pages[el.getAttribute("data-page")];
+      if (!def || el.__hmPage) return;
+      el.__hmPage = true;
+      try {
+        if (def.init) def.init(el);
+      } catch (e) {
+        if (window.console) console.error(e);
+      }
+      live.push({ el: el, def: def });
+    });
+  }
+
+  function destroyPages(scope) {
+    live = live.filter(function (entry) {
+      if (scope && !scope.contains(entry.el)) return true;
+      try {
+        if (entry.def.destroy) entry.def.destroy(entry.el);
+      } catch (e) {
+        if (window.console) console.error(e);
+      }
+      return false;
+    });
+  }
+
+  window.HM = window.HM || {};
+  window.HM.page = function (name, def) {
+    pages[name] = def;
+    if (document.readyState !== "loading") initPages(document.getElementById("main"));
+  };
+
+  /* ---- what may be swapped in place ----------------------------------- */
+
+  function learned() {
+    try {
+      return JSON.parse(sessionStorage.getItem(FULL_LOAD_KEY) || "[]");
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function pattern(path) {
+    return path.replace(/^\/ui\/e\/[^/]+/, "/ui/e/*").replace(/\/$/, "");
+  }
+
+  function learn(path) {
+    var key = pattern(path);
+    var list = learned();
+    if (list.indexOf(key) >= 0) return;
+    list.push(key);
+    try {
+      sessionStorage.setItem(FULL_LOAD_KEY, JSON.stringify(list.slice(-200)));
+    } catch (e) {}
+  }
+
+  /* Never in place: other origins, other apps on this origin (/fhir, /tx,
+     /admin), sign-in and sign-out, language switches (cookies and <html
+     lang>), downloads. */
+  var NEVER = /^\/ui\/(login|logout|callback|admin\/login|admin\/logout|console\/)/;
+
+  function fullLoad(url, elt) {
+    if (url.origin !== location.origin) return true;
+    if (url.pathname !== "/ui" && url.pathname.indexOf("/ui/") !== 0) return true;
+    if (url.pathname.indexOf("/ui/assets/") === 0) return true;
+    if (NEVER.test(url.pathname)) return true;
+    if (url.searchParams.has("lang")) return true;
+    if (/\/download(\/|$)|\.(ndjson|json|csv|zip|parquet|tgz)$/i.test(url.pathname)) return true;
+    if (elt && elt.closest && elt.closest("[data-full-load]")) return true;
+    // A link to a fragment of another page ("Go to field" on the IdP and
+    // Verify reports): the in-place swap scrolls to the top and the
+    // response URL has no fragment, so the target field would be lost.
+    if (url.hash.length > 1 && (url.pathname !== location.pathname || url.search !== location.search)) return true;
+    if (elt && elt.hasAttribute && (elt.hasAttribute("download") || elt.getAttribute("target") === "_blank")) return true;
+    return learned().indexOf(pattern(url.pathname)) >= 0;
+  }
+
+  function explicitHx(elt) {
+    var verbs = ["hx-get", "hx-post", "hx-put", "hx-patch", "hx-delete"];
+    for (var i = 0; i < verbs.length; i++) {
+      if (elt.hasAttribute(verbs[i]) || elt.hasAttribute("data-" + verbs[i])) return true;
+    }
+    return false;
+  }
+
+  function isBoosted(detail) {
+    var cfg = detail && detail.requestConfig;
+    if (cfg && typeof cfg.boosted === "boolean") return cfg.boosted;
+    var elt = detail && detail.elt;
+    return !!(elt && (elt.tagName === "A" || elt.tagName === "FORM") && !explicitHx(elt));
+  }
+
+  function nativeSubmit(form, submitter) {
+    if (submitter && submitter.name) {
+      var carry = document.createElement("input");
+      carry.type = "hidden";
+      carry.name = submitter.name;
+      carry.value = submitter.value;
+      form.appendChild(carry);
+    }
+    if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+    saveSidebarScroll();
+    HTMLFormElement.prototype.submit.call(form);
+  }
+
+  function go(url) {
+    if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+    saveSidebarScroll();
+    location.assign(url);
+  }
+
+  /* ---- progress --------------------------------------------------------- */
+
+  var pending = null;
+
+  function startProgress() {
+    stopProgress();
+    var bar = document.getElementById("nav-progress");
+    var main = document.getElementById("main");
+    var state = { timers: [] };
+    state.timers.push(
+      setTimeout(function () {
+        if (bar) bar.classList.add("is-active");
+      }, PROGRESS_DELAY)
+    );
+    state.timers.push(
+      setTimeout(function () {
+        var m = document.getElementById("main");
+        if (m) m.classList.add("is-navigating");
+      }, SKELETON_DELAY)
+    );
+    if (main) main.setAttribute("aria-busy", "true");
+    pending = state;
+  }
+
+  function stopProgress() {
+    if (!pending) return;
+    pending.timers.forEach(clearTimeout);
+    pending = null;
+    var bar = document.getElementById("nav-progress");
+    if (bar) bar.classList.remove("is-active");
+    var main = document.getElementById("main");
+    if (main) {
+      main.classList.remove("is-navigating");
+      main.removeAttribute("aria-busy");
+    }
+  }
+
+  /* ---- active entry ----------------------------------------------------- */
+
+  var ALIASES = { editor: "resources", history: "resources", queries: "resources", search: "resources", home: "ep-home" };
+
+  function markActive() {
+    var nav = document.getElementById("sidebar-nav");
+    if (!nav) return;
+    var links = nav.querySelectorAll("a.nav-item");
+    var main = document.getElementById("main");
+    var active = main ? main.getAttribute("data-active-page") || "" : "";
+    var chosen = null;
+    if (active) {
+      chosen = nav.querySelector('a.nav-item[data-nav-id="' + (ALIASES[active] || active) + '"]');
+    }
+    if (!chosen) {
+      var path = location.pathname.replace(/\/$/, "") || "/ui";
+      var best = -1;
+      for (var i = 0; i < links.length; i++) {
+        var m = links[i].getAttribute("data-match");
+        if (!m) continue;
+        var hit = m === "/ui" ? path === "/ui" : path === m || path.indexOf(m + "/") === 0;
+        if (hit && m.length > best) {
+          best = m.length;
+          chosen = links[i];
+        }
+      }
+    }
+    for (var j = 0; j < links.length; j++) {
+      if (links[j] === chosen) links[j].setAttribute("aria-current", "page");
+      else if (links[j].getAttribute("aria-current") === "page") links[j].removeAttribute("aria-current");
+    }
+  }
+
+  /* ---- sidebar scroll across full loads --------------------------------- */
+
+  function saveSidebarScroll() {
+    var side = document.getElementById("sidebar");
+    if (!side) return;
+    try {
+      sessionStorage.setItem(SIDEBAR_SCROLL_KEY, String(side.scrollTop));
+    } catch (e) {}
+  }
+
+  function restoreSidebarScroll() {
+    var side = document.getElementById("sidebar");
+    if (!side) return;
+    try {
+      var v = sessionStorage.getItem(SIDEBAR_SCROLL_KEY);
+      if (v !== null) side.scrollTop = parseInt(v, 10) || 0;
+    } catch (e) {}
+  }
+
+  /* ---- swap handling ---------------------------------------------------- */
+
+  var parser = new DOMParser();
+  var nextNav = null;
+  var navigated = false;
+
+  function panel(message, retryUrl) {
+    var main = document.getElementById("main");
+    if (!main) return;
+    var data = document.body.dataset;
+    main.innerHTML = "";
+    var box = document.createElement("div");
+    box.className = "error-page";
+    box.id = "nav-error";
+    var h = document.createElement("h1");
+    h.className = "page-head__title";
+    h.tabIndex = -1;
+    h.textContent = data.msgNavError || "This page could not be loaded.";
+    var p = document.createElement("p");
+    p.className = "error-page__text";
+    p.textContent = message;
+    var actions = document.createElement("div");
+    actions.className = "error-page__actions";
+    var retry = document.createElement("a");
+    retry.className = "btn btn--primary";
+    retry.href = retryUrl;
+    retry.textContent = data.msgNavRetry || "Retry";
+    actions.appendChild(retry);
+    box.appendChild(h);
+    box.appendChild(p);
+    box.appendChild(actions);
+    main.appendChild(box);
+    h.focus();
+  }
+
+  // Forms are never boosted: their pages' scripts handle many of them
+  // (preventDefault + fetch), and a boosted submit would race those
+  // handlers. A form without its own hx-* submits natively (a full page,
+  // kept on screen by the view transition); links are what navigate in
+  // place.
+  document.addEventListener("htmx:beforeProcessNode", function (event) {
+    var elt = event.detail && event.detail.elt;
+    if (!elt || !elt.querySelectorAll) return;
+    var forms = elt.tagName === "FORM" ? [elt] : elt.querySelectorAll("form");
+    for (var i = 0; i < forms.length; i++) {
+      if (!forms[i].hasAttribute("hx-boost") && !explicitHx(forms[i])) forms[i].setAttribute("hx-boost", "false");
+    }
+  });
+
+  document.addEventListener("htmx:configRequest", function (event) {
+    var headers = event.detail && event.detail.headers;
+    if (!headers) return;
+    if (build) headers["X-HM-Build"] = build;
+    var key = document.body.getAttribute("data-nav-key");
+    if (key) headers["X-HM-Nav"] = key;
+  });
+
+  document.addEventListener("htmx:beforeRequest", function (event) {
+    var detail = event.detail || {};
+    if (!isBoosted(detail)) return;
+    var elt = detail.elt;
+    var cfg = detail.requestConfig || {};
+    var verb = String(cfg.verb || "get").toLowerCase();
+    if (elt && elt.tagName === "FORM" && verb !== "get") {
+      event.preventDefault();
+      var submitter = cfg.triggeringEvent && cfg.triggeringEvent.submitter;
+      nativeSubmit(elt, submitter);
+      return;
+    }
+    var href = elt && elt.tagName === "A" ? elt.href : cfg.path;
+    var url;
+    try {
+      url = new URL(href, location.href);
+    } catch (e) {
+      return;
+    }
+    if (elt && elt.tagName === "FORM") {
+      try {
+        url.search = new URLSearchParams(new FormData(elt, cfg.triggeringEvent && cfg.triggeringEvent.submitter)).toString();
+      } catch (e) {}
+    }
+    if (fullLoad(url, elt)) {
+      event.preventDefault();
+      go(url.href);
+      return;
+    }
+    // A request the old page still has in flight (a filter that fired on
+    // blur when the link was clicked) is dropped when it answers after the
+    // new page is in (see the beforeSwap guard below).
+    startProgress();
+    var xhr = detail.xhr;
+    if (xhr) xhr.addEventListener("loadend", stopProgress);
+  });
+
+  // The answer to a request whose element has left the page (a filter that
+  // fired on blur as the user clicked a link) must not touch the history:
+  // its own events no longer reach this document, but this one is fired on
+  // <body>, and htmx reads `history.type` back after it.
+  document.body.addEventListener("htmx:beforeHistoryUpdate", function (event) {
+    var detail = event.detail || {};
+    var cfg = detail.requestConfig || {};
+    var gone = function (el) { return el && el.isConnected === false; };
+    if (detail.history && (gone(detail.elt) || gone(cfg.elt) || gone(detail.target))) {
+      // htmx then pushes or replaces `history.path`: make it a no-op
+      // replace of the current entry.
+      detail.history.type = "replace";
+      detail.history.path = location.pathname + location.search + location.hash;
+    }
+  });
+
+  document.addEventListener("htmx:beforeSwap", function (event) {
+    var detail = event.detail || {};
+    if (!isBoosted(detail)) {
+      // A fragment for a page that is gone: drop it (no swap, no history).
+      var src = detail.elt;
+      if ((src && !src.isConnected) || (detail.target && !detail.target.isConnected)) {
+        detail.shouldSwap = false;
+      }
+      return;
+    }
+    var xhr = detail.xhr;
+    var url = (xhr && xhr.responseURL) || (detail.pathInfo && detail.pathInfo.responsePath) || location.href;
+    var type = xhr ? xhr.getResponseHeader("Content-Type") || "" : "";
+    if (type && type.indexOf("text/html") < 0) {
+      detail.shouldSwap = false;
+      go(url);
+      return;
+    }
+    var doc = parser.parseFromString(detail.serverResponse || "", "text/html");
+    var next = doc.getElementById("main");
+    if (!next) {
+      // A sign-in page, a stand-alone message, or no page at all.
+      detail.shouldSwap = false;
+      if (xhr && xhr.status >= 400 && !/<html/i.test(detail.serverResponse || "")) {
+        panel(xhr.status + " " + (xhr.statusText || ""), url);
+      } else {
+        go(url);
+      }
+      return;
+    }
+    if (next.querySelector("script[src]")) {
+      // Page scripts expect a fresh document: load it as one, and go there
+      // directly next time.
+      detail.shouldSwap = false;
+      learn(new URL(url, location.href).pathname);
+      go(url);
+      return;
+    }
+    var key = doc.body ? doc.body.getAttribute("data-nav-key") : null;
+    nextNav = null;
+    if (key && key !== document.body.getAttribute("data-nav-key")) {
+      nextNav = { key: key, nav: doc.getElementById("sidebar-nav") };
+    }
+    detail.shouldSwap = true;
+    detail.isError = false;
+    detail.target = document.getElementById("main");
+    detail.selectOverride = "#main";
+    detail.swapOverride = "outerHTML show:window:top";
+    navigated = {
+      title: doc.title,
+      bodyClass: doc.body ? doc.body.getAttribute("class") || "" : "",
+      method: String((detail.requestConfig || {}).verb || "get"),
+    };
+    destroyPages(document.getElementById("main"));
+  });
+
+  document.addEventListener("htmx:afterSettle", function (event) {
+    if (!navigated) return;
+    var info = navigated;
+    navigated = false;
+    var main = document.getElementById("main");
+    if (nextNav) {
+      var current = document.getElementById("sidebar-nav");
+      if (current && nextNav.nav) current.replaceWith(document.importNode(nextNav.nav, true));
+      document.body.setAttribute("data-nav-key", nextNav.key);
+      if (window.htmx) window.htmx.process(document.getElementById("sidebar-nav"));
+      nextNav = null;
+    }
+    if (info.title) document.title = info.title;
+    // Menus opened to navigate (endpoint switcher, account) close, as they
+    // would on a fresh page.
+    var menus = document.querySelectorAll("#sidebar details.menu[open], .topbar details[open]");
+    for (var k = 0; k < menus.length; k++) menus[k].open = false;
+    // Page-level body classes (`app-shell` on full-height workspaces).
+    var keep = document.body.classList.contains("nav-open") ? " nav-open" : "";
+    document.body.setAttribute("class", (info.bodyClass + keep).trim());
+    markActive();
+    initPages(main);
+    var heading = main && main.querySelector("h1");
+    if (heading) {
+      if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+      heading.focus({ preventScroll: true });
+    } else if (main) {
+      main.focus({ preventScroll: true });
+    }
+    var announcer = document.getElementById("nav-announcer");
+    if (announcer) announcer.textContent = document.title;
+    rememberPage();
+    document.dispatchEvent(new CustomEvent("hm:navigated", { detail: { main: main } }));
+  });
+
+  // A list filter that pushes its URL is the same page under a new address.
+  document.addEventListener("htmx:pushedIntoHistory", function () {
+    if (!navigated) rememberPage();
+  });
+  document.addEventListener("htmx:replacedInHistory", function () {
+    if (!navigated) rememberPage();
+  });
+
+  document.addEventListener("htmx:responseError", function (event) {
+    var detail = event.detail || {};
+    if (!isBoosted(detail) || navigated) return;
+    stopProgress();
+  });
+
+  document.addEventListener("htmx:sendError", function (event) {
+    var detail = event.detail || {};
+    if (!isBoosted(detail)) return;
+    stopProgress();
+    var cfg = detail.requestConfig || {};
+    var data = document.body.dataset;
+    panel(data.msgNavOffline || "The server could not be reached.", cfg.path || location.href);
+  });
+
+  // What belongs to a page but is not inside the #main snapshot htmx keeps:
+  // body classes, the active entry, the sidebar context. And form values,
+  // which innerHTML does not carry: written into attributes first, so Back
+  // shows the filter the list was filtered by.
+  var pageState = {};
+  function rememberPage() {
+    var main = document.getElementById("main");
+    pageState[location.href] = {
+      bodyClass: document.body.getAttribute("class") || "",
+      active: main ? main.getAttribute("data-active-page") || "" : "",
+      navKey: document.body.getAttribute("data-nav-key") || "",
+    };
+  }
+  document.addEventListener("htmx:beforeHistorySave", function () {
+    var main = document.getElementById("main");
+    if (main) {
+      var fields = main.querySelectorAll("input, select, textarea");
+      for (var i = 0; i < fields.length; i++) {
+        var el = fields[i];
+        if (el.type === "password" || el.type === "file") continue;
+        if (el.tagName === "SELECT") {
+          for (var o = 0; o < el.options.length; o++) {
+            if (el.options[o].selected) el.options[o].setAttribute("selected", "");
+            else el.options[o].removeAttribute("selected");
+          }
+        } else if (el.type === "checkbox" || el.type === "radio") {
+          if (el.checked) el.setAttribute("checked", "");
+          else el.removeAttribute("checked");
+        } else if (el.tagName === "TEXTAREA") {
+          el.textContent = el.value;
+        } else {
+          el.setAttribute("value", el.value);
+        }
+      }
+    }
+    // Not `rememberPage()` here: htmx also saves on popstate, when
+    // `location` already names the page being restored.
+  });
+
+  document.addEventListener("htmx:historyRestore", function () {
+    var state = pageState[location.href];
+    var main = document.getElementById("main");
+    if (state) {
+      document.body.setAttribute("class", state.bodyClass);
+      if (main) main.setAttribute("data-active-page", state.active);
+      if (state.navKey && state.navKey !== document.body.getAttribute("data-nav-key")) {
+        // The page belongs to another sidebar (another endpoint or role).
+        location.reload();
+        return;
+      }
+    } else if (main) {
+      // Restored from the server: its own active entry is unknown here.
+      main.removeAttribute("data-active-page");
+    }
+    markActive();
+    initPages(main);
+    document.dispatchEvent(new CustomEvent("hm:navigated", { detail: { main: main } }));
+  });
+
+  window.addEventListener("pagehide", saveSidebarScroll);
+
+  function start() {
+    rememberPage();
+    restoreSidebarScroll();
+    markActive();
+    initPages(document.getElementById("main"));
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
+})();

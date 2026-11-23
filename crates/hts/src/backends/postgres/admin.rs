@@ -160,8 +160,16 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
 
     async fn footprint(&self) -> Result<DbFootprint, HtsError> {
         let c = self.client().await?;
+        // The store's own schema, not the whole database: in the unified
+        // server terminology shares the HFS database (schema `terminology`).
         let bytes: i64 = c
-            .query_one("SELECT pg_database_size(current_database())", &[])
+            .query_one(
+                "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint
+                   FROM pg_class c
+                  WHERE c.relnamespace = to_regnamespace(current_schema())
+                    AND c.relkind IN ('r', 'm')",
+                &[],
+            )
             .await
             .map_err(pg)?
             .get(0);
@@ -172,7 +180,8 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             .query_one(
                 "SELECT COALESCE(SUM(pg_relation_size(relid) * n_dead_tup::float8
                                      / NULLIF(n_live_tup + n_dead_tup, 0)), 0)::bigint
-                   FROM pg_stat_user_tables",
+                   FROM pg_stat_user_tables
+                  WHERE schemaname = current_schema()",
                 &[],
             )
             .await

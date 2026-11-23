@@ -41,7 +41,7 @@ where
 {
     debug!("Processing health check request");
 
-    let health_response = serde_json::json!({
+    let mut health_response = serde_json::json!({
         "status": "ok",
         "service": "hfs",
         "version": env!("CARGO_PKG_VERSION"),
@@ -49,6 +49,11 @@ where
         "started_at": helios_observability::uptime::started_at_rfc3339(),
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
+    // The terminology service (embedded or remote), from the background
+    // probe — never a live call, so `/health` stays instant (design §10).
+    if let Some(terminology) = crate::terminology::health_component() {
+        health_response["components"] = serde_json::json!({ "terminology": terminology });
+    }
 
     Ok((StatusCode::OK, Json(health_response)).into_response())
 }
@@ -313,9 +318,22 @@ where
         }
     };
 
+    // Terminology is reported, and only gates readiness when the deployment
+    // asks for it (`HFS_READINESS_REQUIRE_TERMINOLOGY=true`).
+    let mut status = status;
+    let mut body_status = body_status;
+    let mut checks = serde_json::json!({ "storage": storage_status });
+    if crate::terminology::health_component().is_some() {
+        let down = crate::terminology::terminology_down();
+        checks["terminology"] = serde_json::json!(if down { "unavailable" } else { "ok" });
+        if down && state.config().readiness_require_terminology {
+            status = StatusCode::SERVICE_UNAVAILABLE;
+            body_status = "not_ready";
+        }
+    }
     let body = serde_json::json!({
         "status": body_status,
-        "checks": { "storage": storage_status },
+        "checks": checks,
     });
 
     let mut response = (status, Json(body)).into_response();

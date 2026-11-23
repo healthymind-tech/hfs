@@ -1,8 +1,19 @@
 {% call ui::form_section("sec-auth", i18n.t("mgr-sec-auth"), i18n.t("mgr-sec-auth-desc")) %}
-  {% call ui::inherit_toggle("auth_inherit", v.auth_inherit, "auth-fields", i18n.t_arg("mgr-inherit-auth", "mode", i18n.t(env.auth_mode_key))) %}{% endcall %}
+  {% call ui::inherit_toggle("auth_inherit", v.auth_inherit, "auth-fields auth-fields-more", i18n.t_arg("mgr-inherit-auth", "mode", i18n.t(env.auth_mode_key))) %}{% endcall %}
+  {#- UX-11: what "inherit" means, read-only, with where each value comes from. #}
+  <div class="verify-effective" data-inherit-shows="auth_inherit"{% if !v.auth_inherit %} hidden{% endif %}>
+    <strong>{{ i18n.t("mgr-effective-title") }}</strong>
+    <dl>
+      <dt>{{ i18n.t("mgr-field-auth-mode") }}</dt><dd>{{ i18n.t(env.auth_mode_key) }} <span class="muted">· HFS_AUTH_MODE</span></dd>
+      <dt>{{ i18n.t("mgr-field-issuer") }}</dt><dd>{% if env.auth_issuer.is_empty() %}<span class="muted">{{ i18n.t("mgr-effective-unset") }}</span>{% else %}<code>{{ env.auth_issuer }}</code>{% endif %} <span class="muted">· HFS_AUTH_ISSUER</span></dd>
+      <dt>{{ i18n.t("mgr-field-audience") }}</dt><dd>{% if env.auth_audience.is_empty() %}<span class="muted">{{ i18n.t("mgr-effective-unset") }}</span>{% else %}<code>{{ env.auth_audience }}</code>{% endif %} <span class="muted">· HFS_AUTH_AUDIENCE</span></dd>
+      <dt>{{ i18n.t("mgr-field-jwks") }}</dt><dd>{% if env.auth_jwks.is_empty() %}<span class="muted">{{ i18n.t("mgr-effective-from-discovery") }}</span>{% else %}<code>{{ env.auth_jwks }}</code>{% endif %} <span class="muted">· HFS_AUTH_JWKS_URL</span></dd>
+    </dl>
+    <p class="mfield__hint">{{ i18n.t("mgr-effective-customise") }}</p>
+  </div>
   <fieldset class="inherit-target" id="auth-fields"{% if v.auth_inherit %} disabled{% endif %}>
     <legend class="mfield__label">{{ i18n.t("mgr-field-auth-mode") }}</legend>
-    <div class="radio-cards__grid">
+    <div class="radio-cards__grid" id="f-auth_mode">
       <label class="radio-card">
         <input type="radio" name="auth_mode" value="off"{% if v.auth_mode == "off" %} checked{% endif %}>
         <span class="radio-card__title">{{ i18n.t("mgr-auth-mode-off") }}</span>
@@ -19,18 +30,24 @@
         <span class="radio-card__desc">{{ i18n.t("mgr-auth-mode-full-desc") }}</span>
       </label>
     </div>
-    <div class="form-grid">
+    {#- Built-in IdP (HFS_IDP=on): External / Internal provider choice. -#}
+    <div data-show-when="auth_mode=write-protect|full">
+    {% include "partials/idp/security-provider.html" %}
+    </div>
+    {#- UX-23: the IdP fields only matter with a token mode; Issuer first,
+        then Audience, then the JWKS URL (filled from discovery). -#}
+    <div class="form-grid" data-show-when="auth_mode=write-protect|full">
       {% call ui::field_text(i18n.t("mgr-field-issuer"), "auth_issuer", v.auth_issuer, self.err("auth.issuer"), i18n.t("mgr-field-issuer-hint"), "url", false, "https://idp.example.org/realms/fhir", false, true) %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-field-jwks"), "auth_jwks_url", v.auth_jwks_url, self.err("auth.jwksUrl"), i18n.t("mgr-field-jwks-hint"), "url", false, "", false, true) %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-field-audience"), "auth_audience", v.auth_audience, self.err("auth.audience"), i18n.t("mgr-field-audience-hint"), "text", false, "", false, true) %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-field-algorithms"), "auth_algorithms", v.auth_algorithms, self.err("auth.algorithms"), i18n.t("mgr-field-algorithms-hint"), "text", false, "RS256, ES256", false, true) %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-field-clock-skew"), "auth_clock_skew", v.auth_clock_skew, self.err("auth.clockSkewSecs"), i18n.t("mgr-field-seconds-default-60"), "number", false, "60") %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-field-jwks-max-age"), "auth_jwks_max_age", v.auth_jwks_max_age, self.err("auth.jwksMaxAgeSecs"), i18n.t("mgr-field-seconds-default-300"), "number", false, "300") %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-audience-recommended"), "auth_audience", v.auth_audience, self.err("auth.audience"), i18n.t("mgr-field-audience-hint-recommended"), "text", false, "", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-field-jwks"), "auth_jwks_url", v.auth_jwks_url, self.err("auth.jwksUrl"), i18n.t("mgr-field-jwks-hint-optional"), "url", false, "", false, true) %}{% endcall %}
     </div>
-    <div class="probe">
-      <button type="button" class="btn btn--small" hx-post="/ui/e/{{ head.name }}/security/test" hx-include="#auth-fields" hx-target="#probe-result" hx-swap="innerHTML">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("mgr-test-auth") }}</button>
-      <div id="probe-result" class="probe__result" aria-live="polite"></div>
-    </div>
+  </fieldset>
+  {#- Outside the fieldset so it works while inheriting (UX-11): it then
+      checks the server's own settings. -#}
+  {% call ui::verify_panel("verify-auth", "/ui/e/" ~ head.name ~ "/security/verify", "auth_inherit auth_mode auth_issuer auth_jwks_url auth_audience auth_algorithms", "verify-intro-auth", "verify-run", true, false) %}{% endcall %}
+  <fieldset class="inherit-target" id="auth-fields-more"{% if v.auth_inherit %} disabled{% endif %}>
+    <legend class="visually-hidden">{{ i18n.t("mgr-sec-advanced") }}</legend>
+    <div data-show-when="auth_mode=write-protect|full">
     <fieldset class="checks{% if self.bad("auth.scopes") %} checks--error{% endif %}">
       <legend class="mfield__label">{{ i18n.t("mgr-field-scopes") }}</legend>
       {% call ui::checkbox(i18n.t("mgr-scope-patient"), "scopes_allow_patient", v.scopes_allow_patient) %}{% endcall %}
@@ -46,6 +63,16 @@
         </select>
       </div>
     </fieldset>
+    <details class="disclosure"{% if self.bad("auth.algorithms") || self.bad("auth.clockSkewSecs") || self.bad("auth.jwksMaxAgeSecs") %} open{% endif %}>
+      <summary>{{ i18n.t("mgr-sec-advanced") }}</summary>
+      <div class="disclosure__body">
+        <div class="form-grid">
+          {% call ui::field_text(i18n.t("mgr-field-algorithms"), "auth_algorithms", v.auth_algorithms, self.err("auth.algorithms"), i18n.t("mgr-field-algorithms-hint"), "text", false, "RS256, ES256", false, true) %}{% endcall %}
+          {% call ui::field_text(i18n.t("mgr-field-clock-skew"), "auth_clock_skew", v.auth_clock_skew, self.err("auth.clockSkewSecs"), i18n.t("mgr-field-seconds-default-60"), "number", false, "60") %}{% endcall %}
+          {% call ui::field_text(i18n.t("mgr-field-jwks-max-age"), "auth_jwks_max_age", v.auth_jwks_max_age, self.err("auth.jwksMaxAgeSecs"), i18n.t("mgr-field-seconds-default-300"), "number", false, "300") %}{% endcall %}
+        </div>
+      </div>
+    </details>
     <details class="disclosure">
       <summary>{{ i18n.t("mgr-sec-smart") }}</summary>
       <div class="disclosure__body">
@@ -58,6 +85,7 @@
       </div>
     </details>
     {% call ui::checkbox(i18n.t("mgr-accept-admin"), "accept_admin", v.accept_admin, i18n.t("mgr-accept-admin-hint")) %}{% endcall %}
+    </div>
   </fieldset>
 {% endcall %}
 

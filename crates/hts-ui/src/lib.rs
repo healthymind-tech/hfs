@@ -56,9 +56,12 @@ mod concepts;
 mod home;
 mod i18n;
 mod import;
+pub mod in_process;
 mod login;
 mod metrics_parse;
 mod metrics_ring;
+/// Console paths (`/ui/hts` stand-alone, `/ui/terminology` embedded).
+pub mod paths;
 mod raw_fold;
 mod raw_json_fragment;
 mod upstream;
@@ -168,6 +171,120 @@ pub struct HtsUiState {
     /// Use [`Default::default()`] at construction sites that do not care
     /// about the chart.
     pub metrics_ring: Arc<metrics_ring::MetricsRing>,
+}
+
+/// The console embedded in a host console (HFS, unified-server design §7.1,
+/// §9.2): the host mounts it at `/ui/terminology` (mapping the paths onto
+/// these `/hts/...` routes with [`paths::internal_path`]), guards it with its
+/// own console sign-in and role table, serves the assets from its own
+/// `/ui/assets`, and renders every page inside its shell
+/// ([`helios_ui_chrome::shell::scope_host_frame`]). No administrator
+/// sign-in, no `hts_admin` cookie, no product switcher.
+///
+/// `admin` is the browser admin API (`/hts/api/admin/...`), already guarded
+/// by the host. Call [`paths::configure`] with
+/// [`paths::TerminologyPaths::EMBEDDED`] before rendering any page.
+pub fn embedded_router(state: Arc<HtsUiState>, admin: Option<Router>) -> Router {
+    let base = match admin {
+        Some(admin) => Router::new().nest_service("/hts/api/admin", admin),
+        None => Router::new(),
+    };
+    base.merge(home::routes())
+        .merge(code_systems::routes())
+        .merge(value_sets::routes())
+        .merge(concept_maps::routes())
+        .merge(concepts::routes())
+        .merge(import::routes())
+        .merge(admin::routes())
+        .merge(capability::routes())
+        .merge(raw_json_fragment::concept_fragment_routes())
+        .merge(raw_json_fragment::workbench_fragment_routes())
+        .fallback(not_found_page)
+        .with_state(state)
+        // No `AutoVaryLayer` here: the host router already has one, and the
+        // layer refuses to be stacked twice on one request.
+        .layer(axum::middleware::from_fn(i18n::negotiate_locale))
+}
+
+/// The Terminology section's sidebar entries (design §9.1), registered in
+/// the shared navigation registry when the console is embedded. `admin`:
+/// whether the management pages exist (the upstream admin API is reachable).
+pub fn register_nav(admin: bool) {
+    use helios_ui_chrome::nav::{NavItem, NavRole, NavScope, NavSection, register};
+    let p = paths::get();
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let item = |id: &'static str, label: &'static str, href: String, icon: &'static str, order| {
+        let href = leak(href);
+        NavItem::new(NavSection::Terminology, id, label, href)
+            .icon(icon)
+            .order(order)
+            .scope(NavScope::Terminology)
+    };
+    register(item("tx-home", "hts-nav-home", p.ui.to_string(), "home", 0));
+    register(item(
+        "tx-code-systems",
+        "hts-nav-code-systems",
+        format!("{}/code-systems", p.ui),
+        "book",
+        10,
+    ));
+    register(item(
+        "tx-value-sets",
+        "hts-nav-value-sets",
+        format!("{}/value-sets", p.ui),
+        "bookmark",
+        20,
+    ));
+    register(item(
+        "tx-concept-maps",
+        "hts-nav-concept-maps",
+        format!("{}/concept-maps", p.ui),
+        "arrows-exchange",
+        30,
+    ));
+    register(
+        item(
+            "tx-capability",
+            "nav-capability-conformance",
+            format!("{}/capability-statement", p.ui),
+            "shield",
+            70,
+        )
+        .min_role(NavRole::Viewer),
+    );
+    if admin {
+        register(
+            item(
+                "tx-manage",
+                "hts-nav-terminology",
+                p.manage.to_string(),
+                "sliders",
+                40,
+            )
+            .min_role(NavRole::Admin),
+        );
+        register(
+            item(
+                "tx-import",
+                "hts-nav-import",
+                format!("{}/import", p.ui),
+                "import",
+                50,
+            )
+            .min_role(NavRole::Admin)
+            .full_load(),
+        );
+        register(
+            item(
+                "tx-jobs",
+                "hts-nav-jobs",
+                format!("{}/jobs", p.ui),
+                "sync",
+                60,
+            )
+            .min_role(NavRole::Admin),
+        );
+    }
 }
 
 /// Build the HTS UI router.
@@ -350,6 +467,11 @@ pub(crate) struct Chrome<'a> {
 }
 
 impl Chrome<'_> {
+    /// The host console's shell, when this page is rendered embedded.
+    pub(crate) fn host(&self) -> Option<Arc<helios_ui_chrome::shell::HostFrame>> {
+        helios_ui_chrome::shell::host_frame()
+    }
+
     /// Render the topbar account menu from the shared chrome (#799).
     ///
     /// Deliberately a method rather than a `Chrome` field, which leaves all
@@ -405,7 +527,7 @@ impl Chrome<'_> {
     fn brand_links<'b>(&self, version: &'b str) -> helios_ui_chrome::BrandLinks<'b> {
         helios_ui_chrome::BrandLinks {
             home: helios_ui_chrome::HTS_CONSOLE_PATH,
-            assets: "/ui/hts/assets",
+            assets: paths::assets(),
             product_line: "Terminology Server",
             version,
             home_key: "hts-nav-home",
@@ -426,7 +548,7 @@ impl Chrome<'_> {
 
     /// Favicon / app-icon links for `<head>`, shared with HFS.
     pub(crate) fn brand_head(&self) -> Result<String, askama::Error> {
-        helios_ui_chrome::brand_head("/ui/hts/assets")
+        helios_ui_chrome::brand_head(paths::assets())
     }
 
     /// The attribution footer, shared with HFS; links HFS's About page when
@@ -454,6 +576,18 @@ pub(crate) fn render_page(rendered: Result<String, askama::Error>) -> Response {
                 .into_response()
         }
     }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn test_state() -> Arc<HtsUiState> {
+    Arc::new(HtsUiState {
+        fhir_version: "R4",
+        version: "0.0.0-test",
+        upstream: UpstreamClient::new("http://127.0.0.1:1").expect("test client"),
+        bundled_data_bytes: None,
+        metrics_ring: Default::default(),
+    })
 }
 
 /// Cheap constructor for local mount tests: an [`HtsUiState`] pointed at a
@@ -485,16 +619,4 @@ mod topbar_tests {
         assert_eq!(initials("Jane Q Doe"), "JD");
         assert_eq!(initials(""), "");
     }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn test_state() -> Arc<HtsUiState> {
-    Arc::new(HtsUiState {
-        fhir_version: "R4",
-        version: "0.0.0-test",
-        upstream: UpstreamClient::new("http://127.0.0.1:1").expect("test client"),
-        bundled_data_bytes: None,
-        metrics_ring: Default::default(),
-    })
 }

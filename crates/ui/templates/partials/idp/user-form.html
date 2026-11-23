@@ -1,0 +1,28 @@
+{#- "Add a user" fields (wizard step 3, Users page). Needs `v`, `err`, `endpoint_names`, `password_min`. -#}
+<div class="form-grid">
+  {% call ui::field_text(i18n.t("idpc-user-username"), "user_username", self.v("user_username"), self.err("user_username"), i18n.t("idpc-user-username-hint"), "text", true, "alice", false, false, "off") %}{% endcall %}
+  {% call ui::field_text(i18n.t("idpc-user-display"), "user_display", self.v("user_display"), self.err("user_display"), "", "text", false, "Alice Chen") %}{% endcall %}
+  {% call ui::field_text(i18n.t("idpc-user-password"), "user_password", "", self.err("user_password"), i18n.t_arg("idpc-user-password-hint", "min", password_min.to_string()), "password", false, "", false, false, "new-password") %}{% endcall %}
+  <div class="mfield">
+    <label class="mfield__label" for="f-user_kind">{{ i18n.t("idpc-user-kind") }}</label>
+    <select class="mfield__input" id="f-user_kind" name="user_kind">
+      {% for (val, key) in [("patient", "idpc-user-kind-patient"), ("practitioner", "idpc-user-kind-practitioner"), ("related-person", "idpc-user-kind-related-person"), ("staff", "idpc-user-kind-staff")] %}
+      <option value="{{ val }}"{% if self.is_v("user_kind", val) %} selected{% endif %}>{{ i18n.t(key) }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</div>
+<fieldset class="idp-link">
+  <legend class="mfield__label">{{ i18n.t("idpc-user-link") }}</legend>
+  <p class="mfield__hint">{{ i18n.t("idpc-user-link-hint") }}</p>
+  <div class="form-grid">
+    <div class="mfield">
+      <label class="mfield__label" for="f-user_endpoint">{{ i18n.t("idpc-user-endpoint") }}</label>
+      <select class="mfield__input" id="f-user_endpoint" name="user_endpoint">
+        <option value="">{{ i18n.t("idpc-user-endpoint-none") }}</option>
+        {% for e in endpoint_names %}<option value="{{ e }}"{% if self.v("user_endpoint") == e.as_str() %} selected{% endif %}>{{ e }}</option>{% endfor %}
+      </select>
+    </div>
+    {% call ui::field_text(i18n.t("idpc-user-reference"), "user_reference", self.v("user_reference"), self.err("user_reference"), i18n.t("idpc-user-reference-hint"), "text", false, "Patient/123", false, true) %}{% endcall %}
+  </div>
+</fieldset>

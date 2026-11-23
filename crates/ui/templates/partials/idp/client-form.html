@@ -1,0 +1,43 @@
+{#-
+  "Add an app" fields (wizard step 4 and the Clients page). The page provides
+  `client_kinds`, `scope_presets`, `v(name)` and `err(name)`.
+-#}
+<fieldset class="idp-kinds">
+  <legend class="mfield__label">{{ i18n.t("idpc-client-kind") }}</legend>
+  <div class="radio-cards__grid">
+    {% for k in client_kinds %}
+    <label class="radio-card">
+      <input type="radio" name="client_kind" value="{{ k.value }}"{% if k.checked %} checked{% endif %} data-idp-kind>
+      <span class="radio-card__title">{{ i18n.t(k.label_key) }}</span>
+      <span class="radio-card__desc">{{ i18n.t(k.hint_key) }}</span>
+    </label>
+    {% endfor %}
+  </div>
+</fieldset>
+<div class="form-grid">
+  {% call ui::field_text(i18n.t("idpc-client-name"), "client_name", self.v("client_name"), self.err("client_name"), i18n.t("idpc-client-name-hint"), "text", true, "My SMART app") %}{% endcall %}
+  {% call ui::field_text(i18n.t("idpc-client-id"), "client_id", self.v("client_id"), self.err("client_id"), i18n.t("idpc-client-id-hint"), "text", false, "my-smart-app", false, true) %}{% endcall %}
+</div>
+<div data-idp-for-kind="public secret key">
+  {% call ui::field_area(i18n.t("idpc-client-redirects"), "redirect_uris", self.v("redirect_uris"), self.err("redirect_uris"), i18n.t("idpc-client-redirects-hint"), 3, "https://app.example.org/callback") %}{% endcall %}
+  <fieldset class="checks{% if !self.err("launch").is_empty() %} checks--error{% endif %}" id="f-launch">
+    <legend class="mfield__label">{{ i18n.t("idpc-client-launch") }}</legend>
+    <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-launch-standalone" name="launch" value="standalone" checked><label class="mcheck__label" for="f-launch-standalone">{{ i18n.t("idpc-client-launch-standalone") }}</label></div>
+    <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-launch-ehr" name="launch" value="ehr"><label class="mcheck__label" for="f-launch-ehr">{{ i18n.t("idpc-client-launch-ehr") }}</label></div>
+    {% if !self.err("launch").is_empty() %}<p class="mfield__error">{{ self.err("launch") }}</p>{% endif %}
+  </fieldset>
+</div>
+<div data-idp-for-kind="key backend" hidden>
+  {% call ui::field_text(i18n.t("idpc-client-jwks-uri"), "jwks_uri", self.v("jwks_uri"), self.err("jwks_uri"), i18n.t("idpc-client-jwks-uri-hint"), "url", false, "https://app.example.org/.well-known/jwks.json", false, true) %}{% endcall %}
+  {% call ui::field_area(i18n.t("idpc-client-jwks"), "jwks", self.v("jwks"), self.err("jwks"), i18n.t("idpc-client-jwks-hint"), 4, "{\"keys\": [ … ]}") %}{% endcall %}
+</div>
+<fieldset class="checks" id="f-scopes_custom-group">
+  <legend class="mfield__label">{{ i18n.t("idpc-client-scopes") }}</legend>
+  <div class="idp-scope-grid">
+  {% for s in scope_presets %}
+    <div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-scope-{{ loop.index }}" name="scope" value="{{ s.value }}"{% if s.checked %} checked{% endif %}><label class="mcheck__label" for="f-scope-{{ loop.index }}">{{ i18n.t(s.label_key) }} <code>{{ s.value }}</code></label></div>
+  {% endfor %}
+  </div>
+  {% call ui::field_text(i18n.t("idpc-client-scopes-custom"), "scopes_custom", self.v("scopes_custom"), self.err("scopes_custom"), i18n.t("idpc-client-scopes-custom-hint"), "text", false, "patient/Observation.rs?category=laboratory", false, true) %}{% endcall %}
+</fieldset>
+{% call ui::checkbox(i18n.t("idpc-client-trusted"), "trusted", self.v("trusted") == "on", i18n.t("idpc-client-trusted-hint")) %}{% endcall %}

@@ -42,6 +42,7 @@ pub mod progress;
 pub mod rxnorm_rrf;
 pub mod snomed_rf2;
 pub mod tgz;
+pub mod throttle;
 pub mod ucum;
 
 use async_trait::async_trait;

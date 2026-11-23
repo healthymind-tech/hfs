@@ -10,7 +10,7 @@
 
 {% block content %}
 <section class="page-head">
-  <a class="back-link" href="/ui/hts/terminology">{{ chrome.i18n.t("hts-del-back") }}</a>
+  <a class="back-link" href="{{ crate::paths::manage() }}">{{ chrome.i18n.t("hts-del-back") }}</a>
   <h1 id="hts-del-heading" class="page-head__title">{{ chrome.i18n.t("hts-del-title") }}</h1>
   <p class="page-head__lede"><span class="url">{{ url }}</span> · <code>{{ version_label }}</code></p>
 </section>
@@ -64,7 +64,7 @@
   {% endif %}
 </section>
 
-<form class="card" method="post" action="/ui/hts/terminology/delete" aria-labelledby="hts-del-confirm-heading">
+<form class="card" method="post" action="{{ crate::paths::manage() }}/delete" aria-labelledby="hts-del-confirm-heading">
   <div class="card-head"><h3 id="hts-del-confirm-heading">{{ chrome.i18n.t("hts-del-confirm-heading") }}</h3></div>
   <div class="panel">
     <input type="hidden" name="url" value="{{ url }}">
@@ -75,7 +75,7 @@
       <span class="field__hint">{{ chrome.i18n.t("hts-del-confirm-hint") }}</span>
     </label>
     <div class="form-actions">
-      <a class="btn" href="/ui/hts/terminology">{{ chrome.i18n.t("hts-del-cancel") }}</a>
+      <a class="btn" href="{{ crate::paths::manage() }}">{{ chrome.i18n.t("hts-del-cancel") }}</a>
       <button class="btn btn--danger" type="submit">{{ chrome.i18n.t("hts-del-submit") }}</button>
     </div>
   </div>

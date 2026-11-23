@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 24 crates (23 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
+The project is a Rust workspace with 25 crates (24 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -20,9 +20,9 @@ The project is a Rust workspace with 24 crates (23 default-members; `pysof` excl
 | **`helios-serde-support`** | Shared serde helpers. |
 | **`helios-rest`** | FHIR RESTful API layer (Axum) — handlers, middleware, extractors, multi-tenancy routing. |
 | **`helios-persistence`** | Polyglot persistence — backends (SQLite, PostgreSQL, Elasticsearch, MongoDB), composite storage, search registry, tenant isolation. |
-| **`helios-hfs`** | Main FHIR server binary. Combines `helios-rest` with storage backends. |
+| **`helios-hfs`** | Main FHIR server binary. Combines `helios-rest` with storage backends. With the default feature `terminology` it embeds HTS: `HFS_TERMINOLOGY=embedded\|remote\|off` (a deployment that sets `HFS_TERMINOLOGY_SERVER` without `HFS_TERMINOLOGY` stays remote), `/tx` served in-process, every terminology caller on one `TerminologyService` — see `docs/design/unified-server.md` U2/U3. |
 | **`helios-sof`** | SQL-on-FHIR implementation — ViewDefinition processing, CLI and HTTP server. |
-| **`helios-hts`** | FHIR Terminology Server (HTS) — CodeSystem/ValueSet/ConceptMap operations and terminology import (SNOMED, LOINC, RxNorm, ICD-10-CM). Provides the `hts` binary. |
+| **`helios-hts`** | FHIR Terminology Server (HTS) — CodeSystem/ValueSet/ConceptMap operations and terminology import (SNOMED, LOINC, RxNorm, ICD-10-CM). Provides the `hts` binary (standalone server and the `hts import` / `hts migrate` CLIs) and `helios_hts::embedded`, the in-process service `hfs` links. |
 | **`helios-auth`** | Authentication & authorization — SMART-on-FHIR / OAuth2 JWT bearer validation, JWKS, scopes. Configured via `HFS_AUTH_*`. |
 | **`helios-audit`** | Audit logging — FHIR AuditEvent with IHE BALP profiles; pluggable sinks (database, file, CloudWatch, S3). Configured via `HFS_AUDIT_*`. |
 | **`helios-subscriptions`** | FHIR topic-based Subscriptions engine — rest-hook, websocket, email, and messaging channels. Configured via `HFS_SUBSCRIPTION(S)_*`. |
@@ -33,6 +33,7 @@ The project is a Rust workspace with 24 crates (23 default-members; `pysof` excl
 | **`helios-admin-auth`** (`crates/admin-auth`) | Administrator password sign-in shared by HFS and HTS (`HFS_ADMIN_PASSWORD`, `HTS_ADMIN_PASSWORD`): fail-closed gate, session cookie, CSRF origin check, failed-attempt lockout, axum guard middleware. |
 | **`helios-hts-ui`** (`crates/hts-ui`) | Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS), built on `helios-ui-chrome`. |
 | **`helios-endpoints`** (`crates/endpoints`) | FHIR server manager foundation — endpoint model, routing snapshot and hot-swappable registry, endpoint/console/sync store contracts, sealed secrets (`HFS_SECRET_KEYS`), outbound SSRF policy. See `docs/design/fhir-server-manager.md`. |
+| **`helios-terminology`** (`crates/terminology`) | Unified server foundation — the `TerminologyService` contract (in-process loopback over the embedded HTS router, remote HTTP, off), `HFS_TERMINOLOGY_*` settings with the `HTS_*` alias/deprecation table, the one-database schema plan, terminology console roles and the `/tx` `/ui/terminology` `/idp` route namespace. See `docs/design/unified-server.md`. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
 ### Binaries

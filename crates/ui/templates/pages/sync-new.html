@@ -15,7 +15,7 @@
   <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
 </section>
 {% endif %}
-<form method="post" action="/ui/sync/new" autocomplete="off" class="stack">
+<form method="post" action="/ui/sync/new" autocomplete="off" class="stack" data-unsaved-form>
   {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   {% call ui::form_section("sync-basics", i18n.t("sync-step-basics")) %}
     {% call ui::field_text(i18n.t("sync-col-name"), "name", v("name"), "", "", "text", true) %}{% endcall %}
@@ -41,8 +41,8 @@
     <div class="mfield">
       <label class="mfield__label" for="f-{{ side }}_auth">{{ i18n.t("sync-auth") }}</label>
       <select class="mfield__input" id="f-{{ side }}_auth" name="{{ side }}_auth">
-        {% for a in ["none", "bearer", "basic", "client-credentials"] %}
-        <option value="{{ a }}"{% if fis(side, "auth", a, "none") %} selected{% endif %}>{{ a }}</option>
+        {% for (a, key) in [("none", "sync-auth-opt-none"), ("bearer", "sync-auth-opt-bearer"), ("basic", "sync-auth-opt-basic"), ("client-credentials", "sync-auth-opt-client-credentials")] %}
+        <option value="{{ a }}"{% if fis(side, "auth", a, "none") %} selected{% endif %}>{{ i18n.t(key) }}</option>
         {% endfor %}
       </select>
     </div>
@@ -57,6 +57,8 @@
     <div data-show-when="{{ side }}_auth=bearer|basic|client-credentials">
     {% call ui::secret_field(i18n.t("sync-secret"), side_field(side, "secret"), false, i18n.t("sync-secret-hint")) %}{% endcall %}
     </div>
+    {#- UX-08: test the connection before saving the job. -#}
+    {% call ui::verify_panel("verify-" ~ side, "/ui/sync/verify?side=" ~ side, side ~ "_url " ~ side ~ "_auth " ~ side ~ "_username " ~ side ~ "_token_url " ~ side ~ "_client_id " ~ side ~ "_scope " ~ side ~ "_secret resource_types", "verify-intro-peer", "verify-run-peer", false, false) %}{% endcall %}
     </div>
   {% endcall %}
   {% endfor %}
@@ -65,8 +67,8 @@
     <div class="mfield">
       <label class="mfield__label" for="f-initial_load">{{ i18n.t("sync-initial-load") }}</label>
       <select class="mfield__input" id="f-initial_load" name="initial_load">
-        {% for o in ["paged-read", "storage-copy", "bulk-export", "none"] %}
-        <option value="{{ o }}"{% if is("initial_load", o, "paged-read") %} selected{% endif %}>{{ o }}</option>
+        {% for (o, key) in [("paged-read", "sync-load-opt-paged-read"), ("storage-copy", "sync-load-opt-storage-copy"), ("bulk-export", "sync-load-opt-bulk-export"), ("none", "sync-load-opt-none")] %}
+        <option value="{{ o }}"{% if is("initial_load", o, "paged-read") %} selected{% endif %}>{{ i18n.t(key) }}</option>
         {% endfor %}
       </select>
     </div>
@@ -76,8 +78,8 @@
     <div class="mfield">
       <label class="mfield__label" for="f-trigger">{{ i18n.t("sync-col-trigger") }}</label>
       <select class="mfield__input" id="f-trigger" name="trigger">
-        {% for o in ["manual", "interval", "continuous", "subscription"] %}
-        <option value="{{ o }}"{% if is("trigger", o, "manual") %} selected{% endif %}>{{ o }}</option>
+        {% for (o, key) in [("manual", "sync-trigger-opt-manual"), ("interval", "sync-trigger-opt-interval"), ("continuous", "sync-trigger-opt-continuous"), ("subscription", "sync-trigger-opt-subscription")] %}
+        <option value="{{ o }}"{% if is("trigger", o, "manual") %} selected{% endif %}>{{ i18n.t(key) }}</option>
         {% endfor %}
       </select>
     </div>
@@ -90,8 +92,8 @@
     <div class="mfield">
       <label class="mfield__label" for="f-conflict">{{ i18n.t("sync-conflict") }}</label>
       <select class="mfield__input" id="f-conflict" name="conflict">
-        {% for o in ["source-wins", "skip-if-target-newer", "fail"] %}
-        <option value="{{ o }}"{% if is("conflict", o, "source-wins") %} selected{% endif %}>{{ o }}</option>
+        {% for (o, key) in [("source-wins", "sync-conflict-opt-source-wins"), ("skip-if-target-newer", "sync-conflict-opt-skip-if-target-newer"), ("fail", "sync-conflict-opt-fail")] %}
+        <option value="{{ o }}"{% if is("conflict", o, "source-wins") %} selected{% endif %}>{{ i18n.t(key) }}</option>
         {% endfor %}
       </select>
     </div>
