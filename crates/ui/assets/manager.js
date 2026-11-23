@@ -299,8 +299,24 @@
     var panel = t.closest("[data-verify]");
     if (panel) panel.classList.remove("is-stale");
     var summary = t.querySelector("[data-verify-summary]");
-    if (summary && !(panel && panel.hasAttribute("data-verify-auto"))) summary.focus({ preventScroll: true });
+    if (summary && !(panel && panel.hasAttribute("data-verify-auto"))) {
+      summary.focus({ preventScroll: true });
+      revealVerifyResult(t, summary);
+    }
   });
+
+  // Bring the first failing step (else the summary) into view above the
+  // sticky save bar: its height becomes the steps' scroll margin, so the
+  // bar never covers what the check found.
+  function revealVerifyResult(result, summary) {
+    var bar = document.querySelector(".save-bar");
+    var barHeight = bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+    document.documentElement.style.setProperty("--save-bar-h", barHeight + "px");
+    var first = result.querySelector(".verify-step--fail") ||
+      result.querySelector(".verify-step--warn") || summary;
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    first.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
+  }
 
   // Elements wired once each (pages swapped in place bring new elements).
   function once(el, key) {

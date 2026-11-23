@@ -4,7 +4,7 @@
     <legend class="visually-hidden">{{ i18n.t("mgr-sec-terminology") }}</legend>
     <div class="form-grid">
       {% call ui::field_text(i18n.t("mgr-term-server"), "term_server_url", v.term_server_url, self.err("terminology.serverUrl"), i18n.t("mgr-term-server-hint"), "url", false, "http://hts:8090", false, true) %}{% endcall %}
-      {% call ui::field_text(i18n.t("mgr-term-public"), "term_public_url", v.term_public_url, self.err("terminology.publicUrl"), i18n.t("mgr-term-public-hint"), "url", false, "/ui/hts", false, true) %}{% endcall %}
+      {% call ui::field_text(i18n.t("mgr-term-public"), "term_public_url", v.term_public_url, self.err("terminology.publicUrl"), i18n.t("mgr-term-public-hint"), "url", false, "/ui/terminology", false, true) %}{% endcall %}
       {% call ui::field_text(i18n.t("mgr-term-timeout"), "term_timeout", v.term_timeout, self.err("terminology.timeoutSecs"), i18n.t("mgr-term-timeout-hint"), "number") %}{% endcall %}
     </div>
     {% call ui::secret_field(i18n.t("mgr-term-token"), "term_token", v.term_token_set, i18n.t("mgr-term-token-hint")) %}{% endcall %}

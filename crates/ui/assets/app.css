@@ -10688,6 +10688,23 @@ html.js .reveal:not(.is-shown) {
   height: 16px;
 }
 
+/* Verify results never sit under the sticky save bar: scrolling to a step
+   (manager.js revealVerifyResult, Go to field) keeps the bar's height free
+   below it, and the result ends with room to scroll past the bar. */
+.verify__summary,
+.verify-step {
+  scroll-margin-top: 72px;
+  scroll-margin-bottom: calc(var(--save-bar-h, 88px) + 16px);
+}
+
+form:has(.save-bar) .verify__result:not(:empty) {
+  padding-bottom: 12px;
+}
+
+form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
+  margin-bottom: calc(var(--save-bar-h, 88px) * 0.5);
+}
+
 /* Sticky save bar. */
 .save-bar {
   position: sticky;
