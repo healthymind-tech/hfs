@@ -43,6 +43,14 @@ fn bundle() -> String {
                 ]
             }},
             {"resource": {
+                "resourceType": "ConceptMap", "id": "hm-explore-map", "url": "http://hm.test/explore/map",
+                "version": "1", "name": "ExploreMap", "title": "Explore map", "status": "active",
+                "group": [{"source": TREE, "target": FLAT, "element": [
+                    {"code": "A-1", "target": [{"code": "f1", "equivalence": "equivalent"}]},
+                    {"code": "A-2", "target": [{"code": "f2", "equivalence": "wider"}]}
+                ]}]
+            }},
+            {"resource": {
                 "resourceType": "CodeSystem", "id": "hm-explore-zh", "url": ZH, "version": "1",
                 "name": "ExploreZh", "status": "active", "content": "complete",
                 "concept": [
@@ -235,4 +243,29 @@ async fn bad_requests_are_400_and_unknown_systems_404() {
         .get_fhir("/CodeSystem/$hm-explore?mode=stats&system=http://nope")
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mappings_come_from_the_element_index_both_ways() {
+    let app = app().await;
+    let fwd = get(&app, &format!("mode=mappings&system={TREE}&code=A-1")).await;
+    let items = fwd["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{fwd}");
+    assert_eq!(items[0]["direction"], "forward");
+    assert_eq!(items[0]["system"], FLAT);
+    assert_eq!(items[0]["code"], "f1");
+    assert_eq!(items[0]["display"], "First flat");
+    assert_eq!(items[0]["map"], "http://hm.test/explore/map|1");
+    let rev = get(&app, &format!("mode=mappings&system={FLAT}&code=f2")).await;
+    assert_eq!(rev["items"][0]["direction"], "reverse", "{rev}");
+    assert_eq!(rev["items"][0]["code"], "A-2");
+    assert_eq!(rev["items"][0]["relationship"], "wider");
+    let none = get(&app, &format!("mode=mappings&system={TREE}&code=Z")).await;
+    assert_eq!(none["items"].as_array().unwrap().len(), 0);
+    let (status, _) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$hm-explore?mode=mappings&system={TREE}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

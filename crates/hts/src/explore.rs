@@ -15,6 +15,7 @@
 //! | `members` | one page of the concepts within the filters, with the `show` properties |
 //! | `search` | code (exact, prefix) and display (all words) matches |
 //! | `node` | a concept with its parents, path to a root and child count (SNOMED CT: attributes too) |
+//! | `mappings` | the stored ConceptMap elements that map `code` (as source) or map to it (as target), straight from the element index |
 //!
 //! SNOMED CT `children`, `node` and `search` are answered from the in-memory
 //! concept model (active concepts only, semantic tags from the FSN). The JSON
@@ -56,6 +57,7 @@ pub enum ExploreMode {
     Members,
     Search,
     Node,
+    Mappings,
 }
 
 impl ExploreMode {
@@ -68,6 +70,7 @@ impl ExploreMode {
             "members" => Self::Members,
             "search" => Self::Search,
             "node" => Self::Node,
+            "mappings" => Self::Mappings,
             _ => return None,
         })
     }
@@ -81,6 +84,7 @@ impl ExploreMode {
             Self::Members => "members",
             Self::Search => "search",
             Self::Node => "node",
+            Self::Mappings => "mappings",
         }
     }
 
@@ -91,7 +95,7 @@ impl ExploreMode {
             Self::Facets => 24,
             Self::Members => 25,
             Self::Search => 20,
-            Self::Stats | Self::Node => 50,
+            Self::Stats | Self::Node | Self::Mappings => 50,
         }
     }
 
@@ -99,7 +103,7 @@ impl ExploreMode {
         match self {
             Self::Children => MAX_COUNT,
             Self::Buckets => 200,
-            Self::Facets | Self::Members | Self::Node => 100,
+            Self::Facets | Self::Members | Self::Node | Self::Mappings => 100,
             Self::Search => 50,
             Self::Stats => 1,
         }
@@ -156,7 +160,7 @@ impl ExploreRequest {
         let mode_raw = get("mode").unwrap_or_else(|| "stats".into());
         let mode = ExploreMode::parse(&mode_raw).ok_or_else(|| {
             HtsError::InvalidRequest(format!(
-                "$hm-explore: unknown mode '{mode_raw}' (stats, children, buckets, facets, members, search, node)"
+                "$hm-explore: unknown mode '{mode_raw}' (stats, children, buckets, facets, members, search, node, mappings)"
             ))
         })?;
         let system = get("system").ok_or_else(|| {
@@ -236,9 +240,12 @@ impl ExploreRequest {
             lang,
         };
         match req.mode {
-            ExploreMode::Node if req.code.is_none() => Err(HtsError::InvalidRequest(
-                "$hm-explore: mode=node needs a code".into(),
-            )),
+            ExploreMode::Node | ExploreMode::Mappings if req.code.is_none() => {
+                Err(HtsError::InvalidRequest(format!(
+                    "$hm-explore: mode={} needs a code",
+                    req.mode.as_str()
+                )))
+            }
             ExploreMode::Buckets if req.code.is_none() => Err(HtsError::InvalidRequest(
                 "$hm-explore: mode=buckets needs the parent code".into(),
             )),
@@ -290,6 +297,56 @@ impl ExploreRequest {
             self.lang
         )
     }
+}
+
+/// One stored ConceptMap element of `mode=mappings`, from the point of view
+/// of the looked-up concept (`system`/`code` are the other side).
+#[derive(Clone, Debug, Default)]
+pub struct MapRow {
+    pub direction: String,
+    pub map: String,
+    pub map_version: Option<String>,
+    pub map_title: Option<String>,
+    pub system: String,
+    pub code: String,
+    pub relationship: String,
+    pub display: String,
+}
+
+/// Drop rows that map the concept to itself and repeats from other stored
+/// versions of the same map; keeps the first of each.
+pub fn dedupe_maps(rows: Vec<MapRow>, system: &str, code: &str) -> Vec<MapRow> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|m| !(m.system == system && m.code == code))
+        .filter(|m| {
+            seen.insert((
+                m.direction.clone(),
+                m.map.clone(),
+                m.system.clone(),
+                m.code.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// The `mode=mappings` answer.
+pub fn map_rows_json(code: &str, rows: Vec<MapRow>) -> Value {
+    json!({
+        "code": code,
+        "items": rows.into_iter().map(|m| json!({
+            "direction": m.direction,
+            "map": match &m.map_version {
+                Some(v) if !v.is_empty() => format!("{}|{v}", m.map),
+                _ => m.map.clone(),
+            },
+            "mapTitle": m.map_title,
+            "system": m.system,
+            "code": m.code,
+            "display": m.display,
+            "relationship": m.relationship,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// `%`, `_` and `\` escaped for a `LIKE … ESCAPE '\'` pattern.
@@ -398,7 +455,8 @@ fn cache_put(key: String, ttl: Duration, value: &Value) {
 
 /// Warm what the explorers open first, in the background, so the first
 /// visitor after a restart does not wait: the SNOMED CT concept model (built
-/// on first use, 5–15 s on a full edition) and the LOINC overview counts
+/// on first use, 5–15 s on a full edition), the page headers of the large
+/// systems (exact concept counts) and the LOINC overview counts
 /// (class types, and the classes of each class type). Repeated every five
 /// hours, inside the six-hour life of those cache entries. Never blocks
 /// start-up; `HTS_EXPLORE_WARMUP=false` turns it off.
@@ -441,6 +499,22 @@ async fn warm<B: TerminologyBackend>(state: &AppState<B>) {
             .await,
         Ok(Some(_))
     );
+    // The explorer page header (`stats`, exact concept counts) of the large
+    // systems, as the page asks for it (no version).
+    let mut headers = 0usize;
+    for system in [
+        crate::snomed::SNOMED_URL,
+        "http://hl7.org/fhir/sid/icd-10-cm",
+        "https://twcore.mohw.gov.tw/ig/twcore/CodeSystem/icd-10-cm-2023-tw",
+        "http://hl7.org/fhir/sid/ndc",
+        UCUM_URL,
+    ] {
+        if let Some(req) = request(&[("mode", "stats"), ("system", system)])
+            && explore(state, &req).await.is_ok()
+        {
+            headers += 1;
+        }
+    }
     // LOINC, as the explorer asks for it (the version it shows is pinned).
     let mut loinc = 0usize;
     if let Some(req) = request(&[("mode", "stats"), ("system", "http://loinc.org")])
@@ -481,6 +555,7 @@ async fn warm<B: TerminologyBackend>(state: &AppState<B>) {
     }
     tracing::info!(
         snomed_model = snomed,
+        page_headers = headers,
         loinc_overviews = loinc,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "terminology explorer warm-up done"

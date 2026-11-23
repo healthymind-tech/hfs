@@ -12,6 +12,7 @@ use crate::error::HtsError;
 use crate::explore::{
     COUNT_CAP, ExploreMode, ExploreRequest, MAX_DEPTH, PROPS_CENSUS_MAX, like_escape,
 };
+use crate::explore::{MapRow, dedupe_maps, map_rows_json};
 
 type P = Box<dyn ToSql + Sync + Send>;
 
@@ -239,6 +240,7 @@ impl PostgresTerminologyBackend {
             ExploreMode::Members => members(&tx, &sid, req).await?,
             ExploreMode::Search => search(&tx, &sid, req).await?,
             ExploreMode::Node => node(&tx, &sid, req).await?,
+            ExploreMode::Mappings => mappings(&tx, req).await?,
         };
         let _ = tx.commit().await;
         out["system"] = json!(req.system);
@@ -822,4 +824,76 @@ async fn node(tx: &Transaction<'_>, sid: &str, req: &ExploreRequest) -> Result<V
         }
     }
     Ok(out)
+}
+
+/// The stored ConceptMap elements of `code` in either direction, straight
+/// from the element indexes (`idx_map_elements_source_code` /
+/// `_target_code`) — not `$translate`, which loads every candidate map of
+/// the system to apply its unmapped rules (seconds for SNOMED CT).
+async fn mappings(tx: &Transaction<'_>, req: &ExploreRequest) -> Result<Value, HtsError> {
+    let code = req.code.clone().unwrap_or_default();
+    let limit = req.count as i64;
+    let r = rows(
+        tx,
+        "(SELECT 'forward', cm.url, cm.version, COALESCE(cm.title, cm.name), cme.target_system, \
+                 cme.target_code, cme.equivalence \
+          FROM concept_map_elements cme JOIN concept_maps cm ON cm.id = cme.map_id \
+          WHERE cme.source_code = $2 AND cme.source_system = $1 LIMIT $3) \
+         UNION ALL \
+         (SELECT 'reverse', cm.url, cm.version, COALESCE(cm.title, cm.name), cme.source_system, \
+                 cme.source_code, cme.equivalence \
+          FROM concept_map_elements cme JOIN concept_maps cm ON cm.id = cme.map_id \
+          WHERE cme.target_code = $2 AND cme.target_system = $1 LIMIT $3)",
+        &[
+            Box::new(req.system.clone()),
+            Box::new(code.clone()),
+            Box::new(limit),
+        ],
+    )
+    .await?;
+    let raw: Vec<MapRow> = r
+        .into_iter()
+        .map(|r| MapRow {
+            direction: r.get(0),
+            map: r.get(1),
+            map_version: r.get(2),
+            map_title: r.get(3),
+            system: r.get(4),
+            code: r.get(5),
+            relationship: r.get(6),
+            display: String::new(),
+        })
+        .collect();
+    let mut items = dedupe_maps(raw, req.system.as_str(), &code);
+    // Displays of the other side, one query per system.
+    let mut systems: Vec<String> = items.iter().map(|m| m.system.clone()).collect();
+    systems.sort();
+    systems.dedup();
+    let mut names = std::collections::HashMap::new();
+    for sys in systems.into_iter().take(8) {
+        let Some((sid, _)) = resolve(tx, &sys, None).await? else {
+            continue;
+        };
+        let codes: Vec<String> = items
+            .iter()
+            .filter(|m| m.system == sys)
+            .map(|m| m.code.clone())
+            .collect();
+        for r in rows(
+            tx,
+            "SELECT code, display FROM concepts WHERE system_id = $1 AND code = ANY($2)",
+            &[Box::new(sid), Box::new(codes)],
+        )
+        .await?
+        {
+            let d: Option<String> = r.get(1);
+            names.insert((sys.clone(), r.get::<_, String>(0)), d.unwrap_or_default());
+        }
+    }
+    for m in items.iter_mut() {
+        if let Some(d) = names.get(&(m.system.clone(), m.code.clone())) {
+            m.display = d.clone();
+        }
+    }
+    Ok(map_rows_json(&code, items))
 }
