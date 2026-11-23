@@ -11418,7 +11418,8 @@ mod tests {
             .expect("deferred theme.js");
         assert!(boot < script);
         assert!(html.contains("<svg"));
-        assert!(html.contains(r#"fill="currentColor""#));
+        // One outline icon family (console redesign §6): stroked, currentColor.
+        assert!(html.contains(r#"stroke="currentColor""#));
     }
 
     #[test]
