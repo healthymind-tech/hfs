@@ -27,14 +27,20 @@ pub struct RealmChoice {
 
 /// Realms for the select (empty when the IdP is not installed).
 pub fn realm_choices() -> Vec<RealmChoice> {
-    let Some(c) = service::global() else { return vec![] };
+    let Some(c) = service::global() else {
+        return vec![];
+    };
     let mut v: Vec<RealmChoice> = c
         .admin
         .runtime()
         .realms()
         .iter()
         .filter(|r| r.spec.enabled)
-        .map(|r| RealmChoice { name: r.spec.name.as_str().to_string(), display: r.spec.display_name.clone(), issuer: c.issuer(&r.spec) })
+        .map(|r| RealmChoice {
+            name: r.spec.name.as_str().to_string(),
+            display: r.spec.display_name.clone(),
+            issuer: c.issuer(&r.spec),
+        })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
@@ -48,7 +54,11 @@ pub fn available() -> bool {
 /// The realm whose issuer the auth section names, if any.
 pub fn current_realm(issuer: &str) -> String {
     let issuer = issuer.trim_end_matches('/');
-    realm_choices().into_iter().find(|r| r.issuer == issuer).map(|r| r.name).unwrap_or_default()
+    realm_choices()
+        .into_iter()
+        .find(|r| r.issuer == issuer)
+        .map(|r| r.name)
+        .unwrap_or_default()
 }
 
 /// The realm an endpoint is bound to: its `provider = Internal{realm}`, or
@@ -60,7 +70,12 @@ pub fn endpoint_realm(endpoint: &str, issuer: &str) -> String {
             .endpoints()
             .iter()
             .find(|e| e.name() == endpoint)
-            .and_then(|e| e.spec.auth.as_ref().and_then(|a| a.provider.internal_realm().map(String::from)))
+            .and_then(|e| {
+                e.spec
+                    .auth
+                    .as_ref()
+                    .and_then(|a| a.provider.internal_realm().map(String::from))
+            })
     });
     provider.unwrap_or_else(|| current_realm(issuer))
 }
@@ -75,7 +90,10 @@ pub fn apply_form(form: &Form, spec_name: &str, auth: &mut EndpointAuth, errs: &
         return;
     }
     let Some(c) = service::global() else {
-        errs.insert("auth.provider".into(), "the built-in authorization server is not enabled (HFS_IDP=on)".into());
+        errs.insert(
+            "auth.provider".into(),
+            "the built-in authorization server is not enabled (HFS_IDP=on)".into(),
+        );
         return;
     };
     let name = form.get("auth_realm");
@@ -84,7 +102,10 @@ pub fn apply_form(form: &Form, spec_name: &str, auth: &mut EndpointAuth, errs: &
         return;
     };
     let Some(base) = c.admin.runtime().endpoint_urls().base_url(spec_name) else {
-        errs.insert("auth.realm".into(), "the endpoint's public URL is unknown".into());
+        errs.insert(
+            "auth.realm".into(),
+            "the endpoint's public URL is unknown".into(),
+        );
         return;
     };
     let keep_mode = auth.mode;

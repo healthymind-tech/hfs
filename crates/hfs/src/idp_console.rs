@@ -45,14 +45,21 @@ pub fn install(rt: &Arc<IdpRuntime>, server_base: &str) {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .and_then(|v| url::Url::parse(v.trim()).ok());
-    let mut console = IdpConsole::new(helios_idp::admin::IdpAdmin::new(rt.clone()), binder).with_fetch_via(via);
-    if let Some(secs) = std::env::var("HFS_IDP_DIAGNOSTIC_TIMEOUT_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+    let mut console =
+        IdpConsole::new(helios_idp::admin::IdpAdmin::new(rt.clone()), binder).with_fetch_via(via);
+    if let Some(secs) = std::env::var("HFS_IDP_DIAGNOSTIC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
         console.timeout = std::time::Duration::from_secs(secs.clamp(1, 120));
     }
     service::install(Arc::new(console));
     #[cfg(feature = "ui")]
     helios_ui::idp::register_nav();
-    info!(endpoint_binding = ENDPOINT_STORE.get().is_some(), "authorization server console on (/ui/idp, /admin/idp)");
+    info!(
+        endpoint_binding = ENDPOINT_STORE.get().is_some(),
+        "authorization server console on (/ui/idp, /admin/idp)"
+    );
 }
 
 /// `/admin/idp/**` (answers 503 until [`install`] ran).
@@ -78,10 +85,15 @@ pub fn admin_routes(app: Router, gate: helios_admin_auth::AdminGate) -> Router {
                 extensions: &parts.extensions,
                 peer,
             };
-            let r: AuthResult = authorizer
-                .authorize(req)
-                .await
-                .map_err(|e| (e.status, e.issues.first().map(|i| i.message.clone()).unwrap_or_default()));
+            let r: AuthResult = authorizer.authorize(req).await.map_err(|e| {
+                (
+                    e.status,
+                    e.issues
+                        .first()
+                        .map(|i| i.message.clone())
+                        .unwrap_or_default(),
+                )
+            });
             r
         })
     });

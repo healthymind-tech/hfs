@@ -36,25 +36,64 @@ use crate::{RequestTenant, WebState};
 pub(crate) fn routes() -> Router<WebState> {
     Router::new()
         .route("/ui/idp", get(manage::list_page))
-        .route("/ui/idp/new", get(wizard::basics_page).post(wizard::basics_submit))
-        .route("/ui/idp/new/{realm}/{step}", get(wizard::step_page).post(wizard::step_submit))
+        .route(
+            "/ui/idp/new",
+            get(wizard::basics_page).post(wizard::basics_submit),
+        )
+        .route(
+            "/ui/idp/new/{realm}/{step}",
+            get(wizard::step_page).post(wizard::step_submit),
+        )
         .route("/ui/idp/new/{realm}/preview", post(wizard::smart_preview))
         .route("/ui/idp/new/{realm}/discard", post(wizard::discard))
         .route("/ui/idp/{realm}", get(manage::overview_page))
-        .route("/ui/idp/{realm}/clients", get(manage::clients_page).post(manage::client_create))
-        .route("/ui/idp/{realm}/clients/{client}", get(manage::client_page).post(manage::client_save))
-        .route("/ui/idp/{realm}/clients/{client}/{action}", post(manage::client_action))
-        .route("/ui/idp/{realm}/users", get(manage::users_page).post(manage::user_create))
-        .route("/ui/idp/{realm}/users/{user}", get(manage::user_page).post(manage::user_save))
-        .route("/ui/idp/{realm}/users/{user}/{action}", post(manage::user_action))
+        .route(
+            "/ui/idp/{realm}/clients",
+            get(manage::clients_page).post(manage::client_create),
+        )
+        .route(
+            "/ui/idp/{realm}/clients/{client}",
+            get(manage::client_page).post(manage::client_save),
+        )
+        .route(
+            "/ui/idp/{realm}/clients/{client}/{action}",
+            post(manage::client_action),
+        )
+        .route(
+            "/ui/idp/{realm}/users",
+            get(manage::users_page).post(manage::user_create),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}",
+            get(manage::user_page).post(manage::user_save),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/{action}",
+            post(manage::user_action),
+        )
         .route("/ui/idp/{realm}/keys", get(manage::keys_page))
         .route("/ui/idp/{realm}/keys/{action}", post(manage::keys_action))
         .route("/ui/idp/{realm}/sessions", get(manage::sessions_page))
-        .route("/ui/idp/{realm}/sessions/{kind}/{id}/revoke", post(manage::session_revoke))
-        .route("/ui/idp/{realm}/settings", get(manage::settings_page).post(manage::settings_save))
-        .route("/ui/idp/{realm}/settings/{action}", post(manage::settings_action))
-        .route("/ui/idp/{realm}/test", get(manage::test_page).post(manage::test_run))
-        .route("/ui/idp/{realm}/test/report.json", get(manage::test_report_json))
+        .route(
+            "/ui/idp/{realm}/sessions/{kind}/{id}/revoke",
+            post(manage::session_revoke),
+        )
+        .route(
+            "/ui/idp/{realm}/settings",
+            get(manage::settings_page).post(manage::settings_save),
+        )
+        .route(
+            "/ui/idp/{realm}/settings/{action}",
+            post(manage::settings_action),
+        )
+        .route(
+            "/ui/idp/{realm}/test",
+            get(manage::test_page).post(manage::test_run),
+        )
+        .route(
+            "/ui/idp/{realm}/test/report.json",
+            get(manage::test_report_json),
+        )
 }
 
 /// Registers the sidebar section (called by the server when it installs
@@ -78,21 +117,43 @@ pub fn register_nav() {
 
 /// The installed service, or the "not enabled" page.
 pub(crate) fn console() -> Result<Arc<IdpConsole>, Response> {
-    service::global().ok_or_else(|| (StatusCode::NOT_FOUND, "The built-in authorization server is not enabled on this server (HFS_IDP=on).").into_response())
+    service::global().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "The built-in authorization server is not enabled on this server (HFS_IDP=on).",
+        )
+            .into_response()
+    })
 }
 
 /// The acting console user (audit / endpoint history).
 pub(crate) fn actor(rt: &RequestTenant, principal: Option<&ConsolePrincipal>) -> Actor {
     if let Some(p) = principal {
-        return Actor { subject: p.subject.clone(), display: Some(p.display_name.clone()), via: "console-session".into() };
+        return Actor {
+            subject: p.subject.clone(),
+            display: Some(p.display_name.clone()),
+            via: "console-session".into(),
+        };
     }
     if let Some(user) = &rt.admin_user {
-        return Actor { subject: "admin".into(), display: Some(user.clone()), via: "admin-password".into() };
+        return Actor {
+            subject: "admin".into(),
+            display: Some(user.clone()),
+            via: "admin-password".into(),
+        };
     }
     if let Some(s) = &rt.signed_in {
-        return Actor { subject: format!("oidc:{}", s.subject), display: Some(s.display().to_string()), via: "console-session".into() };
+        return Actor {
+            subject: format!("oidc:{}", s.subject),
+            display: Some(s.display().to_string()),
+            via: "console-session".into(),
+        };
     }
-    Actor { subject: "anonymous".into(), display: None, via: "console-session".into() }
+    Actor {
+        subject: "anonymous".into(),
+        display: None,
+        via: "console-session".into(),
+    }
 }
 
 /// Every value of a repeated form field (checkbox groups).
@@ -149,7 +210,10 @@ impl Errors {
     }
     /// Error-summary entries: (field id, message).
     pub fn summary(&self) -> Vec<(String, String)> {
-        self.fields.iter().map(|(k, v)| (format!("f-{k}"), v.clone())).collect()
+        self.fields
+            .iter()
+            .map(|(k, v)| (format!("f-{k}"), v.clone()))
+            .collect()
     }
 }
 
@@ -183,7 +247,10 @@ pub(crate) fn json_download(name: &str, v: &impl serde::Serialize) -> Response {
     (
         [
             (header::CONTENT_TYPE, "application/json".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
         ],
         serde_json::to_string_pretty(v).unwrap_or_default(),
     )

@@ -63,35 +63,70 @@ pub(crate) fn field_href(realm: &str, field: &str, in_wizard: bool) -> String {
     let m = |page: &str, anchor: &str| format!("/ui/idp/{realm}/{page}#{anchor}");
     if let Some(rest) = field.strip_prefix("client.") {
         let (client, f) = rest.split_once('.').unwrap_or((rest, ""));
-        let anchor = if f.is_empty() { "f-name".to_string() } else { format!("f-{f}") };
-        return if in_wizard { w(4, &format!("client-{client}")) } else { format!("/ui/idp/{realm}/clients/{client}#{anchor}") };
+        let anchor = if f.is_empty() {
+            "f-name".to_string()
+        } else {
+            format!("f-{f}")
+        };
+        return if in_wizard {
+            w(4, &format!("client-{client}"))
+        } else {
+            format!("/ui/idp/{realm}/clients/{client}#{anchor}")
+        };
     }
     if field == "keys" {
-        return if in_wizard { w(2, "keys") } else { m("keys", "keys") };
+        return if in_wizard {
+            w(2, "keys")
+        } else {
+            m("keys", "keys")
+        };
     }
     if field == "clients" {
-        return if in_wizard { w(4, "f-client_name") } else { m("clients", "f-client_name") };
+        return if in_wizard {
+            w(4, "f-client_name")
+        } else {
+            m("clients", "f-client_name")
+        };
     }
     if field == "users" {
-        return if in_wizard { w(3, "f-user_username") } else { m("users", "f-user_username") };
+        return if in_wizard {
+            w(3, "f-user_username")
+        } else {
+            m("users", "f-user_username")
+        };
     }
     if field == "endpoints" || field.starts_with("endpoints.") {
         let ep = field.strip_prefix("endpoints.").unwrap_or("");
-        let anchor = if ep.is_empty() { "endpoints".to_string() } else { format!("ep-{ep}") };
-        return if in_wizard { w(6, &anchor) } else { m("settings", &anchor) };
+        let anchor = if ep.is_empty() {
+            "endpoints".to_string()
+        } else {
+            format!("ep-{ep}")
+        };
+        return if in_wizard {
+            w(6, &anchor)
+        } else {
+            m("settings", &anchor)
+        };
     }
     if let Some(f) = field.strip_prefix("realm.") {
         let step = if f.starts_with("features") || f.starts_with("lifetimes") {
             5
         } else if f.starts_with("security") || f.starts_with("userSource") {
             3
-        } else if f.starts_with("signingAlgs") || f.starts_with("rotation") || f.starts_with("rsaBits") {
+        } else if f.starts_with("signingAlgs")
+            || f.starts_with("rotation")
+            || f.starts_with("rsaBits")
+        {
             2
         } else {
             1
         };
         let anchor = format!("f-{f}");
-        return if in_wizard { w(step, &anchor) } else { m("settings", &anchor) };
+        return if in_wizard {
+            w(step, &anchor)
+        } else {
+            m("settings", &anchor)
+        };
     }
     m("settings", &format!("f-{field}"))
 }
@@ -149,7 +184,11 @@ pub(crate) fn view(i18n: &I18n, r: &Report, in_wizard: bool) -> VerifyView {
                 icon,
                 status_label: i18n.t(label),
                 duration: format!("{} ms", s.duration_ms),
-                checks: s.checks.iter().map(|c| check_view(i18n, realm, c, in_wizard)).collect(),
+                checks: s
+                    .checks
+                    .iter()
+                    .map(|c| check_view(i18n, realm, c, in_wizard))
+                    .collect(),
                 open: matches!(s.status, Status::Fail | Status::Warn),
             }
         })
@@ -158,7 +197,10 @@ pub(crate) fn view(i18n: &I18n, r: &Report, in_wizard: bool) -> VerifyView {
     let warnings = r.warnings();
     let (status, icon, _) = look(r.status);
     let (headline, detail) = match r.status {
-        Status::Pass if warnings.is_empty() => (i18n.t("idpc-verify-all-passed"), i18n.t("idpc-verify-all-passed-detail")),
+        Status::Pass if warnings.is_empty() => (
+            i18n.t("idpc-verify-all-passed"),
+            i18n.t("idpc-verify-all-passed-detail"),
+        ),
         Status::Pass | Status::Warn => (
             i18n.t_arg("idpc-verify-warnings", "count", warnings.len() as i64),
             i18n.t("idpc-verify-warnings-detail"),
@@ -176,7 +218,9 @@ pub(crate) fn view(i18n: &I18n, r: &Report, in_wizard: bool) -> VerifyView {
         detail,
         when: r.finished_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         steps,
-        first_problem: problems.first().map(|c| check_view(i18n, realm, c, in_wizard)),
+        first_problem: problems
+            .first()
+            .map(|c| check_view(i18n, realm, c, in_wizard)),
     }
 }
 
@@ -186,12 +230,30 @@ mod tests {
 
     #[test]
     fn field_links() {
-        assert_eq!(field_href("r", "client.app.redirectUris", false), "/ui/idp/r/clients/app#f-redirectUris");
-        assert_eq!(field_href("r", "client.app.redirectUris", true), "/ui/idp/new/r/4#client-app");
+        assert_eq!(
+            field_href("r", "client.app.redirectUris", false),
+            "/ui/idp/r/clients/app#f-redirectUris"
+        );
+        assert_eq!(
+            field_href("r", "client.app.redirectUris", true),
+            "/ui/idp/new/r/4#client-app"
+        );
         assert_eq!(field_href("r", "keys", false), "/ui/idp/r/keys#keys");
-        assert_eq!(field_href("r", "endpoints.ep1", false), "/ui/idp/r/settings#ep-ep1");
-        assert_eq!(field_href("r", "endpoints.ep1", true), "/ui/idp/new/r/6#ep-ep1");
-        assert_eq!(field_href("r", "realm.lifetimes.accessToken", true), "/ui/idp/new/r/5#f-lifetimes.accessToken");
-        assert_eq!(field_href("r", "realm.enabled", false), "/ui/idp/r/settings#f-enabled");
+        assert_eq!(
+            field_href("r", "endpoints.ep1", false),
+            "/ui/idp/r/settings#ep-ep1"
+        );
+        assert_eq!(
+            field_href("r", "endpoints.ep1", true),
+            "/ui/idp/new/r/6#ep-ep1"
+        );
+        assert_eq!(
+            field_href("r", "realm.lifetimes.accessToken", true),
+            "/ui/idp/new/r/5#f-lifetimes.accessToken"
+        );
+        assert_eq!(
+            field_href("r", "realm.enabled", false),
+            "/ui/idp/r/settings#f-enabled"
+        );
     }
 }

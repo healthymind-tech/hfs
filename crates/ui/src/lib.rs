@@ -69,14 +69,14 @@ mod sql_export;
 /// — `editor.rs` included — keeps compiling unchanged.
 pub(crate) use helios_ui_chrome::capability_json;
 pub(crate) use helios_ui_chrome::json_view;
+/// Built-in authorization server console (`/ui/idp`, design I6).
+pub mod idp;
 /// Persistent-shell plumbing: build id, versioned assets, CSP.
 mod shell;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
 mod sync_pages;
-/// Built-in authorization server console (`/ui/idp`, design I6).
-pub mod idp;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
 #[doc(hidden)]

@@ -9,10 +9,10 @@
 use std::collections::HashMap;
 
 use askama::Template;
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse, Response};
-use axum::Extension;
 use helios_endpoints::ConsolePrincipal;
 use helios_idp::client::{ClientAuth, ClientSpec, GrantType, LaunchType};
 use helios_idp::keys::{RsaBits, SigningAlg};
@@ -21,7 +21,9 @@ use helios_idp::realm::{RealmSpec, UserSource};
 use helios_idp::scope::ScopePolicy;
 use helios_idp::user::{FhirLink, RealmUser, UserKind};
 use helios_idp_admin::binding::BindMode;
-use helios_idp_admin::service::{DIAGNOSTIC_PREFIX, FinishOutcome, IdpConsole, OpError, Template as RealmTemplate, WizardState};
+use helios_idp_admin::service::{
+    DIAGNOSTIC_PREFIX, FinishOutcome, IdpConsole, OpError, Template as RealmTemplate, WizardState,
+};
 
 use super::verify::{self, VerifyView};
 use super::{Errors, actor, console, labels, values};
@@ -192,14 +194,31 @@ fn nav(realm: &str, current: u8, reached: u8) -> Vec<StepNav> {
             StepNav {
                 n,
                 label_key: key,
-                state: if n == current { "current" } else if n < reached.max(current) { "done" } else { "todo" },
-                href: if realm.is_empty() || n == 1 { String::new() } else { format!("/ui/idp/new/{realm}/{n}") },
+                state: if n == current {
+                    "current"
+                } else if n < reached.max(current) {
+                    "done"
+                } else {
+                    "todo"
+                },
+                href: if realm.is_empty() || n == 1 {
+                    String::new()
+                } else {
+                    format!("/ui/idp/new/{realm}/{n}")
+                },
             }
         })
         .collect()
 }
 
-fn base_page(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, step: u8) -> WizardPage {
+fn base_page(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    step: u8,
+) -> WizardPage {
     let i18n = I18n::new(locale);
     WizardPage {
         status: current_status(st, rv.0, rt),
@@ -259,7 +278,12 @@ fn base_page(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &Req
 
 // ---------------------------------------------------------------- step 1
 
-pub(crate) async fn basics_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant) -> Response {
+pub(crate) async fn basics_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
     let c = match console() {
         Ok(c) => c,
         Err(r) => return r,
@@ -272,14 +296,23 @@ pub(crate) async fn basics_page(State(st): State<WebState>, locale: RequestLocal
     render(p)
 }
 
-pub(crate) async fn basics_submit(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, body: Bytes) -> Response {
+pub(crate) async fn basics_submit(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    body: Bytes,
+) -> Response {
     let c = match console() {
         Ok(c) => c,
         Err(r) => return r,
     };
     let f = Form::parse(&body);
     let template = RealmTemplate::parse(f.get("template")).unwrap_or(RealmTemplate::Everything);
-    match c.create_draft(f.get("name"), f.get("display_name"), template).await {
+    match c
+        .create_draft(f.get("name"), f.get("display_name"), template)
+        .await
+    {
         Ok(rec) => super::see_other(&format!("/ui/idp/new/{}/2", rec.spec.name.as_str())),
         Err(e) => {
             let mut p = base_page(&st, locale, &rv, &rt, &c, 1);
@@ -302,8 +335,19 @@ pub(crate) async fn basics_submit(State(st): State<WebState>, locale: RequestLoc
 
 // ---------------------------------------------------------------- steps 2-7
 
-async fn load(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, realm: &str, step: u8) -> Result<WizardPage, Response> {
-    let rec = c.realm(realm).await.map_err(|e| (super::op_status(&e), e.message).into_response())?;
+async fn load(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    realm: &str,
+    step: u8,
+) -> Result<WizardPage, Response> {
+    let rec = c
+        .realm(realm)
+        .await
+        .map_err(|e| (super::op_status(&e), e.message).into_response())?;
     let w = WizardState::of(&rec.spec);
     let reached = w.as_ref().map(|w| w.step).unwrap_or(7);
     let mut p = base_page(st, locale, rv, rt, c, step);
@@ -317,45 +361,120 @@ async fn load(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &Re
 
 pub(crate) fn feature_groups(s: &RealmSpec) -> Vec<ToggleGroup> {
     let f = &s.features;
-    let t = |name, label_key, hint_key, checked| Toggle { name, label_key, hint_key, checked };
+    let t = |name, label_key, hint_key, checked| Toggle {
+        name,
+        label_key,
+        hint_key,
+        checked,
+    };
     vec![
         ToggleGroup {
             title_key: "idpc-cap-group-launch",
             items: vec![
-                t("launch_standalone", "idpc-cap-launch-standalone", "idpc-cap-launch-standalone-hint", f.launch_standalone),
-                t("launch_ehr", "idpc-cap-launch-ehr", "idpc-cap-launch-ehr-hint", f.launch_ehr),
-                t("backend_services", "idpc-cap-backend", "idpc-cap-backend-hint", f.backend_services),
+                t(
+                    "launch_standalone",
+                    "idpc-cap-launch-standalone",
+                    "idpc-cap-launch-standalone-hint",
+                    f.launch_standalone,
+                ),
+                t(
+                    "launch_ehr",
+                    "idpc-cap-launch-ehr",
+                    "idpc-cap-launch-ehr-hint",
+                    f.launch_ehr,
+                ),
+                t(
+                    "backend_services",
+                    "idpc-cap-backend",
+                    "idpc-cap-backend-hint",
+                    f.backend_services,
+                ),
             ],
         },
         ToggleGroup {
             title_key: "idpc-cap-group-clients",
             items: vec![
-                t("client_public", "idpc-cap-client-public", "idpc-cap-client-public-hint", f.client_public),
-                t("client_confidential_symmetric", "idpc-cap-client-secret", "idpc-cap-client-secret-hint", f.client_confidential_symmetric),
-                t("client_confidential_asymmetric", "idpc-cap-client-key", "idpc-cap-client-key-hint", f.client_confidential_asymmetric),
+                t(
+                    "client_public",
+                    "idpc-cap-client-public",
+                    "idpc-cap-client-public-hint",
+                    f.client_public,
+                ),
+                t(
+                    "client_confidential_symmetric",
+                    "idpc-cap-client-secret",
+                    "idpc-cap-client-secret-hint",
+                    f.client_confidential_symmetric,
+                ),
+                t(
+                    "client_confidential_asymmetric",
+                    "idpc-cap-client-key",
+                    "idpc-cap-client-key-hint",
+                    f.client_confidential_asymmetric,
+                ),
             ],
         },
         ToggleGroup {
             title_key: "idpc-cap-group-sso",
             items: vec![
-                t("openid_connect", "idpc-cap-oidc", "idpc-cap-oidc-hint", f.openid_connect),
-                t("offline_access", "idpc-cap-offline", "idpc-cap-offline-hint", f.offline_access),
+                t(
+                    "openid_connect",
+                    "idpc-cap-oidc",
+                    "idpc-cap-oidc-hint",
+                    f.openid_connect,
+                ),
+                t(
+                    "offline_access",
+                    "idpc-cap-offline",
+                    "idpc-cap-offline-hint",
+                    f.offline_access,
+                ),
             ],
         },
         ToggleGroup {
             title_key: "idpc-cap-group-permissions",
             items: vec![
-                t("permission_patient", "idpc-cap-perm-patient", "idpc-cap-perm-patient-hint", f.permission_patient),
-                t("permission_user", "idpc-cap-perm-user", "idpc-cap-perm-user-hint", f.permission_user),
-                t("permission_v1", "idpc-cap-perm-v1", "idpc-cap-perm-v1-hint", f.permission_v1),
-                t("context_banner", "idpc-cap-banner", "idpc-cap-banner-hint", f.context_banner),
+                t(
+                    "permission_patient",
+                    "idpc-cap-perm-patient",
+                    "idpc-cap-perm-patient-hint",
+                    f.permission_patient,
+                ),
+                t(
+                    "permission_user",
+                    "idpc-cap-perm-user",
+                    "idpc-cap-perm-user-hint",
+                    f.permission_user,
+                ),
+                t(
+                    "permission_v1",
+                    "idpc-cap-perm-v1",
+                    "idpc-cap-perm-v1-hint",
+                    f.permission_v1,
+                ),
+                t(
+                    "context_banner",
+                    "idpc-cap-banner",
+                    "idpc-cap-banner-hint",
+                    f.context_banner,
+                ),
             ],
         },
         ToggleGroup {
             title_key: "idpc-cap-group-tokens",
             items: vec![
-                t("introspection", "idpc-cap-introspection", "idpc-cap-introspection-hint", f.introspection),
-                t("revocation", "idpc-cap-revocation", "idpc-cap-revocation-hint", f.revocation),
+                t(
+                    "introspection",
+                    "idpc-cap-introspection",
+                    "idpc-cap-introspection-hint",
+                    f.introspection,
+                ),
+                t(
+                    "revocation",
+                    "idpc-cap-revocation",
+                    "idpc-cap-revocation-hint",
+                    f.revocation,
+                ),
             ],
         },
     ]
@@ -363,14 +482,49 @@ pub(crate) fn feature_groups(s: &RealmSpec) -> Vec<ToggleGroup> {
 
 pub(crate) fn lifetime_fields(s: &RealmSpec) -> Vec<NumField> {
     let l = &s.lifetimes;
-    let n = |name, label_key, hint_key, v: u32| NumField { name, label_key, hint_key, value: v.to_string() };
+    let n = |name, label_key, hint_key, v: u32| NumField {
+        name,
+        label_key,
+        hint_key,
+        value: v.to_string(),
+    };
     vec![
-        n("lifetimes.accessToken", "idpc-life-access", "idpc-life-access-hint", l.access_token),
-        n("lifetimes.backendAccessToken", "idpc-life-backend", "idpc-life-backend-hint", l.backend_access_token),
-        n("lifetimes.authorizationCode", "idpc-life-code", "idpc-life-code-hint", l.authorization_code),
-        n("lifetimes.refreshTokenIdle", "idpc-life-refresh-idle", "idpc-life-refresh-idle-hint", l.refresh_token_idle / 86400),
-        n("lifetimes.refreshTokenAbsolute", "idpc-life-refresh-abs", "idpc-life-refresh-abs-hint", l.refresh_token_absolute / 86400),
-        n("lifetimes.ssoSessionIdle", "idpc-life-sso-idle", "idpc-life-sso-idle-hint", l.sso_session_idle / 60),
+        n(
+            "lifetimes.accessToken",
+            "idpc-life-access",
+            "idpc-life-access-hint",
+            l.access_token,
+        ),
+        n(
+            "lifetimes.backendAccessToken",
+            "idpc-life-backend",
+            "idpc-life-backend-hint",
+            l.backend_access_token,
+        ),
+        n(
+            "lifetimes.authorizationCode",
+            "idpc-life-code",
+            "idpc-life-code-hint",
+            l.authorization_code,
+        ),
+        n(
+            "lifetimes.refreshTokenIdle",
+            "idpc-life-refresh-idle",
+            "idpc-life-refresh-idle-hint",
+            l.refresh_token_idle / 86400,
+        ),
+        n(
+            "lifetimes.refreshTokenAbsolute",
+            "idpc-life-refresh-abs",
+            "idpc-life-refresh-abs-hint",
+            l.refresh_token_absolute / 86400,
+        ),
+        n(
+            "lifetimes.ssoSessionIdle",
+            "idpc-life-sso-idle",
+            "idpc-life-sso-idle-hint",
+            l.sso_session_idle / 60,
+        ),
     ]
 }
 
@@ -379,7 +533,13 @@ pub(crate) fn smart_json(c: &IdpConsole, s: &RealmSpec) -> String {
     serde_json::to_string_pretty(&smart_configuration(s, &urls)).unwrap_or_default()
 }
 
-async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec, w: Option<&WizardState>) {
+async fn fill(
+    p: &mut WizardPage,
+    c: &IdpConsole,
+    realm_id: &str,
+    s: &RealmSpec,
+    w: Option<&WizardState>,
+) {
     p.oidc_on = s.features.openid_connect;
     p.algs = SigningAlg::ALL
         .iter()
@@ -394,7 +554,10 @@ async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec,
             checked: s.signing_algs.contains(a),
         })
         .collect();
-    p.rsa_bits = serde_json::to_value(s.rsa_bits).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "2048".into());
+    p.rsa_bits = serde_json::to_value(s.rsa_bits)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "2048".into());
     p.rotate_days = s.rotation.rotate_after_days.to_string();
     p.keys = c
         .admin
@@ -405,7 +568,13 @@ async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec,
         .filter(|k| k.status.published())
         .map(|k| {
             let (status_key, tone) = labels::key_status(k.status);
-            KeyRow { kid: k.kid.chars().take(16).collect(), alg: k.alg.as_str().into(), status_key, tone, created: k.created_at.format("%Y-%m-%d %H:%M UTC").to_string() }
+            KeyRow {
+                kid: k.kid.chars().take(16).collect(),
+                alg: k.alg.as_str().into(),
+                status_key,
+                tone,
+                created: k.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            }
         })
         .collect();
     p.user_source = match s.user_source {
@@ -423,7 +592,12 @@ async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec,
         .into_iter()
         .filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX))
         .map(|u| UserRow {
-            fhir_user: u.links.iter().find(|l| l.is_fhir_user).map(|l| format!("{} · {}", l.endpoint, l.reference)).unwrap_or_default(),
+            fhir_user: u
+                .links
+                .iter()
+                .find(|l| l.is_fhir_user)
+                .map(|l| format!("{} · {}", l.endpoint, l.reference))
+                .unwrap_or_default(),
             username: u.username,
             kind_key: labels::user_kind(u.kind),
         })
@@ -438,20 +612,38 @@ async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec,
         .into_iter()
         .map(|r| r.spec)
         .filter(|c| !c.client_id.starts_with(DIAGNOSTIC_PREFIX))
-        .map(|c| ClientRow { kind_key: labels::client_kind(&c), redirects: c.redirect_uris.join("\n"), disabled: c.disabled, client_id: c.client_id, name: c.name })
+        .map(|c| ClientRow {
+            kind_key: labels::client_kind(&c),
+            redirects: c.redirect_uris.join("\n"),
+            disabled: c.disabled,
+            client_id: c.client_id,
+            name: c.name,
+        })
         .collect();
     p.scope_presets = scope_presets(s, &[]);
     p.groups = feature_groups(s);
     p.lifetimes = lifetime_fields(s);
     p.smart_preview = smart_json(c, s);
-    let chosen: Vec<String> = w.map(|w| w.endpoints.clone()).unwrap_or_else(|| s.endpoints.clone());
-    p.bind_mode = serde_json::to_value(w.map(|w| w.bind_mode).unwrap_or_default()).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "keep".into());
+    let chosen: Vec<String> = w
+        .map(|w| w.endpoints.clone())
+        .unwrap_or_else(|| s.endpoints.clone());
+    p.bind_mode = serde_json::to_value(w.map(|w| w.bind_mode).unwrap_or_default())
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "keep".into());
     p.test_patient = w.and_then(|w| w.test_patient.clone()).unwrap_or_default();
     let mut eps = vec![];
     for e in &views {
-        let diff = c.bind_diff(s.name.as_str(), &e.name, BindMode::Keep).await.ok();
+        let diff = c
+            .bind_diff(s.name.as_str(), &e.name, BindMode::Keep)
+            .await
+            .ok();
         let (before, detail, mode_before) = match &diff {
-            Some(d) => (d.before.clone(), d.before_issuer.clone().unwrap_or_default(), d.mode_before.clone()),
+            Some(d) => (
+                d.before.clone(),
+                d.before_issuer.clone().unwrap_or_default(),
+                d.mode_before.clone(),
+            ),
             None => ("inherit".into(), String::new(), "inherit".into()),
         };
         let mine = before == format!("internal:{}", s.name.as_str());
@@ -459,7 +651,11 @@ async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec,
             name: e.name.clone(),
             base_url: e.base_url.clone(),
             state_key: labels::endpoint_state(&before),
-            state_detail: if before.starts_with("internal:") { before.trim_start_matches("internal:").to_string() } else { detail },
+            state_detail: if before.starts_with("internal:") {
+                before.trim_start_matches("internal:").to_string()
+            } else {
+                detail
+            },
             chosen: chosen.contains(&e.name) || mine,
             changes: !mine && before != "inherit" && before != "off",
             mode_before,
@@ -472,13 +668,61 @@ async fn fill(p: &mut WizardPage, c: &IdpConsole, realm_id: &str, s: &RealmSpec,
         UserSource::Local => "idpc-source-local",
     };
     p.review = vec![
-        ReviewRow { label_key: "idpc-review-name", value: format!("{} — {}", s.name.as_str(), s.display_name), edit_step: 1 },
-        ReviewRow { label_key: "idpc-review-issuer", value: p.issuer.clone(), edit_step: 1 },
-        ReviewRow { label_key: "idpc-review-keys", value: format!("{} ({} key(s))", s.signing_algs.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", "), p.keys.len()), edit_step: 2 },
-        ReviewRow { label_key: "idpc-review-users", value: format!("{} · {}", p.i18n.t(src_key), p.users.len()), edit_step: 3 },
-        ReviewRow { label_key: "idpc-review-clients", value: if p.clients.is_empty() { "—".into() } else { p.clients.iter().map(|c| c.client_id.clone()).collect::<Vec<_>>().join(", ") }, edit_step: 4 },
-        ReviewRow { label_key: "idpc-review-capabilities", value: helios_idp::metadata::smart_capabilities(s).join(", "), edit_step: 5 },
-        ReviewRow { label_key: "idpc-review-endpoints", value: if chosen.is_empty() { "—".into() } else { chosen.join(", ") }, edit_step: 6 },
+        ReviewRow {
+            label_key: "idpc-review-name",
+            value: format!("{} — {}", s.name.as_str(), s.display_name),
+            edit_step: 1,
+        },
+        ReviewRow {
+            label_key: "idpc-review-issuer",
+            value: p.issuer.clone(),
+            edit_step: 1,
+        },
+        ReviewRow {
+            label_key: "idpc-review-keys",
+            value: format!(
+                "{} ({} key(s))",
+                s.signing_algs
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                p.keys.len()
+            ),
+            edit_step: 2,
+        },
+        ReviewRow {
+            label_key: "idpc-review-users",
+            value: format!("{} · {}", p.i18n.t(src_key), p.users.len()),
+            edit_step: 3,
+        },
+        ReviewRow {
+            label_key: "idpc-review-clients",
+            value: if p.clients.is_empty() {
+                "—".into()
+            } else {
+                p.clients
+                    .iter()
+                    .map(|c| c.client_id.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            edit_step: 4,
+        },
+        ReviewRow {
+            label_key: "idpc-review-capabilities",
+            value: helios_idp::metadata::smart_capabilities(s).join(", "),
+            edit_step: 5,
+        },
+        ReviewRow {
+            label_key: "idpc-review-endpoints",
+            value: if chosen.is_empty() {
+                "—".into()
+            } else {
+                chosen.join(", ")
+            },
+            edit_step: 6,
+        },
     ];
 }
 
@@ -491,7 +735,14 @@ pub(crate) fn scope_presets(s: &RealmSpec, selected: &[String]) -> Vec<Opt> {
                 value: value.into(),
                 label_key: format!("idpc-scope-{key}"),
                 hint_key: String::new(),
-                checked: if selected.is_empty() { matches!(key, "openid" | "fhiruser" | "launch-patient" | "patient-read" | "offline") } else { selected.iter().any(|x| x == value) },
+                checked: if selected.is_empty() {
+                    matches!(
+                        key,
+                        "openid" | "fhiruser" | "launch-patient" | "patient-read" | "offline"
+                    )
+                } else {
+                    selected.iter().any(|x| x == value)
+                },
             });
         }
     };
@@ -499,7 +750,11 @@ pub(crate) fn scope_presets(s: &RealmSpec, selected: &[String]) -> Vec<Opt> {
     add("fhirUser", "fhiruser", f.openid_connect);
     add("offline_access", "offline", f.offline_access);
     add("launch", "launch", f.launch_ehr);
-    add("launch/patient", "launch-patient", f.launch_standalone && f.permission_patient);
+    add(
+        "launch/patient",
+        "launch-patient",
+        f.launch_standalone && f.permission_patient,
+    );
     add("patient/*.rs", "patient-read", f.permission_patient);
     add("patient/*.cruds", "patient-write", f.permission_patient);
     add("user/*.rs", "user-read", f.permission_user);
@@ -519,7 +774,9 @@ pub(crate) async fn step_page(
         Ok(c) => c,
         Err(r) => return r,
     };
-    let Ok(step) = step.parse::<u8>() else { return (axum::http::StatusCode::NOT_FOUND, "no such step").into_response() };
+    let Ok(step) = step.parse::<u8>() else {
+        return (axum::http::StatusCode::NOT_FOUND, "no such step").into_response();
+    };
     if !(2..=7).contains(&step) {
         return super::see_other("/ui/idp/new");
     }
@@ -543,7 +800,8 @@ fn num(f: &Form, name: &str, errs: &mut Errors) -> Option<u32> {
     match v.parse::<u32>() {
         Ok(n) => Some(n),
         Err(_) => {
-            errs.fields.insert(name.to_string(), "enter a whole number".into());
+            errs.fields
+                .insert(name.to_string(), "enter a whole number".into());
             None
         }
     }
@@ -597,7 +855,8 @@ pub(crate) fn client_from_form(body: &[u8], f: &Form, errs: &mut Errors) -> Opti
     let kind = f.get("client_kind");
     let name = f.get("client_name").to_string();
     if name.is_empty() {
-        errs.fields.insert("client_name".into(), "enter the app's name".into());
+        errs.fields
+            .insert("client_name".into(), "enter the app's name".into());
     }
     let id = match f.opt("client_id") {
         Some(i) => i,
@@ -612,12 +871,18 @@ pub(crate) fn client_from_form(body: &[u8], f: &Form, errs: &mut Errors) -> Opti
     let redirects = f.list("redirect_uris");
     let launch: Vec<String> = values(body, "launch");
     let mut scopes = values(body, "scope");
-    scopes.extend(f.list("scopes_custom").into_iter().flat_map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>()));
+    scopes.extend(
+        f.list("scopes_custom")
+            .into_iter()
+            .flat_map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>()),
+    );
     scopes.sort();
     scopes.dedup();
     let jwks_source = || -> Option<ClientAuth> {
         let uri = f.opt("jwks_uri");
-        let jwks = f.opt("jwks").map(|j| serde_json::from_str::<serde_json::Value>(&j));
+        let jwks = f
+            .opt("jwks")
+            .map(|j| serde_json::from_str::<serde_json::Value>(&j));
         let jwks = match jwks {
             Some(Ok(v)) => Some(v),
             Some(Err(_)) => {
@@ -625,29 +890,55 @@ pub(crate) fn client_from_form(body: &[u8], f: &Form, errs: &mut Errors) -> Opti
             }
             None => None,
         };
-        Some(ClientAuth::PrivateKeyJwt { jwks_uri: uri, jwks, algs: vec![SigningAlg::ES384, SigningAlg::RS384, SigningAlg::ES256, SigningAlg::RS256] })
+        Some(ClientAuth::PrivateKeyJwt {
+            jwks_uri: uri,
+            jwks,
+            algs: vec![
+                SigningAlg::ES384,
+                SigningAlg::RS384,
+                SigningAlg::ES256,
+                SigningAlg::RS256,
+            ],
+        })
     };
     let (auth, grants, launch_types) = match kind {
         "secret" => (
-            ClientAuth::ClientSecret { secret_hash: String::new() },
+            ClientAuth::ClientSecret {
+                secret_hash: String::new(),
+            },
             vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
             launch.iter().filter_map(|l| launch_type(l)).collect(),
         ),
         "key" => match jwks_source() {
-            Some(a) => (a, vec![GrantType::AuthorizationCode, GrantType::RefreshToken], launch.iter().filter_map(|l| launch_type(l)).collect()),
+            Some(a) => (
+                a,
+                vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+                launch.iter().filter_map(|l| launch_type(l)).collect(),
+            ),
             None => {
                 errs.fields.insert("jwks".into(), "not valid JSON".into());
                 return None;
             }
         },
         "backend" => match jwks_source() {
-            Some(a) => (a, vec![GrantType::ClientCredentials], vec![LaunchType::Backend]),
+            Some(a) => (
+                a,
+                vec![GrantType::ClientCredentials],
+                vec![LaunchType::Backend],
+            ),
             None => {
                 errs.fields.insert("jwks".into(), "not valid JSON".into());
                 return None;
             }
         },
-        _ => (ClientAuth::None, vec![GrantType::AuthorizationCode, GrantType::RefreshToken], launch.iter().filter_map(|l| launch_type(l)).collect::<Vec<_>>()),
+        _ => (
+            ClientAuth::None,
+            vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+            launch
+                .iter()
+                .filter_map(|l| launch_type(l))
+                .collect::<Vec<_>>(),
+        ),
     };
     if errs.fields.contains_key("client_name") {
         return None;
@@ -655,7 +946,10 @@ pub(crate) fn client_from_form(body: &[u8], f: &Form, errs: &mut Errors) -> Opti
     let grants = if scopes.iter().any(|s| s == "offline_access") || kind == "backend" {
         grants
     } else {
-        grants.into_iter().filter(|g| *g != GrantType::RefreshToken).collect()
+        grants
+            .into_iter()
+            .filter(|g| *g != GrantType::RefreshToken)
+            .collect()
     };
     Some(ClientSpec {
         client_id: id,
@@ -665,7 +959,10 @@ pub(crate) fn client_from_form(body: &[u8], f: &Form, errs: &mut Errors) -> Opti
         redirect_uris: redirects,
         post_logout_redirect_uris: vec![],
         launch_types,
-        scopes: ScopePolicy { allowed: scopes, accept_v1: f.checked("accept_v1") },
+        scopes: ScopePolicy {
+            allowed: scopes,
+            accept_v1: f.checked("accept_v1"),
+        },
         trusted: f.checked("trusted"),
         require_dpop: false,
         require_par: false,
@@ -705,7 +1002,12 @@ pub(crate) fn user_from_form(f: &Form) -> RealmUser {
     };
     let mut links = vec![];
     if let (Some(ep), Some(reference)) = (f.opt("user_endpoint"), f.opt("user_reference")) {
-        links.push(FhirLink { endpoint: ep, reference, is_fhir_user: true, accessible_patients: vec![] });
+        links.push(FhirLink {
+            endpoint: ep,
+            reference,
+            is_fhir_user: true,
+            accessible_patients: vec![],
+        });
     }
     RealmUser {
         id: String::new(),
@@ -742,7 +1044,9 @@ pub(crate) async fn step_submit(
         Ok(c) => c,
         Err(r) => return r,
     };
-    let Ok(step) = step.parse::<u8>() else { return (axum::http::StatusCode::NOT_FOUND, "no such step").into_response() };
+    let Ok(step) = step.parse::<u8>() else {
+        return (axum::http::StatusCode::NOT_FOUND, "no such step").into_response();
+    };
     let f = Form::parse(&body);
     let action = f.get("action").to_string();
     let next = |n: u8| super::see_other(&format!("/ui/idp/new/{realm}/{n}"));
@@ -751,7 +1055,10 @@ pub(crate) async fn step_submit(
     let mut new_secret = None;
     let result: Result<(), OpError> = match step {
         2 => {
-            let algs: Vec<SigningAlg> = values(&body, "alg").iter().filter_map(|a| a.parse().ok()).collect();
+            let algs: Vec<SigningAlg> = values(&body, "alg")
+                .iter()
+                .filter_map(|a| a.parse().ok())
+                .collect();
             let bits = match f.get("rsa_bits") {
                 "3072" => RsaBits::B3072,
                 "4096" => RsaBits::B4096,
@@ -759,7 +1066,10 @@ pub(crate) async fn step_submit(
             };
             let days = num(&f, "rotation.rotateAfterDays", &mut errs);
             if !errs.is_empty() {
-                Err(OpError::invalid("rotation.rotateAfterDays", "enter a whole number"))
+                Err(OpError::invalid(
+                    "rotation.rotateAfterDays",
+                    "enter a whole number",
+                ))
             } else {
                 c.save_step(&realm, 3, |s, _| {
                     s.signing_algs = algs;
@@ -798,7 +1108,12 @@ pub(crate) async fn step_submit(
                 r = match rec {
                     Ok(rec) => c
                         .admin
-                        .create_user(&rec.id, user_from_form(&f), f.opt("user_password").as_deref(), false)
+                        .create_user(
+                            &rec.id,
+                            user_from_form(&f),
+                            f.opt("user_password").as_deref(),
+                            false,
+                        )
                         .await
                         .map(|_| ())
                         .map_err(OpError::from)
@@ -817,7 +1132,9 @@ pub(crate) async fn step_submit(
                     Some(spec) => match c.realm(&realm).await {
                         Ok(rec) => match c.admin.create_client(&rec.id, spec).await {
                             Ok(created) => {
-                                new_secret = created.client_secret.map(|s| (created.record.spec.client_id.clone(), s));
+                                new_secret = created
+                                    .client_secret
+                                    .map(|s| (created.record.spec.client_id.clone(), s));
                                 Ok(())
                             }
                             Err(e) => {
@@ -832,7 +1149,12 @@ pub(crate) async fn step_submit(
                 }
             } else if let Some(id) = action.strip_prefix("delete_client:") {
                 match c.realm(&realm).await {
-                    Ok(rec) => c.admin.delete_client(&rec.id, id).await.map(|_| ()).map_err(OpError::from),
+                    Ok(rec) => c
+                        .admin
+                        .delete_client(&rec.id, id)
+                        .await
+                        .map(|_| ())
+                        .map_err(OpError::from),
                     Err(e) => Err(e),
                 }
             } else {
@@ -849,7 +1171,11 @@ pub(crate) async fn step_submit(
                 .await
                 .map(|_| ());
             errs.fields.extend(local.fields);
-            if errs.is_empty() { r } else { Err(OpError::other(400, "")) }
+            if errs.is_empty() {
+                r
+            } else {
+                Err(OpError::other(400, ""))
+            }
         }
         6 => {
             let eps = values(&body, "endpoint");
@@ -874,7 +1200,12 @@ pub(crate) async fn step_submit(
         _ => return super::see_other("/ui/idp/new"),
     };
     match result {
-        Ok(()) if new_secret.is_some() || action == "add_user" || action.starts_with("delete_client:") || (action == "add_client" && step == 4) => {
+        Ok(())
+            if new_secret.is_some()
+                || action == "add_user"
+                || action.starts_with("delete_client:")
+                || (action == "add_client" && step == 4) =>
+        {
             let mut p = match load(&st, locale, &rv, &rt, &c, &realm, step).await {
                 Ok(p) => p,
                 Err(r) => return r,
@@ -892,7 +1223,11 @@ pub(crate) async fn step_submit(
                 Ok(p) => p,
                 Err(r) => return r,
             };
-            let mut all = if e.message.is_empty() { Errors::default() } else { Errors::from_op(&e) };
+            let mut all = if e.message.is_empty() {
+                Errors::default()
+            } else {
+                Errors::from_op(&e)
+            };
             all.fields.extend(errs.fields);
             // Keep what was typed.
             for (k, v) in form_urlencoded::parse(&body) {
@@ -903,7 +1238,8 @@ pub(crate) async fn step_submit(
             if step == 4 {
                 p.scope_presets = {
                     let rec = c.realm(&realm).await.ok();
-                    rec.map(|r| scope_presets(&r.spec, &values(&body, "scope"))).unwrap_or_default()
+                    rec.map(|r| scope_presets(&r.spec, &values(&body, "scope")))
+                        .unwrap_or_default()
                 };
                 for k in &mut p.client_kinds {
                     k.checked = k.value == f.get("client_kind");
@@ -917,14 +1253,31 @@ pub(crate) async fn step_submit(
     }
 }
 
-async fn render_finish(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, realm: &str, out: FinishOutcome) -> Response {
+async fn render_finish(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    realm: &str,
+    out: FinishOutcome,
+) -> Response {
     let mut p = match load(st, locale, rv, rt, c, realm, 7).await {
         Ok(p) => p,
         Err(r) => return r,
     };
-    let still_draft = c.realm(realm).await.ok().and_then(|r| WizardState::of(&r.spec)).is_some();
+    let still_draft = c
+        .realm(realm)
+        .await
+        .ok()
+        .and_then(|r| WizardState::of(&r.spec))
+        .is_some();
     p.verify = Some(verify::view(&p.i18n, &out.report, still_draft));
-    p.finish = Some(FinishView { ok: out.not_bound.is_empty() && out.report.problems().is_empty(), bound: out.bound, not_bound: out.not_bound });
+    p.finish = Some(FinishView {
+        ok: out.not_bound.is_empty() && out.report.problems().is_empty(),
+        bound: out.bound,
+        not_bound: out.not_bound,
+    });
     render(p)
 }
 
@@ -934,15 +1287,36 @@ pub(crate) async fn smart_preview(Path(realm): Path<String>, body: Bytes) -> Res
         Ok(c) => c,
         Err(r) => return r,
     };
-    let Ok(rec) = c.realm(&realm).await else { return Html(String::new()).into_response() };
+    let Ok(rec) = c.realm(&realm).await else {
+        return Html(String::new()).into_response();
+    };
     let mut s = rec.spec.clone();
     let mut errs = Errors::default();
     apply_capabilities(&mut s, &Form::parse(&body), &mut errs);
-    let problem = s.validate().err().map(|e| e.to_string()).unwrap_or_default();
+    let problem = s
+        .validate()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     let json = smart_json(&c, &s);
-    let esc = |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    let warn = if problem.is_empty() { String::new() } else { format!("<p class=\"mfield__error\" role=\"alert\">{}</p>", esc(&problem)) };
-    Html(format!("{warn}<pre class=\"json-preview\"><code>{}</code></pre>", esc(&json))).into_response()
+    let esc = |t: &str| {
+        t.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let warn = if problem.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"mfield__error\" role=\"alert\">{}</p>",
+            esc(&problem)
+        )
+    };
+    Html(format!(
+        "{warn}<pre class=\"json-preview\"><code>{}</code></pre>",
+        esc(&json)
+    ))
+    .into_response()
 }
 
 pub(crate) async fn discard(Path(realm): Path<String>) -> Response {

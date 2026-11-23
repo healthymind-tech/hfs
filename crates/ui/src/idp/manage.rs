@@ -21,7 +21,9 @@ use helios_idp::store::{GrantFilter, RealmRecord};
 use helios_idp::user::RealmUser;
 use helios_idp_admin::binding::BindMode;
 use helios_idp_admin::diagnostic::AppProbe;
-use helios_idp_admin::service::{DIAGNOSTIC_PREFIX, DiagnoseOptions, IdpConsole, RealmSummary, WizardState};
+use helios_idp_admin::service::{
+    DIAGNOSTIC_PREFIX, DiagnoseOptions, IdpConsole, RealmSummary, WizardState,
+};
 use serde::Deserialize;
 
 use super::verify::{self, VerifyView};
@@ -98,7 +100,11 @@ pub(crate) struct ListPage {
 impl ListPage {
     pub fn status_look(&self, r: &RealmSummary) -> (&'static str, &'static str, String) {
         if let Some(d) = &r.draft {
-            return ("accent", "pencil", self.i18n.t_arg("idpc-status-draft", "step", d.step as i64));
+            return (
+                "accent",
+                "pencil",
+                self.i18n.t_arg("idpc-status-draft", "step", d.step as i64),
+            );
         }
         if !r.enabled {
             return ("muted", "power", self.i18n.t("idpc-status-disabled"));
@@ -113,7 +119,13 @@ impl ListPage {
     }
 }
 
-pub(crate) async fn list_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Query(q): Query<Done>) -> Response {
+pub(crate) async fn list_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(q): Query<Done>,
+) -> Response {
     let c = match console() {
         Ok(c) => c,
         Err(r) => return r,
@@ -158,7 +170,14 @@ pub(crate) struct OverviewPage {
     pub flash: Option<String>,
 }
 
-pub(crate) async fn overview_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn overview_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     if let Some(w) = WizardState::of(&rec.spec) {
         return see_other(&format!("/ui/idp/new/{realm}/{}", w.step.max(2)));
@@ -166,39 +185,102 @@ pub(crate) async fn overview_page(State(st): State<WebState>, locale: RequestLoc
     let i18n = I18n::new(locale);
     let issuer = c.issuer(&rec.spec);
     let urls = RealmUrls::new(&issuer);
-    let origin = reqwest::Url::parse(&issuer).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+    let origin = reqwest::Url::parse(&issuer)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_default();
     let views = c.endpoint_views().await;
     let endpoints = rec
         .spec
         .endpoints
         .iter()
-        .map(|e| (e.clone(), views.iter().find(|v| &v.name == e).map(|v| v.base_url.clone()).unwrap_or_default()))
+        .map(|e| {
+            (
+                e.clone(),
+                views
+                    .iter()
+                    .find(|v| &v.name == e)
+                    .map(|v| v.base_url.clone())
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
     let keys = c.admin.list_keys(&rec.id).await.unwrap_or_default();
-    let clients = c.admin.list_clients(&rec.id).await.unwrap_or_default().iter().filter(|r| !r.spec.client_id.starts_with(DIAGNOSTIC_PREFIX)).count();
-    let users = c.admin.list_users(&rec.id).await.unwrap_or_default().iter().filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX)).count();
+    let clients = c
+        .admin
+        .list_clients(&rec.id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| !r.spec.client_id.starts_with(DIAGNOSTIC_PREFIX))
+        .count();
+    let users = c
+        .admin
+        .list_users(&rec.id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX))
+        .count();
     let now = Utc::now();
-    let sessions = c.admin.list_sessions(&rec.id, None).await.unwrap_or_default().iter().filter(|s| s.alive(rec.spec.lifetimes.sso_session_idle, now)).count();
-    let verify = c.last_report(&realm).map(|r| verify::view(&i18n, &r, false));
+    let sessions = c
+        .admin
+        .list_sessions(&rec.id, None)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| s.alive(rec.spec.lifetimes.sso_session_idle, now))
+        .count();
+    let verify = c
+        .last_report(&realm)
+        .map(|r| verify::view(&i18n, &r, false));
     render(OverviewPage {
         status: current_status(&st, rv.0, &rt),
         i18n,
         active_page: "idp-realms",
         head: head(&c, &rec, "overview"),
         links: vec![
-            LinkRow { label_key: "idpc-link-issuer", url: issuer.clone() },
-            LinkRow { label_key: "idpc-link-oidc", url: format!("{issuer}/.well-known/openid-configuration") },
-            LinkRow { label_key: "idpc-link-rfc8414", url: format!("{origin}/.well-known/oauth-authorization-server{}", reqwest::Url::parse(&issuer).map(|u| u.path().to_string()).unwrap_or_default()) },
-            LinkRow { label_key: "idpc-link-jwks", url: urls.jwks.clone() },
-            LinkRow { label_key: "idpc-link-authorize", url: urls.authorization.clone() },
-            LinkRow { label_key: "idpc-link-token", url: urls.token.clone() },
+            LinkRow {
+                label_key: "idpc-link-issuer",
+                url: issuer.clone(),
+            },
+            LinkRow {
+                label_key: "idpc-link-oidc",
+                url: format!("{issuer}/.well-known/openid-configuration"),
+            },
+            LinkRow {
+                label_key: "idpc-link-rfc8414",
+                url: format!(
+                    "{origin}/.well-known/oauth-authorization-server{}",
+                    reqwest::Url::parse(&issuer)
+                        .map(|u| u.path().to_string())
+                        .unwrap_or_default()
+                ),
+            },
+            LinkRow {
+                label_key: "idpc-link-jwks",
+                url: urls.jwks.clone(),
+            },
+            LinkRow {
+                label_key: "idpc-link-authorize",
+                url: urls.authorization.clone(),
+            },
+            LinkRow {
+                label_key: "idpc-link-token",
+                url: urls.token.clone(),
+            },
         ],
         endpoints,
         clients,
         users,
-        active_keys: keys.iter().filter(|k| k.status == KeyStatus::Active).count(),
+        active_keys: keys
+            .iter()
+            .filter(|k| k.status == KeyStatus::Active)
+            .count(),
         sessions,
-        capabilities: helios_idp::metadata::smart_capabilities(&rec.spec).into_iter().map(String::from).collect(),
+        capabilities: helios_idp::metadata::smart_capabilities(&rec.spec)
+            .into_iter()
+            .map(String::from)
+            .collect(),
         verify,
         flash: flash_key(q.done.as_deref()),
     })
@@ -241,11 +323,24 @@ async fn client_rows(c: &IdpConsole, realm_id: &str) -> Vec<wizard::ClientRow> {
         .into_iter()
         .map(|r| r.spec)
         .filter(|s| !s.client_id.starts_with(DIAGNOSTIC_PREFIX))
-        .map(|s| wizard::ClientRow { kind_key: labels::client_kind(&s), redirects: s.redirect_uris.join("\n"), disabled: s.disabled, client_id: s.client_id, name: s.name })
+        .map(|s| wizard::ClientRow {
+            kind_key: labels::client_kind(&s),
+            redirects: s.redirect_uris.join("\n"),
+            disabled: s.disabled,
+            client_id: s.client_id,
+            name: s.name,
+        })
         .collect()
 }
 
-pub(crate) async fn clients_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn clients_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let i18n = I18n::new(locale);
     render(ClientsPage {
@@ -267,11 +362,23 @@ pub(crate) async fn clients_page(State(st): State<WebState>, locale: RequestLoca
 fn kinds(sel: &str) -> Vec<Opt> {
     ["public", "secret", "key", "backend"]
         .iter()
-        .map(|k| Opt { value: k.to_string(), label_key: format!("idpc-client-kind-{k}"), hint_key: format!("idpc-client-kind-{k}-hint"), checked: *k == sel })
+        .map(|k| Opt {
+            value: k.to_string(),
+            label_key: format!("idpc-client-kind-{k}"),
+            hint_key: format!("idpc-client-kind-{k}-hint"),
+            checked: *k == sel,
+        })
         .collect()
 }
 
-pub(crate) async fn client_create(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, body: Bytes) -> Response {
+pub(crate) async fn client_create(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     let mut errs = Errors::default();
@@ -279,7 +386,9 @@ pub(crate) async fn client_create(State(st): State<WebState>, locale: RequestLoc
     if let Some(spec) = wizard::client_from_form(&body, &f, &mut errs) {
         match c.admin.create_client(&rec.id, spec).await {
             Ok(created) => {
-                secret = created.client_secret.map(|s| (created.record.spec.client_id.clone(), s));
+                secret = created
+                    .client_secret
+                    .map(|s| (created.record.spec.client_id.clone(), s));
                 if secret.is_none() {
                     return see_other(&format!("/ui/idp/{realm}/clients?done=client-created"));
                 }
@@ -308,8 +417,19 @@ pub(crate) async fn client_create(State(st): State<WebState>, locale: RequestLoc
         active_page: "idp-realms",
         head: head(&c, &rec, "clients"),
         rows: client_rows(&c, &rec.id).await,
-        client_kinds: kinds(if failed { f.get("client_kind") } else { "public" }),
-        scope_presets: wizard::scope_presets(&rec.spec, &if failed { values(&body, "scope") } else { vec![] }),
+        client_kinds: kinds(if failed {
+            f.get("client_kind")
+        } else {
+            "public"
+        }),
+        scope_presets: wizard::scope_presets(
+            &rec.spec,
+            &if failed {
+                values(&body, "scope")
+            } else {
+                vec![]
+            },
+        ),
         errors: errs,
         form,
         new_secret: secret,
@@ -356,11 +476,36 @@ fn client_form(spec: &ClientSpec) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("name".into(), spec.name.clone());
     m.insert("redirectUris".into(), spec.redirect_uris.join("\n"));
-    let presets = ["openid", "fhirUser", "offline_access", "launch", "launch/patient", "patient/*.rs", "patient/*.cruds", "user/*.rs", "user/*.cruds", "system/*.rs"];
-    m.insert("scopes_custom".into(), spec.scopes.allowed.iter().filter(|s| !presets.contains(&s.as_str())).cloned().collect::<Vec<_>>().join(" "));
+    let presets = [
+        "openid",
+        "fhirUser",
+        "offline_access",
+        "launch",
+        "launch/patient",
+        "patient/*.rs",
+        "patient/*.cruds",
+        "user/*.rs",
+        "user/*.cruds",
+        "system/*.rs",
+    ];
+    m.insert(
+        "scopes_custom".into(),
+        spec.scopes
+            .allowed
+            .iter()
+            .filter(|s| !presets.contains(&s.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     if let ClientAuth::PrivateKeyJwt { jwks_uri, jwks, .. } = &spec.auth {
         m.insert("jwks_uri".into(), jwks_uri.clone().unwrap_or_default());
-        m.insert("jwks".into(), jwks.as_ref().map(|j| serde_json::to_string_pretty(j).unwrap_or_default()).unwrap_or_default());
+        m.insert(
+            "jwks".into(),
+            jwks.as_ref()
+                .map(|j| serde_json::to_string_pretty(j).unwrap_or_default())
+                .unwrap_or_default(),
+        );
     }
     if spec.disabled {
         m.insert("disabled".into(), "on".into());
@@ -371,8 +516,27 @@ fn client_form(spec: &ClientSpec) -> HashMap<String, String> {
     m
 }
 
-async fn render_client(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, rec: &RealmRecord, client: &str, errors: Errors, form_override: Option<HashMap<String, String>>, secret: Option<String>, flash: Option<String>) -> Response {
-    let Some(cr) = c.admin.list_clients(&rec.id).await.unwrap_or_default().into_iter().find(|r| r.spec.client_id == client) else {
+async fn render_client(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    client: &str,
+    errors: Errors,
+    form_override: Option<HashMap<String, String>>,
+    secret: Option<String>,
+    flash: Option<String>,
+) -> Response {
+    let Some(cr) = c
+        .admin
+        .list_clients(&rec.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.spec.client_id == client)
+    else {
         return (StatusCode::NOT_FOUND, "no such client").into_response();
     };
     let s = &cr.spec;
@@ -387,8 +551,12 @@ async fn render_client(st: &WebState, locale: RequestLocale, rv: &RequestVersion
         confidential_secret: matches!(s.auth, ClientAuth::ClientSecret { .. }),
         uses_key: matches!(s.auth, ClientAuth::PrivateKeyJwt { .. }),
         form: form_override.unwrap_or_else(|| client_form(s)),
-        launch_ehr: s.launch_types.contains(&helios_idp::client::LaunchType::Ehr),
-        launch_standalone: s.launch_types.contains(&helios_idp::client::LaunchType::Standalone),
+        launch_ehr: s
+            .launch_types
+            .contains(&helios_idp::client::LaunchType::Ehr),
+        launch_standalone: s
+            .launch_types
+            .contains(&helios_idp::client::LaunchType::Standalone),
         scope_presets: wizard::scope_presets(&rec.spec, &s.scopes.allowed),
         revision: cr.revision,
         errors,
@@ -401,22 +569,59 @@ async fn render_client(st: &WebState, locale: RequestLocale, rv: &RequestVersion
     r
 }
 
-pub(crate) async fn client_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, client)): Path<(String, String)>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn client_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, client)): Path<(String, String)>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
-    render_client(&st, locale, &rv, &rt, &c, &rec, &client, Errors::default(), None, None, flash_key(q.done.as_deref())).await
+    render_client(
+        &st,
+        locale,
+        &rv,
+        &rt,
+        &c,
+        &rec,
+        &client,
+        Errors::default(),
+        None,
+        None,
+        flash_key(q.done.as_deref()),
+    )
+    .await
 }
 
-pub(crate) async fn client_save(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, client)): Path<(String, String)>, body: Bytes) -> Response {
+pub(crate) async fn client_save(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, client)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
-    let Some(cur) = c.admin.list_clients(&rec.id).await.unwrap_or_default().into_iter().find(|r| r.spec.client_id == client) else {
+    let Some(cur) = c
+        .admin
+        .list_clients(&rec.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.spec.client_id == client)
+    else {
         return (StatusCode::NOT_FOUND, "no such client").into_response();
     };
     let mut spec = cur.spec.clone();
     spec.name = f.get("name").to_string();
     spec.redirect_uris = f.list("redirectUris");
     let launch = values(&body, "launch");
-    if !spec.launch_types.contains(&helios_idp::client::LaunchType::Backend) {
+    if !spec
+        .launch_types
+        .contains(&helios_idp::client::LaunchType::Backend)
+    {
         spec.launch_types = launch
             .iter()
             .filter_map(|l| match l.as_str() {
@@ -427,7 +632,11 @@ pub(crate) async fn client_save(State(st): State<WebState>, locale: RequestLocal
             .collect();
     }
     let mut scopes = values(&body, "scope");
-    scopes.extend(f.list("scopes_custom").into_iter().flat_map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>()));
+    scopes.extend(
+        f.list("scopes_custom")
+            .into_iter()
+            .flat_map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>()),
+    );
     scopes.sort();
     scopes.dedup();
     spec.scopes.allowed = scopes;
@@ -456,10 +665,29 @@ pub(crate) async fn client_save(State(st): State<WebState>, locale: RequestLocal
     for (k, v) in form_urlencoded::parse(&body) {
         form.insert(k.into_owned(), v.into_owned());
     }
-    render_client(&st, locale, &rv, &rt, &c, &rec, &client, errs, Some(form), None, None).await
+    render_client(
+        &st,
+        locale,
+        &rv,
+        &rt,
+        &c,
+        &rec,
+        &client,
+        errs,
+        Some(form),
+        None,
+        None,
+    )
+    .await
 }
 
-pub(crate) async fn client_action(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, client, action)): Path<(String, String, String)>) -> Response {
+pub(crate) async fn client_action(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, client, action)): Path<(String, String, String)>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     match action.as_str() {
         "delete" => match c.admin.delete_client(&rec.id, &client).await {
@@ -467,7 +695,22 @@ pub(crate) async fn client_action(State(st): State<WebState>, locale: RequestLoc
             Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         },
         "reset-secret" => match c.admin.reset_client_secret(&rec.id, &client).await {
-            Ok(created) => render_client(&st, locale, &rv, &rt, &c, &rec, &client, Errors::default(), None, created.client_secret, None).await,
+            Ok(created) => {
+                render_client(
+                    &st,
+                    locale,
+                    &rv,
+                    &rt,
+                    &c,
+                    &rec,
+                    &client,
+                    Errors::default(),
+                    None,
+                    created.client_secret,
+                    None,
+                )
+                .await
+            }
             Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         },
         _ => (StatusCode::NOT_FOUND, "unknown action").into_response(),
@@ -525,7 +768,12 @@ fn source_key(s: &UserSource) -> &'static str {
 
 fn user_row(u: RealmUser) -> UserRowFull {
     UserRowFull {
-        fhir_user: u.links.iter().find(|l| l.is_fhir_user).map(|l| format!("{} · {}", l.endpoint, l.reference)).unwrap_or_default(),
+        fhir_user: u
+            .links
+            .iter()
+            .find(|l| l.is_fhir_user)
+            .map(|l| format!("{} · {}", l.endpoint, l.reference))
+            .unwrap_or_default(),
         display: u.display_name.clone().unwrap_or_default(),
         kind_key: labels::user_kind(u.kind),
         disabled: u.disabled,
@@ -534,9 +782,27 @@ fn user_row(u: RealmUser) -> UserRowFull {
     }
 }
 
-async fn users_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, rec: &RealmRecord, errors: Errors, form: HashMap<String, String>, flash: Option<String>) -> Response {
+async fn users_render(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    errors: Errors,
+    form: HashMap<String, String>,
+    flash: Option<String>,
+) -> Response {
     let failed = !errors.is_empty();
-    let rows = c.admin.list_users(&rec.id).await.unwrap_or_default().into_iter().filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX)).map(user_row).collect();
+    let rows = c
+        .admin
+        .list_users(&rec.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX))
+        .map(user_row)
+        .collect();
     let mut r = render(UsersPage {
         status: current_status(st, rv.0, rt),
         i18n: I18n::new(locale),
@@ -545,7 +811,12 @@ async fn users_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion,
         source_key: source_key(&rec.spec.user_source),
         local: matches!(rec.spec.user_source, UserSource::Local),
         rows,
-        endpoint_names: c.endpoint_views().await.into_iter().map(|e| e.name).collect(),
+        endpoint_names: c
+            .endpoint_views()
+            .await
+            .into_iter()
+            .map(|e| e.name)
+            .collect(),
         errors,
         form,
         flash,
@@ -558,15 +829,49 @@ async fn users_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion,
     r
 }
 
-pub(crate) async fn users_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn users_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
-    users_render(&st, locale, &rv, &rt, &c, &rec, Errors::default(), HashMap::new(), flash_key(q.done.as_deref())).await
+    users_render(
+        &st,
+        locale,
+        &rv,
+        &rt,
+        &c,
+        &rec,
+        Errors::default(),
+        HashMap::new(),
+        flash_key(q.done.as_deref()),
+    )
+    .await
 }
 
-pub(crate) async fn user_create(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, body: Bytes) -> Response {
+pub(crate) async fn user_create(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
-    match c.admin.create_user(&rec.id, wizard::user_from_form(&f), f.opt("user_password").as_deref(), f.checked("user_must_change")).await {
+    match c
+        .admin
+        .create_user(
+            &rec.id,
+            wizard::user_from_form(&f),
+            f.opt("user_password").as_deref(),
+            f.checked("user_must_change"),
+        )
+        .await
+    {
         Ok(_) => see_other(&format!("/ui/idp/{realm}/users?done=user-created")),
         Err(e) => {
             let mut e = helios_idp_admin::service::OpError::from(e);
@@ -577,7 +882,18 @@ pub(crate) async fn user_create(State(st): State<WebState>, locale: RequestLocal
                     form.insert(k.into_owned(), v.into_owned());
                 }
             }
-            users_render(&st, locale, &rv, &rt, &c, &rec, Errors::from_op(&e), form, None).await
+            users_render(
+                &st,
+                locale,
+                &rv,
+                &rt,
+                &c,
+                &rec,
+                Errors::from_op(&e),
+                form,
+                None,
+            )
+            .await
         }
     }
 }
@@ -632,9 +948,20 @@ impl UserPage {
     }
 }
 
-async fn sessions_of(c: &IdpConsole, rec: &RealmRecord, user: Option<&str>) -> (Vec<SessionRow>, Vec<GrantRow>) {
+async fn sessions_of(
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    user: Option<&str>,
+) -> (Vec<SessionRow>, Vec<GrantRow>) {
     let now = Utc::now();
-    let users: HashMap<String, String> = c.admin.list_users(&rec.id).await.unwrap_or_default().into_iter().map(|u| (u.id, u.username)).collect();
+    let users: HashMap<String, String> = c
+        .admin
+        .list_users(&rec.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| (u.id, u.username))
+        .collect();
     let name = |id: &str| users.get(id).cloned().unwrap_or_else(|| id.to_string());
     let sessions = c
         .admin
@@ -652,7 +979,12 @@ async fn sessions_of(c: &IdpConsole, rec: &RealmRecord, user: Option<&str>) -> (
             last_seen: s.last_seen_at.format("%Y-%m-%d %H:%M UTC").to_string(),
         })
         .collect();
-    let f = GrantFilter { subject: user.map(String::from), client_id: None, include_revoked: false, limit: Some(500) };
+    let f = GrantFilter {
+        subject: user.map(String::from),
+        client_id: None,
+        include_revoked: false,
+        limit: Some(500),
+    };
     let grants = c
         .admin
         .list_grants(&rec.id, &f)
@@ -673,14 +1005,33 @@ async fn sessions_of(c: &IdpConsole, rec: &RealmRecord, user: Option<&str>) -> (
     (sessions, grants)
 }
 
-async fn render_user(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, rec: &RealmRecord, user_id: &str, errors: Errors, flash: Option<String>) -> Response {
+async fn render_user(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    user_id: &str,
+    errors: Errors,
+    flash: Option<String>,
+) -> Response {
     let Ok(Some(u)) = c.admin.runtime().store().get_user(&rec.id, user_id).await else {
         return (StatusCode::NOT_FOUND, "no such user").into_response();
     };
     let mut form = HashMap::new();
-    form.insert("user_display".into(), u.display_name.clone().unwrap_or_default());
+    form.insert(
+        "user_display".into(),
+        u.display_name.clone().unwrap_or_default(),
+    );
     form.insert("user_email".into(), u.email.clone().unwrap_or_default());
-    form.insert("user_kind".into(), serde_json::to_value(u.kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default());
+    form.insert(
+        "user_kind".into(),
+        serde_json::to_value(u.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default(),
+    );
     if let Some(l) = u.links.iter().find(|l| l.is_fhir_user) {
         form.insert("user_endpoint".into(), l.endpoint.clone());
         form.insert("user_reference".into(), l.reference.clone());
@@ -694,7 +1045,12 @@ async fn render_user(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
         head: head(c, rec, "users"),
         user: user_row(u),
         form,
-        endpoint_names: c.endpoint_views().await.into_iter().map(|e| e.name).collect(),
+        endpoint_names: c
+            .endpoint_views()
+            .await
+            .into_iter()
+            .map(|e| e.name)
+            .collect(),
         sessions,
         grants,
         errors,
@@ -707,12 +1063,37 @@ async fn render_user(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
     r
 }
 
-pub(crate) async fn user_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, user)): Path<(String, String)>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn user_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, user)): Path<(String, String)>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
-    render_user(&st, locale, &rv, &rt, &c, &rec, &user, Errors::default(), flash_key(q.done.as_deref())).await
+    render_user(
+        &st,
+        locale,
+        &rv,
+        &rt,
+        &c,
+        &rec,
+        &user,
+        Errors::default(),
+        flash_key(q.done.as_deref()),
+    )
+    .await
 }
 
-pub(crate) async fn user_save(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, user)): Path<(String, String)>, body: Bytes) -> Response {
+pub(crate) async fn user_save(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, user)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     let Ok(Some(mut u)) = c.admin.runtime().store().get_user(&rec.id, &user).await else {
@@ -730,21 +1111,59 @@ pub(crate) async fn user_save(State(st): State<WebState>, locale: RequestLocale,
         Err(e) => {
             let mut e = helios_idp_admin::service::OpError::from(e);
             e.field = e.field.map(|x| wizard::user_field(&x));
-            render_user(&st, locale, &rv, &rt, &c, &rec, &user, Errors::from_op(&e), None).await
+            render_user(
+                &st,
+                locale,
+                &rv,
+                &rt,
+                &c,
+                &rec,
+                &user,
+                Errors::from_op(&e),
+                None,
+            )
+            .await
         }
     }
 }
 
-pub(crate) async fn user_action(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, user, action)): Path<(String, String, String)>, body: Bytes) -> Response {
+pub(crate) async fn user_action(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, user, action)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     match action.as_str() {
-        "password" => match c.admin.set_password(&rec.id, &user, f.get("user_password"), f.checked("user_must_change")).await {
+        "password" => match c
+            .admin
+            .set_password(
+                &rec.id,
+                &user,
+                f.get("user_password"),
+                f.checked("user_must_change"),
+            )
+            .await
+        {
             Ok(()) => see_other(&format!("/ui/idp/{realm}/users/{user}?done=password-set")),
             Err(e) => {
                 let mut e = helios_idp_admin::service::OpError::from(e);
                 e.field = e.field.map(|x| wizard::user_field(&x));
-                render_user(&st, locale, &rv, &rt, &c, &rec, &user, Errors::from_op(&e), None).await
+                render_user(
+                    &st,
+                    locale,
+                    &rv,
+                    &rt,
+                    &c,
+                    &rec,
+                    &user,
+                    Errors::from_op(&e),
+                    None,
+                )
+                .await
             }
         },
         "delete" => match c.admin.delete_user(&rec.id, &user).await {
@@ -783,15 +1202,44 @@ pub(crate) struct KeysPage {
     pub error: Option<String>,
 }
 
-pub(crate) async fn keys_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn keys_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
-    keys_render(&st, locale, &rv, &rt, &c, &rec, flash_key(q.done.as_deref()), None).await
+    keys_render(
+        &st,
+        locale,
+        &rv,
+        &rt,
+        &c,
+        &rec,
+        flash_key(q.done.as_deref()),
+        None,
+    )
+    .await
 }
 
-async fn keys_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, rec: &RealmRecord, flash: Option<String>, error: Option<String>) -> Response {
+async fn keys_render(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    flash: Option<String>,
+    error: Option<String>,
+) -> Response {
     let keys = c.admin.list_keys(&rec.id).await.unwrap_or_default();
     let now = Utc::now();
-    let fmt = |t: Option<chrono::DateTime<Utc>>| t.map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "—".into());
+    let fmt = |t: Option<chrono::DateTime<Utc>>| {
+        t.map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "—".into())
+    };
     let mut rows: Vec<KeyRowFull> = keys
         .iter()
         .filter(|k| k.status.published())
@@ -816,7 +1264,10 @@ async fn keys_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
         active_page: "idp-realms",
         head: head(c, rec, "keys"),
         rows,
-        retired: keys.iter().filter(|k| k.status == KeyStatus::Retired).count(),
+        retired: keys
+            .iter()
+            .filter(|k| k.status == KeyStatus::Retired)
+            .count(),
         rotate_days: rec.spec.rotation.rotate_after_days,
         prepublish_hours: rec.spec.rotation.prepublish_hours,
         flash,
@@ -824,17 +1275,44 @@ async fn keys_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
     })
 }
 
-pub(crate) async fn keys_action(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path((realm, action)): Path<(String, String)>, body: Bytes) -> Response {
+pub(crate) async fn keys_action(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path((realm, action)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     let r = match action.as_str() {
         "rotate" => c.admin.rotate_keys(&rec.id).await.map(|_| "keys-rotated"),
-        "promote" => c.admin.run_rotation(&rec.id, Utc::now() + chrono::Duration::hours(rec.spec.rotation.prepublish_hours as i64 + 1)).await.map(|_| "keys-promoted"),
+        "promote" => c
+            .admin
+            .run_rotation(
+                &rec.id,
+                Utc::now() + chrono::Duration::hours(rec.spec.rotation.prepublish_hours as i64 + 1),
+            )
+            .await
+            .map(|_| "keys-promoted"),
         "emergency" => {
             if f.get("confirm") != rec.spec.name.as_str() {
-                return keys_render(&st, locale, &rv, &rt, &c, &rec, None, Some(I18n::new(locale).t("idpc-keys-emergency-confirm-mismatch"))).await;
+                return keys_render(
+                    &st,
+                    locale,
+                    &rv,
+                    &rt,
+                    &c,
+                    &rec,
+                    None,
+                    Some(I18n::new(locale).t("idpc-keys-emergency-confirm-mismatch")),
+                )
+                .await;
             }
-            c.admin.emergency_rotate(&rec.id).await.map(|_| "keys-emergency")
+            c.admin
+                .emergency_rotate(&rec.id)
+                .await
+                .map(|_| "keys-emergency")
         }
         _ => return (StatusCode::NOT_FOUND, "unknown action").into_response(),
     };
@@ -864,7 +1342,14 @@ impl SessionsPage {
     }
 }
 
-pub(crate) async fn sessions_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn sessions_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let (sessions, grants) = sessions_of(&c, &rec, None).await;
     render(SessionsPage {
@@ -878,17 +1363,37 @@ pub(crate) async fn sessions_page(State(st): State<WebState>, locale: RequestLoc
     })
 }
 
-pub(crate) async fn session_revoke(Path((realm, kind, id)): Path<(String, String, String)>, body: Bytes) -> Response {
+pub(crate) async fn session_revoke(
+    Path((realm, kind, id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
-    let back = Form::parse(&body).opt("back").filter(|b| b.starts_with("/ui/idp/")).unwrap_or_else(|| format!("/ui/idp/{realm}/sessions"));
+    let back = Form::parse(&body)
+        .opt("back")
+        .filter(|b| b.starts_with("/ui/idp/"))
+        .unwrap_or_else(|| format!("/ui/idp/{realm}/sessions"));
     let r = match kind.as_str() {
-        "session" => c.admin.revoke_session(&rec.id, &id).await.map(|_| "session-revoked"),
-        "grant" => c.admin.revoke_grant(&rec.id, &id).await.map(|_| "grant-revoked"),
+        "session" => c
+            .admin
+            .revoke_session(&rec.id, &id)
+            .await
+            .map(|_| "session-revoked"),
+        "grant" => c
+            .admin
+            .revoke_grant(&rec.id, &id)
+            .await
+            .map(|_| "grant-revoked"),
         "all-sessions" => {
             let now = Utc::now();
             let mut n = Ok("sessions-revoked");
-            for s in c.admin.list_sessions(&rec.id, None).await.unwrap_or_default() {
-                if s.revoked_at.is_none() && s.expires_at > now
+            for s in c
+                .admin
+                .list_sessions(&rec.id, None)
+                .await
+                .unwrap_or_default()
+            {
+                if s.revoked_at.is_none()
+                    && s.expires_at > now
                     && let Err(e) = c.admin.revoke_session(&rec.id, &s.id_hash).await
                 {
                     n = Err(e);
@@ -943,17 +1448,36 @@ impl SettingsPage {
     }
 }
 
-async fn settings_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, rec: &RealmRecord, errors: Errors, flash: Option<String>) -> Response {
+async fn settings_render(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    errors: Errors,
+    flash: Option<String>,
+) -> Response {
     let s = &rec.spec;
     let mut eps = vec![];
     for v in c.endpoint_views().await {
-        let d = c.bind_diff(s.name.as_str(), &v.name, BindMode::Keep).await.ok();
-        let before = d.as_ref().map(|d| d.before.clone()).unwrap_or_else(|| "inherit".into());
+        let d = c
+            .bind_diff(s.name.as_str(), &v.name, BindMode::Keep)
+            .await
+            .ok();
+        let before = d
+            .as_ref()
+            .map(|d| d.before.clone())
+            .unwrap_or_else(|| "inherit".into());
         eps.push(BoundRow {
             bound_here: before == format!("internal:{}", s.name.as_str()),
             listed: s.endpoints.contains(&v.name),
             state_key: labels::endpoint_state(&before),
-            state_detail: if before.starts_with("internal:") { before.trim_start_matches("internal:").to_string() } else { d.and_then(|d| d.before_issuer).unwrap_or_default() },
+            state_detail: if before.starts_with("internal:") {
+                before.trim_start_matches("internal:").to_string()
+            } else {
+                d.and_then(|d| d.before_issuer).unwrap_or_default()
+            },
             name: v.name,
             base_url: v.base_url,
         });
@@ -981,22 +1505,51 @@ async fn settings_render(st: &WebState, locale: RequestLocale, rv: &RequestVersi
     r
 }
 
-pub(crate) async fn settings_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, Query(q): Query<Done>) -> Response {
+pub(crate) async fn settings_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    Query(q): Query<Done>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
-    settings_render(&st, locale, &rv, &rt, &c, &rec, Errors::default(), flash_key(q.done.as_deref())).await
+    settings_render(
+        &st,
+        locale,
+        &rv,
+        &rt,
+        &c,
+        &rec,
+        Errors::default(),
+        flash_key(q.done.as_deref()),
+    )
+    .await
 }
 
-pub(crate) async fn settings_save(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>, body: Bytes) -> Response {
+pub(crate) async fn settings_save(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     let mut errs = Errors::default();
     let mut spec = rec.spec.clone();
     spec.display_name = f.get("display_name").to_string();
     if spec.display_name.is_empty() {
-        errs.fields.insert("display_name".into(), "enter a display name".into());
+        errs.fields
+            .insert("display_name".into(), "enter a display name".into());
     }
     wizard::apply_capabilities(&mut spec, &f, &mut errs);
-    for (field, target) in [("security.passwordMinLength", 0u8), ("security.lockoutThreshold", 1), ("rotation.rotateAfterDays", 2)] {
+    for (field, target) in [
+        ("security.passwordMinLength", 0u8),
+        ("security.lockoutThreshold", 1),
+        ("rotation.rotateAfterDays", 2),
+    ] {
         let v = f.get(field);
         if v.is_empty() {
             continue;
@@ -1008,17 +1561,19 @@ pub(crate) async fn settings_save(State(st): State<WebState>, locale: RequestLoc
                 _ => spec.rotation.rotate_after_days = n,
             },
             Err(_) => {
-                errs.fields.insert(field.into(), "enter a whole number".into());
+                errs.fields
+                    .insert(field.into(), "enter a whole number".into());
             }
         }
     }
     let rev: Option<i64> = f.get("revision").parse().ok();
     if errs.is_empty() {
-        match c.update(&realm, rev, move |s| {
-            *s = spec;
-            Ok(())
-        })
-        .await
+        match c
+            .update(&realm, rev, move |s| {
+                *s = spec;
+                Ok(())
+            })
+            .await
         {
             Ok(_) => return see_other(&format!("/ui/idp/{realm}/settings?done=saved")),
             Err(e) => errs = Errors::from_op(&e),
@@ -1028,13 +1583,32 @@ pub(crate) async fn settings_save(State(st): State<WebState>, locale: RequestLoc
     settings_render(&st, locale, &rv, &rt, &c, &rec, errs, None).await
 }
 
-pub(crate) async fn settings_action(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, principal: Option<Extension<ConsolePrincipal>>, Path((realm, action)): Path<(String, String)>, body: Bytes) -> Response {
+pub(crate) async fn settings_action(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<ConsolePrincipal>>,
+    Path((realm, action)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     let who = actor(&rt, principal.as_ref().map(|p| &p.0));
     let r: Result<&str, helios_idp_admin::service::OpError> = match action.as_str() {
-        "bind" => c.bind(&realm, f.get("endpoint"), BindMode::parse(f.get("bind_mode")), &who).await.map(|_| "endpoint-bound"),
-        "unbind" => c.unbind(&realm, f.get("endpoint"), &who).await.map(|_| "endpoint-unbound"),
+        "bind" => c
+            .bind(
+                &realm,
+                f.get("endpoint"),
+                BindMode::parse(f.get("bind_mode")),
+                &who,
+            )
+            .await
+            .map(|_| "endpoint-bound"),
+        "unbind" => c
+            .unbind(&realm, f.get("endpoint"), &who)
+            .await
+            .map(|_| "endpoint-unbound"),
         "enable" | "disable" => {
             let on = action == "enable";
             c.update(&realm, None, |s| {
@@ -1046,12 +1620,18 @@ pub(crate) async fn settings_action(State(st): State<WebState>, locale: RequestL
         }
         "delete" => {
             if f.get("confirm") != realm {
-                let e = Errors::default().field("confirm", I18n::new(locale).t("idpc-delete-confirm-mismatch"));
+                let e = Errors::default().field(
+                    "confirm",
+                    I18n::new(locale).t("idpc-delete-confirm-mismatch"),
+                );
                 return settings_render(&st, locale, &rv, &rt, &c, &rec, e, None).await;
             }
             return match c.delete_realm(&realm, &who).await {
                 Ok(()) => see_other("/ui/idp?done=realm-deleted"),
-                Err(e) => settings_render(&st, locale, &rv, &rt, &c, &rec, Errors::from_op(&e), None).await,
+                Err(e) => {
+                    settings_render(&st, locale, &rv, &rt, &c, &rec, Errors::from_op(&e), None)
+                        .await
+                }
             };
         }
         _ => return (StatusCode::NOT_FOUND, "unknown action").into_response(),
@@ -1101,7 +1681,15 @@ pub(crate) struct VerifyFragment {
     pub verify: Option<VerifyView>,
 }
 
-async fn test_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, rt: &RequestTenant, c: &IdpConsole, rec: &RealmRecord, form: HashMap<String, String>) -> Response {
+async fn test_render(
+    st: &WebState,
+    locale: RequestLocale,
+    rv: &RequestVersion,
+    rt: &RequestTenant,
+    c: &IdpConsole,
+    rec: &RealmRecord,
+    form: HashMap<String, String>,
+) -> Response {
     let i18n = I18n::new(locale);
     let name = rec.spec.name.as_str();
     let history = c
@@ -1109,7 +1697,13 @@ async fn test_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
         .iter()
         .map(|r| {
             let (tone, icon, key) = verify::look(r.status);
-            HistoryRow { when: r.finished_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(), tone, icon, label: i18n.t(&format!("{key}-short")), problems: r.problems().len() }
+            HistoryRow {
+                when: r.finished_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                tone,
+                icon,
+                label: i18n.t(&format!("{key}-short")),
+                problems: r.problems().len(),
+            }
         })
         .collect();
     let clients = c
@@ -1118,8 +1712,15 @@ async fn test_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| !r.spec.client_id.starts_with(DIAGNOSTIC_PREFIX) && !r.spec.redirect_uris.is_empty())
-        .map(|r| (r.spec.client_id.clone(), r.spec.redirect_uris.first().cloned().unwrap_or_default()))
+        .filter(|r| {
+            !r.spec.client_id.starts_with(DIAGNOSTIC_PREFIX) && !r.spec.redirect_uris.is_empty()
+        })
+        .map(|r| {
+            (
+                r.spec.client_id.clone(),
+                r.spec.redirect_uris.first().cloned().unwrap_or_default(),
+            )
+        })
         .collect();
     render(TestPage {
         status: current_status(st, rv.0, rt),
@@ -1133,27 +1734,51 @@ async fn test_render(st: &WebState, locale: RequestLocale, rv: &RequestVersion, 
     })
 }
 
-pub(crate) async fn test_page(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, Path(realm): Path<String>) -> Response {
+pub(crate) async fn test_page(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Path(realm): Path<String>,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     test_render(&st, locale, &rv, &rt, &c, &rec, HashMap::new()).await
 }
 
 /// Runs the diagnostic. htmx → the panel fragment; plain POST → the page.
-pub(crate) async fn test_run(State(st): State<WebState>, locale: RequestLocale, rv: RequestVersion, rt: RequestTenant, hx: axum_htmx::HxRequest, Path(realm): Path<String>, body: Bytes) -> Response {
+pub(crate) async fn test_run(
+    State(st): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    hx: axum_htmx::HxRequest,
+    Path(realm): Path<String>,
+    body: Bytes,
+) -> Response {
     let (c, rec) = ctx!(c, realm);
     let f = Form::parse(&body);
     let app = match (f.opt("app_client"), f.opt("app_redirect")) {
-        (Some(client_id), Some(redirect_uri)) => Some(AppProbe { client_id, redirect_uri }),
+        (Some(client_id), Some(redirect_uri)) => Some(AppProbe {
+            client_id,
+            redirect_uri,
+        }),
         _ => None,
     };
-    let opts = DiagnoseOptions { app, patient: f.opt("patient"), ..Default::default() };
+    let opts = DiagnoseOptions {
+        app,
+        patient: f.opt("patient"),
+        ..Default::default()
+    };
     let report = match c.diagnose(&realm, opts).await {
         Ok(r) => r,
         Err(e) => return (super::op_status(&e), e.message).into_response(),
     };
     if hx.0 {
         let i18n = I18n::new(locale);
-        return render(VerifyFragment { verify: Some(verify::view(&i18n, &report, false)), i18n });
+        return render(VerifyFragment {
+            verify: Some(verify::view(&i18n, &report, false)),
+            i18n,
+        });
     }
     let mut form = HashMap::new();
     for (k, v) in form_urlencoded::parse(&body) {

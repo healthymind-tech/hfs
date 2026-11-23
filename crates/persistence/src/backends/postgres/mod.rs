@@ -104,8 +104,6 @@ mod transaction;
 mod user_settings;
 
 pub use backend::{PostgresBackend, PostgresConfig};
-/// SQL of fork migration `hm-0020-idp-core` (checked against helios-idp).
-pub use schema::{FORK_IDP_CORE, FORK_IDP_CORE_SQL};
 /// The connection pool snapshot returned by
 /// [`PostgresBackend::pool_status`], re-exported so callers need no direct
 /// deadpool dependency.
@@ -114,6 +112,8 @@ pub use schema::{
     FORK_CONSOLE_TERMINOLOGY_BINDINGS, FORK_TERMINOLOGY_SCHEMA, HM_0011_SQL, HM_0012_SQL,
     TerminologyState, UNIFIED_FORK_MIGRATIONS, is_valid_store_schema_name,
 };
+/// SQL of fork migration `hm-0020-idp-core` (checked against helios-idp).
+pub use schema::{FORK_IDP_CORE, FORK_IDP_CORE_SQL};
 
 pub use tenant_copy::{TenantCopyOptions, TenantCopyReport};
 pub use transaction::PostgresTransaction;
