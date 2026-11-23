@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use helios_endpoints::{
-    Actor, AuthMode, AuthProviderRef, Endpoint, EndpointAuth, EndpointSpec, EndpointStore, StoreError,
+    Actor, AuthMode, AuthProviderRef, Endpoint, EndpointAuth, EndpointSpec, EndpointStore,
+    StoreError,
 };
 use helios_idp::metadata::{RealmUrls, smart_capabilities, smart_configuration};
 use helios_idp::realm::RealmSpec;
@@ -74,7 +75,9 @@ pub fn apply(
 ) {
     let issuer = realm.issuer(public_base);
     let urls = RealmUrls::new(&issuer);
-    auth.provider = AuthProviderRef::Internal { realm: realm.name.as_str().to_string() };
+    auth.provider = AuthProviderRef::Internal {
+        realm: realm.name.as_str().to_string(),
+    };
     auth.mode = match (mode, auth.mode) {
         (BindMode::WriteProtect, _) => AuthMode::WriteProtect,
         (BindMode::Full, _) | (BindMode::Keep, AuthMode::Off) => AuthMode::Full,
@@ -83,29 +86,50 @@ pub fn apply(
     auth.issuer = Some(issuer.clone());
     auth.jwks_url = Some(match jwks_via {
         Some(via) => {
-            let path = Url::parse(&urls.jwks).map(|u| u.path().to_string()).unwrap_or_default();
+            let path = Url::parse(&urls.jwks)
+                .map(|u| u.path().to_string())
+                .unwrap_or_default();
             format!("{}{}", via.as_str().trim_end_matches('/'), path)
         }
         None => urls.jwks.clone(),
     });
     auth.audience = Some(endpoint_base.trim_end_matches('/').to_string());
-    auth.algorithms = realm.signing_algs.iter().map(|a| a.as_str().to_string()).collect();
+    auth.algorithms = realm
+        .signing_algs
+        .iter()
+        .map(|a| a.as_str().to_string())
+        .collect();
     let sc = smart_configuration(realm, &urls);
     let s = &mut auth.smart;
     s.discover_from_issuer = false;
     s.authorization_endpoint = Some(urls.authorization.clone());
     s.token_endpoint = Some(urls.token.clone());
     s.jwks_uri = Some(urls.jwks.clone());
-    s.introspection_endpoint = realm.features.introspection.then(|| urls.introspection.clone());
+    s.introspection_endpoint = realm
+        .features
+        .introspection
+        .then(|| urls.introspection.clone());
     s.revocation_endpoint = realm.features.revocation.then(|| urls.revocation.clone());
     s.management_endpoint = Some(urls.management.clone());
-    s.end_session_endpoint = realm.features.openid_connect.then(|| urls.end_session.clone());
+    s.end_session_endpoint = realm
+        .features
+        .openid_connect
+        .then(|| urls.end_session.clone());
     s.registration_endpoint = None;
-    s.capabilities = Some(smart_capabilities(realm).into_iter().map(String::from).collect());
+    s.capabilities = Some(
+        smart_capabilities(realm)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
     s.scopes_supported = sc
         .get("scopes_supported")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
     // SMART scope families the realm can issue.
     auth.scopes.allow_patient = realm.features.permission_patient;
     auth.scopes.allow_user = realm.features.permission_user;
@@ -148,8 +172,19 @@ pub trait EndpointBinder: Send + Sync {
     /// Every endpoint as the diagnostic sees it.
     async fn views(&self) -> Result<Vec<EndpointView>, String>;
     /// What [`EndpointBinder::bind`] would change.
-    async fn diff(&self, endpoint: &str, realm: &RealmSpec, mode: BindMode) -> Result<BindDiff, String>;
-    async fn bind(&self, endpoint: &str, realm: &RealmSpec, mode: BindMode, actor: &Actor) -> Result<(), String>;
+    async fn diff(
+        &self,
+        endpoint: &str,
+        realm: &RealmSpec,
+        mode: BindMode,
+    ) -> Result<BindDiff, String>;
+    async fn bind(
+        &self,
+        endpoint: &str,
+        realm: &RealmSpec,
+        mode: BindMode,
+        actor: &Actor,
+    ) -> Result<(), String>;
     /// Removes the binding: the endpoint goes back to the server-wide auth
     /// settings (inherit), never silently open.
     async fn unbind(&self, endpoint: &str, realm: &RealmSpec, actor: &Actor) -> Result<(), String>;
@@ -176,7 +211,10 @@ impl StoreBinder {
         EndpointView {
             name: e.name().to_string(),
             base_url: e.public_base(&self.server_base),
-            auth_mode: auth.map(|a| mode_str(a.mode)).unwrap_or("inherit").to_string(),
+            auth_mode: auth
+                .map(|a| mode_str(a.mode))
+                .unwrap_or("inherit")
+                .to_string(),
             provider: match bound_realm(auth, realms, &self.public_base) {
                 Some(r) => EndpointProvider::Internal {
                     realm: r.name.as_str().to_string(),
@@ -197,7 +235,11 @@ impl StoreBinder {
     }
 }
 
-pub fn describe(spec: &EndpointSpec, realms: &[RealmSpec], public_base: &Url) -> (String, Option<String>, String) {
+pub fn describe(
+    spec: &EndpointSpec,
+    realms: &[RealmSpec],
+    public_base: &Url,
+) -> (String, Option<String>, String) {
     match spec.auth.as_ref() {
         None => ("inherit".into(), None, "inherit".into()),
         Some(a) => {
@@ -225,13 +267,25 @@ impl EndpointBinder for StoreBinder {
             .collect())
     }
 
-    async fn diff(&self, endpoint: &str, realm: &RealmSpec, mode: BindMode) -> Result<BindDiff, String> {
+    async fn diff(
+        &self,
+        endpoint: &str,
+        realm: &RealmSpec,
+        mode: BindMode,
+    ) -> Result<BindDiff, String> {
         let e = self.get(endpoint).await?;
         let realms = (self.realms)();
         let (before, before_issuer, mode_before) = describe(&e.spec, &realms, &self.public_base);
         let base = e.public_base(&self.server_base);
         let mut auth = e.spec.auth.clone().unwrap_or_default();
-        apply(&mut auth, realm, &self.public_base, self.jwks_via.as_ref(), &base, mode);
+        apply(
+            &mut auth,
+            realm,
+            &self.public_base,
+            self.jwks_via.as_ref(),
+            &base,
+            mode,
+        );
         Ok(BindDiff {
             endpoint: endpoint.to_string(),
             before,
@@ -243,12 +297,25 @@ impl EndpointBinder for StoreBinder {
         })
     }
 
-    async fn bind(&self, endpoint: &str, realm: &RealmSpec, mode: BindMode, actor: &Actor) -> Result<(), String> {
+    async fn bind(
+        &self,
+        endpoint: &str,
+        realm: &RealmSpec,
+        mode: BindMode,
+        actor: &Actor,
+    ) -> Result<(), String> {
         let e = self.get(endpoint).await?;
         let base = e.public_base(&self.server_base);
         let mut spec = e.spec.clone();
         let mut auth = spec.auth.clone().unwrap_or_default();
-        apply(&mut auth, realm, &self.public_base, self.jwks_via.as_ref(), &base, mode);
+        apply(
+            &mut auth,
+            realm,
+            &self.public_base,
+            self.jwks_via.as_ref(),
+            &base,
+            mode,
+        );
         spec.auth = Some(auth);
         self.store
             .update(endpoint, e.revision, spec, actor)
@@ -284,20 +351,59 @@ mod tests {
         realm.features.introspection = true;
         let base = Url::parse("https://hfs.example.org").unwrap();
         let mut auth = EndpointAuth::default();
-        apply(&mut auth, &realm, &base, None, "https://hfs.example.org/fhir/ep1/", BindMode::Keep);
+        apply(
+            &mut auth,
+            &realm,
+            &base,
+            None,
+            "https://hfs.example.org/fhir/ep1/",
+            BindMode::Keep,
+        );
         assert_eq!(auth.mode, AuthMode::Full);
-        assert_eq!(auth.issuer.as_deref(), Some("https://hfs.example.org/idp/clinic"));
-        assert_eq!(auth.jwks_url.as_deref(), Some("https://hfs.example.org/idp/clinic/jwks"));
-        assert_eq!(auth.audience.as_deref(), Some("https://hfs.example.org/fhir/ep1"));
-        assert_eq!(auth.smart.token_endpoint.as_deref(), Some("https://hfs.example.org/idp/clinic/token"));
+        assert_eq!(
+            auth.issuer.as_deref(),
+            Some("https://hfs.example.org/idp/clinic")
+        );
+        assert_eq!(
+            auth.jwks_url.as_deref(),
+            Some("https://hfs.example.org/idp/clinic/jwks")
+        );
+        assert_eq!(
+            auth.audience.as_deref(),
+            Some("https://hfs.example.org/fhir/ep1")
+        );
+        assert_eq!(
+            auth.smart.token_endpoint.as_deref(),
+            Some("https://hfs.example.org/idp/clinic/token")
+        );
         assert!(!auth.smart.discover_from_issuer);
-        assert!(auth.smart.capabilities.as_ref().unwrap().iter().any(|c| c == "launch-standalone"));
+        assert!(
+            auth.smart
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|c| c == "launch-standalone")
+        );
         assert!(bound_realm(Some(&auth), std::slice::from_ref(&realm), &base).is_some());
 
         let via = Url::parse("http://127.0.0.1:8080").unwrap();
-        let mut auth = EndpointAuth { mode: AuthMode::WriteProtect, ..Default::default() };
-        apply(&mut auth, &realm, &base, Some(&via), "https://h/fhir/x", BindMode::Keep);
+        let mut auth = EndpointAuth {
+            mode: AuthMode::WriteProtect,
+            ..Default::default()
+        };
+        apply(
+            &mut auth,
+            &realm,
+            &base,
+            Some(&via),
+            "https://h/fhir/x",
+            BindMode::Keep,
+        );
         assert_eq!(auth.mode, AuthMode::WriteProtect);
-        assert_eq!(auth.jwks_url.as_deref(), Some("http://127.0.0.1:8080/idp/clinic/jwks"));
+        assert_eq!(
+            auth.jwks_url.as_deref(),
+            Some("http://127.0.0.1:8080/idp/clinic/jwks")
+        );
     }
 }

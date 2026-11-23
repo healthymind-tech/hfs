@@ -165,20 +165,44 @@ pub struct OpError {
 impl From<IdpError> for OpError {
     fn from(e: IdpError) -> Self {
         match e {
-            IdpError::Invalid(field, message) => OpError { status: 400, field: Some(field), message },
-            IdpError::NotFound(m) => OpError { status: 404, field: None, message: format!("not found: {m}") },
-            IdpError::Conflict(m) => OpError { status: 409, field: None, message: m },
-            other => OpError { status: 500, field: None, message: other.to_string() },
+            IdpError::Invalid(field, message) => OpError {
+                status: 400,
+                field: Some(field),
+                message,
+            },
+            IdpError::NotFound(m) => OpError {
+                status: 404,
+                field: None,
+                message: format!("not found: {m}"),
+            },
+            IdpError::Conflict(m) => OpError {
+                status: 409,
+                field: None,
+                message: m,
+            },
+            other => OpError {
+                status: 500,
+                field: None,
+                message: other.to_string(),
+            },
         }
     }
 }
 
 impl OpError {
     pub fn invalid(field: &str, message: impl Into<String>) -> Self {
-        OpError { status: 400, field: Some(field.to_string()), message: message.into() }
+        OpError {
+            status: 400,
+            field: Some(field.to_string()),
+            message: message.into(),
+        }
     }
     pub fn other(status: u16, message: impl Into<String>) -> Self {
-        OpError { status, field: None, message: message.into() }
+        OpError {
+            status,
+            field: None,
+            message: message.into(),
+        }
     }
 }
 
@@ -255,7 +279,13 @@ pub fn global() -> Option<Arc<IdpConsole>> {
 fn rand_suffix() -> String {
     helios_idp::util::random_b64(9)
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { 'x' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                'x'
+            }
+        })
         .collect()
 }
 
@@ -308,7 +338,12 @@ impl IdpConsole {
 
     /// Step 1: validates the basics and creates the draft (keys are
     /// generated now — step 2 shows them and may change algorithms).
-    pub async fn create_draft(&self, name: &str, display_name: &str, template: Template) -> OpResult<RealmRecord> {
+    pub async fn create_draft(
+        &self,
+        name: &str,
+        display_name: &str,
+        template: Template,
+    ) -> OpResult<RealmRecord> {
         let name = RealmName::parse(name.trim()).map_err(|e| match e {
             IdpError::Invalid(_, m) => OpError::invalid("name", m),
             other => other.into(),
@@ -316,16 +351,38 @@ impl IdpConsole {
         if display_name.trim().is_empty() {
             return Err(OpError::invalid("displayName", "enter a display name"));
         }
-        if self.admin.runtime().store().get_realm_by_name(name.as_str()).await?.is_some() {
-            return Err(OpError::invalid("name", format!("an authorization server named {} already exists", name.as_str())));
+        if self
+            .admin
+            .runtime()
+            .store()
+            .get_realm_by_name(name.as_str())
+            .await?
+            .is_some()
+        {
+            return Err(OpError::invalid(
+                "name",
+                format!(
+                    "an authorization server named {} already exists",
+                    name.as_str()
+                ),
+            ));
         }
         if !self.keys_available() {
-            return Err(OpError::other(409, "configure HFS_SECRET_KEYS before creating an authorization server (signing keys are sealed with it)"));
+            return Err(OpError::other(
+                409,
+                "configure HFS_SECRET_KEYS before creating an authorization server (signing keys are sealed with it)",
+            ));
         }
         let mut spec = RealmSpec::new(name, display_name.trim());
         template.apply(&mut spec);
         spec.enabled = false;
-        WizardState { draft: true, step: 2, template: Some(template), ..Default::default() }.store(&mut spec);
+        WizardState {
+            draft: true,
+            step: 2,
+            template: Some(template),
+            ..Default::default()
+        }
+        .store(&mut spec);
         Ok(self.admin.create_realm(spec).await?)
     }
 
@@ -339,7 +396,11 @@ impl IdpConsole {
     ) -> OpResult<RealmRecord> {
         let rec = self.realm(name).await?;
         let mut spec = rec.spec.clone();
-        let mut w = WizardState::of(&spec).unwrap_or(WizardState { draft: true, step: 1, ..Default::default() });
+        let mut w = WizardState::of(&spec).unwrap_or(WizardState {
+            draft: true,
+            step: 1,
+            ..Default::default()
+        });
         edit(&mut spec, &mut w)?;
         w.step = w.step.max(next_step);
         w.store(&mut spec);
@@ -347,12 +408,23 @@ impl IdpConsole {
     }
 
     /// Updates a realm's settings outside the wizard.
-    pub async fn update(&self, name: &str, revision: Option<i64>, edit: impl FnOnce(&mut RealmSpec) -> OpResult<()>) -> OpResult<RealmRecord> {
+    pub async fn update(
+        &self,
+        name: &str,
+        revision: Option<i64>,
+        edit: impl FnOnce(&mut RealmSpec) -> OpResult<()>,
+    ) -> OpResult<RealmRecord> {
         let rec = self.realm(name).await?;
         if let Some(r) = revision
             && r != rec.revision
         {
-            return Err(OpError::other(409, format!("the settings were changed by someone else (revision {} → {}); reload and try again", r, rec.revision)));
+            return Err(OpError::other(
+                409,
+                format!(
+                    "the settings were changed by someone else (revision {} → {}); reload and try again",
+                    r, rec.revision
+                ),
+            ));
         }
         let mut spec = rec.spec.clone();
         edit(&mut spec)?;
@@ -375,11 +447,20 @@ impl IdpConsole {
         }
         WizardState::clear(&mut spec);
         let rec = self.admin.update_realm(&rec.id, spec, rec.revision).await?;
-        let opts = DiagnoseOptions { patient: w.test_patient.clone(), endpoints_override: Some(w.endpoints.clone()), audience_only: true, ..Default::default() };
+        let opts = DiagnoseOptions {
+            patient: w.test_patient.clone(),
+            endpoints_override: Some(w.endpoints.clone()),
+            audience_only: true,
+            ..Default::default()
+        };
         let pre = self.diagnose(name, opts).await?;
         let mut bound = vec![];
         let mut not_bound = vec![];
-        let realm_ok = pre.steps.iter().filter(|s| s.id != "preflight").all(|s| s.status != Status::Fail);
+        let realm_ok = pre
+            .steps
+            .iter()
+            .filter(|s| s.id != "preflight")
+            .all(|s| s.status != Status::Fail);
         if realm_ok && let Some(b) = &self.binder {
             for e in &w.endpoints {
                 match b.bind(e, &rec.spec, w.bind_mode, actor).await {
@@ -393,11 +474,23 @@ impl IdpConsole {
         let report = if bound.is_empty() && !w.endpoints.is_empty() {
             pre
         } else {
-            self.diagnose(name, DiagnoseOptions { patient: w.test_patient.clone(), ..Default::default() }).await?
+            self.diagnose(
+                name,
+                DiagnoseOptions {
+                    patient: w.test_patient.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?
         };
         if !not_bound.is_empty() {
             // Keep the wizard resumable at "Review & test" for a retry.
-            let pending = WizardState { draft: true, step: 7, endpoints: not_bound.clone(), ..w.clone() };
+            let pending = WizardState {
+                draft: true,
+                step: 7,
+                endpoints: not_bound.clone(),
+                ..w.clone()
+            };
             let _ = self
                 .update(name, None, |s| {
                     pending.store(s);
@@ -405,14 +498,22 @@ impl IdpConsole {
                 })
                 .await;
         }
-        Ok(FinishOutcome { realm: name.to_string(), bound, not_bound, report })
+        Ok(FinishOutcome {
+            realm: name.to_string(),
+            bound,
+            not_bound,
+            report,
+        })
     }
 
     /// Abandons a draft (deletes the realm row and its keys).
     pub async fn discard_draft(&self, name: &str) -> OpResult<()> {
         let rec = self.realm(name).await?;
         if WizardState::of(&rec.spec).is_none() {
-            return Err(OpError::other(409, "only unfinished drafts can be discarded here; delete the authorization server from its settings"));
+            return Err(OpError::other(
+                409,
+                "only unfinished drafts can be discarded here; delete the authorization server from its settings",
+            ));
         }
         self.admin.delete_realm(&rec.id).await?;
         self.forget(name);
@@ -428,14 +529,33 @@ impl IdpConsole {
         }
     }
 
-    pub async fn bind_diff(&self, name: &str, endpoint: &str, mode: BindMode) -> OpResult<BindDiff> {
+    pub async fn bind_diff(
+        &self,
+        name: &str,
+        endpoint: &str,
+        mode: BindMode,
+    ) -> OpResult<BindDiff> {
         let rec = self.realm(name).await?;
-        let b = self.binder.as_ref().ok_or_else(|| OpError::other(503, "endpoint management is not available"))?;
-        b.diff(endpoint, &rec.spec, mode).await.map_err(|m| OpError::invalid("endpoints", m))
+        let b = self
+            .binder
+            .as_ref()
+            .ok_or_else(|| OpError::other(503, "endpoint management is not available"))?;
+        b.diff(endpoint, &rec.spec, mode)
+            .await
+            .map_err(|m| OpError::invalid("endpoints", m))
     }
 
-    pub async fn bind(&self, name: &str, endpoint: &str, mode: BindMode, actor: &Actor) -> OpResult<()> {
-        let b = self.binder.clone().ok_or_else(|| OpError::other(503, "endpoint management is not available"))?;
+    pub async fn bind(
+        &self,
+        name: &str,
+        endpoint: &str,
+        mode: BindMode,
+        actor: &Actor,
+    ) -> OpResult<()> {
+        let b = self
+            .binder
+            .clone()
+            .ok_or_else(|| OpError::other(503, "endpoint management is not available"))?;
         self.update(name, None, |s| {
             if !s.endpoints.iter().any(|e| e == endpoint) {
                 s.endpoints.push(endpoint.to_string());
@@ -444,13 +564,17 @@ impl IdpConsole {
         })
         .await?;
         let rec = self.realm(name).await?;
-        b.bind(endpoint, &rec.spec, mode, actor).await.map_err(|m| OpError::invalid("endpoints", m))
+        b.bind(endpoint, &rec.spec, mode, actor)
+            .await
+            .map_err(|m| OpError::invalid("endpoints", m))
     }
 
     pub async fn unbind(&self, name: &str, endpoint: &str, actor: &Actor) -> OpResult<()> {
         let rec = self.realm(name).await?;
         if let Some(b) = &self.binder {
-            b.unbind(endpoint, &rec.spec, actor).await.map_err(|m| OpError::invalid("endpoints", m))?;
+            b.unbind(endpoint, &rec.spec, actor)
+                .await
+                .map_err(|m| OpError::invalid("endpoints", m))?;
         }
         self.update(name, None, |s| {
             s.endpoints.retain(|e| e != endpoint);
@@ -472,13 +596,20 @@ impl IdpConsole {
     }
 
     pub fn last_report(&self, name: &str) -> Option<Report> {
-        self.history.lock().unwrap_or_else(|p| p.into_inner()).get(name).and_then(|q| q.front().cloned())
+        self.history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+            .and_then(|q| q.front().cloned())
     }
 
     /// Drops a realm's run history (the realm was deleted; a new realm with
     /// the same name must not inherit it).
     pub fn forget(&self, name: &str) {
-        self.history.lock().unwrap_or_else(|p| p.into_inner()).remove(name);
+        self.history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
     }
 
     /// Deletes a realm: unbinds its endpoints first (they return to the
@@ -546,12 +677,17 @@ impl IdpConsole {
             now: Utc::now(),
         };
         let issuer = self.issuer(realm);
-        let wanted: Vec<String> = opts.endpoints_override.clone().unwrap_or_else(|| realm.endpoints.clone());
+        let wanted: Vec<String> = opts
+            .endpoints_override
+            .clone()
+            .unwrap_or_else(|| realm.endpoints.clone());
         let endpoints: Vec<EndpointView> = wanted
             .iter()
             .filter_map(|n| all_eps.iter().find(|e| &e.name == n).cloned())
             .collect();
-        let fixture = self.create_fixture(&rec, &endpoints, opts.patient.as_deref()).await;
+        let fixture = self
+            .create_fixture(&rec, &endpoints, opts.patient.as_deref())
+            .await;
         let report = match fixture {
             Ok((fx, cleanup)) => {
                 let mut cfg = RunConfig::new(realm.name.as_str(), &issuer, fx);
@@ -585,7 +721,12 @@ impl IdpConsole {
         Ok(report)
     }
 
-    async fn create_fixture(&self, rec: &RealmRecord, endpoints: &[EndpointView], patient: Option<&str>) -> OpResult<(Fixture, (Vec<String>, Option<String>))> {
+    async fn create_fixture(
+        &self,
+        rec: &RealmRecord,
+        endpoints: &[EndpointView],
+        patient: Option<&str>,
+    ) -> OpResult<(Fixture, (Vec<String>, Option<String>))> {
         let f = &rec.spec.features;
         let tag = rand_suffix();
         let mut clients = vec![];
@@ -618,8 +759,15 @@ impl IdpConsole {
                 grant_types: grants,
                 redirect_uris: vec![DIAGNOSTIC_REDIRECT.into()],
                 post_logout_redirect_uris: vec![],
-                launch_types: vec![if f.launch_standalone { LaunchType::Standalone } else { LaunchType::Ehr }],
-                scopes: ScopePolicy { allowed: scopes.iter().map(|s| s.to_string()).collect(), accept_v1: false },
+                launch_types: vec![if f.launch_standalone {
+                    LaunchType::Standalone
+                } else {
+                    LaunchType::Ehr
+                }],
+                scopes: ScopePolicy {
+                    allowed: scopes.iter().map(|s| s.to_string()).collect(),
+                    accept_v1: false,
+                },
                 trusted: false,
                 require_dpop: false,
                 require_par: false,
@@ -637,12 +785,19 @@ impl IdpConsole {
             let spec = ClientSpec {
                 client_id: id.clone(),
                 name: "Diagnostic backend (temporary)".into(),
-                auth: ClientAuth::PrivateKeyJwt { jwks_uri: None, jwks: Some(json!({"keys": [key.public_jwk()]})), algs: vec![SigningAlg::ES256] },
+                auth: ClientAuth::PrivateKeyJwt {
+                    jwks_uri: None,
+                    jwks: Some(json!({"keys": [key.public_jwk()]})),
+                    algs: vec![SigningAlg::ES256],
+                },
                 grant_types: vec![GrantType::ClientCredentials],
                 redirect_uris: vec![],
                 post_logout_redirect_uris: vec![],
                 launch_types: vec![LaunchType::Backend],
-                scopes: ScopePolicy { allowed: vec!["system/*.rs".into()], accept_v1: false },
+                scopes: ScopePolicy {
+                    allowed: vec!["system/*.rs".into()],
+                    accept_v1: false,
+                },
                 trusted: false,
                 require_dpop: false,
                 require_par: false,
@@ -660,20 +815,36 @@ impl IdpConsole {
             backend = Some((id, Arc::new(key)));
         }
         if clients.is_empty() {
-            return Err(OpError::invalid("features", "no client type the diagnostic can use is enabled"));
+            return Err(OpError::invalid(
+                "features",
+                "no client type the diagnostic can use is enabled",
+            ));
         }
         let username = format!("{DIAGNOSTIC_PREFIX}{tag}");
-        let password = format!("Diag-{}-{}", helios_idp::util::random_b64(18), rand_suffix());
+        let password = format!(
+            "Diag-{}-{}",
+            helios_idp::util::random_b64(18),
+            rand_suffix()
+        );
         let mut user_id = None;
         if interactive {
             let links = match (patient, endpoints.first()) {
-                (Some(p), Some(e)) => vec![FhirLink { endpoint: e.name.clone(), reference: format!("Patient/{p}"), is_fhir_user: true, accessible_patients: vec![] }],
+                (Some(p), Some(e)) => vec![FhirLink {
+                    endpoint: e.name.clone(),
+                    reference: format!("Patient/{p}"),
+                    is_fhir_user: true,
+                    accessible_patients: vec![],
+                }],
                 _ => vec![],
             };
             let user = RealmUser {
                 id: String::new(),
                 username: username.clone(),
-                kind: if patient.is_some() { UserKind::Patient } else { UserKind::Practitioner },
+                kind: if patient.is_some() {
+                    UserKind::Patient
+                } else {
+                    UserKind::Practitioner
+                },
                 display_name: Some("Diagnostic user (temporary)".into()),
                 email: None,
                 email_verified: false,
@@ -681,7 +852,11 @@ impl IdpConsole {
                 external_subject: None,
                 disabled: false,
             };
-            match self.admin.create_user(&rec.id, user, Some(&password), false).await {
+            match self
+                .admin
+                .create_user(&rec.id, user, Some(&password), false)
+                .await
+            {
                 Ok(u) => user_id = Some(u.id),
                 Err(e) => {
                     for c in &clients {
@@ -692,7 +867,11 @@ impl IdpConsole {
             }
         }
         let fx = Fixture {
-            public_client_id: if interactive { public_id } else { String::new() },
+            public_client_id: if interactive {
+                public_id
+            } else {
+                String::new()
+            },
             redirect_uri: DIAGNOSTIC_REDIRECT.into(),
             backend_client_id: backend.as_ref().map(|b| b.0.clone()),
             backend_key: backend.map(|b| b.1),
@@ -705,7 +884,11 @@ impl IdpConsole {
         Ok((fx, (clients, user_id)))
     }
 
-    async fn cleanup_fixture(&self, realm_id: &str, (clients, user): (Vec<String>, Option<String>)) {
+    async fn cleanup_fixture(
+        &self,
+        realm_id: &str,
+        (clients, user): (Vec<String>, Option<String>),
+    ) {
         if let Some(u) = user
             && let Err(e) = self.admin.delete_user(realm_id, &u).await
         {
@@ -740,25 +923,28 @@ impl IdpConsole {
     pub async fn summaries(&self) -> OpResult<Vec<RealmSummary>> {
         let mut out = vec![];
         for r in self.realms().await? {
-            let clients = self.visible_clients(&r.id).await.map(|c| c.len()).unwrap_or(0);
+            let clients = self
+                .visible_clients(&r.id)
+                .await
+                .map(|c| c.len())
+                .unwrap_or(0);
             let users = self
                 .admin
                 .list_users(&r.id)
                 .await
-                .map(|u| u.iter().filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX)).count())
+                .map(|u| {
+                    u.iter()
+                        .filter(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX))
+                        .count()
+                })
                 .unwrap_or(0);
             let now = Utc::now();
-            let key_age_days = self
-                .admin
-                .list_keys(&r.id)
-                .await
-                .ok()
-                .and_then(|ks| {
-                    ks.iter()
-                        .filter(|k| k.status == helios_idp::keys::KeyStatus::Active)
-                        .map(|k| (now - k.activate_at.unwrap_or(k.created_at)).num_days())
-                        .max()
-                });
+            let key_age_days = self.admin.list_keys(&r.id).await.ok().and_then(|ks| {
+                ks.iter()
+                    .filter(|k| k.status == helios_idp::keys::KeyStatus::Active)
+                    .map(|k| (now - k.activate_at.unwrap_or(k.created_at)).num_days())
+                    .max()
+            });
             out.push(RealmSummary {
                 name: r.spec.name.as_str().to_string(),
                 display_name: r.spec.display_name.clone(),
@@ -801,7 +987,13 @@ mod tests {
     fn wizard_state_roundtrips_in_branding() {
         let mut s = RealmSpec::new(RealmName::parse("x").unwrap(), "X");
         assert!(WizardState::of(&s).is_none());
-        let w = WizardState { draft: true, step: 3, template: Some(Template::Patient), endpoints: vec!["ep".into()], ..Default::default() };
+        let w = WizardState {
+            draft: true,
+            step: 3,
+            template: Some(Template::Patient),
+            endpoints: vec!["ep".into()],
+            ..Default::default()
+        };
         w.store(&mut s);
         assert_eq!(WizardState::of(&s), Some(w));
         WizardState::clear(&mut s);

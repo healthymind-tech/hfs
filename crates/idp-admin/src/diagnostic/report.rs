@@ -148,9 +148,7 @@ impl Step {
             None => Status::Skipped,
             Some(Status::Skipped) => Status::Skipped,
             Some(s) => {
-                if s == Status::Pass
-                    && self.checks.iter().all(|c| c.status == Status::Skipped)
-                {
+                if s == Status::Pass && self.checks.iter().all(|c| c.status == Status::Skipped) {
                     Status::Skipped
                 } else {
                     s
@@ -163,9 +161,11 @@ impl Step {
     pub fn skipped_because(n: u8, id: &str, title: &str, depends_on: &str) -> Self {
         let mut s = Self::new(n, id, title);
         s.push(
-            Check::skipped(&format!("{id}.dependency"), "skipped-dependency", format!(
-                "Skipped: it depends on step \"{depends_on}\", which failed."
-            ))
+            Check::skipped(
+                &format!("{id}.dependency"),
+                "skipped-dependency",
+                format!("Skipped: it depends on step \"{depends_on}\", which failed."),
+            )
             .param("step", depends_on),
         );
         s.finish();

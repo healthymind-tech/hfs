@@ -4,10 +4,10 @@
 //! field" anchor), not only as the protocol error it later produces.
 
 use chrono::{DateTime, Duration, Utc};
+use helios_idp::IdpError;
 use helios_idp::client::ClientSpec;
 use helios_idp::keys::{KeyRecord, KeyStatus};
 use helios_idp::realm::RealmSpec;
-use helios_idp::IdpError;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -19,8 +19,12 @@ use super::report::{Check, Step};
 pub enum EndpointProvider {
     /// External issuer (may still be this realm's issuer URL — the
     /// compatibility binding used until the `Internal` provider lands).
-    External { issuer: Option<String> },
-    Internal { realm: String },
+    External {
+        issuer: Option<String>,
+    },
+    Internal {
+        realm: String,
+    },
 }
 
 /// An endpoint as the diagnostic sees it.
@@ -94,21 +98,37 @@ pub fn run(input: &PreflightInput<'_>) -> Step {
 
     // Realm switched on and valid.
     if realm.enabled {
-        step.push(Check::pass("preflight.realm-enabled", "realm-enabled", "The authorization server is enabled."));
+        step.push(Check::pass(
+            "preflight.realm-enabled",
+            "realm-enabled",
+            "The authorization server is enabled.",
+        ));
     } else {
         step.push(
-            Check::fail("preflight.realm-enabled", "realm-disabled", "The authorization server is disabled: every request to it is refused.")
-                .field("realm.enabled")
-                .fix("Enable it in Settings → General."),
+            Check::fail(
+                "preflight.realm-enabled",
+                "realm-disabled",
+                "The authorization server is disabled: every request to it is refused.",
+            )
+            .field("realm.enabled")
+            .fix("Enable it in Settings → General."),
         );
     }
     match realm.validate() {
-        Ok(()) => step.push(Check::pass("preflight.realm-valid", "realm-valid", "Realm settings are valid.")),
+        Ok(()) => step.push(Check::pass(
+            "preflight.realm-valid",
+            "realm-valid",
+            "Realm settings are valid.",
+        )),
         Err(e) => step.push(
-            Check::fail("preflight.realm-valid", "realm-invalid", format!("Realm settings are invalid — {}", invalid_message(&e)))
-                .param("detail", invalid_message(&e))
-                .field(format!("realm.{}", field_of(&e).unwrap_or_default()))
-                .fix("Correct the highlighted setting and save."),
+            Check::fail(
+                "preflight.realm-valid",
+                "realm-invalid",
+                format!("Realm settings are invalid — {}", invalid_message(&e)),
+            )
+            .param("detail", invalid_message(&e))
+            .field(format!("realm.{}", field_of(&e).unwrap_or_default()))
+            .fix("Correct the highlighted setting and save."),
         ),
     }
 
@@ -131,11 +151,18 @@ fn keys(step: &mut Step, input: &PreflightInput<'_>) {
             .collect();
         let Some(k) = active.first() else {
             step.push(
-                Check::fail(&id, "key-missing", format!("No active {} signing key: tokens cannot be signed with this algorithm.", alg.as_str()))
-                    .param("alg", alg.as_str())
-                    .field("keys")
-                    .spec("design §6 (one active key per algorithm)")
-                    .fix("Open Signing keys and choose “Rotate now” to generate a key."),
+                Check::fail(
+                    &id,
+                    "key-missing",
+                    format!(
+                        "No active {} signing key: tokens cannot be signed with this algorithm.",
+                        alg.as_str()
+                    ),
+                )
+                .param("alg", alg.as_str())
+                .field("keys")
+                .spec("design §6 (one active key per algorithm)")
+                .fix("Open Signing keys and choose “Rotate now” to generate a key."),
             );
             continue;
         };
@@ -165,16 +192,28 @@ fn keys(step: &mut Step, input: &PreflightInput<'_>) {
             );
         } else {
             step.push(
-                Check::pass(&id, "key-active", format!("Active {} key {}.", alg.as_str(), short(&k.kid)))
-                    .param("alg", alg.as_str())
-                    .param("kid", short(&k.kid)),
+                Check::pass(
+                    &id,
+                    "key-active",
+                    format!("Active {} key {}.", alg.as_str(), short(&k.kid)),
+                )
+                .param("alg", alg.as_str())
+                .param("kid", short(&k.kid)),
             );
         }
         if active.len() > 1 {
             step.push(
-                Check::warn(&format!("{id}.duplicate"), "key-duplicate-active", format!("{} active {} keys; only one should sign.", active.len(), alg.as_str()))
-                    .param("alg", alg.as_str())
-                    .field("keys"),
+                Check::warn(
+                    &format!("{id}.duplicate"),
+                    "key-duplicate-active",
+                    format!(
+                        "{} active {} keys; only one should sign.",
+                        active.len(),
+                        alg.as_str()
+                    ),
+                )
+                .param("alg", alg.as_str())
+                .field("keys"),
             );
         }
     }
@@ -183,28 +222,51 @@ fn keys(step: &mut Step, input: &PreflightInput<'_>) {
 fn clients(step: &mut Step, input: &PreflightInput<'_>) {
     if input.clients.is_empty() {
         step.push(
-            Check::warn("preflight.clients", "clients-none", "No apps are registered: nothing can sign in yet.")
-                .field("clients")
-                .fix("Add an app under Clients."),
+            Check::warn(
+                "preflight.clients",
+                "clients-none",
+                "No apps are registered: nothing can sign in yet.",
+            )
+            .field("clients")
+            .fix("Add an app under Clients."),
         );
     }
     for c in input.clients {
         let base = format!("preflight.client.{}", c.client_id);
         if let Err(e) = c.validate() {
             step.push(
-                Check::fail(&format!("{base}.valid"), "client-invalid", format!("App {} is misconfigured — {}", c.client_id, invalid_message(&e)))
-                    .param("client", &c.client_id)
-                    .param("detail", invalid_message(&e))
-                    .field(format!("client.{}.{}", c.client_id, field_of(&e).unwrap_or_default()))
-                    .fix("Open the app and correct the highlighted field."),
+                Check::fail(
+                    &format!("{base}.valid"),
+                    "client-invalid",
+                    format!(
+                        "App {} is misconfigured — {}",
+                        c.client_id,
+                        invalid_message(&e)
+                    ),
+                )
+                .param("client", &c.client_id)
+                .param("detail", invalid_message(&e))
+                .field(format!(
+                    "client.{}.{}",
+                    c.client_id,
+                    field_of(&e).unwrap_or_default()
+                ))
+                .fix("Open the app and correct the highlighted field."),
             );
         }
         if c.disabled {
             step.push(
-                Check::warn(&format!("{base}.disabled"), "client-disabled", format!("App {} is disabled: it gets invalid_client on every request.", c.client_id))
-                    .param("client", &c.client_id)
-                    .field(format!("client.{}.disabled", c.client_id))
-                    .fix("Enable the app if it should be able to sign in."),
+                Check::warn(
+                    &format!("{base}.disabled"),
+                    "client-disabled",
+                    format!(
+                        "App {} is disabled: it gets invalid_client on every request.",
+                        c.client_id
+                    ),
+                )
+                .param("client", &c.client_id)
+                .field(format!("client.{}.disabled", c.client_id))
+                .fix("Enable the app if it should be able to sign in."),
             );
         }
     }
@@ -212,10 +274,17 @@ fn clients(step: &mut Step, input: &PreflightInput<'_>) {
         let base = format!("preflight.app.{}", app.client_id);
         match input.clients.iter().find(|c| c.client_id == app.client_id) {
             None => step.push(
-                Check::fail(&base, "app-unknown", format!("No app with client ID {} is registered in this authorization server.", app.client_id))
-                    .param("client", &app.client_id)
-                    .field("clients")
-                    .fix("Check the client ID the app is configured with, or register the app."),
+                Check::fail(
+                    &base,
+                    "app-unknown",
+                    format!(
+                        "No app with client ID {} is registered in this authorization server.",
+                        app.client_id
+                    ),
+                )
+                .param("client", &app.client_id)
+                .field("clients")
+                .fix("Check the client ID the app is configured with, or register the app."),
             ),
             Some(c) => {
                 if c.disabled {
@@ -229,9 +298,16 @@ fn clients(step: &mut Step, input: &PreflightInput<'_>) {
                 }
                 if c.redirect_uri_allowed(&app.redirect_uri) {
                     step.push(
-                        Check::pass(&format!("{base}.redirect"), "app-redirect-ok", format!("Redirect URI {} is registered for {}.", app.redirect_uri, c.client_id))
-                            .param("client", &c.client_id)
-                            .param("uri", &app.redirect_uri),
+                        Check::pass(
+                            &format!("{base}.redirect"),
+                            "app-redirect-ok",
+                            format!(
+                                "Redirect URI {} is registered for {}.",
+                                app.redirect_uri, c.client_id
+                            ),
+                        )
+                        .param("client", &c.client_id)
+                        .param("uri", &app.redirect_uri),
                     );
                 } else {
                     let registered = if c.redirect_uris.is_empty() {
@@ -400,7 +476,10 @@ mod tests {
                 realm: realm(),
                 base: Url::parse("https://h").unwrap(),
                 clients: vec![client("app")],
-                keys: vec![key(SigningAlg::RS256, 3, now), key(SigningAlg::ES256, 3, now)],
+                keys: vec![
+                    key(SigningAlg::RS256, 3, now),
+                    key(SigningAlg::ES256, 3, now),
+                ],
                 eps: vec![ep(Some("https://h/idp/clinic"))],
                 app: Some(AppProbe {
                     client_id: "app".into(),
@@ -445,8 +524,15 @@ mod tests {
         let mut fx = Fx::healthy();
         fx.clients[0].redirect_uris = vec!["https://app.example.org/callback".into()];
         let s = fx.run();
-        assert_eq!(failing(&s), vec![f("app-redirect-unregistered", "client.app.redirectUris")]);
-        let c = s.checks.iter().find(|c| c.code == "app-redirect-unregistered").unwrap();
+        assert_eq!(
+            failing(&s),
+            vec![f("app-redirect-unregistered", "client.app.redirectUris")]
+        );
+        let c = s
+            .checks
+            .iter()
+            .find(|c| c.code == "app-redirect-unregistered")
+            .unwrap();
         assert!(c.message.contains("https://app.example.org/callback"));
         assert!(!c.fix.is_empty());
     }
@@ -480,7 +566,10 @@ mod tests {
     fn endpoint_not_bound_is_pinpointed() {
         let mut fx = Fx::healthy();
         fx.eps[0] = ep(Some("https://keycloak.example/realms/x"));
-        assert_eq!(failing(&fx.run()), vec![f("endpoint-not-bound", "endpoints.ep1")]);
+        assert_eq!(
+            failing(&fx.run()),
+            vec![f("endpoint-not-bound", "endpoints.ep1")]
+        );
         fx.eps[0].provider = EndpointProvider::Internal {
             realm: "clinic".into(),
         };

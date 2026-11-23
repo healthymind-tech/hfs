@@ -157,7 +157,10 @@ impl Browser {
     }
 
     fn store_cookies(&mut self, url: &str, headers: &HeaderMap) {
-        let Some(host) = Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)) else {
+        let Some(host) = Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+        else {
             return;
         };
         for v in headers.get_all(header::SET_COOKIE) {
@@ -195,11 +198,17 @@ impl Browser {
     ) -> Result<Exchange, FetchError> {
         let mut waited = Duration::ZERO;
         loop {
-            let x = self.send_once(method.clone(), url, headers.clone(), body.clone()).await?;
+            let x = self
+                .send_once(method.clone(), url, headers.clone(), body.clone())
+                .await?;
             if x.status != 429 {
                 return Ok(x);
             }
-            let secs = x.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5).clamp(1, 30);
+            let secs = x
+                .header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(5)
+                .clamp(1, 30);
             let wait = Duration::from_secs(secs);
             if waited + wait > self.max_rate_wait {
                 self.rate_limited = true;
@@ -366,7 +375,18 @@ impl Form {
 
     /// The submit button whose name/value/label best means "approve".
     pub fn approve_button(&self) -> Option<(String, String)> {
-        const YES: &[&str] = &["approve", "allow", "accept", "grant", "consent", "yes", "continue", "authorize", "submit", "select"];
+        const YES: &[&str] = &[
+            "approve",
+            "allow",
+            "accept",
+            "grant",
+            "consent",
+            "yes",
+            "continue",
+            "authorize",
+            "submit",
+            "select",
+        ];
         const NO: &[&str] = &["deny", "reject", "cancel", "decline", "no"];
         let score = |s: &str| {
             let s = s.to_ascii_lowercase();
@@ -380,7 +400,9 @@ impl Form {
         };
         self.submits
             .iter()
-            .filter(|(n, v, l)| score(n) + score(v) + score(l) >= 0 && !(score(n) < 0 || score(v) < 0))
+            .filter(|(n, v, l)| {
+                score(n) + score(v) + score(l) >= 0 && !(score(n) < 0 || score(v) < 0)
+            })
             .max_by_key(|(n, v, l)| score(n) + score(v) + score(l))
             .map(|(n, v, _)| (n.clone(), v.clone()))
     }
@@ -434,14 +456,20 @@ pub fn forms(html: &str, page_url: &str) -> Vec<Form> {
                         }
                         "checkbox" => {
                             if v.attr("checked").is_some() && !name.is_empty() {
-                                form.fields.push((name, if value.is_empty() { "on".into() } else { value }));
+                                form.fields.push((
+                                    name,
+                                    if value.is_empty() { "on".into() } else { value },
+                                ));
                             }
                         }
                         "radio" => {
                             if name.is_empty() {
                                 continue;
                             }
-                            form.choices.entry(name.clone()).or_default().push(value.clone());
+                            form.choices
+                                .entry(name.clone())
+                                .or_default()
+                                .push(value.clone());
                             if v.attr("checked").is_some() {
                                 form.fields.push((name, value));
                             }
@@ -521,10 +549,11 @@ pub fn classify_page(html: &str, page_url: &str) -> PageKind {
     if let Some(f) = fs.iter().find(|f| f.password_field.is_some()) {
         return PageKind::Login(f.clone());
     }
-    if let Some(f) = fs
-        .iter()
-        .find(|f| f.choices.keys().any(|k| k == "patient" || k.ends_with("patient")))
-    {
+    if let Some(f) = fs.iter().find(|f| {
+        f.choices
+            .keys()
+            .any(|k| k == "patient" || k.ends_with("patient"))
+    }) {
         return PageKind::PatientPicker(f.clone());
     }
     if let Some(f) = fs
@@ -602,7 +631,10 @@ mod tests {
         match classify_page(CONSENT, "https://h/idp/p/consent?tx=1") {
             PageKind::Consent(f) => {
                 assert_eq!(f.action, "https://h/idp/p/consent");
-                assert_eq!(f.approve_button(), Some(("decision".into(), "approve".into())));
+                assert_eq!(
+                    f.approve_button(),
+                    Some(("decision".into(), "approve".into()))
+                );
                 assert_eq!(f.fields.iter().filter(|(n, _)| n == "scope").count(), 2);
             }
             other => panic!("{other:?}"),

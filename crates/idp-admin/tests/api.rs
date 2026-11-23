@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use helios_endpoints::{Actor, EndpointName, EndpointSpec, EndpointStore, MemoryEndpointStore, SecretKeyRing};
+use helios_endpoints::{
+    Actor, EndpointName, EndpointSpec, EndpointStore, MemoryEndpointStore, SecretKeyRing,
+};
 use helios_idp::admin::IdpAdmin;
 use helios_idp::memory::MemoryStore;
 use helios_idp::runtime::{ConventionalEndpointUrls, IdpRuntime};
@@ -19,9 +21,16 @@ use url::Url;
 fn auth() -> Authorize {
     api::authorize_sync(|parts| {
         if parts.headers.get("x-test-admin").is_some() {
-            Ok(Actor { subject: "local:admin".into(), display: None, via: "console-session".into() })
+            Ok(Actor {
+                subject: "local:admin".into(),
+                display: None,
+                via: "console-session".into(),
+            })
         } else {
-            Err((StatusCode::UNAUTHORIZED, "sign in as an administrator".into()))
+            Err((
+                StatusCode::UNAUTHORIZED,
+                "sign in as an administrator".into(),
+            ))
         }
     })
 }
@@ -29,10 +38,26 @@ fn auth() -> Authorize {
 async fn install() -> Arc<dyn EndpointStore> {
     let base = Url::parse("http://127.0.0.1:9").unwrap();
     let ring = Arc::new(SecretKeyRing::parse(&SecretKeyRing::generate_spec("t1")).unwrap());
-    let rt = IdpRuntime::new(Arc::new(MemoryStore::new()), Some(ring), base.clone(), Arc::new(ConventionalEndpointUrls { public_base: base.to_string() }));
+    let rt = IdpRuntime::new(
+        Arc::new(MemoryStore::new()),
+        Some(ring),
+        base.clone(),
+        Arc::new(ConventionalEndpointUrls {
+            public_base: base.to_string(),
+        }),
+    );
     let eps: Arc<dyn EndpointStore> = Arc::new(MemoryEndpointStore::default());
-    let actor = Actor { subject: "t".into(), display: None, via: "t".into() };
-    eps.create(EndpointSpec::named(EndpointName::parse("clinic").unwrap(), "Clinic"), &actor).await.unwrap();
+    let actor = Actor {
+        subject: "t".into(),
+        display: None,
+        via: "t".into(),
+    };
+    eps.create(
+        EndpointSpec::named(EndpointName::parse("clinic").unwrap(), "Clinic"),
+        &actor,
+    )
+    .await
+    .unwrap();
     let rt2 = rt.clone();
     let binder = StoreBinder {
         store: eps.clone(),
@@ -41,25 +66,46 @@ async fn install() -> Arc<dyn EndpointStore> {
         jwks_via: None,
         realms: Arc::new(move || rt2.realms().iter().map(|r| r.spec.clone()).collect()),
     };
-    service::install(Arc::new(IdpConsole::new(IdpAdmin::new(rt), Some(Arc::new(binder)))));
+    service::install(Arc::new(IdpConsole::new(
+        IdpAdmin::new(rt),
+        Some(Arc::new(binder)),
+    )));
     eps
 }
 
-async fn call(method: &str, path: &str, body: Option<Value>, headers: &[(&str, &str)]) -> (StatusCode, Value, Option<String>) {
+async fn call(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value, Option<String>) {
     let app = api::router(Some(auth()));
-    let mut b = Request::builder().method(method).uri(path).header("x-test-admin", "1");
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-test-admin", "1");
     for (k, v) in headers {
         b = b.header(*k, *v);
     }
     let req = match body {
-        Some(v) => b.header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+        Some(v) => b
+            .header("content-type", "application/json")
+            .body(Body::from(v.to_string()))
+            .unwrap(),
         None => b.body(Body::empty()).unwrap(),
     };
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let etag = resp.headers().get("etag").map(|v| v.to_str().unwrap().to_string());
+    let etag = resp
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string());
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null), etag)
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        etag,
+    )
 }
 
 fn realm_body(name: &str) -> Value {
@@ -75,32 +121,65 @@ async fn admin_api_end_to_end() {
 
     // Refused without an administrator.
     let resp = api::router(Some(auth()))
-        .oneshot(Request::get("/admin/idp/realms").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/admin/idp/realms")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let resp = api::router(None).oneshot(Request::get("/admin/idp/realms").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = api::router(None)
+        .oneshot(
+            Request::get("/admin/idp/realms")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Realms.
     let (s, v, _) = call("GET", "/admin/idp/realms", None, &[]).await;
-    assert_eq!((s, v["realms"].as_array().unwrap().len()), (StatusCode::OK, 0));
+    assert_eq!(
+        (s, v["realms"].as_array().unwrap().len()),
+        (StatusCode::OK, 0)
+    );
     let (s, v, _) = call("POST", "/admin/idp/realms", Some(realm_body("clinic")), &[]).await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     assert_eq!(v["issuer"], "http://127.0.0.1:9/idp/clinic");
     let mut bad = realm_body("clinic2");
     bad["lifetimes"] = json!({"accessToken": 99999});
     let (s, v, _) = call("POST", "/admin/idp/realms", Some(bad), &[]).await;
-    assert_eq!((s, v["field"].as_str()), (StatusCode::BAD_REQUEST, Some("lifetimes.accessToken")), "{v}");
+    assert_eq!(
+        (s, v["field"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("lifetimes.accessToken")),
+        "{v}"
+    );
     let (s, v, etag) = call("GET", "/admin/idp/realms/clinic", None, &[]).await;
     assert_eq!(s, StatusCode::OK);
     let etag = etag.unwrap();
     let mut spec = v["spec"].clone();
     spec["displayName"] = json!("Clinic (renamed)");
-    let (s, _, _) = call("PUT", "/admin/idp/realms/clinic", Some(spec.clone()), &[("if-match", "\"999\"")]).await;
+    let (s, _, _) = call(
+        "PUT",
+        "/admin/idp/realms/clinic",
+        Some(spec.clone()),
+        &[("if-match", "\"999\"")],
+    )
+    .await;
     assert_eq!(s, StatusCode::CONFLICT);
-    let (s, v, _) = call("PUT", "/admin/idp/realms/clinic", Some(spec), &[("if-match", &etag)]).await;
-    assert_eq!((s, v["spec"]["displayName"].as_str()), (StatusCode::OK, Some("Clinic (renamed)")));
+    let (s, v, _) = call(
+        "PUT",
+        "/admin/idp/realms/clinic",
+        Some(spec),
+        &[("if-match", &etag)],
+    )
+    .await;
+    assert_eq!(
+        (s, v["spec"]["displayName"].as_str()),
+        (StatusCode::OK, Some("Clinic (renamed)"))
+    );
     let (s, _, _) = call("GET", "/admin/idp/realms/nope", None, &[]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
@@ -109,9 +188,23 @@ async fn admin_api_end_to_end() {
     assert_eq!(v["keys"].as_array().unwrap().len(), 2);
     assert!(v["keys"][0]["publicJwk"].get("d").is_none());
     let (s, v, _) = call("POST", "/admin/idp/realms/clinic/$rotate-keys", None, &[]).await;
-    assert_eq!((s, v["created"].as_array().unwrap().len()), (StatusCode::OK, 2));
-    let (_, v, _) = call("POST", "/admin/idp/realms/clinic/$emergency-rotate", None, &[]).await;
-    let active = v["keys"].as_array().unwrap().iter().filter(|k| k["status"] == "active").count();
+    assert_eq!(
+        (s, v["created"].as_array().unwrap().len()),
+        (StatusCode::OK, 2)
+    );
+    let (_, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/$emergency-rotate",
+        None,
+        &[],
+    )
+    .await;
+    let active = v["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|k| k["status"] == "active")
+        .count();
     assert_eq!(active, 2);
 
     // Clients: secret returned once, write-only afterwards.
@@ -120,24 +213,50 @@ async fn admin_api_end_to_end() {
         "grantTypes": ["authorization_code"], "redirectUris": ["https://portal.example.org/cb"],
         "launchTypes": ["standalone"], "scopes": {"allowed": ["openid", "patient/*.rs"]},
     });
-    let (s, v, _) = call("POST", "/admin/idp/realms/clinic/clients", Some(client.clone()), &[]).await;
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/clients",
+        Some(client.clone()),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     let secret = v["clientSecret"].as_str().unwrap().to_string();
     assert!(secret.len() >= 32);
     assert_eq!(v["spec"]["auth"]["secret_hash"], json!({"set": true}));
     let (_, v, _) = call("GET", "/admin/idp/realms/clinic/clients/portal", None, &[]).await;
     assert!(!v.to_string().contains("argon2"), "{v}");
-    let (_, v, _) = call("POST", "/admin/idp/realms/clinic/clients/portal/$reset-secret", None, &[]).await;
+    let (_, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/clients/portal/$reset-secret",
+        None,
+        &[],
+    )
+    .await;
     assert_ne!(v["clientSecret"].as_str().unwrap(), secret);
     let mut wrong = client.clone();
     wrong["redirectUris"] = json!(["http://portal.example.org/cb"]);
     wrong["clientId"] = json!("x2");
     let (s, v, _) = call("POST", "/admin/idp/realms/clinic/clients", Some(wrong), &[]).await;
-    assert_eq!((s, v["field"].as_str()), (StatusCode::BAD_REQUEST, Some("redirectUris")), "{v}");
+    assert_eq!(
+        (s, v["field"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("redirectUris")),
+        "{v}"
+    );
     let mut upd = client.clone();
     upd["disabled"] = json!(true);
-    let (s, v, _) = call("PUT", "/admin/idp/realms/clinic/clients/portal", Some(upd), &[]).await;
-    assert_eq!((s, &v["spec"]["disabled"]), (StatusCode::OK, &json!(true)), "{v}");
+    let (s, v, _) = call(
+        "PUT",
+        "/admin/idp/realms/clinic/clients/portal",
+        Some(upd),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (s, &v["spec"]["disabled"]),
+        (StatusCode::OK, &json!(true)),
+        "{v}"
+    );
 
     // Users.
     let (s, v, _) = call("POST", "/admin/idp/realms/clinic/users", Some(json!({
@@ -147,9 +266,24 @@ async fn admin_api_end_to_end() {
     })), &[]).await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     let uid = v["id"].as_str().unwrap().to_string();
-    let (s, v, _) = call("POST", &format!("/admin/idp/realms/clinic/users/{uid}/$set-password"), Some(json!({"password": "short"})), &[]).await;
-    assert_eq!((s, v["field"].as_str()), (StatusCode::BAD_REQUEST, Some("password")));
-    let (s, _, _) = call("POST", &format!("/admin/idp/realms/clinic/users/{uid}/$set-password"), Some(json!({"password": "another long password!"})), &[]).await;
+    let (s, v, _) = call(
+        "POST",
+        &format!("/admin/idp/realms/clinic/users/{uid}/$set-password"),
+        Some(json!({"password": "short"})),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (s, v["field"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("password"))
+    );
+    let (s, _, _) = call(
+        "POST",
+        &format!("/admin/idp/realms/clinic/users/{uid}/$set-password"),
+        Some(json!({"password": "another long password!"})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, v, _) = call("GET", "/admin/idp/realms/clinic/users", None, &[]).await;
     assert_eq!(v["users"].as_array().unwrap().len(), 1);
@@ -160,32 +294,88 @@ async fn admin_api_end_to_end() {
     assert_eq!(v["grants"], json!([]));
 
     // Binding.
-    let (s, v, _) = call("GET", "/admin/idp/realms/clinic/endpoints/clinic", None, &[]).await;
-    assert_eq!((s, v["before"].as_str()), (StatusCode::OK, Some("inherit")), "{v}");
-    let (s, _, _) = call("PUT", "/admin/idp/realms/clinic/endpoints/clinic", Some(json!({"mode": "write-protect"})), &[]).await;
+    let (s, v, _) = call(
+        "GET",
+        "/admin/idp/realms/clinic/endpoints/clinic",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (s, v["before"].as_str()),
+        (StatusCode::OK, Some("inherit")),
+        "{v}"
+    );
+    let (s, _, _) = call(
+        "PUT",
+        "/admin/idp/realms/clinic/endpoints/clinic",
+        Some(json!({"mode": "write-protect"})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     let auth = eps.get("clinic").await.unwrap().unwrap().spec.auth.unwrap();
-    assert_eq!(auth.issuer.as_deref(), Some("http://127.0.0.1:9/idp/clinic"));
+    assert_eq!(
+        auth.issuer.as_deref(),
+        Some("http://127.0.0.1:9/idp/clinic")
+    );
     // Launch on a bound endpoint.
-    let (s, v, _) = call("POST", "/admin/idp/realms/clinic/launches", Some(json!({"endpoint": "clinic", "context": {"patient": "p1"}})), &[]).await;
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/launches",
+        Some(json!({"endpoint": "clinic", "context": {"patient": "p1"}})),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     assert!(v["launch"].as_str().unwrap().starts_with("hmlh_"));
 
     // Diagnostic (preflight only; the disabled client is pinpointed).
-    let (s, v, _) = call("POST", "/admin/idp/realms/clinic/$diagnose?preflight=only", Some(json!({"app": {"clientId": "portal", "redirectUri": "https://portal.example.org/cb"}})), &[]).await;
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/$diagnose?preflight=only",
+        Some(
+            json!({"app": {"clientId": "portal", "redirectUri": "https://portal.example.org/cb"}}),
+        ),
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     let checks: Vec<&Value> = v["steps"][0]["checks"].as_array().unwrap().iter().collect();
-    let dis = checks.iter().find(|c| c["code"] == "app-disabled").expect("app-disabled");
+    let dis = checks
+        .iter()
+        .find(|c| c["code"] == "app-disabled")
+        .expect("app-disabled");
     assert_eq!(dis["field"], "client.portal.disabled");
 
     // Delete client, realm (unbinds first).
-    let (s, _, _) = call("DELETE", "/admin/idp/realms/clinic/clients/portal", None, &[]).await;
+    let (s, _, _) = call(
+        "DELETE",
+        "/admin/idp/realms/clinic/clients/portal",
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, _, _) = call("DELETE", "/admin/idp/realms/clinic/clients/portal", None, &[]).await;
+    let (s, _, _) = call(
+        "DELETE",
+        "/admin/idp/realms/clinic/clients/portal",
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _, _) = call("DELETE", "/admin/idp/realms/clinic", None, &[]).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    assert!(eps.get("clinic").await.unwrap().unwrap().spec.auth.is_none());
+    assert!(
+        eps.get("clinic")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .auth
+            .is_none()
+    );
     service::uninstall();
     let (s, _, _) = call("GET", "/admin/idp/realms", None, &[]).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
@@ -201,7 +391,10 @@ fn openapi_matches_routes() {
             documented.push((m.to_uppercase(), p.clone()));
         }
     }
-    let mut routes: Vec<(String, String)> = ROUTES.iter().map(|(m, p)| (m.to_string(), p.to_string())).collect();
+    let mut routes: Vec<(String, String)> = ROUTES
+        .iter()
+        .map(|(m, p)| (m.to_string(), p.to_string()))
+        .collect();
     documented.sort();
     routes.sort();
     assert_eq!(documented, routes);

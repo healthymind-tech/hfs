@@ -25,7 +25,9 @@ use helios_idp::realm::RealmFeatures;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::http::{Browser, Exchange, FetchError, PageKind, classify_page, page_text, query_map, resolve};
+use super::http::{
+    Browser, Exchange, FetchError, PageKind, classify_page, page_text, query_map, resolve,
+};
 use super::preflight::{AppProbe, EndpointView};
 use super::report::{Check, Report, Status, Step};
 
@@ -172,7 +174,10 @@ fn net_fail(id: &str, url: &str, e: &FetchError) -> Check {
 fn oauth_error(x: &Exchange) -> (String, String) {
     let j = x.json().unwrap_or(Value::Null);
     (
-        j.get("error").and_then(Value::as_str).unwrap_or("").to_string(),
+        j.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         j.get("error_description")
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -220,7 +225,10 @@ pub async fn run(cfg: RunConfig, report: &mut Report) {
         steps.insert(4, timed(step_negative(&mut cx, None)).await);
         for (n, dep) in [(5u8, 3u8), (6, 3), (8, 3), (9, 3), (10, 3)] {
             let (id, title) = STEP_TITLES[(n - 1) as usize];
-            steps.insert(n, Step::skipped_because(n, id, title, STEP_TITLES[(dep - 1) as usize].1));
+            steps.insert(
+                n,
+                Step::skipped_because(n, id, title, STEP_TITLES[(dep - 1) as usize].1),
+            );
         }
         steps.insert(7, timed(step_backend(&mut cx)).await);
         report.steps.extend(steps.into_values());
@@ -279,7 +287,11 @@ async fn timed_with<T>(f: impl std::future::Future<Output = (Step, T)>) -> (Step
 // ---------------------------------------------------------------- step 1
 
 async fn fetch_json_doc(cx: &mut Ctx, s: &mut Step, id: &str, url: &str) -> Option<Value> {
-    let x = match cx.b.get_with(url, vec![("accept", "application/json".into())]).await {
+    let x = match cx
+        .b
+        .get_with(url, vec![("accept", "application/json".into())])
+        .await
+    {
         Ok(x) => x,
         Err(e) => {
             s.push(net_fail(id, url, &e));
@@ -298,11 +310,15 @@ async fn fetch_json_doc(cx: &mut Ctx, s: &mut Step, id: &str, url: &str) -> Opti
     }
     if x.status != 200 {
         s.push(
-            Check::fail(id, "doc-status", format!("{url} answered HTTP {}.", x.status))
-                .param("url", url)
-                .param("status", x.status.to_string())
-                .url(url)
-                .fix("Look at the server log for this request."),
+            Check::fail(
+                id,
+                "doc-status",
+                format!("{url} answered HTTP {}.", x.status),
+            )
+            .param("url", url)
+            .param("status", x.status.to_string())
+            .url(url)
+            .fix("Look at the server log for this request."),
         );
         return None;
     }
@@ -310,10 +326,14 @@ async fn fetch_json_doc(cx: &mut Ctx, s: &mut Step, id: &str, url: &str) -> Opti
         Some(v) if v.is_object() => Some(v),
         _ => {
             s.push(
-                Check::fail(id, "doc-not-json", format!("{url} answered with a web page, not JSON."))
-                    .param("url", url)
-                    .url(url)
-                    .fix("A proxy or another application answers this path. Route it to HFS."),
+                Check::fail(
+                    id,
+                    "doc-not-json",
+                    format!("{url} answered with a web page, not JSON."),
+                )
+                .param("url", url)
+                .url(url)
+                .fix("A proxy or another application answers this path. Route it to HFS."),
             );
             None
         }
@@ -351,7 +371,14 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
     if let Some(m) = &meta {
         let got = m.get("issuer").and_then(Value::as_str).unwrap_or("");
         if got == issuer {
-            s.push(Check::pass("discovery.oidc", "discovery-ok", format!("{oidc_url} names issuer {issuer}.")).url(&oidc_url));
+            s.push(
+                Check::pass(
+                    "discovery.oidc",
+                    "discovery-ok",
+                    format!("{oidc_url} names issuer {issuer}."),
+                )
+                .url(&oidc_url),
+            );
         } else {
             s.push(
                 Check::fail("discovery.oidc", "issuer-mismatch", format!(
@@ -375,21 +402,32 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
         .filter(|k| m.get(*k).is_none())
         .collect();
         if cx.cfg.features.openid_connect {
-            for k in ["subject_types_supported", "id_token_signing_alg_values_supported"] {
+            for k in [
+                "subject_types_supported",
+                "id_token_signing_alg_values_supported",
+            ] {
                 if m.get(k).is_none() {
                     missing.push(k);
                 }
             }
         }
         if missing.is_empty() {
-            s.push(Check::pass("discovery.fields", "discovery-fields-ok", "Required metadata fields are present."));
+            s.push(Check::pass(
+                "discovery.fields",
+                "discovery-fields-ok",
+                "Required metadata fields are present.",
+            ));
         } else {
             s.push(
-                Check::fail("discovery.fields", "discovery-fields-missing", format!("Discovery lacks: {}.", missing.join(", ")))
-                    .param("fields", missing.join(", "))
-                    .url(&oidc_url)
-                    .spec("RFC 8414 §2 / OIDC Discovery §3")
-                    .fix("This is a server defect; report it with the JSON report attached."),
+                Check::fail(
+                    "discovery.fields",
+                    "discovery-fields-missing",
+                    format!("Discovery lacks: {}.", missing.join(", ")),
+                )
+                .param("fields", missing.join(", "))
+                .url(&oidc_url)
+                .spec("RFC 8414 §2 / OIDC Discovery §3")
+                .fix("This is a server defect; report it with the JSON report attached."),
             );
         }
         let pkce: Vec<&str> = m
@@ -398,13 +436,21 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         if pkce.contains(&"S256") && !pkce.contains(&"plain") {
-            s.push(Check::pass("discovery.pkce", "pkce-s256-only", "PKCE S256 is advertised and plain is not."));
+            s.push(Check::pass(
+                "discovery.pkce",
+                "pkce-s256-only",
+                "PKCE S256 is advertised and plain is not.",
+            ));
         } else {
             s.push(
-                Check::fail("discovery.pkce", "pkce-advertised-wrong", format!("PKCE methods advertised: {pkce:?}; expected S256 only."))
-                    .param("methods", format!("{pkce:?}"))
-                    .spec("SMART 2.2 “Considerations for PKCE Support”")
-                    .fix("This is a server defect; report it."),
+                Check::fail(
+                    "discovery.pkce",
+                    "pkce-advertised-wrong",
+                    format!("PKCE methods advertised: {pkce:?}; expected S256 only."),
+                )
+                .param("methods", format!("{pkce:?}"))
+                .spec("SMART 2.2 “Considerations for PKCE Support”")
+                .fix("This is a server defect; report it."),
             );
         }
     }
@@ -418,7 +464,14 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
         if let Some(m2) = fetch_json_doc(cx, &mut s, "discovery.rfc8414", &as_url).await {
             let got = m2.get("issuer").and_then(Value::as_str).unwrap_or("");
             if got == issuer {
-                s.push(Check::pass("discovery.rfc8414", "discovery-ok", format!("{as_url} names issuer {issuer}.")).url(&as_url));
+                s.push(
+                    Check::pass(
+                        "discovery.rfc8414",
+                        "discovery-ok",
+                        format!("{as_url} names issuer {issuer}."),
+                    )
+                    .url(&as_url),
+                );
             } else {
                 s.push(
                     Check::fail("discovery.rfc8414", "issuer-mismatch", format!("RFC 8414 metadata says issuer {got:?}; expected {issuer}."))
@@ -433,19 +486,30 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
     }
     cx.meta = meta;
     // SMART configuration of every bound endpoint.
-    let eps = if cx.cfg.audience_only { vec![] } else { cx.cfg.endpoints.clone() };
+    let eps = if cx.cfg.audience_only {
+        vec![]
+    } else {
+        cx.cfg.endpoints.clone()
+    };
     if cx.cfg.audience_only {
         s.push(Check::skipped("discovery.smart", "endpoints-pending", "The endpoints are bound after these checks pass; their SMART configuration is checked then."));
     } else if eps.is_empty() {
         s.push(
-            Check::warn("discovery.smart", "endpoints-none", "No FHIR endpoint is bound, so no SMART configuration to check.")
-                .field("endpoints")
-                .fix("Bind an endpoint (Settings → Endpoints)."),
+            Check::warn(
+                "discovery.smart",
+                "endpoints-none",
+                "No FHIR endpoint is bound, so no SMART configuration to check.",
+            )
+            .field("endpoints")
+            .fix("Bind an endpoint (Settings → Endpoints)."),
         );
     }
     for e in eps {
         let id = format!("discovery.smart.{}", e.name);
-        let url = format!("{}/.well-known/smart-configuration", e.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/.well-known/smart-configuration",
+            e.base_url.trim_end_matches('/')
+        );
         let Some(sc) = fetch_json_doc(cx, &mut s, &id, &url).await else {
             if let Some(last) = s.checks.last_mut() {
                 last.field = Some(format!("endpoints.{}", e.name));
@@ -453,7 +517,10 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
             continue;
         };
         let got = sc.get("issuer").and_then(Value::as_str).unwrap_or("");
-        let authz = sc.get("authorization_endpoint").and_then(Value::as_str).unwrap_or("");
+        let authz = sc
+            .get("authorization_endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let want_authz = cx.ep("authorization_endpoint", "authorize");
         if got != issuer || authz != want_authz {
             s.push(
@@ -474,7 +541,11 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
         let caps: Vec<String> = sc
             .get("capabilities")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let f = &cx.cfg.features;
         let mut want = vec![];
@@ -490,9 +561,23 @@ async fn step_discovery(cx: &mut Ctx) -> Step {
         if f.openid_connect {
             want.push("sso-openid-connect");
         }
-        let missing: Vec<&str> = want.into_iter().filter(|w| !caps.iter().any(|c| c == w)).collect();
+        let missing: Vec<&str> = want
+            .into_iter()
+            .filter(|w| !caps.iter().any(|c| c == w))
+            .collect();
         if missing.is_empty() {
-            s.push(Check::pass(&id, "endpoint-smart-ok", format!("Endpoint {} advertises this server and its capabilities.", e.name)).param("endpoint", &e.name).url(&url));
+            s.push(
+                Check::pass(
+                    &id,
+                    "endpoint-smart-ok",
+                    format!(
+                        "Endpoint {} advertises this server and its capabilities.",
+                        e.name
+                    ),
+                )
+                .param("endpoint", &e.name)
+                .url(&url),
+            );
         } else {
             s.push(
                 Check::warn(&id, "endpoint-smart-capabilities", format!(
@@ -517,13 +602,21 @@ async fn step_jwks(cx: &mut Ctx) -> Step {
     let Some(doc) = fetch_json_doc(cx, &mut s, "jwks.fetch", &url).await else {
         return s;
     };
-    let keys: Vec<Value> = doc.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
+    let keys: Vec<Value> = doc
+        .get("keys")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     if keys.is_empty() {
         s.push(
-            Check::fail("jwks.keys", "jwks-empty", "The JWKS has no keys: no token can be verified.")
-                .url(&url)
-                .field("keys")
-                .fix("Open Signing keys and generate keys (“Rotate now”)."),
+            Check::fail(
+                "jwks.keys",
+                "jwks-empty",
+                "The JWKS has no keys: no token can be verified.",
+            )
+            .url(&url)
+            .field("keys")
+            .fix("Open Signing keys and generate keys (“Rotate now”)."),
         );
         return s;
     }
@@ -534,12 +627,22 @@ async fn step_jwks(cx: &mut Ctx) -> Step {
         if thumbprint(k) != kid {
             bad_kid.push(kid.to_string());
         }
-        if ["d", "p", "q", "dp", "dq", "qi", "k"].iter().any(|m| k.get(*m).is_some()) {
+        if ["d", "p", "q", "dp", "dq", "qi", "k"]
+            .iter()
+            .any(|m| k.get(*m).is_some())
+        {
             private.push(kid.to_string());
         }
     }
     if private.is_empty() {
-        s.push(Check::pass("jwks.private", "jwks-public-only", format!("{} published keys, no private members.", keys.len())).param("count", keys.len().to_string()));
+        s.push(
+            Check::pass(
+                "jwks.private",
+                "jwks-public-only",
+                format!("{} published keys, no private members.", keys.len()),
+            )
+            .param("count", keys.len().to_string()),
+        );
     } else {
         s.push(
             Check::fail("jwks.private", "jwks-private-member", format!("Keys {} publish private key material!", private.join(", ")))
@@ -549,13 +652,24 @@ async fn step_jwks(cx: &mut Ctx) -> Step {
         );
     }
     if bad_kid.is_empty() {
-        s.push(Check::pass("jwks.kid", "jwks-kid-thumbprint", "Every kid is the key's RFC 7638 thumbprint."));
+        s.push(Check::pass(
+            "jwks.kid",
+            "jwks-kid-thumbprint",
+            "Every kid is the key's RFC 7638 thumbprint.",
+        ));
     } else {
         s.push(
-            Check::warn("jwks.kid", "jwks-kid-not-thumbprint", format!("kid differs from the RFC 7638 thumbprint for {}.", bad_kid.join(", ")))
-                .param("kids", bad_kid.join(", "))
-                .spec("RFC 7638")
-                .field("keys"),
+            Check::warn(
+                "jwks.kid",
+                "jwks-kid-not-thumbprint",
+                format!(
+                    "kid differs from the RFC 7638 thumbprint for {}.",
+                    bad_kid.join(", ")
+                ),
+            )
+            .param("kids", bad_kid.join(", "))
+            .spec("RFC 7638")
+            .field("keys"),
         );
     }
     // An active key per advertised signing algorithm.
@@ -564,24 +678,36 @@ async fn step_jwks(cx: &mut Ctx) -> Step {
         .as_ref()
         .and_then(|m| m.get("id_token_signing_alg_values_supported"))
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     for alg in algs {
         let kty = if alg.starts_with("ES") { "EC" } else { "RSA" };
         let found = keys.iter().any(|k| {
-            k.get("alg").and_then(Value::as_str).map(|a| a == alg).unwrap_or_else(|| {
-                k.get("kty").and_then(Value::as_str) == Some(kty)
-            })
+            k.get("alg")
+                .and_then(Value::as_str)
+                .map(|a| a == alg)
+                .unwrap_or_else(|| k.get("kty").and_then(Value::as_str) == Some(kty))
         });
         let id = format!("jwks.alg.{alg}");
         if found {
-            s.push(Check::pass(&id, "jwks-alg-ok", format!("A {alg} key is published.")).param("alg", &alg));
+            s.push(
+                Check::pass(&id, "jwks-alg-ok", format!("A {alg} key is published."))
+                    .param("alg", &alg),
+            );
         } else {
             s.push(
-                Check::fail(&id, "jwks-alg-missing", format!("{alg} is advertised but no {alg} key is published."))
-                    .param("alg", &alg)
-                    .field("keys")
-                    .fix("Open Signing keys and rotate the missing algorithm."),
+                Check::fail(
+                    &id,
+                    "jwks-alg-missing",
+                    format!("{alg} is advertised but no {alg} key is published."),
+                )
+                .param("alg", &alg)
+                .field("keys")
+                .fix("Open Signing keys and rotate the missing algorithm."),
             );
         }
     }
@@ -610,8 +736,18 @@ enum AuthzOutcome {
     Redirect(BTreeMap<String, String>),
     /// The server stopped on a page (error page, or a login page that did
     /// not accept the credentials).
-    Page { status: u16, url: String, text: String, login_rejected: bool },
-    Json { status: u16, error: String, description: String, url: String },
+    Page {
+        status: u16,
+        url: String,
+        text: String,
+        login_rejected: bool,
+    },
+    Json {
+        status: u16,
+        error: String,
+        description: String,
+        url: String,
+    },
     Net(String, FetchError),
     TooManyHops(String),
 }
@@ -666,7 +802,12 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
         };
         if (300..400).contains(&x.status) {
             let Some(loc) = x.location().and_then(|l| resolve(&x.url, l)) else {
-                return AuthzOutcome::Page { status: x.status, url: x.url, text: "redirect without Location".into(), login_rejected: false };
+                return AuthzOutcome::Page {
+                    status: x.status,
+                    url: x.url,
+                    text: "redirect without Location".into(),
+                    login_rejected: false,
+                };
             };
             if loc.starts_with(r.redirect_uri) {
                 return AuthzOutcome::Redirect(query_map(&loc));
@@ -676,7 +817,12 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
         }
         if x.is_json() {
             let (error, description) = oauth_error(&x);
-            return AuthzOutcome::Json { status: x.status, error, description, url: x.url };
+            return AuthzOutcome::Json {
+                status: x.status,
+                error,
+                description,
+                url: x.url,
+            };
         }
         // form_post response mode: an auto-submitting form to redirect_uri.
         let kind = classify_page(&x.body, &x.url);
@@ -688,13 +834,23 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
         }
         if r.interactive || x.status >= 400 {
             let login_rejected = false;
-            return AuthzOutcome::Page { status: x.status, url: x.url.clone(), text: page_text(&x.body, 400), login_rejected };
+            return AuthzOutcome::Page {
+                status: x.status,
+                url: x.url.clone(),
+                text: page_text(&x.body, 400),
+                login_rejected,
+            };
         }
         match kind {
             PageKind::Login(mut f) => {
                 logins += 1;
                 if logins > 1 {
-                    return AuthzOutcome::Page { status: x.status, url: x.url.clone(), text: page_text(&x.body, 400), login_rejected: true };
+                    return AuthzOutcome::Page {
+                        status: x.status,
+                        url: x.url.clone(),
+                        text: page_text(&x.body, 400),
+                        login_rejected: true,
+                    };
                 }
                 if let Some(u) = f.username_field.clone() {
                     f.set(&u, &cx.cfg.fixture.username);
@@ -708,7 +864,12 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
                 pending = Some((f.action.clone(), f.fields.clone()));
             }
             PageKind::PatientPicker(mut f) => {
-                let key = f.choices.keys().find(|k| k.ends_with("patient")).cloned().unwrap_or_else(|| "patient".into());
+                let key = f
+                    .choices
+                    .keys()
+                    .find(|k| k.ends_with("patient"))
+                    .cloned()
+                    .unwrap_or_else(|| "patient".into());
                 let opts = f.choices.get(&key).cloned().unwrap_or_default();
                 let pick = cx
                     .cfg
@@ -716,7 +877,11 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
                     .patient
                     .clone()
                     .filter(|p| opts.iter().any(|o| o == p || o.ends_with(&format!("/{p}"))))
-                    .and_then(|p| opts.iter().find(|o| **o == p || o.ends_with(&format!("/{p}"))).cloned())
+                    .and_then(|p| {
+                        opts.iter()
+                            .find(|o| **o == p || o.ends_with(&format!("/{p}")))
+                            .cloned()
+                    })
                     .or_else(|| opts.iter().find(|o| !o.is_empty()).cloned())
                     .unwrap_or_default();
                 f.set(&key, &pick);
@@ -732,7 +897,12 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
                 pending = Some((f.action.clone(), f.fields.clone()));
             }
             PageKind::Other => {
-                return AuthzOutcome::Page { status: x.status, url: x.url.clone(), text: page_text(&x.body, 400), login_rejected: false };
+                return AuthzOutcome::Page {
+                    status: x.status,
+                    url: x.url.clone(),
+                    text: page_text(&x.body, 400),
+                    login_rejected: false,
+                };
             }
         }
     }
@@ -743,7 +913,12 @@ async fn drive(cx: &mut Ctx, r: &AuthzRequest<'_>) -> AuthzOutcome {
 fn secrets() -> (String, String, String, String) {
     let v = helios_idp::util::random_b64(32);
     let c = pkce::s256_challenge(&v);
-    (v, c, helios_idp::util::random_b64(16), helios_idp::util::random_b64(16))
+    (
+        v,
+        c,
+        helios_idp::util::random_b64(16),
+        helios_idp::util::random_b64(16),
+    )
 }
 
 async fn exchange_code(cx: &mut Ctx, code: &str, verifier: &str) -> Result<Exchange, FetchError> {
@@ -780,26 +955,46 @@ async fn code_flow(cx: &mut Ctx, id: &str) -> Result<(Value, String, String), Ch
         other => return Err(authz_failure(id, other, &f)),
     };
     if let Some(err) = params.get("error") {
-        return Err(Check::fail(id, "authorize-error", format!(
-            "The authorization server redirected back with error={err} ({}).",
-            params.get("error_description").cloned().unwrap_or_default()
-        ))
+        return Err(Check::fail(
+            id,
+            "authorize-error",
+            format!(
+                "The authorization server redirected back with error={err} ({}).",
+                params.get("error_description").cloned().unwrap_or_default()
+            ),
+        )
         .param("error", err)
-        .param("detail", params.get("error_description").cloned().unwrap_or_default())
+        .param(
+            "detail",
+            params.get("error_description").cloned().unwrap_or_default(),
+        )
         .fix(hint_for_error(err)));
     }
     let Some(code) = params.get("code") else {
-        return Err(Check::fail(id, "authorize-no-code", "Redirected back without a code."));
+        return Err(Check::fail(
+            id,
+            "authorize-no-code",
+            "Redirected back without a code.",
+        ));
     };
-    let x = exchange_code(cx, code, &verifier).await.map_err(|e| net_fail(id, &cx.ep("token_endpoint", "token"), &e))?;
+    let x = exchange_code(cx, code, &verifier)
+        .await
+        .map_err(|e| net_fail(id, &cx.ep("token_endpoint", "token"), &e))?;
     if x.status != 200 {
         let (e, d) = oauth_error(&x);
-        return Err(Check::fail(id, "token-refused", format!("The token endpoint refused the code: HTTP {} {e} ({d}).", x.status))
-            .param("status", x.status.to_string())
-            .param("error", &e)
-            .param("detail", &d)
-            .url(&x.url)
-            .fix(hint_for_error(&e)));
+        return Err(Check::fail(
+            id,
+            "token-refused",
+            format!(
+                "The token endpoint refused the code: HTTP {} {e} ({d}).",
+                x.status
+            ),
+        )
+        .param("status", x.status.to_string())
+        .param("error", &e)
+        .param("detail", &d)
+        .url(&x.url)
+        .fix(hint_for_error(&e)));
     }
     let body = x.json().unwrap_or(Value::Null);
     Ok((body, nonce, state_check(&params, &state)))
@@ -822,11 +1017,19 @@ fn rate_limited_check(id: &str, url: &str) -> Check {
 
 fn hint_for_error(err: &str) -> &'static str {
     match err {
-        "invalid_client" | "unauthorized_client" => "The client is unknown, disabled or not allowed this grant. Check the app under Clients.",
-        "invalid_scope" => "A requested scope is not allowed for this client. Widen the client's allowed scopes or the realm's capabilities.",
-        "invalid_request" => "The request was refused; the description says which parameter. A common cause is an aud that is not a bound endpoint.",
+        "invalid_client" | "unauthorized_client" => {
+            "The client is unknown, disabled or not allowed this grant. Check the app under Clients."
+        }
+        "invalid_scope" => {
+            "A requested scope is not allowed for this client. Widen the client's allowed scopes or the realm's capabilities."
+        }
+        "invalid_request" => {
+            "The request was refused; the description says which parameter. A common cause is an aud that is not a bound endpoint."
+        }
         "access_denied" => "Consent was denied or the user is not allowed to use this app.",
-        "invalid_grant" => "The code or refresh token was refused (expired, reused, or PKCE mismatch).",
+        "invalid_grant" => {
+            "The code or refresh token was refused (expired, reused, or PKCE mismatch)."
+        }
         "login_required" | "interaction_required" => "The session is not valid.",
         "server_error" | "temporarily_unavailable" => "The server failed; look at its log.",
         _ => "Look at the server log for this request.",
@@ -869,7 +1072,9 @@ fn authz_failure(id: &str, o: AuthzOutcome, f: &Fixture) -> Check {
 /// Verifies a JWS against the fetched JWKS; returns header + claims.
 fn verify_jwt(jwks: Option<&Value>, token: &str) -> Result<(Value, Value), String> {
     let mut parts = token.split('.');
-    let (Some(h), Some(p), Some(_sig), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+    let (Some(h), Some(p), Some(_sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return Err("not a compact JWS".into());
     };
     let dec = |s: &str| -> Result<Value, String> {
@@ -882,22 +1087,34 @@ fn verify_jwt(jwks: Option<&Value>, token: &str) -> Result<(Value, Value), Strin
     let claims = dec(p)?;
     let kid = header.get("kid").and_then(Value::as_str).unwrap_or("");
     let alg_s = header.get("alg").and_then(Value::as_str).unwrap_or("");
-    let alg: jsonwebtoken::Algorithm = alg_s.parse().map_err(|_| format!("unsupported alg {alg_s:?}"))?;
-    if matches!(alg, jsonwebtoken::Algorithm::HS256 | jsonwebtoken::Algorithm::HS384 | jsonwebtoken::Algorithm::HS512) {
+    let alg: jsonwebtoken::Algorithm = alg_s
+        .parse()
+        .map_err(|_| format!("unsupported alg {alg_s:?}"))?;
+    if matches!(
+        alg,
+        jsonwebtoken::Algorithm::HS256
+            | jsonwebtoken::Algorithm::HS384
+            | jsonwebtoken::Algorithm::HS512
+    ) {
         return Err(format!("symmetric alg {alg_s} must not be used"));
     }
     let jwk = jwks
         .and_then(|j| j.get("keys"))
         .and_then(Value::as_array)
-        .and_then(|ks| ks.iter().find(|k| k.get("kid").and_then(Value::as_str) == Some(kid)))
+        .and_then(|ks| {
+            ks.iter()
+                .find(|k| k.get("kid").and_then(Value::as_str) == Some(kid))
+        })
         .ok_or_else(|| format!("kid {kid:?} is not in the published JWKS"))?;
-    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk.clone()).map_err(|e| e.to_string())?;
+    let jwk: jsonwebtoken::jwk::Jwk =
+        serde_json::from_value(jwk.clone()).map_err(|e| e.to_string())?;
     let key = jsonwebtoken::DecodingKey::from_jwk(&jwk).map_err(|e| e.to_string())?;
     let mut v = jsonwebtoken::Validation::new(alg);
     v.validate_exp = false;
     v.validate_aud = false;
     v.required_spec_claims.clear();
-    jsonwebtoken::decode::<Value>(token, &key, &v).map_err(|e| format!("signature does not verify: {e}"))?;
+    jsonwebtoken::decode::<Value>(token, &key, &v)
+        .map_err(|e| format!("signature does not verify: {e}"))?;
     Ok((header, claims))
 }
 
@@ -935,21 +1152,40 @@ async fn step_authorization_code(cx: &mut Ctx, jwks_ok: bool) -> (Step, Option<T
         std::mem::swap(&mut probe, &mut cx.b);
         match outcome {
             AuthzOutcome::Page { status, text, .. } if status < 400 => s.push(
-                Check::pass(&id, "app-authorize-ok", format!("App {} reaches the sign-in page with redirect URI {}.", app.client_id, app.redirect_uri))
-                    .param("client", &app.client_id)
-                    .param("uri", &app.redirect_uri)
-                    .param("detail", text),
+                Check::pass(
+                    &id,
+                    "app-authorize-ok",
+                    format!(
+                        "App {} reaches the sign-in page with redirect URI {}.",
+                        app.client_id, app.redirect_uri
+                    ),
+                )
+                .param("client", &app.client_id)
+                .param("uri", &app.redirect_uri)
+                .param("detail", text),
             ),
             AuthzOutcome::Redirect(p) if !p.contains_key("error") => s.push(
-                Check::pass(&id, "app-authorize-ok", format!("App {} is accepted.", app.client_id)).param("client", &app.client_id).param("uri", &app.redirect_uri),
+                Check::pass(
+                    &id,
+                    "app-authorize-ok",
+                    format!("App {} is accepted.", app.client_id),
+                )
+                .param("client", &app.client_id)
+                .param("uri", &app.redirect_uri),
             ),
             other => {
                 let mut c = authz_failure(&id, other, &cx.cfg.fixture);
                 c.code = "app-authorize-refused".into();
-                c.message = format!("App {} is refused at the authorization endpoint — {}", app.client_id, c.message);
+                c.message = format!(
+                    "App {} is refused at the authorization endpoint — {}",
+                    app.client_id, c.message
+                );
                 c.field = Some(format!("client.{}.redirectUris", app.client_id));
                 c.fix = "See the Configuration step for the exact cause (disabled app, unregistered redirect URI).".into();
-                s.push(c.param("client", &app.client_id).param("uri", &app.redirect_uri));
+                s.push(
+                    c.param("client", &app.client_id)
+                        .param("uri", &app.redirect_uri),
+                );
             }
         }
     }
@@ -960,29 +1196,63 @@ async fn step_authorization_code(cx: &mut Ctx, jwks_ok: bool) -> (Step, Option<T
             return (s, None);
         }
     };
-    s.push(Check::pass("authorization-code.flow", "code-flow-ok", "Signed in through the hosted login form and exchanged the code with PKCE S256."));
+    s.push(Check::pass(
+        "authorization-code.flow",
+        "code-flow-ok",
+        "Signed in through the hosted login form and exchanged the code with PKCE S256.",
+    ));
     match state.as_str() {
-        "ok" => s.push(Check::pass("authorization-code.state", "state-echoed", "state was echoed.")),
+        "ok" => s.push(Check::pass(
+            "authorization-code.state",
+            "state-echoed",
+            "state was echoed.",
+        )),
         other => s.push(
-            Check::fail("authorization-code.state", "state-not-echoed", format!("state was {other} in the authorization response."))
-                .spec("RFC 6749 §4.1.2")
-                .fix("Server defect; report it."),
+            Check::fail(
+                "authorization-code.state",
+                "state-not-echoed",
+                format!("state was {other} in the authorization response."),
+            )
+            .spec("RFC 6749 §4.1.2")
+            .fix("Server defect; report it."),
         ),
     }
-    let access = body.get("access_token").and_then(Value::as_str).unwrap_or("").to_string();
-    let refresh = body.get("refresh_token").and_then(Value::as_str).map(String::from);
-    let id_token = body.get("id_token").and_then(Value::as_str).map(String::from);
-    if body.get("token_type").and_then(Value::as_str).map(|t| t.eq_ignore_ascii_case("bearer")) != Some(true)
+    let access = body
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let refresh = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let id_token = body
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(String::from);
+    if body
+        .get("token_type")
+        .and_then(Value::as_str)
+        .map(|t| t.eq_ignore_ascii_case("bearer"))
+        != Some(true)
         || access.is_empty()
         || body.get("expires_in").is_none()
     {
         s.push(
-            Check::fail("authorization-code.response", "token-response-shape", "The token response lacks access_token, token_type=Bearer or expires_in.")
-                .spec("SMART “Obtain access token”")
-                .fix("Server defect; report it."),
+            Check::fail(
+                "authorization-code.response",
+                "token-response-shape",
+                "The token response lacks access_token, token_type=Bearer or expires_in.",
+            )
+            .spec("SMART “Obtain access token”")
+            .fix("Server defect; report it."),
         );
     }
-    let mut tokens = Tokens { access: access.clone(), id_token: id_token.clone(), id_sub: None };
+    let mut tokens = Tokens {
+        access: access.clone(),
+        id_token: id_token.clone(),
+        id_sub: None,
+    };
     let jwks = if jwks_ok { cx.jwks.clone() } else { None };
     // Access token.
     match verify_jwt(jwks.as_ref(), &access) {
@@ -1037,18 +1307,27 @@ async fn step_authorization_code(cx: &mut Ctx, jwks_ok: bool) -> (Step, Option<T
     if cx.cfg.features.openid_connect && cx.cfg.fixture.scopes.split(' ').any(|t| t == "openid") {
         match id_token.as_deref().map(|t| verify_jwt(jwks.as_ref(), t)) {
             None => s.push(
-                Check::fail("authorization-code.id-token", "id-token-missing", "scope openid was granted but no id_token was returned.")
-                    .spec("OIDC Core §3.1.3.3")
-                    .fix("Server defect; report it."),
+                Check::fail(
+                    "authorization-code.id-token",
+                    "id-token-missing",
+                    "scope openid was granted but no id_token was returned.",
+                )
+                .spec("OIDC Core §3.1.3.3")
+                .fix("Server defect; report it."),
             ),
             Some(Err(e)) => s.push(
-                Check::fail("authorization-code.id-token", "id-token-signature", format!("The id_token does not verify: {e}"))
-                    .param("detail", e)
-                    .field("keys"),
+                Check::fail(
+                    "authorization-code.id-token",
+                    "id-token-signature",
+                    format!("The id_token does not verify: {e}"),
+                )
+                .param("detail", e)
+                .field("keys"),
             ),
             Some(Ok((h, c))) => {
                 let mut problems = vec![];
-                if c.get("aud").and_then(Value::as_str) != Some(cx.cfg.fixture.public_client_id.as_str())
+                if c.get("aud").and_then(Value::as_str)
+                    != Some(cx.cfg.fixture.public_client_id.as_str())
                     && !aud_contains(&c, &cx.cfg.fixture.public_client_id)
                 {
                     problems.push("aud is not the client id".to_string());
@@ -1061,28 +1340,45 @@ async fn step_authorization_code(cx: &mut Ctx, jwks_ok: bool) -> (Step, Option<T
                 }
                 if let (Some(ah), Some(alg)) = (
                     c.get("at_hash").and_then(Value::as_str),
-                    h.get("alg").and_then(Value::as_str).and_then(|a| a.parse::<SigningAlg>().ok()),
+                    h.get("alg")
+                        .and_then(Value::as_str)
+                        .and_then(|a| a.parse::<SigningAlg>().ok()),
                 ) && ah != helios_idp::token::at_hash(&access, alg)
                 {
                     problems.push("at_hash does not match the access token".into());
                 }
                 tokens.id_sub = c.get("sub").and_then(Value::as_str).map(String::from);
                 if problems.is_empty() {
-                    s.push(Check::pass("authorization-code.id-token", "id-token-ok", "The id_token verifies (signature, iss, aud, nonce, at_hash)."));
+                    s.push(Check::pass(
+                        "authorization-code.id-token",
+                        "id-token-ok",
+                        "The id_token verifies (signature, iss, aud, nonce, at_hash).",
+                    ));
                 } else {
                     s.push(
-                        Check::fail("authorization-code.id-token", "id-token-claims", format!("id_token claims are wrong: {}.", problems.join("; ")))
-                            .param("detail", problems.join("; "))
-                            .spec("OIDC Core §3.1.3.7"),
+                        Check::fail(
+                            "authorization-code.id-token",
+                            "id-token-claims",
+                            format!("id_token claims are wrong: {}.", problems.join("; ")),
+                        )
+                        .param("detail", problems.join("; "))
+                        .spec("OIDC Core §3.1.3.7"),
                     );
                 }
             }
         }
     }
-    if cx.cfg.features.offline_access && cx.cfg.fixture.scopes.contains("offline_access") && refresh.is_none() {
+    if cx.cfg.features.offline_access
+        && cx.cfg.fixture.scopes.contains("offline_access")
+        && refresh.is_none()
+    {
         s.push(
-            Check::warn("authorization-code.refresh-token", "refresh-token-missing", "offline_access was requested but no refresh token was issued.")
-                .field("realm.features.offlineAccess"),
+            Check::warn(
+                "authorization-code.refresh-token",
+                "refresh-token-missing",
+                "offline_access was requested but no refresh token was issued.",
+            )
+            .field("realm.features.offlineAccess"),
         );
     }
     (s, Some(tokens))
@@ -1112,8 +1408,12 @@ fn token_clock(cx: &Ctx, s: &mut Step, id: &str, claims: &Value) {
         && exp <= now
     {
         s.push(
-            Check::fail(id, "token-already-expired", "The token is already expired when received.")
-                .fix("Check token lifetimes (Settings → Lifetimes) and the server clock."),
+            Check::fail(
+                id,
+                "token-already-expired",
+                "The token is already expired when received.",
+            )
+            .fix("Check token lifetimes (Settings → Lifetimes) and the server clock."),
         );
     }
 }
@@ -1140,12 +1440,20 @@ async fn step_negative(cx: &mut Ctx, tokens: Option<&Tokens>) -> Step {
         };
         match drive(cx, &req).await {
             AuthzOutcome::Redirect(_) => s.push(
-                Check::fail("negative.redirect", "open-redirect", "An unregistered redirect_uri was redirected to: this is an open redirector.")
-                    .spec("RFC 9700 §4.1.3; RFC 6749 §4.1.2.1")
-                    .fix("Server defect — do not use this realm until fixed; report it."),
+                Check::fail(
+                    "negative.redirect",
+                    "open-redirect",
+                    "An unregistered redirect_uri was redirected to: this is an open redirector.",
+                )
+                .spec("RFC 9700 §4.1.3; RFC 6749 §4.1.2.1")
+                .fix("Server defect — do not use this realm until fixed; report it."),
             ),
             AuthzOutcome::Net(u, e) => s.push(net_fail("negative.redirect", &u, &e)),
-            _ => s.push(Check::pass("negative.redirect", "redirect-refused", "An unregistered redirect_uri shows an error page and is never redirected to.")),
+            _ => s.push(Check::pass(
+                "negative.redirect",
+                "redirect-refused",
+                "An unregistered redirect_uri shows an error page and is never redirected to.",
+            )),
         }
     }
     // PKCE plain refused.
@@ -1164,16 +1472,31 @@ async fn step_negative(cx: &mut Ctx, tokens: Option<&Tokens>) -> Step {
         };
         match drive(cx, &req).await {
             AuthzOutcome::Redirect(p) if p.contains_key("code") => s.push(
-                Check::fail("negative.pkce-plain", "pkce-plain-accepted", "code_challenge_method=plain was accepted.")
-                    .spec("SMART 2.2 PKCE; OAuth 2.1 §4.1.1")
-                    .fix("Server defect; report it."),
+                Check::fail(
+                    "negative.pkce-plain",
+                    "pkce-plain-accepted",
+                    "code_challenge_method=plain was accepted.",
+                )
+                .spec("SMART 2.2 PKCE; OAuth 2.1 §4.1.1")
+                .fix("Server defect; report it."),
             ),
             AuthzOutcome::Net(u, e) => s.push(net_fail("negative.pkce-plain", &u, &e)),
-            _ => s.push(Check::pass("negative.pkce-plain", "pkce-plain-refused", "PKCE plain is refused.")),
+            _ => s.push(Check::pass(
+                "negative.pkce-plain",
+                "pkce-plain-refused",
+                "PKCE plain is refused.",
+            )),
         }
     }
     if tokens.is_none() {
-        s.push(Check::skipped("negative.code", "skipped-dependency", "Code checks skipped: sign-in failed.").param("step", "authorization-code"));
+        s.push(
+            Check::skipped(
+                "negative.code",
+                "skipped-dependency",
+                "Code checks skipped: sign-in failed.",
+            )
+            .param("step", "authorization-code"),
+        );
         return s;
     }
     // Wrong code_verifier → invalid_grant.
@@ -1182,15 +1505,31 @@ async fn step_negative(cx: &mut Ctx, tokens: Option<&Tokens>) -> Step {
             let (wrong, _, _, _) = secrets();
             match exchange_code(cx, &code, &wrong).await {
                 Ok(x) if x.status == 400 && oauth_error(&x).0 == "invalid_grant" => {
-                    s.push(Check::pass("negative.verifier", "verifier-refused", "A wrong code_verifier gets invalid_grant."))
+                    s.push(Check::pass(
+                        "negative.verifier",
+                        "verifier-refused",
+                        "A wrong code_verifier gets invalid_grant.",
+                    ))
                 }
                 Ok(x) => s.push(
-                    Check::fail("negative.verifier", "verifier-accepted", format!("A wrong code_verifier got HTTP {} {}.", x.status, oauth_error(&x).0))
-                        .param("status", x.status.to_string())
-                        .spec("RFC 7636 §4.6")
-                        .fix("Server defect; report it."),
+                    Check::fail(
+                        "negative.verifier",
+                        "verifier-accepted",
+                        format!(
+                            "A wrong code_verifier got HTTP {} {}.",
+                            x.status,
+                            oauth_error(&x).0
+                        ),
+                    )
+                    .param("status", x.status.to_string())
+                    .spec("RFC 7636 §4.6")
+                    .fix("Server defect; report it."),
                 ),
-                Err(e) => s.push(net_fail("negative.verifier", &cx.ep("token_endpoint", "token"), &e)),
+                Err(e) => s.push(net_fail(
+                    "negative.verifier",
+                    &cx.ep("token_endpoint", "token"),
+                    &e,
+                )),
             }
         }
         Err(c) => s.push(c),
@@ -1203,29 +1542,53 @@ async fn step_negative(cx: &mut Ctx, tokens: Option<&Tokens>) -> Step {
                 .ok()
                 .filter(|x| x.status == 200)
                 .and_then(|x| x.json())
-                .and_then(|j| j.get("access_token").and_then(Value::as_str).map(String::from));
+                .and_then(|j| {
+                    j.get("access_token")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                });
             match exchange_code(cx, &code, &verifier).await {
                 Ok(x) if x.status == 400 && oauth_error(&x).0 == "invalid_grant" => {
-                    s.push(Check::pass("negative.replay", "code-replay-refused", "A replayed code gets invalid_grant."));
+                    s.push(Check::pass(
+                        "negative.replay",
+                        "code-replay-refused",
+                        "A replayed code gets invalid_grant.",
+                    ));
                     if let Some(at) = first_at
                         && cx.cfg.features.introspection
                     {
                         match introspect(cx, &at).await {
-                            Some(false) => s.push(Check::pass("negative.replay-revokes", "code-replay-revokes", "The replay revoked the tokens of the first exchange.")),
+                            Some(false) => s.push(Check::pass(
+                                "negative.replay-revokes",
+                                "code-replay-revokes",
+                                "The replay revoked the tokens of the first exchange.",
+                            )),
                             Some(true) => s.push(
-                                Check::warn("negative.replay-revokes", "code-replay-not-revoking", "The replay did not revoke the tokens issued for the code.")
-                                    .spec("RFC 6749 §4.1.2 (SHOULD revoke)"),
+                                Check::warn(
+                                    "negative.replay-revokes",
+                                    "code-replay-not-revoking",
+                                    "The replay did not revoke the tokens issued for the code.",
+                                )
+                                .spec("RFC 6749 §4.1.2 (SHOULD revoke)"),
                             ),
                             None => {}
                         }
                     }
                 }
                 Ok(x) => s.push(
-                    Check::fail("negative.replay", "code-replay-accepted", format!("A replayed code got HTTP {}.", x.status))
-                        .spec("RFC 6749 §4.1.2")
-                        .fix("Server defect; report it."),
+                    Check::fail(
+                        "negative.replay",
+                        "code-replay-accepted",
+                        format!("A replayed code got HTTP {}.", x.status),
+                    )
+                    .spec("RFC 6749 §4.1.2")
+                    .fix("Server defect; report it."),
                 ),
-                Err(e) => s.push(net_fail("negative.replay", &cx.ep("token_endpoint", "token"), &e)),
+                Err(e) => s.push(net_fail(
+                    "negative.replay",
+                    &cx.ep("token_endpoint", "token"),
+                    &e,
+                )),
             }
         }
         Err(c) => s.push(c),
@@ -1249,11 +1612,18 @@ async fn fresh_code(cx: &mut Ctx) -> Result<(String, String), Check> {
         interactive: false,
     };
     match drive(cx, &req).await {
-        AuthzOutcome::Redirect(p) => p
-            .get("code")
-            .cloned()
-            .map(|c| (c, verifier))
-            .ok_or_else(|| Check::fail("negative.code", "authorize-error", format!("No code: {:?}", p.get("error")))),
+        AuthzOutcome::Redirect(p) => {
+            p.get("code")
+                .cloned()
+                .map(|c| (c, verifier))
+                .ok_or_else(|| {
+                    Check::fail(
+                        "negative.code",
+                        "authorize-error",
+                        format!("No code: {:?}", p.get("error")),
+                    )
+                })
+        }
         other => Err(authz_failure("negative.code", other, &f)),
     }
 }
@@ -1263,12 +1633,19 @@ async fn fresh_code(cx: &mut Ctx) -> Result<(String, String), Check> {
 async fn step_fhir(cx: &mut Ctx, access: &str) -> Step {
     let mut s = new_step(5);
     if cx.cfg.audience_only {
-        s.push(Check::skipped("fhir.pending", "endpoints-pending", "The endpoints are bound after these checks pass; the FHIR call runs then."));
+        s.push(Check::skipped(
+            "fhir.pending",
+            "endpoints-pending",
+            "The endpoints are bound after these checks pass; the FHIR call runs then.",
+        ));
         return s;
     }
     let eps = cx.cfg.endpoints.clone();
     if eps.is_empty() {
-        s.push(Check::skipped("fhir.none", "endpoints-none", "No bound endpoint to call.").field("endpoints"));
+        s.push(
+            Check::skipped("fhir.none", "endpoints-none", "No bound endpoint to call.")
+                .field("endpoints"),
+        );
         return s;
     }
     for e in eps {
@@ -1285,8 +1662,26 @@ async fn step_fhir(cx: &mut Ctx, access: &str) -> Step {
             None => format!("{base}/Patient?_count=1"),
         };
         let id = format!("fhir.{}.read", e.name);
-        match cx.b.get_with(&url, vec![("authorization", format!("Bearer {access}")), ("accept", "application/fhir+json".into())]).await {
-            Ok(x) if x.status == 200 => s.push(Check::pass(&id, "fhir-read-ok", format!("GET {url} with the token → 200.")).param("endpoint", &e.name).url(&url)),
+        match cx
+            .b
+            .get_with(
+                &url,
+                vec![
+                    ("authorization", format!("Bearer {access}")),
+                    ("accept", "application/fhir+json".into()),
+                ],
+            )
+            .await
+        {
+            Ok(x) if x.status == 200 => s.push(
+                Check::pass(
+                    &id,
+                    "fhir-read-ok",
+                    format!("GET {url} with the token → 200."),
+                )
+                .param("endpoint", &e.name)
+                .url(&url),
+            ),
             Ok(x) if x.status == 401 || x.status == 403 => {
                 let www = x.header("www-authenticate").unwrap_or("").to_string();
                 s.push(
@@ -1302,15 +1697,27 @@ async fn step_fhir(cx: &mut Ctx, access: &str) -> Step {
                 );
             }
             Ok(x) if x.status == 404 && cx.cfg.fixture.patient.is_some() => s.push(
-                Check::warn(&id, "fhir-patient-missing", format!("The token was accepted but Patient/{} does not exist on {}.", cx.cfg.fixture.patient.clone().unwrap_or_default(), e.name))
-                    .param("endpoint", &e.name)
-                    .url(&url),
+                Check::warn(
+                    &id,
+                    "fhir-patient-missing",
+                    format!(
+                        "The token was accepted but Patient/{} does not exist on {}.",
+                        cx.cfg.fixture.patient.clone().unwrap_or_default(),
+                        e.name
+                    ),
+                )
+                .param("endpoint", &e.name)
+                .url(&url),
             ),
             Ok(x) => s.push(
-                Check::fail(&id, "fhir-status", format!("GET {url} → HTTP {}.", x.status))
-                    .param("endpoint", &e.name)
-                    .param("status", x.status.to_string())
-                    .url(&url),
+                Check::fail(
+                    &id,
+                    "fhir-status",
+                    format!("GET {url} → HTTP {}.", x.status),
+                )
+                .param("endpoint", &e.name)
+                .param("status", x.status.to_string())
+                .url(&url),
             ),
             Err(err) => s.push(net_fail(&id, &url, &err)),
         }
@@ -1335,17 +1742,43 @@ async fn step_fhir(cx: &mut Ctx, access: &str) -> Step {
         let wurl = format!("{base}/Patient");
         match cx
             .b
-            .post_raw(&wurl, "application/fhir+json", r#"{"resourceType":"Patient","active":"diagnostic-not-a-boolean"}"#.into(), vec![("authorization", format!("Bearer {access}"))])
+            .post_raw(
+                &wurl,
+                "application/fhir+json",
+                r#"{"resourceType":"Patient","active":"diagnostic-not-a-boolean"}"#.into(),
+                vec![("authorization", format!("Bearer {access}"))],
+            )
             .await
         {
-            Ok(x) if x.status == 403 => s.push(Check::pass(&id, "fhir-scope-enforced", "A write with a read-only token is refused (403).").param("endpoint", &e.name)),
-            Ok(x) if x.status == 401 => s.push(Check::pass(&id, "fhir-scope-enforced", "A write with a read-only token is refused (401).").param("endpoint", &e.name)),
+            Ok(x) if x.status == 403 => s.push(
+                Check::pass(
+                    &id,
+                    "fhir-scope-enforced",
+                    "A write with a read-only token is refused (403).",
+                )
+                .param("endpoint", &e.name),
+            ),
+            Ok(x) if x.status == 401 => s.push(
+                Check::pass(
+                    &id,
+                    "fhir-scope-enforced",
+                    "A write with a read-only token is refused (401).",
+                )
+                .param("endpoint", &e.name),
+            ),
             Ok(x) => s.push(
-                Check::warn(&id, "fhir-scope-not-enforced", format!("A write with a read-only token got HTTP {} instead of 403.", x.status))
-                    .param("endpoint", &e.name)
-                    .param("status", x.status.to_string())
-                    .field(format!("endpoints.{}", e.name))
-                    .fix("Check the endpoint's auth mode (Write-protect/Full) and scope policy."),
+                Check::warn(
+                    &id,
+                    "fhir-scope-not-enforced",
+                    format!(
+                        "A write with a read-only token got HTTP {} instead of 403.",
+                        x.status
+                    ),
+                )
+                .param("endpoint", &e.name)
+                .param("status", x.status.to_string())
+                .field(format!("endpoints.{}", e.name))
+                .fix("Check the endpoint's auth mode (Write-protect/Full) and scope policy."),
             ),
             Err(err) => s.push(net_fail(&id, &wurl, &err)),
         }
@@ -1368,33 +1801,61 @@ async fn refresh(cx: &mut Ctx, rt: &str) -> Result<Exchange, FetchError> {
 async fn step_refresh(cx: &mut Ctx) -> Step {
     let mut s = new_step(6);
     if !cx.cfg.features.offline_access || !cx.cfg.fixture.scopes.contains("offline_access") {
-        s.push(Check::skipped("refresh.off", "refresh-off", "Refresh tokens are off for this realm.").field("realm.features.offlineAccess"));
+        s.push(
+            Check::skipped(
+                "refresh.off",
+                "refresh-off",
+                "Refresh tokens are off for this realm.",
+            )
+            .field("realm.features.offlineAccess"),
+        );
         return s;
     }
     // A separate grant, so reuse detection does not kill the tokens the
     // other steps use.
     let rt1 = match code_flow(cx, "refresh.flow").await {
-        Ok((body, _, _)) => body.get("refresh_token").and_then(Value::as_str).map(String::from),
+        Ok((body, _, _)) => body
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(String::from),
         Err(c) => {
             s.push(c);
             return s;
         }
     };
     let Some(rt1) = rt1 else {
-        s.push(Check::fail("refresh.issued", "refresh-token-missing", "No refresh token was issued for offline_access.").field("realm.features.offlineAccess"));
+        s.push(
+            Check::fail(
+                "refresh.issued",
+                "refresh-token-missing",
+                "No refresh token was issued for offline_access.",
+            )
+            .field("realm.features.offlineAccess"),
+        );
         return s;
     };
     let url = cx.ep("token_endpoint", "token");
     let rt2 = match refresh(cx, &rt1).await {
         Ok(x) if x.status == 200 => {
             let j = x.json().unwrap_or(Value::Null);
-            let rt2 = j.get("refresh_token").and_then(Value::as_str).map(String::from);
+            let rt2 = j
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .map(String::from);
             match &rt2 {
-                Some(r) if *r != rt1 => s.push(Check::pass("refresh.rotate", "refresh-rotated", "Refreshing returned a new access token and a rotated refresh token.")),
+                Some(r) if *r != rt1 => s.push(Check::pass(
+                    "refresh.rotate",
+                    "refresh-rotated",
+                    "Refreshing returned a new access token and a rotated refresh token.",
+                )),
                 _ => s.push(
-                    Check::fail("refresh.rotate", "refresh-not-rotated", "The refresh token was not rotated.")
-                        .spec("RFC 9700 §4.14.2")
-                        .fix("Server defect; report it."),
+                    Check::fail(
+                        "refresh.rotate",
+                        "refresh-not-rotated",
+                        "The refresh token was not rotated.",
+                    )
+                    .spec("RFC 9700 §4.14.2")
+                    .fix("Server defect; report it."),
                 ),
             }
             rt2
@@ -1402,10 +1863,14 @@ async fn step_refresh(cx: &mut Ctx) -> Step {
         Ok(x) => {
             let (e, d) = oauth_error(&x);
             s.push(
-                Check::fail("refresh.rotate", "refresh-refused", format!("Refreshing failed: HTTP {} {e} ({d}).", x.status))
-                    .param("error", e)
-                    .param("detail", d)
-                    .url(&url),
+                Check::fail(
+                    "refresh.rotate",
+                    "refresh-refused",
+                    format!("Refreshing failed: HTTP {} {e} ({d}).", x.status),
+                )
+                .param("error", e)
+                .param("detail", d)
+                .url(&url),
             );
             return s;
         }
@@ -1416,23 +1881,42 @@ async fn step_refresh(cx: &mut Ctx) -> Step {
     };
     match refresh(cx, &rt1).await {
         Ok(x) if x.status == 400 && oauth_error(&x).0 == "invalid_grant" => {
-            s.push(Check::pass("refresh.reuse", "refresh-reuse-refused", "Reusing the old refresh token gets invalid_grant."));
+            s.push(Check::pass(
+                "refresh.reuse",
+                "refresh-reuse-refused",
+                "Reusing the old refresh token gets invalid_grant.",
+            ));
             if let Some(rt2) = rt2 {
                 match refresh(cx, &rt2).await {
-                    Ok(x) if x.status == 400 => s.push(Check::pass("refresh.family", "refresh-family-revoked", "The reuse revoked the whole token family.")),
+                    Ok(x) if x.status == 400 => s.push(Check::pass(
+                        "refresh.family",
+                        "refresh-family-revoked",
+                        "The reuse revoked the whole token family.",
+                    )),
                     Ok(x) => s.push(
-                        Check::fail("refresh.family", "refresh-family-alive", format!("After reuse, the newest refresh token still works (HTTP {}).", x.status))
-                            .spec("RFC 9700 §4.14.2")
-                            .fix("Server defect; report it."),
+                        Check::fail(
+                            "refresh.family",
+                            "refresh-family-alive",
+                            format!(
+                                "After reuse, the newest refresh token still works (HTTP {}).",
+                                x.status
+                            ),
+                        )
+                        .spec("RFC 9700 §4.14.2")
+                        .fix("Server defect; report it."),
                     ),
                     Err(e) => s.push(net_fail("refresh.family", &url, &e)),
                 }
             }
         }
         Ok(x) => s.push(
-            Check::fail("refresh.reuse", "refresh-reuse-accepted", format!("Reusing the old refresh token got HTTP {}.", x.status))
-                .spec("RFC 9700 §4.14.2")
-                .fix("Server defect; report it."),
+            Check::fail(
+                "refresh.reuse",
+                "refresh-reuse-accepted",
+                format!("Reusing the old refresh token got HTTP {}.", x.status),
+            )
+            .spec("RFC 9700 §4.14.2")
+            .fix("Server defect; report it."),
         ),
         Err(e) => s.push(net_fail("refresh.reuse", &url, &e)),
     }
@@ -1454,12 +1938,19 @@ fn assertion(cx: &Ctx, client: &str, key: &SigningKey, exp_secs: i64) -> String 
     key.sign_jws("JWT", &claims).unwrap_or_default()
 }
 
-async fn client_credentials(cx: &mut Ctx, scope: &str, assertion: &str) -> Result<Exchange, FetchError> {
+async fn client_credentials(
+    cx: &mut Ctx,
+    scope: &str,
+    assertion: &str,
+) -> Result<Exchange, FetchError> {
     let url = cx.ep("token_endpoint", "token");
     let pairs = vec![
         ("grant_type".into(), "client_credentials".into()),
         ("scope".into(), scope.to_string()),
-        ("client_assertion_type".into(), "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into()),
+        (
+            "client_assertion_type".into(),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+        ),
         ("client_assertion".into(), assertion.to_string()),
     ];
     cx.b.post_form(&url, pairs, vec![]).await
@@ -1467,8 +1958,18 @@ async fn client_credentials(cx: &mut Ctx, scope: &str, assertion: &str) -> Resul
 
 async fn step_backend(cx: &mut Ctx) -> Step {
     let mut s = new_step(7);
-    let (Some(client), Some(key)) = (cx.cfg.fixture.backend_client_id.clone(), cx.cfg.fixture.backend_key.clone()) else {
-        s.push(Check::skipped("backend.off", "backend-off", "Backend Services is off for this realm.").field("realm.features.backendServices"));
+    let (Some(client), Some(key)) = (
+        cx.cfg.fixture.backend_client_id.clone(),
+        cx.cfg.fixture.backend_key.clone(),
+    ) else {
+        s.push(
+            Check::skipped(
+                "backend.off",
+                "backend-off",
+                "Backend Services is off for this realm.",
+            )
+            .field("realm.features.backendServices"),
+        );
         return s;
     };
     let url = cx.ep("token_endpoint", "token");
@@ -1484,7 +1985,10 @@ async fn step_backend(cx: &mut Ctx) -> Step {
             if j.get("refresh_token").is_some() {
                 problems.push("a refresh token was issued (SHOULD NOT)".into());
             }
-            if j.get("expires_in").and_then(Value::as_i64).is_some_and(|e| e > 300) {
+            if j.get("expires_in")
+                .and_then(Value::as_i64)
+                .is_some_and(|e| e > 300)
+            {
                 problems.push("expires_in exceeds 300 s".into());
             }
             if let Some(at) = j.get("access_token").and_then(Value::as_str)
@@ -1493,24 +1997,39 @@ async fn step_backend(cx: &mut Ctx) -> Step {
                 token_clock(cx, &mut s, "backend.clock", &c);
             }
             if problems.is_empty() {
-                s.push(Check::pass("backend.token", "backend-ok", "client_credentials with private_key_jwt issued a short-lived token."));
+                s.push(Check::pass(
+                    "backend.token",
+                    "backend-ok",
+                    "client_credentials with private_key_jwt issued a short-lived token.",
+                ));
             } else {
                 s.push(
-                    Check::warn("backend.token", "backend-token-shape", format!("Backend token: {}.", problems.join("; ")))
-                        .param("detail", problems.join("; "))
-                        .spec("SMART Backend Services")
-                        .field("realm.lifetimes.backendAccessToken"),
+                    Check::warn(
+                        "backend.token",
+                        "backend-token-shape",
+                        format!("Backend token: {}.", problems.join("; ")),
+                    )
+                    .param("detail", problems.join("; "))
+                    .spec("SMART Backend Services")
+                    .field("realm.lifetimes.backendAccessToken"),
                 );
             }
         }
         Ok(x) => {
             let (e, d) = oauth_error(&x);
             s.push(
-                Check::fail("backend.token", "backend-refused", format!("client_credentials was refused: HTTP {} {e} ({d}).", x.status))
-                    .param("error", &e)
-                    .param("detail", d)
-                    .url(&url)
-                    .fix(hint_for_error(&e)),
+                Check::fail(
+                    "backend.token",
+                    "backend-refused",
+                    format!(
+                        "client_credentials was refused: HTTP {} {e} ({d}).",
+                        x.status
+                    ),
+                )
+                .param("error", &e)
+                .param("detail", d)
+                .url(&url)
+                .fix(hint_for_error(&e)),
             );
             return s;
         }
@@ -1520,23 +2039,41 @@ async fn step_backend(cx: &mut Ctx) -> Step {
         }
     }
     match client_credentials(cx, &scope, &a).await {
-        Ok(x) if x.status == 401 || (x.status == 400 && oauth_error(&x).0 == "invalid_client") => {
-            s.push(Check::pass("backend.replay", "assertion-replay-refused", "A replayed client assertion (same jti) is refused."))
-        }
+        Ok(x) if x.status == 401 || (x.status == 400 && oauth_error(&x).0 == "invalid_client") => s
+            .push(Check::pass(
+                "backend.replay",
+                "assertion-replay-refused",
+                "A replayed client assertion (same jti) is refused.",
+            )),
         Ok(x) => s.push(
-            Check::fail("backend.replay", "assertion-replay-accepted", format!("A replayed client assertion got HTTP {}.", x.status))
-                .spec("SMART Client Authentication: Asymmetric (jti)")
-                .fix("Server defect; report it."),
+            Check::fail(
+                "backend.replay",
+                "assertion-replay-accepted",
+                format!("A replayed client assertion got HTTP {}.", x.status),
+            )
+            .spec("SMART Client Authentication: Asymmetric (jti)")
+            .fix("Server defect; report it."),
         ),
         Err(e) => s.push(net_fail("backend.replay", &url, &e)),
     }
     let long = assertion(cx, &client, &key, 3600);
     match client_credentials(cx, &scope, &long).await {
-        Ok(x) if x.status == 401 || x.status == 400 => s.push(Check::pass("backend.exp", "assertion-exp-refused", "An assertion valid for more than 5 minutes is refused.")),
+        Ok(x) if x.status == 401 || x.status == 400 => s.push(Check::pass(
+            "backend.exp",
+            "assertion-exp-refused",
+            "An assertion valid for more than 5 minutes is refused.",
+        )),
         Ok(x) => s.push(
-            Check::fail("backend.exp", "assertion-exp-accepted", format!("An assertion with exp one hour ahead got HTTP {}.", x.status))
-                .spec("SMART Client Authentication: Asymmetric (exp ≤ 5 min)")
-                .fix("Server defect; report it."),
+            Check::fail(
+                "backend.exp",
+                "assertion-exp-accepted",
+                format!(
+                    "An assertion with exp one hour ahead got HTTP {}.",
+                    x.status
+                ),
+            )
+            .spec("SMART Client Authentication: Asymmetric (exp ≤ 5 min)")
+            .fix("Server defect; report it."),
         ),
         Err(e) => s.push(net_fail("backend.exp", &url, &e)),
     }
@@ -1557,10 +2094,16 @@ async fn introspect(cx: &mut Ctx, token: &str) -> Option<bool> {
 async fn introspect_raw(cx: &mut Ctx, token: &str) -> Result<Exchange, FetchError> {
     let url = cx.ep("introspection_endpoint", "introspect");
     let mut pairs = vec![("token".to_string(), token.to_string())];
-    if let (Some(client), Some(key)) = (cx.cfg.fixture.backend_client_id.clone(), cx.cfg.fixture.backend_key.clone()) {
+    if let (Some(client), Some(key)) = (
+        cx.cfg.fixture.backend_client_id.clone(),
+        cx.cfg.fixture.backend_key.clone(),
+    ) {
         let a = assertion(cx, &client, &key, 120);
         pairs.push(("client_id".into(), client));
-        pairs.push(("client_assertion_type".into(), "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into()));
+        pairs.push((
+            "client_assertion_type".into(),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+        ));
         pairs.push(("client_assertion".into(), a));
     } else {
         pairs.push(("client_id".into(), cx.cfg.fixture.public_client_id.clone()));
@@ -1571,7 +2114,14 @@ async fn introspect_raw(cx: &mut Ctx, token: &str) -> Result<Exchange, FetchErro
 async fn step_introspection(cx: &mut Ctx, access: &str) -> Step {
     let mut s = new_step(8);
     if !cx.cfg.features.introspection {
-        s.push(Check::skipped("introspection.off", "introspection-off", "Introspection is off for this realm.").field("realm.features.introspection"));
+        s.push(
+            Check::skipped(
+                "introspection.off",
+                "introspection-off",
+                "Introspection is off for this realm.",
+            )
+            .field("realm.features.introspection"),
+        );
         return s;
     }
     let url = cx.ep("introspection_endpoint", "introspect");
@@ -1585,33 +2135,52 @@ async fn step_introspection(cx: &mut Ctx, access: &str) -> Step {
                         missing.push(k);
                     }
                 }
-                if cx.cfg.fixture.patient.is_some() && cx.cfg.fixture.scopes.contains("launch/patient") && j.get("patient").is_none() {
+                if cx.cfg.fixture.patient.is_some()
+                    && cx.cfg.fixture.scopes.contains("launch/patient")
+                    && j.get("patient").is_none()
+                {
                     missing.push("patient");
                 }
                 if missing.is_empty() {
-                    s.push(Check::pass("introspection.active", "introspection-active", "A live token introspects as active with its scope and context."));
+                    s.push(Check::pass(
+                        "introspection.active",
+                        "introspection-active",
+                        "A live token introspects as active with its scope and context.",
+                    ));
                 } else {
                     s.push(
-                        Check::warn("introspection.active", "introspection-fields", format!("Active, but missing {}.", missing.join(", ")))
-                            .param("fields", missing.join(", "))
-                            .spec("RFC 7662 §2.2; SMART “Token Introspection”"),
+                        Check::warn(
+                            "introspection.active",
+                            "introspection-fields",
+                            format!("Active, but missing {}.", missing.join(", ")),
+                        )
+                        .param("fields", missing.join(", "))
+                        .spec("RFC 7662 §2.2; SMART “Token Introspection”"),
                     );
                 }
             } else {
                 s.push(
-                    Check::fail("introspection.active", "introspection-inactive", "A live token introspects as inactive.")
-                        .url(&url)
-                        .fix("Server defect, or the grant was revoked by an earlier step; report it."),
+                    Check::fail(
+                        "introspection.active",
+                        "introspection-inactive",
+                        "A live token introspects as inactive.",
+                    )
+                    .url(&url)
+                    .fix("Server defect, or the grant was revoked by an earlier step; report it."),
                 );
             }
         }
         Ok(x) => {
             let (e, d) = oauth_error(&x);
             s.push(
-                Check::fail("introspection.active", "introspection-refused", format!("Introspection answered HTTP {} {e} ({d}).", x.status))
-                    .param("error", e)
-                    .param("detail", d)
-                    .url(&url),
+                Check::fail(
+                    "introspection.active",
+                    "introspection-refused",
+                    format!("Introspection answered HTTP {} {e} ({d}).", x.status),
+                )
+                .param("error", e)
+                .param("detail", d)
+                .url(&url),
             );
             return s;
         }
@@ -1621,11 +2190,26 @@ async fn step_introspection(cx: &mut Ctx, access: &str) -> Step {
         }
     }
     match introspect(cx, "hmac_garbage-token-from-diagnostic").await {
-        Some(false) => s.push(Check::pass("introspection.garbage", "introspection-garbage-inactive", "A garbage token introspects as active:false.")),
-        Some(true) => s.push(Check::fail("introspection.garbage", "introspection-garbage-active", "A garbage token introspects as active!").fix("Server defect; report it.")),
+        Some(false) => s.push(Check::pass(
+            "introspection.garbage",
+            "introspection-garbage-inactive",
+            "A garbage token introspects as active:false.",
+        )),
+        Some(true) => s.push(
+            Check::fail(
+                "introspection.garbage",
+                "introspection-garbage-active",
+                "A garbage token introspects as active!",
+            )
+            .fix("Server defect; report it."),
+        ),
         None => s.push(
-            Check::fail("introspection.garbage", "introspection-garbage-error", "Introspecting a garbage token did not answer 200 {\"active\":false}.")
-                .spec("RFC 7662 §2.2"),
+            Check::fail(
+                "introspection.garbage",
+                "introspection-garbage-error",
+                "Introspecting a garbage token did not answer 200 {\"active\":false}.",
+            )
+            .spec("RFC 7662 §2.2"),
         ),
     }
     s
@@ -1636,18 +2220,40 @@ async fn step_introspection(cx: &mut Ctx, access: &str) -> Step {
 async fn step_revocation(cx: &mut Ctx, access: &str) -> Step {
     let mut s = new_step(9);
     if !cx.cfg.features.revocation {
-        s.push(Check::skipped("revocation.off", "revocation-off", "Revocation is off for this realm.").field("realm.features.revocation"));
+        s.push(
+            Check::skipped(
+                "revocation.off",
+                "revocation-off",
+                "Revocation is off for this realm.",
+            )
+            .field("realm.features.revocation"),
+        );
         return s;
     }
     let url = cx.ep("revocation_endpoint", "revoke");
     let pairs = vec![
         ("token".to_string(), access.to_string()),
-        ("client_id".to_string(), cx.cfg.fixture.public_client_id.clone()),
+        (
+            "client_id".to_string(),
+            cx.cfg.fixture.public_client_id.clone(),
+        ),
     ];
     match cx.b.post_form(&url, pairs, vec![]).await {
-        Ok(x) if x.status == 200 => s.push(Check::pass("revocation.revoke", "revoke-ok", "Revocation answered 200.")),
+        Ok(x) if x.status == 200 => s.push(Check::pass(
+            "revocation.revoke",
+            "revoke-ok",
+            "Revocation answered 200.",
+        )),
         Ok(x) => {
-            s.push(Check::fail("revocation.revoke", "revoke-status", format!("Revocation answered HTTP {}.", x.status)).url(&url).spec("RFC 7009 §2.2"));
+            s.push(
+                Check::fail(
+                    "revocation.revoke",
+                    "revoke-status",
+                    format!("Revocation answered HTTP {}.", x.status),
+                )
+                .url(&url)
+                .spec("RFC 7009 §2.2"),
+            );
             return s;
         }
         Err(e) => {
@@ -1657,12 +2263,29 @@ async fn step_revocation(cx: &mut Ctx, access: &str) -> Step {
     }
     if cx.cfg.features.introspection {
         match introspect(cx, access).await {
-            Some(false) => s.push(Check::pass("revocation.introspect", "revoked-inactive", "The revoked token introspects as inactive.")),
-            Some(true) => s.push(Check::fail("revocation.introspect", "revoked-still-active", "The revoked token still introspects as active.").fix("Server defect; report it.")),
+            Some(false) => s.push(Check::pass(
+                "revocation.introspect",
+                "revoked-inactive",
+                "The revoked token introspects as inactive.",
+            )),
+            Some(true) => s.push(
+                Check::fail(
+                    "revocation.introspect",
+                    "revoked-still-active",
+                    "The revoked token still introspects as active.",
+                )
+                .fix("Server defect; report it."),
+            ),
             None => {}
         }
     }
-    let Some(e) = cx.cfg.endpoints.first().cloned().filter(|_| !cx.cfg.audience_only) else {
+    let Some(e) = cx
+        .cfg
+        .endpoints
+        .first()
+        .cloned()
+        .filter(|_| !cx.cfg.audience_only)
+    else {
         return s;
     };
     let base = e.base_url.trim_end_matches('/');
@@ -1673,7 +2296,11 @@ async fn step_revocation(cx: &mut Ctx, access: &str) -> Step {
     let deadline = Instant::now() + cx.cfg.revocation_wait;
     let mut last: u16;
     loop {
-        match cx.b.get_with(&furl, vec![("authorization", format!("Bearer {access}"))]).await {
+        match cx
+            .b
+            .get_with(&furl, vec![("authorization", format!("Bearer {access}"))])
+            .await
+        {
             Ok(x) => last = x.status,
             Err(err) => {
                 s.push(net_fail("revocation.fhir", &furl, &err));
@@ -1686,7 +2313,14 @@ async fn step_revocation(cx: &mut Ctx, access: &str) -> Step {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     if last == 401 {
-        s.push(Check::pass("revocation.fhir", "revoked-fhir-refused", format!("Endpoint {} refuses the revoked token.", e.name)).param("endpoint", &e.name));
+        s.push(
+            Check::pass(
+                "revocation.fhir",
+                "revoked-fhir-refused",
+                format!("Endpoint {} refuses the revoked token.", e.name),
+            )
+            .param("endpoint", &e.name),
+        );
     } else {
         s.push(
             Check::warn("revocation.fhir", "revoked-fhir-accepted", format!(
@@ -1705,23 +2339,57 @@ async fn step_revocation(cx: &mut Ctx, access: &str) -> Step {
 
 async fn userinfo(cx: &mut Ctx, t: &Tokens, s: &mut Step) {
     if !cx.cfg.features.openid_connect {
-        s.push(Check::skipped("userinfo-logout.userinfo", "oidc-off", "OpenID Connect is off.").field("realm.features.openidConnect"));
+        s.push(
+            Check::skipped(
+                "userinfo-logout.userinfo",
+                "oidc-off",
+                "OpenID Connect is off.",
+            )
+            .field("realm.features.openidConnect"),
+        );
         return;
     }
     let url = cx.ep("userinfo_endpoint", "userinfo");
-    match cx.b.get_with(&url, vec![("authorization", format!("Bearer {}", t.access))]).await {
+    match cx
+        .b
+        .get_with(
+            &url,
+            vec![("authorization", format!("Bearer {}", t.access))],
+        )
+        .await
+    {
         Ok(x) if x.status == 200 => {
-            let sub = x.json().and_then(|j| j.get("sub").and_then(Value::as_str).map(String::from));
+            let sub = x
+                .json()
+                .and_then(|j| j.get("sub").and_then(Value::as_str).map(String::from));
             if sub.is_some() && sub == t.id_sub {
-                s.push(Check::pass("userinfo-logout.userinfo", "userinfo-ok", "userinfo sub equals the id_token sub."));
+                s.push(Check::pass(
+                    "userinfo-logout.userinfo",
+                    "userinfo-ok",
+                    "userinfo sub equals the id_token sub.",
+                ));
             } else {
                 s.push(
-                    Check::fail("userinfo-logout.userinfo", "userinfo-sub-mismatch", format!("userinfo sub {sub:?} differs from the id_token sub {:?}.", t.id_sub))
-                        .spec("OIDC Core §5.3.2"),
+                    Check::fail(
+                        "userinfo-logout.userinfo",
+                        "userinfo-sub-mismatch",
+                        format!(
+                            "userinfo sub {sub:?} differs from the id_token sub {:?}.",
+                            t.id_sub
+                        ),
+                    )
+                    .spec("OIDC Core §5.3.2"),
                 );
             }
         }
-        Ok(x) => s.push(Check::fail("userinfo-logout.userinfo", "userinfo-status", format!("userinfo answered HTTP {}.", x.status)).url(&url)),
+        Ok(x) => s.push(
+            Check::fail(
+                "userinfo-logout.userinfo",
+                "userinfo-status",
+                format!("userinfo answered HTTP {}.", x.status),
+            )
+            .url(&url),
+        ),
         Err(e) => s.push(net_fail("userinfo-logout.userinfo", &url, &e)),
     }
 }
@@ -1737,14 +2405,22 @@ async fn logout(cx: &mut Ctx, t: &Tokens, s: &mut Step) {
         .and_then(Value::as_str)
         .map(String::from)
     else {
-        s.push(Check::warn("userinfo-logout.logout", "logout-not-advertised", "No end_session_endpoint is advertised.").spec("OIDC RP-Initiated Logout 1.0"));
+        s.push(
+            Check::warn(
+                "userinfo-logout.logout",
+                "logout-not-advertised",
+                "No end_session_endpoint is advertised.",
+            )
+            .spec("OIDC RP-Initiated Logout 1.0"),
+        );
         return;
     };
     let mut u = Url::parse(&end).expect("end_session url");
     if let Some(h) = &t.id_token {
         u.query_pairs_mut().append_pair("id_token_hint", h);
     }
-    u.query_pairs_mut().append_pair("client_id", &cx.cfg.fixture.public_client_id);
+    u.query_pairs_mut()
+        .append_pair("client_id", &cx.cfg.fixture.public_client_id);
     let mut url = u.to_string();
     // Follow a confirmation form if the server asks.
     for _ in 0..4 {
@@ -1764,7 +2440,10 @@ async fn logout(cx: &mut Ctx, t: &Tokens, s: &mut Step) {
                 _ => break,
             }
         }
-        if let Some(f) = super::http::forms(&x.body, &x.url).into_iter().find(|f| f.method == "post") {
+        if let Some(f) = super::http::forms(&x.body, &x.url)
+            .into_iter()
+            .find(|f| f.method == "post")
+        {
             let mut fields = f.fields.clone();
             if let Some((n, v)) = f.approve_button().filter(|(n, _)| !n.is_empty()) {
                 fields.push((n, v));
@@ -1788,13 +2467,23 @@ async fn logout(cx: &mut Ctx, t: &Tokens, s: &mut Step) {
         interactive: true,
     };
     match drive(cx, &req).await {
-        AuthzOutcome::Redirect(p) if p.get("error").map(String::as_str) == Some("login_required") => {
-            s.push(Check::pass("userinfo-logout.logout", "logout-ok", "After RP-initiated logout, prompt=none answers login_required."))
+        AuthzOutcome::Redirect(p)
+            if p.get("error").map(String::as_str) == Some("login_required") =>
+        {
+            s.push(Check::pass(
+                "userinfo-logout.logout",
+                "logout-ok",
+                "After RP-initiated logout, prompt=none answers login_required.",
+            ))
         }
         AuthzOutcome::Redirect(p) if p.contains_key("code") => s.push(
-            Check::fail("userinfo-logout.logout", "logout-session-alive", "After logout the session still signs in silently (prompt=none returned a code).")
-                .spec("OIDC RP-Initiated Logout 1.0 §2")
-                .fix("Server defect; report it."),
+            Check::fail(
+                "userinfo-logout.logout",
+                "logout-session-alive",
+                "After logout the session still signs in silently (prompt=none returned a code).",
+            )
+            .spec("OIDC RP-Initiated Logout 1.0 §2")
+            .fix("Server defect; report it."),
         ),
         other => {
             let detail = match other {
@@ -1805,9 +2494,13 @@ async fn logout(cx: &mut Ctx, t: &Tokens, s: &mut Step) {
                 AuthzOutcome::TooManyHops(_) => "redirect loop".into(),
             };
             s.push(
-                Check::warn("userinfo-logout.logout", "logout-prompt-none-unexpected", format!("After logout, prompt=none answered unexpectedly: {detail}"))
-                    .param("detail", detail)
-                    .spec("OIDC Core §3.1.2.6"),
+                Check::warn(
+                    "userinfo-logout.logout",
+                    "logout-prompt-none-unexpected",
+                    format!("After logout, prompt=none answered unexpectedly: {detail}"),
+                )
+                .param("detail", detail)
+                .spec("OIDC Core §3.1.2.6"),
             );
         }
     }

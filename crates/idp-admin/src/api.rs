@@ -44,13 +44,18 @@ pub type AuthResult = Result<Actor, (StatusCode, String)>;
 /// Decides whether a request may use the API, and who it acts as (async:
 /// the host's authorizer may consult session stores).
 pub type Authorize = Arc<
-    dyn for<'a> Fn(&'a axum::http::request::Parts) -> std::pin::Pin<Box<dyn std::future::Future<Output = AuthResult> + Send + 'a>>
+    dyn for<'a> Fn(
+            &'a axum::http::request::Parts,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = AuthResult> + Send + 'a>>
         + Send
         + Sync,
 >;
 
 /// An [`Authorize`] from a synchronous decision.
-pub fn authorize_sync(f: impl Fn(&axum::http::request::Parts) -> AuthResult + Send + Sync + 'static) -> Authorize {
+pub fn authorize_sync(
+    f: impl Fn(&axum::http::request::Parts) -> AuthResult + Send + Sync + 'static,
+) -> Authorize {
     Arc::new(move |p| {
         let r = f(p);
         Box::pin(async move { r })
@@ -78,13 +83,19 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/idp/realms/{realm}/clients/{client}"),
     ("PUT", "/admin/idp/realms/{realm}/clients/{client}"),
     ("DELETE", "/admin/idp/realms/{realm}/clients/{client}"),
-    ("POST", "/admin/idp/realms/{realm}/clients/{client}/$reset-secret"),
+    (
+        "POST",
+        "/admin/idp/realms/{realm}/clients/{client}/$reset-secret",
+    ),
     ("GET", "/admin/idp/realms/{realm}/users"),
     ("POST", "/admin/idp/realms/{realm}/users"),
     ("GET", "/admin/idp/realms/{realm}/users/{user}"),
     ("PUT", "/admin/idp/realms/{realm}/users/{user}"),
     ("DELETE", "/admin/idp/realms/{realm}/users/{user}"),
-    ("POST", "/admin/idp/realms/{realm}/users/{user}/$set-password"),
+    (
+        "POST",
+        "/admin/idp/realms/{realm}/users/{user}/$set-password",
+    ),
     ("GET", "/admin/idp/realms/{realm}/sessions"),
     ("DELETE", "/admin/idp/realms/{realm}/sessions/{session}"),
     ("GET", "/admin/idp/realms/{realm}/grants"),
@@ -113,18 +124,42 @@ pub fn router(auth: Option<Authorize>) -> Router {
         .route(&format!("{r}/keys"), get(list_keys))
         .route(&format!("{r}/$rotate-keys"), post(rotate_keys))
         .route(&format!("{r}/$emergency-rotate"), post(emergency_rotate))
-        .route(&format!("{r}/clients"), get(list_clients).post(create_client))
-        .route(&format!("{r}/clients/{{client}}"), get(get_client).put(put_client).delete(delete_client))
-        .route(&format!("{r}/clients/{{client}}/$reset-secret"), post(reset_secret))
+        .route(
+            &format!("{r}/clients"),
+            get(list_clients).post(create_client),
+        )
+        .route(
+            &format!("{r}/clients/{{client}}"),
+            get(get_client).put(put_client).delete(delete_client),
+        )
+        .route(
+            &format!("{r}/clients/{{client}}/$reset-secret"),
+            post(reset_secret),
+        )
         .route(&format!("{r}/users"), get(list_users).post(create_user))
-        .route(&format!("{r}/users/{{user}}"), get(get_user).put(put_user).delete(delete_user))
-        .route(&format!("{r}/users/{{user}}/$set-password"), post(set_password))
+        .route(
+            &format!("{r}/users/{{user}}"),
+            get(get_user).put(put_user).delete(delete_user),
+        )
+        .route(
+            &format!("{r}/users/{{user}}/$set-password"),
+            post(set_password),
+        )
         .route(&format!("{r}/sessions"), get(list_sessions))
-        .route(&format!("{r}/sessions/{{session}}"), axum::routing::delete(revoke_session))
+        .route(
+            &format!("{r}/sessions/{{session}}"),
+            axum::routing::delete(revoke_session),
+        )
         .route(&format!("{r}/grants"), get(list_grants))
-        .route(&format!("{r}/grants/{{grant}}"), axum::routing::delete(revoke_grant))
+        .route(
+            &format!("{r}/grants/{{grant}}"),
+            axum::routing::delete(revoke_grant),
+        )
         .route(&format!("{r}/launches"), post(create_launch))
-        .route(&format!("{r}/endpoints/{{endpoint}}"), get(bind_diff).put(bind).delete(unbind))
+        .route(
+            &format!("{r}/endpoints/{{endpoint}}"),
+            get(bind_diff).put(bind).delete(unbind),
+        )
         .route_layer(middleware::from_fn_with_state(st.clone(), authorize))
         .route("/admin/idp/openapi.json", get(openapi))
         .with_state(st)
@@ -133,7 +168,10 @@ pub fn router(auth: Option<Authorize>) -> Router {
 async fn authorize(State(st): State<ApiState>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
     let Some(auth) = st.auth.as_ref() else {
-        return err(&OpError::other(401, "the IdP admin API has no authorizer configured"));
+        return err(&OpError::other(
+            401,
+            "the IdP admin API has no authorizer configured",
+        ));
     };
     match auth(&parts).await {
         Ok(actor) => {
@@ -154,7 +192,12 @@ fn err(e: &OpError) -> Response {
 }
 
 fn console() -> Result<Arc<IdpConsole>, Response> {
-    service::global().ok_or_else(|| err(&OpError::other(503, "the built-in authorization server is not enabled (HFS_IDP=on)")))
+    service::global().ok_or_else(|| {
+        err(&OpError::other(
+            503,
+            "the built-in authorization server is not enabled (HFS_IDP=on)",
+        ))
+    })
 }
 
 type ApiResult = Result<Response, Response>;
@@ -174,7 +217,13 @@ fn idp<T>(r: Result<T, helios_idp::IdpError>) -> Result<T, Response> {
 fn if_match(h: &HeaderMap) -> Option<i64> {
     h.get(header::IF_MATCH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().trim_start_matches("W/").trim_matches('"').parse().ok())
+        .and_then(|v| {
+            v.trim()
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .parse()
+                .ok()
+        })
 }
 
 fn etag(rev: i64) -> (header::HeaderName, String) {
@@ -212,7 +261,12 @@ async fn list_realms() -> ApiResult {
 async fn create_realm(Json(spec): Json<RealmSpec>) -> ApiResult {
     let c = console()?;
     let rec = idp(c.admin.create_realm(spec).await)?;
-    Ok((StatusCode::CREATED, [etag(rec.revision)], Json(realm_json(&c, &rec))).into_response())
+    Ok((
+        StatusCode::CREATED,
+        [etag(rec.revision)],
+        Json(realm_json(&c, &rec)),
+    )
+        .into_response())
 }
 
 fn realm_json(c: &IdpConsole, rec: &helios_idp::store::RealmRecord) -> Value {
@@ -230,13 +284,18 @@ async fn get_realm(Path(realm): Path<String>) -> ApiResult {
     Ok(([etag(rec.revision)], Json(realm_json(&c, &rec))).into_response())
 }
 
-async fn put_realm(Path(realm): Path<String>, h: HeaderMap, Json(spec): Json<RealmSpec>) -> ApiResult {
+async fn put_realm(
+    Path(realm): Path<String>,
+    h: HeaderMap,
+    Json(spec): Json<RealmSpec>,
+) -> ApiResult {
     let c = console()?;
-    let rec = op(c.update(&realm, if_match(&h), move |s| {
-        *s = spec;
-        Ok(())
-    })
-    .await)?;
+    let rec = op(c
+        .update(&realm, if_match(&h), move |s| {
+            *s = spec;
+            Ok(())
+        })
+        .await)?;
     Ok(([etag(rec.revision)], Json(realm_json(&c, &rec))).into_response())
 }
 
@@ -252,7 +311,11 @@ struct DiagnoseQuery {
     preflight: Option<String>,
 }
 
-async fn diagnose(Path(realm): Path<String>, Query(q): Query<DiagnoseQuery>, body: Option<Json<DiagnoseOptions>>) -> ApiResult {
+async fn diagnose(
+    Path(realm): Path<String>,
+    Query(q): Query<DiagnoseQuery>,
+    body: Option<Json<DiagnoseOptions>>,
+) -> ApiResult {
     let c = console()?;
     let opts = body.map(|b| b.0).unwrap_or_default();
     let report = if q.preflight.as_deref() == Some("only") {
@@ -320,7 +383,11 @@ async fn create_client(Path(realm): Path<String>, Json(body): Json<Value>) -> Ap
         .into_response())
 }
 
-async fn find_client(c: &IdpConsole, realm_id: &str, client: &str) -> Result<helios_idp::store::ClientRecord, Response> {
+async fn find_client(
+    c: &IdpConsole,
+    realm_id: &str,
+    client: &str,
+) -> Result<helios_idp::store::ClientRecord, Response> {
     idp(c.admin.list_clients(realm_id).await)?
         .into_iter()
         .find(|r| r.spec.client_id == client)
@@ -331,24 +398,43 @@ async fn get_client(Path((realm, client)): Path<(String, String)>) -> ApiResult 
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
     let cl = find_client(&c, &rec.id, &client).await?;
-    Ok(([etag(cl.revision)], Json(json!({"revision": cl.revision, "spec": redact_client(&cl.spec)}))).into_response())
+    Ok((
+        [etag(cl.revision)],
+        Json(json!({"revision": cl.revision, "spec": redact_client(&cl.spec)})),
+    )
+        .into_response())
 }
 
-async fn put_client(Path((realm, client)): Path<(String, String)>, h: HeaderMap, Json(body): Json<Value>) -> ApiResult {
+async fn put_client(
+    Path((realm, client)): Path<(String, String)>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
     let cur = find_client(&c, &rec.id, &client).await?;
     let mut spec = client_from_body(body)?;
     if spec.client_id != client {
-        return Err(err(&OpError::invalid("clientId", "the client id cannot be changed")));
+        return Err(err(&OpError::invalid(
+            "clientId",
+            "the client id cannot be changed",
+        )));
     }
-    if let (ClientAuth::ClientSecret { secret_hash }, ClientAuth::ClientSecret { secret_hash: old }) = (&mut spec.auth, &cur.spec.auth)
+    if let (ClientAuth::ClientSecret { secret_hash }, ClientAuth::ClientSecret { secret_hash: old }) =
+        (&mut spec.auth, &cur.spec.auth)
         && secret_hash.is_empty()
     {
         old.clone_into(secret_hash);
     }
-    let r = idp(c.admin.update_client(&rec.id, spec, if_match(&h).unwrap_or(cur.revision)).await)?;
-    Ok(([etag(r.revision)], Json(json!({"revision": r.revision, "spec": redact_client(&r.spec)}))).into_response())
+    let r = idp(c
+        .admin
+        .update_client(&rec.id, spec, if_match(&h).unwrap_or(cur.revision))
+        .await)?;
+    Ok((
+        [etag(r.revision)],
+        Json(json!({"revision": r.revision, "spec": redact_client(&r.spec)})),
+    )
+        .into_response())
 }
 
 async fn delete_client(Path((realm, client)): Path<(String, String)>) -> ApiResult {
@@ -392,7 +478,15 @@ async fn list_users(Path(realm): Path<String>) -> ApiResult {
 async fn create_user(Path(realm): Path<String>, Json(b): Json<NewUser>) -> ApiResult {
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
-    let u = idp(c.admin.create_user(&rec.id, b.user, b.password.as_deref(), b.must_change_password).await)?;
+    let u = idp(c
+        .admin
+        .create_user(
+            &rec.id,
+            b.user,
+            b.password.as_deref(),
+            b.must_change_password,
+        )
+        .await)?;
     Ok((StatusCode::CREATED, Json(u)).into_response())
 }
 
@@ -404,7 +498,10 @@ async fn get_user(Path((realm, user)): Path<(String, String)>) -> ApiResult {
     ok(u)
 }
 
-async fn put_user(Path((realm, user)): Path<(String, String)>, Json(mut u): Json<RealmUser>) -> ApiResult {
+async fn put_user(
+    Path((realm, user)): Path<(String, String)>,
+    Json(mut u): Json<RealmUser>,
+) -> ApiResult {
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
     u.id = user;
@@ -428,10 +525,16 @@ struct SetPassword {
     must_change: bool,
 }
 
-async fn set_password(Path((realm, user)): Path<(String, String)>, Json(b): Json<SetPassword>) -> ApiResult {
+async fn set_password(
+    Path((realm, user)): Path<(String, String)>,
+    Json(b): Json<SetPassword>,
+) -> ApiResult {
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
-    idp(c.admin.set_password(&rec.id, &user, &b.password, b.must_change).await)?;
+    idp(c
+        .admin
+        .set_password(&rec.id, &user, &b.password, b.must_change)
+        .await)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -461,7 +564,12 @@ async fn revoke_session(Path((realm, session)): Path<(String, String)>) -> ApiRe
 async fn list_grants(Path(realm): Path<String>, Query(q): Query<UserQuery>) -> ApiResult {
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
-    let f = GrantFilter { subject: q.user, client_id: q.client, include_revoked: q.include_revoked, limit: Some(500) };
+    let f = GrantFilter {
+        subject: q.user,
+        client_id: q.client,
+        include_revoked: q.include_revoked,
+        limit: Some(500),
+    };
     ok(json!({"grants": idp(c.admin.list_grants(&rec.id, &f).await)?}))
 }
 
@@ -472,13 +580,21 @@ async fn revoke_grant(Path((realm, grant)): Path<(String, String)>) -> ApiResult
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn create_launch(Path(realm): Path<String>, Extension(actor): Extension<Actor>, Json(mut req): Json<LaunchRequest>) -> ApiResult {
+async fn create_launch(
+    Path(realm): Path<String>,
+    Extension(actor): Extension<Actor>,
+    Json(mut req): Json<LaunchRequest>,
+) -> ApiResult {
     let c = console()?;
     let rec = op(c.realm(&realm).await)?;
     if req.launched_by.is_none() {
         req.launched_by = Some(actor.subject.clone());
     }
-    Ok((StatusCode::CREATED, Json(idp(c.admin.create_launch(&rec.id, req).await)?)).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(idp(c.admin.create_launch(&rec.id, req).await)?),
+    )
+        .into_response())
 }
 
 // ------------------------------------------------------------ endpoint binding
@@ -489,20 +605,30 @@ struct BindBody {
     mode: Option<String>,
 }
 
-async fn bind_diff(Path((realm, endpoint)): Path<(String, String)>, Query(q): Query<BindBody>) -> ApiResult {
+async fn bind_diff(
+    Path((realm, endpoint)): Path<(String, String)>,
+    Query(q): Query<BindBody>,
+) -> ApiResult {
     let c = console()?;
     let mode = BindMode::parse(q.mode.as_deref().unwrap_or(""));
     ok(op(c.bind_diff(&realm, &endpoint, mode).await)?)
 }
 
-async fn bind(Path((realm, endpoint)): Path<(String, String)>, Extension(actor): Extension<Actor>, body: Option<Json<BindBody>>) -> ApiResult {
+async fn bind(
+    Path((realm, endpoint)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
+    body: Option<Json<BindBody>>,
+) -> ApiResult {
     let c = console()?;
     let mode = BindMode::parse(body.and_then(|b| b.0.mode).as_deref().unwrap_or(""));
     op(c.bind(&realm, &endpoint, mode, &actor).await)?;
     ok(json!({"bound": endpoint, "realm": realm}))
 }
 
-async fn unbind(Path((realm, endpoint)): Path<(String, String)>, Extension(actor): Extension<Actor>) -> ApiResult {
+async fn unbind(
+    Path((realm, endpoint)): Path<(String, String)>,
+    Extension(actor): Extension<Actor>,
+) -> ApiResult {
     let c = console()?;
     op(c.unbind(&realm, &endpoint, &actor).await)?;
     Ok(StatusCode::NO_CONTENT.into_response())
