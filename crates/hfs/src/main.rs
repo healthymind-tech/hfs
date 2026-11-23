@@ -19,6 +19,7 @@
 //! `postgres-elasticsearch`, `mongodb`, `mongodb-elasticsearch`, `s3`, or `s3-elasticsearch`.
 
 mod cluster;
+mod idp;
 mod manager;
 
 use std::sync::Arc;
@@ -1652,6 +1653,17 @@ async fn serve(
     );
     // The console admin API, inside the admin guard below.
     let app = manager::console_auth::routes(app, console.as_ref());
+    // Built-in authorization server (`HFS_IDP=on`): /idp/{realm}/… with its
+    // own CSRF, CSP and rate limits; outside the admin guard (public pages).
+    let app = idp::attach(
+        app,
+        config,
+        audit_state
+            .as_ref()
+            .map(|a| (Arc::clone(&a.sink), a.config.source_observer.clone())),
+        idp::PG_POOL.get().cloned(),
+    )
+    .await?;
     // Outermost of the application layers, so it sees `/admin/...` whether
     // the UI router or the FHIR router answers it.
     // Just inside the admin gate: the signed-in administrator becomes the
@@ -1841,6 +1853,7 @@ async fn open_admin_session_store(
     backend: &helios_persistence::backends::postgres::PostgresBackend,
 ) {
     manager::console_auth::record_pool(backend.shared_pool());
+    let _ = idp::PG_POOL.set(backend.shared_pool());
     match helios_admin_auth::store::postgres::PgAdminSessionStore::connect(
         backend.shared_pool(),
         "HFS",
