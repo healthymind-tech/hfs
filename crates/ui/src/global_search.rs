@@ -2797,7 +2797,7 @@ mod tests {
             top.href
         );
         assert!(
-            path_of(top).starts_with("FHIR endpoints › Default › Security › "),
+            path_of(top).starts_with("FHIR endpoints › Default › Settings › Security › "),
             "{}",
             path_of(top)
         );
@@ -2811,7 +2811,7 @@ mod tests {
             settings
                 .hits
                 .iter()
-                .any(|h| path_of(h) == "FHIR endpoints › Default › Security › FHIR authentication (SMART on FHIR) › SMART discovery document › Public JWKS URI"),
+                .any(|h| path_of(h) == "FHIR endpoints › Default › Settings › Security › FHIR authentication (SMART on FHIR) › SMART discovery document › Public JWKS URI"),
             "{:?}",
             settings.hits.iter().map(path_of).collect::<Vec<_>>()
         );

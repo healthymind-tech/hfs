@@ -13780,6 +13780,15 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     gap: 0;
   }
 
+  /* Console settings sit at the foot of the sidebar. */
+  .sidebar-nav > .nav {
+    flex: 1 0 auto;
+  }
+
+  .sidebar-nav > .sidebar__foot {
+    margin: var(--s4) calc(-1 * var(--s3)) calc(-1 * var(--s4));
+  }
+
   .nav__group + .nav__group {
     margin-top: var(--s4);
   }
