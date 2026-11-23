@@ -570,8 +570,9 @@ impl AuthHook {
                             // Built-in authorization server: in-process keys and
                             // revoked-grant set, no JWKS fetch; closed (503)
                             // while HFS_IDP is off.
-                            Some(realm) => Arc::new(helios_auth::InternalVerifier::new(
-                                helios_auth::internal_realms(),
+                            // The source is looked up per request: this
+                            // snapshot may be built before the IdP starts.
+                            Some(realm) => Arc::new(helios_auth::InternalVerifier::for_process(
                                 realm,
                                 endpoint.name(),
                                 auth.audience.clone(),

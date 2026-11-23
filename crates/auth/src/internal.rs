@@ -210,6 +210,9 @@ pub fn internal_realms() -> Option<Arc<dyn InternalRealmSource>> {
 /// Token verifier of one endpoint bound to one internal realm.
 pub struct InternalVerifier {
     source: Option<Arc<dyn InternalRealmSource>>,
+    /// Look the process-wide source up at every request instead of keeping
+    /// the one passed at construction ([`Self::for_process`]).
+    process_source: bool,
     realm: String,
     endpoint: String,
     audience_override: Option<String>,
@@ -229,10 +232,30 @@ impl InternalVerifier {
     ) -> Self {
         Self {
             source,
+            process_source: false,
             realm: realm.into(),
             endpoint: endpoint.into(),
             audience_override: audience_override.filter(|a| !a.trim().is_empty()),
             leeway_secs,
+        }
+    }
+
+    /// The verifier of `endpoint` bound to `realm`, using the process-wide
+    /// realm source ([`install_internal_realms`]) as it is **at request
+    /// time**. Endpoint routing snapshots are built at start-up before the
+    /// `hfs` binary installs the IdP runtime; capturing the source at
+    /// construction left every internal endpoint answering 503 ("the
+    /// built-in authorization server is off") after each restart until its
+    /// binding was saved again.
+    pub fn for_process(
+        realm: impl Into<String>,
+        endpoint: impl Into<String>,
+        audience_override: Option<String>,
+        leeway_secs: u64,
+    ) -> Self {
+        Self {
+            process_source: true,
+            ..Self::new(None, realm, endpoint, audience_override, leeway_secs)
         }
     }
 
@@ -255,7 +278,12 @@ fn is_at_jwt(typ: Option<&str>) -> bool {
 #[async_trait]
 impl AuthProvider for InternalVerifier {
     async fn authenticate(&self, authorization_header: &str) -> Result<Principal, AuthError> {
-        let source = self.source.as_ref().ok_or_else(|| {
+        let process = if self.process_source {
+            internal_realms()
+        } else {
+            None
+        };
+        let source = self.source.as_ref().or(process.as_ref()).ok_or_else(|| {
             self.unavailable("is unavailable: the built-in authorization server is off (HFS_IDP)")
         })?;
         let trust = source
