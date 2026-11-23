@@ -32,8 +32,11 @@ ADMIN = "Basic " + base64.b64encode(
 ).decode()
 CB = "https://app.example/cb"
 CLIENT = "growth-chart"
-LAB = f"{BASE}/lab"
-WARD = f"{BASE}/ward"
+# FHIR endpoints live under HFS_BASE_URL, which behind the production nginx is
+# `{origin}/fhir` while the hosted pages and admin API stay at the origin.
+FHIR = os.environ.get("HFS_E2E_FHIR_BASE", BASE).rstrip("/")
+LAB = f"{FHIR}/lab"
+WARD = f"{FHIR}/ward"
 CHROME = os.environ.get(
     "HFS_E2E_CHROME",
     os.path.expanduser("~/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome"),
