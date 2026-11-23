@@ -344,3 +344,27 @@ async fn fails_closed_when_the_idp_is_off_or_the_realm_is_gone() {
         Err(AuthError::JwksFetchError(_))
     ));
 }
+
+/// Regression (production, 2026-11-24): routing snapshots are built at
+/// start-up before `hfs` installs the IdP runtime. A verifier built then
+/// must pick the source up once it is installed, not stay "off" forever.
+/// This is the only test in this binary that installs the process source.
+#[tokio::test]
+async fn a_verifier_built_before_the_idp_starts_uses_it_once_installed() {
+    let (a, _b, source) = setup();
+    let t = mint(&a.keys[0], Mint::default());
+    let v = InternalVerifier::for_process("clinic", "lab", None, 0);
+    if helios_auth::internal_realms().is_none() {
+        match v.authenticate(&format!("Bearer {t}")).await {
+            Err(AuthError::JwksFetchError(m)) => assert!(m.contains("HFS_IDP"), "{m}"),
+            other => panic!("expected 503-class refusal before start-up, got {other:?}"),
+        }
+        let src: Arc<dyn InternalRealmSource> = source.clone();
+        assert!(helios_auth::install_internal_realms(src));
+    }
+    let principal = v
+        .authenticate(&format!("Bearer {t}"))
+        .await
+        .expect("token accepted once the IdP runtime is installed");
+    assert!(!principal.subject.is_empty());
+}
