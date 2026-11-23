@@ -13460,7 +13460,7 @@ select.ctl {
    IdP diagnostic steps…) have their own classes and are not touched. */
 details:not([class]) > summary:not([class]),
 details.disclosure > summary:not([class]),
-summary.disclosure__summary:not(.card-head),
+details:not(.card) > summary.disclosure__summary:not(.card-head),
 .verify__token > summary,
 .verify-block__details > summary,
 .pkg-log > summary,
@@ -13489,7 +13489,7 @@ summary.disclosure__summary:not(.card-head),
 
 details:not([class]) > summary:not([class])::-webkit-details-marker,
 details.disclosure > summary:not([class])::-webkit-details-marker,
-summary.disclosure__summary::-webkit-details-marker,
+details:not(.card) > summary.disclosure__summary::-webkit-details-marker,
 .verify__token > summary::-webkit-details-marker,
 .verify-block__details > summary::-webkit-details-marker,
 .pkg-log > summary::-webkit-details-marker,
@@ -13503,7 +13503,7 @@ summary.disclosure__summary::-webkit-details-marker,
    carry are hidden so every inline disclosure shows exactly one marker. */
 details:not([class]) > summary:not([class])::before,
 details.disclosure > summary:not([class])::before,
-summary.disclosure__summary:not(.card-head)::before,
+details:not(.card) > summary.disclosure__summary:not(.card-head)::before,
 .verify__token > summary::before,
 .verify-block__details > summary::before,
 .pkg-log > summary::before,
@@ -13521,19 +13521,19 @@ summary.disclosure__summary:not(.card-head)::before,
   transition: transform 120ms ease;
 }
 
-summary.disclosure__summary:not(.card-head) > .disclosure__chevron {
+details:not(.card) > summary.disclosure__summary:not(.card-head) > .disclosure__chevron {
   display: none;
 }
 
 details[open] > summary:not([class])::before,
 details.disclosure[open] > summary::before,
-details[open] > summary.disclosure__summary::before {
+details:not(.card)[open] > summary.disclosure__summary::before {
   transform: rotate(45deg);
 }
 
 details:not([class]) > summary:not([class]):hover,
 details.disclosure > summary:not([class]):hover,
-summary.disclosure__summary:not(.card-head):hover,
+details:not(.card) > summary.disclosure__summary:not(.card-head):hover,
 .verify__token > summary:hover,
 .verify-block__details > summary:hover,
 .pkg-log > summary:hover,
@@ -13552,7 +13552,7 @@ details > summary:focus-visible {
 /* Space between an open inline summary and what it reveals. */
 details:not([class])[open] > summary:not([class]),
 details.disclosure[open] > summary:not([class]),
-details[open] > summary.disclosure__summary:not(.card-head),
+details:not(.card)[open] > summary.disclosure__summary:not(.card-head),
 .verify__token[open] > summary,
 .verify-block__details[open] > summary,
 .pkg-log[open] > summary,
@@ -13773,4 +13773,57 @@ details.card[open] > summary.card-head > .disclosure__chevron {
    page. */
 .timeline {
   grid-template-columns: minmax(0, 1fr);
+}
+
+/* ---------- Fieldsets ----------
+   A <fieldset> is only a grouping for assistive technology here, never a
+   frame: browsers draw a 2px groove border around it with the legend cut
+   into the top edge. On endpoint Security the "Authorization server"
+   (External / Internal) group kept that frame — its idp.css reset only loads
+   on the /ui/idp pages — and the frame's bottom line ran across the Issuer /
+   Audience / JWKS label row under it. Zero specificity: a fieldset that
+   wants a frame (.pkg-options__group) still draws its own. */
+:where(fieldset) {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+:where(legend) {
+  padding: 0;
+}
+
+/* The External / Internal choice is an ordinary spaced block in the form. */
+.idp-provider {
+  margin: 4px 0 20px;
+}
+
+.idp-provider > legend {
+  margin-bottom: 8px;
+}
+
+/* View Definitions / SQL Queries on phones and small tablets: the stacked
+   editor and guided-form cards were each capped at 70vh with overflow
+   hidden — and the desktop `flex: 1 1 0` (declared after the phone rule)
+   still applied in the stacked column, so each card was only its 320px
+   floor tall: the card cut the editor off mid-document and hid its Save /
+   Cancel row and the guided form's rows. Stacked, the cards take their
+   content's height; the editor and the row tree scroll inside 60vh. */
+@media (max-width: 900px) {
+  .editor__grid--stretch > .card,
+  .editor__grid--stretch > .needs-js {
+    flex: 0 0 auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .editor__grid--stretch .code-editor .cm-editor {
+    height: auto;
+    max-height: 60vh;
+  }
+
+  .editor__grid--stretch .editor-form .editor-tree {
+    max-height: 60vh;
+  }
 }

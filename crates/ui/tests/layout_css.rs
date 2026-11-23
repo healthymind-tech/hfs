@@ -72,3 +72,14 @@ fn stacked_cards_are_spaced() {
             .contains("margin-top: 20px")
     );
 }
+
+#[test]
+fn fieldsets_draw_no_browser_frame() {
+    // The endpoint Security "Authorization server" group kept the browser's
+    // groove frame; its bottom rule lay on the Issuer/Audience/JWKS labels.
+    let fieldset = rule(":where(fieldset)");
+    for decl in ["border: 0", "padding: 0", "margin: 0", "min-width: 0"] {
+        assert!(fieldset.contains(decl), "{decl} on fieldsets");
+    }
+    assert!(rule(".idp-provider").contains("margin: 4px 0 20px"));
+}

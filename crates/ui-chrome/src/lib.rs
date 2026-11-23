@@ -294,6 +294,36 @@ struct ThemeBootTemplate {
     legacy_key: &'static str,
 }
 
+/// Avatar initials for a person, endpoint or tenant label: the first letter
+/// of each of the first two words, upper-cased. Words are runs of letters and
+/// digits, so punctuation and brackets never become an "initial"
+/// ("Sandbox (demo)" is `SD`, not `S(`). A label that starts in a caseless
+/// script (Chinese, Japanese, Korean…) gives its first character alone
+/// ("臺大醫院 測試" is `臺`): two CJK characters read as a word, not as
+/// initials. Returns an empty string when the label has no letter or digit;
+/// callers pick their own placeholder.
+#[must_use]
+pub fn avatar_initials(label: &str) -> String {
+    let mut words = label
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty());
+    let Some(first) = words.next().and_then(|w| w.chars().next()) else {
+        return String::new();
+    };
+    let caseless =
+        |c: char| c.is_alphabetic() && !c.is_ascii() && !c.is_lowercase() && !c.is_uppercase();
+    if caseless(first) {
+        return first.to_string();
+    }
+    let mut out: String = first.to_uppercase().collect();
+    if let Some(second) = words.next().and_then(|w| w.chars().next())
+        && !caseless(second)
+    {
+        out.extend(second.to_uppercase());
+    }
+    out
+}
+
 /// Re-exported so consumers can name [`askama::Error`] — the error type of
 /// [`user_menu`] — without adding their own askama dependency, and without the
 /// two crates being able to drift onto different askama versions.
@@ -310,4 +340,38 @@ pub use askama;
 struct UserMenuTemplate<'a> {
     i18n: &'a dyn ChromeLabels,
     user: UserIdentity<'a>,
+}
+
+#[cfg(test)]
+mod initials_tests {
+    use super::avatar_initials;
+
+    #[test]
+    fn first_letters_of_the_first_two_words() {
+        assert_eq!(avatar_initials("Demo User"), "DU");
+        assert_eq!(avatar_initials("Ada Byron Lovelace"), "AB");
+        assert_eq!(avatar_initials("console-admin"), "CA");
+        assert_eq!(avatar_initials("demo"), "D");
+        assert_eq!(avatar_initials("  spaced   out  "), "SO");
+    }
+
+    #[test]
+    fn punctuation_and_brackets_are_never_initials() {
+        assert_eq!(avatar_initials("Sandbox (demo)"), "SD");
+        assert_eq!(avatar_initials("sandbox (demo)"), "SD");
+        assert_eq!(avatar_initials("(test) server"), "TS");
+        assert_eq!(avatar_initials("[EU] — Production"), "EP");
+        assert_eq!(avatar_initials("\"quoted\" name"), "QN");
+        assert_eq!(avatar_initials("()"), "");
+        assert_eq!(avatar_initials(""), "");
+    }
+
+    #[test]
+    fn cjk_names_give_their_first_character() {
+        assert_eq!(avatar_initials("臺大醫院 測試"), "臺");
+        assert_eq!(avatar_initials("（測試）端點"), "測");
+        assert_eq!(avatar_initials("東京 Clinic"), "東");
+        assert_eq!(avatar_initials("서울 병원"), "서");
+        assert_eq!(avatar_initials("Clinic 東京"), "C");
+    }
 }
