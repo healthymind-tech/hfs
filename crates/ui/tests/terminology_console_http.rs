@@ -90,10 +90,16 @@ async fn detail_routes_with_their_own_path_parameters_work() {
     // The host route's wildcard must not reach the embedded router's
     // `Path` extractors (it used to answer 500 "Wrong number of path
     // arguments").
-    let (status, _, html) = get("/ui/terminology/code-systems/snomed-ct", &[]).await;
+    let (status, headers, html) = get("/ui/terminology/code-systems/snomed-ct", &[]).await;
     assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{html}");
     assert!(!html.contains("Wrong number of path arguments"));
-    assert!(html.contains(r#"id="sidebar""#));
+    if status.is_redirection() {
+        // Unknown upstream: the page sends the browser on, inside the section.
+        let to = headers[header::LOCATION].to_str().unwrap();
+        assert!(to.starts_with("/ui/terminology/"), "{to}");
+    } else {
+        assert!(html.contains(r#"id="sidebar""#), "{status}");
+    }
 }
 
 #[tokio::test]
