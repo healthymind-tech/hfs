@@ -38,7 +38,11 @@ const MAX_ADMIN_BODY: usize = 256 * 1024 * 1024;
 pub struct InProcessUpstream {
     service: Arc<dyn TerminologyService>,
     admin: Option<axum::Router>,
+    metrics: Option<MetricsSource>,
 }
+
+/// The host's Prometheus exposition (`GET /metrics` of the whole server).
+pub type MetricsSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 impl std::fmt::Debug for InProcessUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,7 +57,20 @@ impl InProcessUpstream {
     /// `service`: the server's terminology service; `admin`: the
     /// terminology admin router (`/admin/terminology`), when enabled.
     pub fn new(service: Arc<dyn TerminologyService>, admin: Option<axum::Router>) -> Self {
-        Self { service, admin }
+        Self {
+            service,
+            admin,
+            metrics: None,
+        }
+    }
+
+    /// The dashboard's request figures: embedded, terminology requests are
+    /// counted by the host's own recorder (`route="/tx/…"`), so the console
+    /// reads the host exposition, narrowed to terminology routes
+    /// ([`terminology_metrics`]), instead of a terminology `/metrics`.
+    pub fn with_metrics(mut self, source: MetricsSource) -> Self {
+        self.metrics = Some(source);
+        self
     }
 
     /// The admin router, with the console user attached for its audit
@@ -86,6 +103,20 @@ impl InProcessUpstream {
             .body()
             .and_then(reqwest::Body::as_bytes)
             .map(bytes::Bytes::copy_from_slice);
+        if rest == "/metrics"
+            && let Some(source) = &self.metrics
+        {
+            return Ok(match source() {
+                Some(text) => UpResponse {
+                    status: reqwest::StatusCode::OK,
+                    body: bytes::Bytes::from(terminology_metrics(&text)),
+                },
+                None => UpResponse {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    body: bytes::Bytes::new(),
+                },
+            });
+        }
         if let Some(admin_tail) = rest.strip_prefix("/admin") {
             return self
                 .admin(&request, admin_tail, &query, body, op, url)
@@ -200,6 +231,41 @@ impl InProcessUpstream {
             body,
         })
     }
+}
+
+/// The host exposition narrowed to terminology traffic, in the shape a
+/// stand-alone terminology server reports it: samples whose `route` is under
+/// `/tx` lose that prefix (`/tx/CodeSystem/$lookup` → `/CodeSystem/$lookup`),
+/// `/admin/terminology/…` becomes `/admin/…`; samples of other routes (FHIR,
+/// console) are dropped; samples without a `route` label are kept.
+pub fn terminology_metrics(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() / 2);
+    for line in text.lines() {
+        let Some(at) = line.find("route=\"") else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let start = at + "route=\"".len();
+        let Some(len) = line[start..].find('"') else {
+            continue;
+        };
+        let route = &line[start..start + len];
+        let mapped = if route == "/tx" {
+            "/".to_string()
+        } else if let Some(r) = route.strip_prefix("/tx/") {
+            format!("/{r}")
+        } else if let Some(r) = route.strip_prefix("/admin/terminology") {
+            format!("/admin{r}")
+        } else {
+            continue;
+        };
+        out.push_str(&line[..start]);
+        out.push_str(&mapped);
+        out.push_str(&line[start + len..]);
+        out.push('\n');
+    }
+    out
 }
 
 /// A fully read upstream answer, over HTTP or in-process. Mirrors the
@@ -372,6 +438,38 @@ mod tests {
             rec.seen.lock().unwrap().is_empty(),
             "admin calls bypass the tx service"
         );
+    }
+
+    #[test]
+    fn host_metrics_are_narrowed_to_terminology_routes() {
+        let host = "# TYPE http_requests_total counter\n\
+http_requests_total{service=\"hfs\",method=\"GET\",route=\"/tx/CodeSystem\",status=\"200\"} 4\n\
+http_requests_total{service=\"hfs\",method=\"GET\",route=\"/Patient\",status=\"200\"} 9\n\
+http_requests_total{service=\"hfs\",method=\"GET\",route=\"/admin/terminology/jobs\",status=\"200\"} 1\n\
+uptime_seconds{service=\"hfs\"} 12\n";
+        let tx = terminology_metrics(host);
+        assert!(tx.contains("route=\"/CodeSystem\""), "{tx}");
+        assert!(tx.contains("route=\"/admin/jobs\""), "{tx}");
+        assert!(!tx.contains("/Patient"), "{tx}");
+        assert!(tx.contains("uptime_seconds"), "{tx}");
+        assert!(tx.contains("# TYPE http_requests_total counter"), "{tx}");
+    }
+
+    #[tokio::test]
+    async fn metrics_come_from_the_host_exposition_when_given() {
+        let rec = Arc::new(Recorder {
+            seen: Mutex::new(Vec::new()),
+        });
+        let service: Arc<dyn TerminologyService> = rec.clone();
+        let local = InProcessUpstream::new(service, None).with_metrics(Arc::new(|| {
+            Some("http_requests_total{route=\"/tx/ValueSet\",status=\"200\"} 2\n".to_string())
+        }));
+        let c = UpstreamClient::in_process(local).unwrap();
+        assert_eq!(
+            c.metrics_text().await.unwrap(),
+            "http_requests_total{route=\"/ValueSet\",status=\"200\"} 2\n"
+        );
+        assert!(rec.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

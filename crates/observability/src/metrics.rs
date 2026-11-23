@@ -108,6 +108,14 @@ pub fn router() -> Router {
 // (`mongodb_deferred_search_index_*`): the only label is `reason`, over a fixed
 // two-value set. No tenant, resource type or Bundle id.
 
+/// The exposition text `GET /metrics` serves, for in-process readers (the
+/// embedded terminology console's dashboard). `None` before [`init`].
+pub fn render_text() -> Option<String> {
+    metrics::gauge!("uptime_seconds").set(uptime::uptime_seconds());
+    pool_metrics::publish();
+    HANDLE.get().map(|handle| handle.render())
+}
+
 /// Render the Prometheus exposition text. The `uptime_seconds` gauge and the
 /// registered PostgreSQL pool gauges are set immediately before rendering
 /// because the pull exporter has no scrape callback.

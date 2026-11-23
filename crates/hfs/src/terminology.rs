@@ -494,10 +494,12 @@ fn embedded_audit(
 pub fn console_upstream() -> Option<helios_ui::terminology_console::InProcessUpstream> {
     let mount = MOUNT.get()?;
     let service = helios_rest::terminology::server_terminology()?;
-    Some(helios_ui::terminology_console::InProcessUpstream::new(
-        service,
-        mount.admin.clone(),
-    ))
+    Some(
+        helios_ui::terminology_console::InProcessUpstream::new(service, mount.admin.clone())
+            .with_metrics(std::sync::Arc::new(
+                helios_observability::metrics::render_text,
+            )),
+    )
 }
 
 /// Mount the embedded terminology API at `/tx` and its admin API at
