@@ -148,6 +148,10 @@ pub async fn ensure_schema(database_url: &str, schema: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// How long after an import's last batch the cache-sync eviction stays
+/// deferred (see [`crate::import::throttle::ImportActivity`]).
+pub const IMPORT_EVICTION_GRACE_MS: u64 = 5_000;
+
 /// The import pool's connection string: `url` plus
 /// `-c synchronous_commit=off` (import sessions only; FHIR and terminology
 /// reads keep durable commits) appended to any `options` already there.
@@ -359,6 +363,17 @@ async fn start_postgres(options: EmbeddedOptions) -> anyhow::Result<EmbeddedHts>
             backend,
             Duration::from_millis(config.cache_sync_interval_ms),
             Arc::new(move || {
+                // An admin import is writing: its batches move the epoch
+                // every second; evicting on each would keep every cache
+                // (validation included) cold for the whole import. The job
+                // evicts everything when it ends.
+                if st
+                    .import_activity
+                    .active(Duration::from_millis(IMPORT_EVICTION_GRACE_MS))
+                {
+                    tracing::debug!("terminology epoch moved during an import; eviction deferred");
+                    return;
+                }
                 st.clear_expand_cache();
                 st.backend().invalidate_caches();
             }),

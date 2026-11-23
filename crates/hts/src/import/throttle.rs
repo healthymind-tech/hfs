@@ -35,6 +35,37 @@ use crate::error::HtsError;
 use crate::import::bundle_parser::ParsedBundle;
 use crate::import::{BundleImportBackend, ImportStats, PropertyRow};
 
+/// When an import last wrote (shared by the throttled importer and the
+/// cache-sync eviction): while an admin import is writing, the cross-instance
+/// epoch poll would otherwise evict every terminology and validator cache
+/// once a second, turning FHIR validation cold for the whole import. The
+/// eviction is deferred while [`ImportActivity::active`]; the import job
+/// itself evicts everything when it ends (`AdminCore::on_change`).
+#[derive(Debug, Default)]
+pub struct ImportActivity {
+    last_write_ms: AtomicU64,
+}
+
+impl ImportActivity {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Record a write (start or end of a batch).
+    pub fn touch(&self) {
+        self.last_write_ms.store(Self::now_ms(), Ordering::Relaxed);
+    }
+
+    /// Whether an import wrote within `window`.
+    pub fn active(&self, window: Duration) -> bool {
+        let last = self.last_write_ms.load(Ordering::Relaxed);
+        last != 0 && Self::now_ms().saturating_sub(last) < window.as_millis() as u64
+    }
+}
+
 /// Measures how long a trivial query takes on the serving pool.
 pub type Probe = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Duration> + Send>> + Send + Sync>;
 
@@ -49,6 +80,9 @@ pub struct ThrottlePolicy {
     pub probe_slow: Duration,
     /// The serving-pool probe; `None` = duty cycle only.
     pub probe: Option<Probe>,
+    /// Where writes are recorded for deferred cache eviction (see
+    /// [`ImportActivity`]); `None` = evictions are not deferred.
+    pub activity: Option<Arc<ImportActivity>>,
 }
 
 impl std::fmt::Debug for ThrottlePolicy {
@@ -58,6 +92,7 @@ impl std::fmt::Debug for ThrottlePolicy {
             .field("max_pause", &self.max_pause)
             .field("probe_slow", &self.probe_slow)
             .field("probe", &self.probe.is_some())
+            .field("defer_eviction", &self.activity.is_some())
             .finish()
     }
 }
@@ -69,6 +104,7 @@ impl Default for ThrottlePolicy {
             max_pause: Duration::from_secs(2),
             probe_slow: Duration::from_millis(25),
             probe: None,
+            activity: None,
         }
     }
 }
@@ -76,7 +112,7 @@ impl Default for ThrottlePolicy {
 impl ThrottlePolicy {
     /// Whether this policy changes anything.
     pub fn is_active(&self) -> bool {
-        self.duty < 1.0 || self.probe.is_some()
+        self.duty < 1.0 || self.probe.is_some() || self.activity.is_some()
     }
 
     /// The duty-cycle pause after a write that took `elapsed`.
@@ -149,8 +185,14 @@ impl ThrottledBackend {
         F: Future<Output = T>,
     {
         // tokio's clock, so paused-time tests see the batch duration.
+        if let Some(activity) = &self.policy.activity {
+            activity.touch();
+        }
         let started = tokio::time::Instant::now();
         let out = fut.await;
+        if let Some(activity) = &self.policy.activity {
+            activity.touch();
+        }
         self.pace(started.elapsed()).await;
         out
     }
@@ -276,6 +318,25 @@ mod tests {
         ) -> Result<ImportStats, HtsError> {
             Ok(ImportStats::default())
         }
+    }
+
+    #[tokio::test]
+    async fn writes_mark_the_import_active() {
+        let activity = Arc::new(ImportActivity::default());
+        assert!(!activity.active(Duration::from_secs(5)));
+        let b = ThrottledBackend::new(
+            Arc::new(Slow),
+            ThrottlePolicy {
+                duty: 1.0,
+                activity: Some(activity.clone()),
+                ..Default::default()
+            },
+        );
+        b.import_bundle(&TenantContext::system(), b"{}")
+            .await
+            .unwrap();
+        assert!(activity.active(Duration::from_secs(5)));
+        assert!(!activity.active(Duration::ZERO));
     }
 
     #[test]

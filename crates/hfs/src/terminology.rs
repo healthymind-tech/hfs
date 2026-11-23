@@ -370,6 +370,17 @@ pub fn import_throttle(view: &EnvView) -> helios_hts::import::throttle::Throttle
             num("HFS_TERMINOLOGY_IMPORT_PROBE_SLOW_MS").unwrap_or(25.0) as u64,
         ),
         probe: None,
+        // HFS_TERMINOLOGY_IMPORT_DEFER_EVICTION=false evicts on every epoch
+        // move even while an admin import writes.
+        activity: (!view
+            .get("HFS_TERMINOLOGY_IMPORT_DEFER_EVICTION")
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            }))
+        .then(Default::default),
     }
 }
 

@@ -312,6 +312,11 @@ pub struct AppState<B: TerminologyBackend> {
     /// Pacing of admin-job imports (`HFS_TERMINOLOGY_IMPORT_*`): see
     /// [`crate::import::throttle`]. `None`: unthrottled.
     pub import_throttle: Option<crate::import::throttle::ThrottlePolicy>,
+
+    /// Last write of a throttled (admin-job) import; the cache-sync
+    /// eviction is deferred while it is recent (see
+    /// [`crate::import::throttle::ImportActivity`]).
+    pub import_activity: Arc<crate::import::throttle::ImportActivity>,
 }
 
 /// Default for [`AppState::import_finalize_wait`]: comfortably inside the
@@ -354,6 +359,7 @@ impl<B: TerminologyBackend> AppState<B> {
             import_runtime: None,
             import_backend: None,
             import_throttle: None,
+            import_activity: Arc::default(),
         }
     }
 
@@ -440,7 +446,15 @@ impl<B: TerminologyBackend> AppState<B> {
         mut self,
         policy: Option<crate::import::throttle::ThrottlePolicy>,
     ) -> Self {
-        self.import_throttle = policy.filter(|p| p.is_active());
+        self.import_throttle = policy
+            .map(|mut p| {
+                if p.activity.is_some() {
+                    // Share the state's tracker with the eviction side.
+                    p.activity = Some(Arc::clone(&self.import_activity));
+                }
+                p
+            })
+            .filter(|p| p.is_active());
         self
     }
 
