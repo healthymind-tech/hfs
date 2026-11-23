@@ -208,6 +208,28 @@ pub fn embedded_router(state: Arc<HtsUiState>, admin: Option<Router>) -> Router 
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
 }
 
+/// Queued or running terminology jobs, for the console topbar's activity
+/// chip; `None` when the admin API is not reachable.
+pub async fn active_jobs(upstream: &UpstreamClient) -> Option<usize> {
+    match upstream
+        .admin_call(
+            reqwest::Method::GET,
+            "/jobs?limit=100",
+            None,
+            std::time::Duration::from_secs(3),
+            &[],
+        )
+        .await
+    {
+        Ok((200, v)) => Some(v["jobs"].as_array().map_or(0, |jobs| {
+            jobs.iter()
+                .filter(|j| matches!(j["status"].as_str(), Some("queued" | "running")))
+                .count()
+        })),
+        _ => None,
+    }
+}
+
 /// The Terminology section's sidebar entries (design §9.1), registered in
 /// the shared navigation registry when the console is embedded. `admin`:
 /// whether the management pages exist (the upstream admin API is reachable).

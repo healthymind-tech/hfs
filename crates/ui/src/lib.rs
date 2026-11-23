@@ -39,6 +39,7 @@
 //! resource type of the active FHIR version, offering the untouched ones at 0.
 
 mod account;
+mod activity;
 mod admin_login;
 mod auth_shell;
 mod bulk_export;
@@ -2473,6 +2474,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
         .merge(sync_pages::routes())
+        .merge(activity::routes())
         .merge(idp::routes())
         // Persists the sidebar's FHIR-version choice (#343) and redirects back.
         .route("/ui/version", axum::routing::post(set_version))

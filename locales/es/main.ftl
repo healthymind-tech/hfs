@@ -1762,3 +1762,10 @@ sql-library-unavailable-lede = No se pudieron verificar las consultas y vistas d
 # Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
 nav-route-tabs = Páginas de esta sección
 rail-show-empty = Mostrar vacíos
+activity-jobs = Trabajos
+activity-idle = Ningún trabajo en curso
+activity-running = { $count ->
+    [one] 1 trabajo en curso
+   *[other] { $count } trabajos en curso
+}
+activity-detail = Importaciones de terminología en curso: { $imports } · Sincronizaciones: { $syncs }

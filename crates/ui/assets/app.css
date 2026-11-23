@@ -16015,3 +16015,39 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     scroll-behavior: auto !important;
   }
 }
+
+/* Topbar activity chip: running imports and sync runs. */
+@layer pages {
+  .activity-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 10px;
+    border-radius: var(--r-full);
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: var(--fs-xs);
+    font-weight: 500;
+    white-space: nowrap;
+    text-decoration: none;
+    transition: background-color var(--dur-1) var(--ease-std), color var(--dur-1) var(--ease-std);
+  }
+
+  .activity-chip:hover {
+    color: var(--text);
+    background: color-mix(in srgb, var(--surface-2) 70%, var(--border-strong));
+    text-decoration: none;
+  }
+
+  .activity-chip--busy {
+    color: var(--accent-text);
+    background: var(--accent-soft);
+  }
+
+  @media (max-width: 1024px) {
+    .activity-chip {
+      display: none;
+    }
+  }
+}
