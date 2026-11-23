@@ -67,7 +67,7 @@
                 <td class="col-name">
                   {#- ConceptMap ids have no version pipe, but the segment is
                       encoded anyway so any future id shape stays safe. -#}
-                  <a href="{{ crate::paths::ui() }}/concept-maps/{{ row.id|urlencode_strict }}">
+                  <a href="{{ crate::paths::ui() }}/concept-maps/{{ row.id|urlencode_strict }}" title="{% if !row.name.is_empty() %}{{ row.name }}{% else %}{{ row.id }}{% endif %}">
                     {% if !row.name.is_empty() %}{{ row.name }}
                     {%- else %}{{ row.id }}
                     {%- endif %}

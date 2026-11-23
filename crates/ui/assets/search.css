@@ -1,0 +1,423 @@
+/*
+ * The console's global search (assets/search.js, partials/shell/global-search.html).
+ * Kept out of app.css on purpose: the topbar combobox, its result list and
+ * the pulse that marks the section or field a result led to. Only the
+ * design tokens of app.css are used, so light and dark follow the theme.
+ */
+@layer components {
+  /* The topbar is its own stacking context (view-transition-name): lift it
+     over the content so the result list is not painted under the cards. */
+  .topbar:has(.gsearch) {
+    position: relative;
+    z-index: 30;
+  }
+
+  .gsearch {
+    position: relative;
+    flex: 0 1 460px;
+    min-width: 0;
+    margin-right: auto;
+    margin-left: 4px;
+  }
+
+  .gsearch__open {
+    display: none;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .gsearch__open svg {
+    width: 20px;
+    height: 20px;
+  }
+  .gsearch__open:hover {
+    background: var(--accent-soft);
+  }
+  .gsearch__open:focus-visible,
+  .gsearch__close:focus-visible,
+  .gsearch__chip:focus-visible,
+  .gsearch__link:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .gsearch__form {
+    position: relative;
+    display: flex;
+    align-items: center;
+    height: 38px;
+    margin: 0;
+    padding: 0 8px 0 10px;
+    border: 1px solid var(--outline);
+    border-radius: 10px;
+    background: var(--input-bg);
+    color: var(--text);
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  .gsearch__form:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+    background: var(--surface);
+  }
+  .gsearch__icon {
+    display: inline-flex;
+    flex: none;
+    color: var(--muted);
+  }
+  .gsearch__icon svg {
+    width: 17px;
+    height: 17px;
+  }
+  .gsearch__input {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    margin: 0 6px 0 8px;
+    padding: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text-strong);
+    font: inherit;
+    font-size: 14px;
+  }
+  .gsearch__input::placeholder {
+    color: var(--muted);
+    opacity: 1;
+  }
+  .gsearch__input::-webkit-search-cancel-button {
+    display: none;
+  }
+  .gsearch__kbd,
+  .gsearch__foot kbd {
+    flex: none;
+    padding: 1px 6px;
+    border: 1px solid var(--outline);
+    border-bottom-width: 2px;
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--muted);
+    font: 600 11px/1.5 inherit;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  .gsearch--active .gsearch__kbd {
+    display: none;
+  }
+  .gsearch__close {
+    display: none;
+    place-items: center;
+    flex: none;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .gsearch__close svg {
+    width: 16px;
+    height: 16px;
+  }
+  .gsearch__close:hover {
+    background: var(--accent-soft);
+    color: var(--text-strong);
+  }
+
+  /* ---- the dropdown ---- */
+  .gsearch__panel {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    width: max(100%, 560px);
+    max-width: min(720px, calc(100vw - 32px));
+    max-height: min(70vh, 620px);
+    overflow: hidden;
+    border: 1px solid var(--popover-border);
+    border-radius: var(--radius-lg);
+    background: var(--popover);
+    box-shadow: var(--popover-shadow);
+    color: var(--text);
+  }
+  .gsearch__panel[hidden] {
+    display: none;
+  }
+  .gsearch__list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 6px;
+  }
+  .gsearch__list[hidden] {
+    display: none;
+  }
+  .gsearch__list[aria-busy="true"] .gs-part {
+    opacity: 0.85;
+  }
+
+  .gs-group:not(.gs-group--first) {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid var(--divider);
+  }
+  .gs-group__title {
+    padding: 8px 10px 4px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .gs-hit {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 9px;
+    color: var(--text);
+    text-decoration: none;
+    cursor: pointer;
+    scroll-margin: 6px;
+  }
+  .gs-hit:hover,
+  .gs-hit[aria-selected="true"] {
+    background: var(--accent-soft);
+  }
+  .gs-hit[aria-selected="true"] {
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .gs-hit__icon {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--surface-border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--accent-text);
+  }
+  .gs-hit__icon svg {
+    width: 16px;
+    height: 16px;
+  }
+  .gs-hit__body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .gs-hit__label {
+    overflow: hidden;
+    color: var(--text-strong);
+    font-size: 14px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .gs-hit__label mark {
+    padding: 0 1px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: inherit;
+  }
+  .gs-hit__path {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .gs-hit__sep {
+    color: var(--muted);
+    opacity: 0.8;
+  }
+  .gs-hit__note {
+    color: var(--muted);
+    font-size: 11.5px;
+    font-style: italic;
+  }
+  .gs-hit__kind {
+    flex: none;
+    padding: 1px 8px;
+    border: 1px solid var(--surface-border);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  /* ---- empty, no-results, footer ---- */
+  .gsearch__empty,
+  .gsearch__none {
+    padding: 16px 18px 14px;
+  }
+  .gsearch__empty[hidden],
+  .gsearch__none[hidden],
+  .gsearch__recent[hidden] {
+    display: none;
+  }
+  .gsearch__empty-title {
+    margin: 0 0 4px;
+    color: var(--text-strong);
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .gsearch__empty-text {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .gsearch__subhead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 10px 0 6px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .gsearch__chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .gsearch__chip {
+    max-width: 100%;
+    overflow: hidden;
+    padding: 4px 12px;
+    border: 1px solid var(--outline);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .gsearch__chip:hover {
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+  .gsearch__link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent-text);
+    font: inherit;
+    font-size: 12px;
+    letter-spacing: normal;
+    text-transform: none;
+    cursor: pointer;
+  }
+  .gsearch__foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding: 8px 14px;
+    border-top: 1px solid var(--divider);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .gsearch__foot kbd {
+    margin-right: 2px;
+  }
+
+  /* ---- the spot a result led to ---- */
+  .gs-pulse {
+    border-radius: var(--radius);
+    animation: gs-pulse 2.4s ease-out 1;
+  }
+  @keyframes gs-pulse {
+    0%,
+    30% {
+      box-shadow: 0 0 0 3px var(--accent), 0 0 0 9px var(--accent-soft);
+      background-color: var(--accent-soft);
+    }
+    100% {
+      box-shadow: 0 0 0 3px transparent, 0 0 0 9px transparent;
+    }
+  }
+
+  /* ---- the no-JavaScript results page ---- */
+  .gs-page-form {
+    display: flex;
+    gap: 8px;
+    max-width: 640px;
+    margin: 0 0 16px;
+  }
+  .gs-page-form .mfield__input {
+    flex: 1 1 auto;
+  }
+  .gs-page-results {
+    padding: 6px;
+  }
+
+  /* ---- tablets and phones: an icon that expands over the topbar ---- */
+  @media (max-width: 1024px) {
+    .gsearch {
+      flex: none;
+      margin: 0 0 0 auto;
+      position: static;
+    }
+    .gsearch__open {
+      display: grid;
+    }
+    .gsearch__form,
+    .gsearch__kbd {
+      display: none;
+    }
+    .gsearch--expanded .gsearch__form {
+      position: absolute;
+      inset: 8px 12px;
+      z-index: 61;
+      display: flex;
+      height: auto;
+      background: var(--surface);
+    }
+    .gsearch--expanded .gsearch__close {
+      display: grid;
+    }
+    .gsearch__panel {
+      top: calc(var(--topbar-h) - 2px);
+      left: 8px;
+      right: 8px;
+      width: auto;
+      max-width: none;
+      max-height: calc(100dvh - var(--topbar-h) - 16px);
+    }
+    .gs-hit__kind {
+      display: none;
+    }
+    .gsearch__foot {
+      display: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .gs-pulse {
+      animation: none;
+      box-shadow: 0 0 0 3px var(--accent);
+    }
+    .gsearch__form {
+      transition: none;
+    }
+  }
+}

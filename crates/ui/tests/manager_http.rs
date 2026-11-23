@@ -689,3 +689,37 @@ fn manager_catalog_is_complete_in_en_and_zh_hant() {
         "keys used but not in en/manager.ftl: {missing:?}"
     );
 }
+
+/// The endpoint switcher's avatar: first letters of words only, so a name
+/// with brackets ("Sandbox (demo)") never renders "S(", and a Chinese name
+/// gives its first character.
+#[tokio::test]
+async fn switcher_initials_skip_punctuation_and_handle_cjk() {
+    let f = fixture().await;
+    let (s, _, _) = post(
+        &f.app,
+        "/ui/e/twcore/config",
+        "revision=1&display_name=Sandbox+%28demo%29",
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let (_, html) = get(&f.app, "/ui/e/twcore").await;
+    assert!(
+        html.contains(r#"<span class="avatar avatar--brand">SD</span>"#),
+        "Sandbox (demo) → SD"
+    );
+    assert!(!html.contains(">S(<"), "no bracket as an initial");
+
+    let (s, _, _) = post(
+        &f.app,
+        "/ui/e/twcore/config",
+        "revision=2&display_name=%E8%87%BA%E5%A4%A7+%E6%B8%AC%E8%A9%A6",
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let (_, html) = get(&f.app, "/ui/e/twcore").await;
+    assert!(
+        html.contains(r#"<span class="avatar avatar--brand">臺</span>"#),
+        "CJK name → its first character"
+    );
+}

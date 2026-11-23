@@ -410,19 +410,10 @@ fn hfs_console_href(configured: Option<&'static str>, cookie: bool) -> Option<&'
     configured.or(cookie.then_some(helios_ui_chrome::HFS_CONSOLE_PATH))
 }
 
-/// Up to two initials for the account avatar, like the FHIR console's.
+/// Up to two initials for the account avatar — the FHIR console's rule
+/// (`helios_ui_chrome::avatar_initials`).
 fn initials(name: &str) -> String {
-    let parts: Vec<&str> = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|p| !p.is_empty())
-        .collect();
-    let mut out: String = match parts.as_slice() {
-        [] => String::new(),
-        [one] => one.chars().take(2).collect(),
-        [first, .., last] => first.chars().take(1).chain(last.chars().take(1)).collect(),
-    };
-    out = out.to_uppercase();
-    out
+    helios_ui_chrome::avatar_initials(name)
 }
 
 /// The generic "not found" page, `404` inside the full chrome.
@@ -614,9 +605,10 @@ mod topbar_tests {
 
     #[test]
     fn avatar_initials_match_the_fhir_console() {
-        assert_eq!(initials("admin"), "AD");
+        assert_eq!(initials("admin"), "A");
         assert_eq!(initials("console-admin"), "CA");
-        assert_eq!(initials("Jane Q Doe"), "JD");
+        assert_eq!(initials("Jane Q Doe"), "JQ");
+        assert_eq!(initials("Sandbox (demo)"), "SD");
         assert_eq!(initials(""), "");
     }
 }

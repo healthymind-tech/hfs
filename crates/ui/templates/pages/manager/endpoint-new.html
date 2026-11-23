@@ -59,7 +59,7 @@
         </div>
         <div class="mfield{% if self.bad("path") %} mfield--error{% endif %}">
           <label class="mfield__label" for="f-path">{{ i18n.t("mgr-field-path") }}</label>
-          <div class="input-prefix"><span class="input-prefix__text">{{ server_base }}/</span>
+          <div class="input-prefix"><span class="input-prefix__text" title="{{ server_base }}/">{{ server_base }}/</span>
           <input class="mfield__input mfield__input--mono" id="f-path" name="path" value="{{ nv.path }}" autocomplete="off" placeholder="{{ i18n.t("mgr-field-path-same") }}"
                  hx-get="/ui/endpoints/check" hx-trigger="input changed delay:300ms" hx-include="#f-name, #f-path" hx-target="#name-check"
                  aria-describedby="f-path-hint{% if self.bad("path") %} f-path-err{% endif %}"{% if self.bad("path") %} aria-invalid="true"{% endif %}></div>

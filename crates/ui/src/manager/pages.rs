@@ -2316,7 +2316,9 @@ pub(crate) async fn about(
 
 /// Sync jobs for the manager pages: the backend's own, else those of the
 /// installed sync service.
-async fn sync_jobs_of(backend: &Arc<dyn ManagerBackend>) -> Result<Vec<SyncJobView>, BackendError> {
+pub(crate) async fn sync_jobs_of(
+    backend: &Arc<dyn ManagerBackend>,
+) -> Result<Vec<SyncJobView>, BackendError> {
     if !backend.sync_available()
         && let Some(views) = crate::sync_pages::service_job_views().await
     {

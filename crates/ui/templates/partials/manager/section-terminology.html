@@ -14,7 +14,7 @@
   {% call ui::verify_panel("verify-terminology", "/ui/e/" ~ head.name ~ "/terminology/verify", "term_inherit term_server_url term_token term_timeout", "verify-intro-terminology", "verify-run-terminology", false, false) %}{% endcall %}
 {% endcall %}
 
-<section class="card form-section" aria-labelledby="sec-hts-title">
+<section class="card form-section" aria-labelledby="sec-hts-title" id="sec-hts">
   <header class="form-section__head">
     <h2 class="form-section__title" id="sec-hts-title">{{ i18n.t("mgr-sec-hts") }}</h2>
     <p class="form-section__desc">{{ i18n.t("mgr-sec-hts-desc") }}</p>

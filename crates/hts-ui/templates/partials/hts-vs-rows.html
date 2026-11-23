@@ -59,7 +59,7 @@
                 <td class="col-name">
                   {#- ValueSet ids have no version pipe, but the segment is
                       encoded anyway so any future id shape stays safe. -#}
-                  <a href="{{ crate::paths::ui() }}/value-sets/{{ row.id|urlencode_strict }}">
+                  <a href="{{ crate::paths::ui() }}/value-sets/{{ row.id|urlencode_strict }}" title="{% if !row.name.is_empty() %}{{ row.name }}{% else %}{{ row.id }}{% endif %}">
                     {% if !row.name.is_empty() %}{{ row.name }}
                     {%- else %}{{ row.id }}
                     {%- endif %}

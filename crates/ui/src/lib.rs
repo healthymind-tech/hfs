@@ -79,6 +79,9 @@ mod subscriptions;
 mod sync_pages;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
+/// The console-wide search (topbar, `/ui/find`).
+#[doc(hidden)]
+pub mod global_search;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
@@ -1021,18 +1024,7 @@ impl Status {
 
     /// Up-to-two-letter avatar initials from the tenant label.
     pub(crate) fn tenant_initials(&self) -> String {
-        let letters: String = self
-            .tenant_label()
-            .split([' ', '-', '_', '/'])
-            .filter(|w| !w.is_empty())
-            .take(2)
-            .filter_map(|w| w.chars().next())
-            .collect();
-        if letters.is_empty() {
-            "?".to_string()
-        } else {
-            letters.to_uppercase()
-        }
+        initials_of(self.tenant_label())
     }
 }
 
@@ -2465,7 +2457,8 @@ pub fn mount_with_conformance_source_and_runtime(
         // The manager console: overview at `/ui`, endpoint pages, About.
         Some(_) => router
             .merge(manager::pages::routes())
-            .merge(manager::verify_pages::routes()),
+            .merge(manager::verify_pages::routes())
+            .route("/ui/find", get(global_search::find)),
         None => router
             .route("/ui", get(index))
             .route("/ui/about", get(manager::pages::about)),
@@ -2883,16 +2876,11 @@ struct TenantOptionsPartial {
 }
 
 fn initials_of(label: &str) -> String {
-    let letters: String = label
-        .split([' ', '-', '_', '/'])
-        .filter(|w| !w.is_empty())
-        .take(2)
-        .filter_map(|w| w.chars().next())
-        .collect();
+    let letters = helios_ui_chrome::avatar_initials(label);
     if letters.is_empty() {
         "?".to_string()
     } else {
-        letters.to_uppercase()
+        letters
     }
 }
 
@@ -12345,6 +12333,8 @@ mod user_summary_tests {
         assert_eq!(initials_of("Ada Byron Lovelace"), "AB");
         assert_eq!(initials_of("demo"), "D");
         assert_eq!(initials_of("  spaced   out  "), "SO");
+        assert_eq!(initials_of("Sandbox (demo)"), "SD");
+        assert_eq!(initials_of("臺大醫院"), "臺");
         // The shared helper marks an unlabelable input with "?" — never reached for
         // a signed-in user, whose display name falls back to the subject.
         assert_eq!(initials_of(""), "?");

@@ -1,0 +1,27 @@
+{% extends "layouts/base.html" %}
+{% import "partials/components.html" as ui %}
+{#- The global search without JavaScript: the topbar form submits here. -#}
+{% block title %}{{ i18n.t("gs-page-title") }} — {{ i18n.t("app-short-name") }}{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div class="page-head__text">
+    <h1 class="page-head__title">{{ i18n.t("gs-page-title") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("gs-page-lede") }}</p>
+  </div>
+</header>
+<form class="gs-page-form" method="get" action="/ui/find" role="search">
+  <label class="visually-hidden" for="gs-page-q">{{ i18n.t("gs-label") }}</label>
+  <input class="mfield__input" id="gs-page-q" type="search" name="q" value="{{ query }}" placeholder="{{ i18n.t("gs-placeholder") }}" autocomplete="off">
+  <button class="btn btn--primary" type="submit">{% call ui::icon("search") %}{% endcall %}{{ i18n.t("gs-open") }}</button>
+</form>
+{% if !query.is_empty() %}
+<p class="muted" role="status">{% if self.count() == 0 %}{{ i18n.t_arg("gs-no-results", "query", query.clone()) }}{% else if self.count() == 1 %}{{ i18n.t("gs-count-one") }}{% else %}{{ i18n.t_arg("gs-count-other", "count", self.count().to_string()) }}{% endif %}</p>
+{% endif %}
+{% if self.count() > 0 %}
+<section class="card gs-page-results">
+{% include "partials/global-search-results.html" %}
+</section>
+{% else if query.is_empty() %}
+<p class="muted">{{ i18n.t("gs-page-empty") }}</p>
+{% endif %}
+{% endblock %}

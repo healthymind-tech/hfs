@@ -179,13 +179,7 @@ impl EndpointChip {
     fn new(e: &Endpoint) -> Self {
         let badge = view::status_badge(e.spec.status);
         let display = e.spec.display_name.clone();
-        let initials: String = display
-            .split([' ', '-', '_'])
-            .filter(|w| !w.is_empty())
-            .take(2)
-            .filter_map(|w| w.chars().next())
-            .collect::<String>()
-            .to_uppercase();
+        let initials = helios_ui_chrome::avatar_initials(&display);
         Self {
             name: e.name().to_string(),
             initials: if initials.is_empty() {

@@ -1,0 +1,64 @@
+{#-
+  The console's global search (crates/ui/src/global_search.rs, assets/search.js,
+  assets/search.css): a combobox in the topbar, `/` or Ctrl/⌘+K to focus it,
+  results in a listbox that says where each hit lives. Without JavaScript the
+  form submits to the full results page.
+-#}
+<div class="gsearch" id="gsearch" data-gs-url="/ui/find" data-gs-user="{{ status.user_display().unwrap_or("local") }}"
+     data-msg-count-zero="{{ i18n.t("gs-count-zero") }}"
+     data-msg-count-one="{{ i18n.t("gs-count-one") }}"
+     data-msg-count-other="{{ i18n.t_arg("gs-count-other", "count", "{count}") }}"
+     data-msg-no-results="{{ i18n.t_arg("gs-no-results", "query", "{query}") }}"
+     data-msg-loading="{{ i18n.t("gs-loading") }}">
+  <button type="button" class="gsearch__open" data-gs-open aria-label="{{ i18n.t("gs-label") }}" aria-controls="gsearch-form" aria-expanded="false">
+    {% include "icons/search.svg" %}
+  </button>
+  <form class="gsearch__form" id="gsearch-form" role="search" method="get" action="/ui/find" hx-boost="false" data-gs-form>
+    <span class="gsearch__icon" aria-hidden="true">{% include "icons/search.svg" %}</span>
+    <input class="gsearch__input" id="gsearch-input" type="search" name="q" autocomplete="off" spellcheck="false"
+           role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="gsearch-list" aria-haspopup="listbox"
+           aria-label="{{ i18n.t("gs-label") }}" aria-describedby="gsearch-hint" placeholder="{{ i18n.t("gs-placeholder") }}" maxlength="100">
+    <kbd class="gsearch__kbd" aria-hidden="true" data-gs-kbd>Ctrl K</kbd>
+    <button type="button" class="gsearch__close" data-gs-close aria-label="{{ i18n.t("gs-close") }}">{% include "icons/x.svg" %}</button>
+  </form>
+  <span class="visually-hidden" id="gsearch-hint">{{ i18n.t("gs-help-navigate") }}, {{ i18n.t("gs-help-open") }}, {{ i18n.t("gs-help-close") }}</span>
+  <div class="gsearch__panel" id="gsearch-panel" hidden>
+    <div class="gsearch__list" id="gsearch-list" role="listbox" aria-label="{{ i18n.t("gs-results") }}">
+      <div class="gsearch__static" data-gs-static></div>
+      <div class="gsearch__data" data-gs-data></div>
+      <div class="gsearch__data" data-gs-tx></div>
+    </div>
+    <div class="gsearch__empty" data-gs-empty hidden>
+      <p class="gsearch__empty-title">{{ i18n.t("gs-empty-title") }}</p>
+      <p class="gsearch__empty-text">{{ i18n.t("gs-empty-text") }}</p>
+      <div class="gsearch__recent" data-gs-recent hidden>
+        <div class="gsearch__subhead"><span>{{ i18n.t("gs-recent") }}</span><button type="button" class="gsearch__link" data-gs-clear-recent>{{ i18n.t("gs-clear-recent") }}</button></div>
+        <div class="gsearch__chips" data-gs-recent-list></div>
+      </div>
+      <div class="gsearch__subhead"><span>{{ i18n.t("gs-suggestions") }}</span></div>
+      <div class="gsearch__chips" data-gs-suggest>
+        <button type="button" class="gsearch__chip" data-gs-q="SMART">SMART</button>
+        <button type="button" class="gsearch__chip" data-gs-q="JWKS">JWKS</button>
+        <button type="button" class="gsearch__chip" data-gs-q="{{ i18n.t("gs-suggest-password") }}">{{ i18n.t("gs-suggest-password") }}</button>
+        <button type="button" class="gsearch__chip" data-gs-q="{{ i18n.t("gs-suggest-rate") }}">{{ i18n.t("gs-suggest-rate") }}</button>
+        <button type="button" class="gsearch__chip" data-gs-q="LOINC">LOINC</button>
+        <button type="button" class="gsearch__chip" data-gs-q="CORS">CORS</button>
+      </div>
+    </div>
+    <div class="gsearch__none" data-gs-none hidden>
+      <p class="gsearch__empty-title" data-gs-none-title></p>
+      <p class="gsearch__empty-text">{{ i18n.t("gs-no-results-text") }}</p>
+      <div class="gsearch__chips">
+        <button type="button" class="gsearch__chip" data-gs-q="{{ i18n.t("gs-suggest-security") }}">{{ i18n.t("gs-suggest-security") }}</button>
+        <button type="button" class="gsearch__chip" data-gs-q="{{ i18n.t("gs-suggest-terminology") }}">{{ i18n.t("gs-suggest-terminology") }}</button>
+        <button type="button" class="gsearch__chip" data-gs-q="{{ i18n.t("gs-suggest-users") }}">{{ i18n.t("gs-suggest-users") }}</button>
+      </div>
+    </div>
+    <div class="gsearch__foot" aria-hidden="true">
+      <span><kbd>↑</kbd><kbd>↓</kbd> {{ i18n.t("gs-help-navigate") }}</span>
+      <span><kbd>↵</kbd> {{ i18n.t("gs-help-open") }}</span>
+      <span><kbd>Esc</kbd> {{ i18n.t("gs-help-close") }}</span>
+    </div>
+  </div>
+  <div class="visually-hidden" id="gsearch-status" role="status" aria-live="polite" aria-atomic="true"></div>
+</div>

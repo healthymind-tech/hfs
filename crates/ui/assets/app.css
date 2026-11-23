@@ -13432,3 +13432,398 @@ select.ctl {
   .review-list dt { color: var(--muted); }
   .review-list dd { margin: 0; display: flex; gap: 8px; align-items: center; justify-content: space-between; overflow-wrap: anywhere; }
 }
+
+/* ==========================================================================
+   Layout audit fixes (hm/fix-layout-overflow). Unlayered on purpose: they
+   must win over the component rules above. Checked by
+   hfs-eval/eval/scripts/ui-functional/layout_audit.py (overlap, overflow,
+   touching blocks, cramped pills, native controls).
+   ========================================================================== */
+
+/* Form controls take the console font. Browsers give <input>, <button>,
+   <select> and <textarea> their own (Arial on Linux), so every control
+   without an explicit `font: inherit` — the list search boxes, the theme
+   toggle, filter inputs — rendered in a different typeface from the page.
+   Zero specificity: monospace editors and sized controls keep their rules. */
+:where(button, input, select, textarea) {
+  font-family: inherit;
+}
+
+/* ---------- Disclosures (<details>/<summary>): one look everywhere ----------
+   Inline disclosures ("Advanced", "Raw response", "Details", "Log"…): a muted
+   label led by a chevron that turns down when open, a soft hover chip, a
+   focus ring and a gap to the content below. Card disclosures (a
+   `details.card` whose summary is the card head) keep the card-head padding,
+   carry a chevron at the right end and lose the head's bottom rule while
+   closed (it read as a stray underline under a pill). Menus, dialogs and
+   other custom summaries (.menu, .addbox, .editor-add, capability JSON,
+   IdP diagnostic steps…) have their own classes and are not touched. */
+details:not([class]) > summary:not([class]),
+details.disclosure > summary:not([class]),
+details:not(.card) > summary.disclosure__summary:not(.card-head),
+.verify__token > summary,
+.verify-block__details > summary,
+.pkg-log > summary,
+.auth-detail > summary,
+.auth-notice__detail > summary,
+.diff__textual > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 6px 10px 6px 8px;
+  border: 0;
+  border-radius: var(--radius, 8px);
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-decoration: none;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  overflow-wrap: anywhere;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+details:not([class]) > summary:not([class])::-webkit-details-marker,
+details.disclosure > summary:not([class])::-webkit-details-marker,
+details:not(.card) > summary.disclosure__summary::-webkit-details-marker,
+.verify__token > summary::-webkit-details-marker,
+.verify-block__details > summary::-webkit-details-marker,
+.pkg-log > summary::-webkit-details-marker,
+.auth-detail > summary::-webkit-details-marker,
+.auth-notice__detail > summary::-webkit-details-marker,
+.diff__textual > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The CSS chevron (right → down). The SVG chevrons some templates still
+   carry are hidden so every inline disclosure shows exactly one marker. */
+details:not([class]) > summary:not([class])::before,
+details.disclosure > summary:not([class])::before,
+details:not(.card) > summary.disclosure__summary:not(.card-head)::before,
+.verify__token > summary::before,
+.verify-block__details > summary::before,
+.pkg-log > summary::before,
+.auth-detail > summary::before,
+.auth-notice__detail > summary::before,
+.diff__textual > summary::before {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin: 0 3px 0 2px;
+  border-right: 1.75px solid currentColor;
+  border-bottom: 1.75px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+
+details:not(.card) > summary.disclosure__summary:not(.card-head) > .disclosure__chevron {
+  display: none;
+}
+
+details[open] > summary:not([class])::before,
+details.disclosure[open] > summary::before,
+details:not(.card)[open] > summary.disclosure__summary::before {
+  transform: rotate(45deg);
+}
+
+details:not([class]) > summary:not([class]):hover,
+details.disclosure > summary:not([class]):hover,
+details:not(.card) > summary.disclosure__summary:not(.card-head):hover,
+.verify__token > summary:hover,
+.verify-block__details > summary:hover,
+.pkg-log > summary:hover,
+.auth-detail > summary:hover,
+.auth-notice__detail > summary:hover,
+.diff__textual > summary:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+details > summary:focus-visible {
+  outline: 2px solid var(--color-focus-ring, var(--accent));
+  outline-offset: 2px;
+}
+
+/* Space between an open inline summary and what it reveals. */
+details:not([class])[open] > summary:not([class]),
+details.disclosure[open] > summary:not([class]),
+details:not(.card)[open] > summary.disclosure__summary:not(.card-head),
+.verify__token[open] > summary,
+.verify-block__details[open] > summary,
+.pkg-log[open] > summary,
+.auth-detail[open] > summary,
+.auth-notice__detail[open] > summary,
+.diff__textual[open] > summary {
+  margin-bottom: 8px;
+}
+
+/* A summary's own inline hint/code keeps the summary's colour. */
+details:not([class]) > summary:not([class]) .detail__hint-inline {
+  color: inherit;
+}
+
+/* Card disclosures. */
+details.card > summary.card-head {
+  display: flex;
+  padding: 12px 14px;
+  border-radius: 15px 15px 0 0;
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+details.card:not([open]) > summary.card-head {
+  border-bottom-color: transparent;
+  border-radius: 15px;
+}
+
+details.card > summary.card-head:hover {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+details.card > summary.card-head:focus-visible {
+  outline-offset: -2px;
+}
+
+details.card > summary.card-head:not(:has(> .icon, > .disclosure__chevron))::after {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin: 0 4px 3px auto;
+  border-right: 1.75px solid var(--muted);
+  border-bottom: 1.75px solid var(--muted);
+  transform: rotate(45deg);
+  transition: transform 120ms ease;
+}
+
+details.card[open] > summary.card-head:not(:has(> .icon, > .disclosure__chevron))::after {
+  margin-bottom: -3px;
+  transform: rotate(-135deg);
+}
+
+details.card > summary.card-head > .disclosure__chevron {
+  margin-left: auto;
+}
+
+details.card[open] > summary.card-head > .disclosure__chevron {
+  transform: rotate(180deg);
+}
+
+/* ---------- Name cells with a canonical URL and tags ----------
+   `.data-table .col-name` is a one-line ellipsis cell (max 240px). A
+   `.url` inside it used to be an inline-block capped at 40ch that cannot
+   wrap there (the cell is nowrap), so its text ran past its own box and the
+   status/supplement tag laid out after the box was painted over it (the
+   "supplement" tag on the ICD-10-CM zh-Hant row). Now the title and the URL
+   are block lines that truncate with an ellipsis (the full value is in their
+   title attribute) and the tags sit beside the URL in a flex row whose URL
+   can shrink — the tags always keep their own space. */
+.data-table .col-name__title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-table .col-name .url {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-table .col-name__line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 2px;
+}
+
+.data-table .col-name__line > .url {
+  flex: 0 1 auto;
+}
+
+.data-table .col-name__line > .tag {
+  flex: none;
+}
+
+@media (max-width: 640px) {
+  /* Stacked phone rows have the room: wrap instead of truncating. */
+  .data-table--stack td.col-name .col-name__title,
+  .data-table--stack td.col-name .url {
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+  }
+  .data-table--stack td.col-name .col-name__line {
+    flex-wrap: wrap;
+  }
+}
+
+/* ---------- Vertical rhythm between cards ----------
+   `.content > .card ~ .card` only spaced cards that are direct siblings;
+   cards that follow a wrapper (an htmx target like #hts-term-body, a
+   two-column grid like .idp-cols) or that sit inside a classless wrapper
+   (the import job detail, the jobs list) were glued together with no gap.
+   .content is block flow, so these margins collapse with any margin the
+   previous block already has — they never double up. */
+.content:not(.content--app) > * + :is(.card, details.card),
+.content:not(.content--app) > div:not([class]) > :is(.card, details.card) ~ :is(.card, details.card) {
+  margin-top: 20px;
+}
+
+/* ---------- Padding and spacing gaps found by the layout audit ---------- */
+
+/* The Validate page's input form sat directly in its card with no padding:
+   the toolbar buttons, the editor and "Profile (optional)" touched the
+   card's border. Same inset as the result card below it. */
+.card > .validate-form {
+  padding: 12px 14px 14px;
+}
+
+/* The IdP pages put the danger-zone title straight into the card
+   (`<section class="card danger-zone"><h2 class="danger-zone__heading">`),
+   so it sat on the card's top-left border. Align it with the rows below. */
+.card.danger-zone > .danger-zone__heading {
+  margin: 0;
+  padding: 16px 20px 0;
+  color: var(--danger-text);
+}
+
+/* Stacked radio cards (General → Console access to data) were glued
+   together, their borders doubling into one thick line. */
+.radio-cards > .radio-card + .radio-card {
+  margin-top: 8px;
+}
+
+/* Configuration history: a changed list value (SMART capabilities…) is one
+   long JSON token; it pushed the page 150px wider than the window. */
+.diff-table td.mono {
+  overflow-wrap: anywhere;
+}
+
+/* Name cells: any secondary line (a package's subtitle…) truncates with an
+   ellipsis instead of being cut mid-letter by the cell's overflow. */
+.data-table .col-name > :is(div, p) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Terminology import: "Uploaded files" sat flush under the drop zone. */
+.batch-drop ~ .field {
+  margin-top: 16px;
+}
+
+/* Package detail: the Dependencies / Required-by columns touched the
+   Package card above them. */
+.card + .pkg-columns {
+  margin-top: 16px;
+}
+
+/* ---------- Long values on narrow screens ---------- */
+
+/* A page title made of a long file name (an import job's
+   "…/SnomedCT_InternationalRF2_PRODUCTION_20250601T120000Z.zip") ran
+   470px past a phone screen. */
+.page-head__title {
+  overflow-wrap: anywhere;
+}
+
+/* Stat-card footnotes such as "from TerminologyCapabilities.codeSystem[]". */
+.stat__sub,
+.stat__value {
+  overflow-wrap: anywhere;
+}
+
+/* Facet chips carrying a canonical URL / edition id (SNOMED CT's module
+   URI) wrap inside their pill instead of running off the screen. */
+.facets > .chip {
+  max-width: 100%;
+  height: auto;
+  min-height: 26px;
+  padding-block: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* Segmented controls: labels never break one character per line (CJK
+   "檢視表" stacked vertically on a phone); the group wraps instead. */
+.seg {
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.seg__btn {
+  white-space: nowrap;
+}
+
+/* Configuration history: let timeline items shrink to the column so a
+   wide diff table scrolls inside its .table-wrap instead of widening the
+   page. */
+.timeline {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* ---------- Fieldsets ----------
+   A <fieldset> is only a grouping for assistive technology here, never a
+   frame: browsers draw a 2px groove border around it with the legend cut
+   into the top edge. On endpoint Security the "Authorization server"
+   (External / Internal) group kept that frame — its idp.css reset only loads
+   on the /ui/idp pages — and the frame's bottom line ran across the Issuer /
+   Audience / JWKS label row under it. Zero specificity: a fieldset that
+   wants a frame (.pkg-options__group) still draws its own. */
+:where(fieldset) {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+:where(legend) {
+  padding: 0;
+}
+
+/* The External / Internal choice is an ordinary spaced block in the form. */
+.idp-provider {
+  margin: 4px 0 20px;
+}
+
+.idp-provider > legend {
+  margin-bottom: 8px;
+}
+
+/* View Definitions / SQL Queries on phones and small tablets: the stacked
+   editor and guided-form cards were each capped at 70vh with overflow
+   hidden — and the desktop `flex: 1 1 0` (declared after the phone rule)
+   still applied in the stacked column, so each card was only its 320px
+   floor tall: the card cut the editor off mid-document and hid its Save /
+   Cancel row and the guided form's rows. Stacked, the cards take their
+   content's height; the editor and the row tree scroll inside 60vh. */
+@media (max-width: 900px) {
+  .editor__grid--stretch > .card,
+  .editor__grid--stretch > .needs-js {
+    flex: 0 0 auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .editor__grid--stretch .code-editor .cm-editor {
+    height: auto;
+    max-height: 60vh;
+  }
+
+  .editor__grid--stretch .editor-form .editor-tree {
+    max-height: 60vh;
+  }
+}

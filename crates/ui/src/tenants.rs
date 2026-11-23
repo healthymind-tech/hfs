@@ -138,16 +138,11 @@ impl TenantRow {
     /// Up-to-two-letter avatar initials from the display name or id.
     fn initials(&self) -> String {
         let source = self.display_name.as_deref().unwrap_or(&self.id);
-        let letters: String = source
-            .split([' ', '-', '_', '/'])
-            .filter(|w| !w.is_empty())
-            .take(2)
-            .filter_map(|w| w.chars().next())
-            .collect();
+        let letters = helios_ui_chrome::avatar_initials(source);
         if letters.is_empty() {
             "?".to_string()
         } else {
-            letters.to_uppercase()
+            letters
         }
     }
 

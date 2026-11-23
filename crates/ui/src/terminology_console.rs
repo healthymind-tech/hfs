@@ -106,6 +106,9 @@ pub const TERMINOLOGY_SCOPE: &str = "terminology";
 struct Installed {
     router: Router,
     admin: bool,
+    /// The terminology service client the section's pages use; the global
+    /// search reads code systems and value sets through it.
+    upstream: helios_hts_ui::UpstreamClient,
 }
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
@@ -138,9 +141,16 @@ pub fn install(config: TerminologyConsoleConfig) -> bool {
             metrics_ring: Default::default(),
         });
         helios_hts_ui::spawn_metrics_sampler(&state);
+        let upstream = state.upstream.clone();
         let router = helios_hts_ui::embedded_router(state, local.admin_router());
         helios_hts_ui::register_nav(admin);
-        return INSTALLED.set(Installed { router, admin }).is_ok();
+        return INSTALLED
+            .set(Installed {
+                router,
+                admin,
+                upstream,
+            })
+            .is_ok();
     }
     let upstream_url = config.upstream_url.trim_end_matches('/').to_string();
     let token = config
@@ -182,9 +192,21 @@ pub fn install(config: TerminologyConsoleConfig) -> bool {
         });
         Router::new().fallback(any(admin_proxy)).with_state(target)
     });
+    let upstream = state.upstream.clone();
     let router = helios_hts_ui::embedded_router(state, proxy);
     helios_hts_ui::register_nav(admin);
-    INSTALLED.set(Installed { router, admin }).is_ok()
+    INSTALLED
+        .set(Installed {
+            router,
+            admin,
+            upstream,
+        })
+        .is_ok()
+}
+
+/// The terminology service client, when the section is installed.
+pub(crate) fn upstream() -> Option<&'static helios_hts_ui::UpstreamClient> {
+    INSTALLED.get().map(|i| &i.upstream)
 }
 
 /// Whether the section is installed.
