@@ -200,8 +200,9 @@ pub fn embedded_router(state: Arc<HtsUiState>, admin: Option<Router>) -> Router 
         .merge(raw_json_fragment::workbench_fragment_routes())
         .fallback(not_found_page)
         .with_state(state)
+        // No `AutoVaryLayer` here: the host router already has one, and the
+        // layer refuses to be stacked twice on one request.
         .layer(axum::middleware::from_fn(i18n::negotiate_locale))
-        .layer(AutoVaryLayer)
 }
 
 /// The Terminology section's sidebar entries (design §9.1), registered in
