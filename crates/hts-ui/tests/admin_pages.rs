@@ -114,6 +114,11 @@ async fn start_mock(admin_on: bool) -> (String, Captured) {
                             {"url": "http://loinc.org", "title": "LOINC", "versions": [
                                 {"id": "loinc|2.80", "version": "2.80", "content": "complete", "status": "active",
                                  "pinned": true, "current": true, "stats": {"concepts": 176668, "est_bytes": 2200000000u64}}
+                            ]},
+                            {"url": "https://terminology.healthymind.tw/CodeSystem/icd-10-cm-zh-hant",
+                             "title": "ICD-10-CM 中文名稱 (zh-Hant) supplement", "versions": [
+                                {"id": "icd-zh|2024-11-18", "version": "2024-11-18", "content": "supplement", "status": "active",
+                                 "pinned": false, "current": true, "stats": {"concepts": 96802, "est_bytes": 112700000u64}}
                             ]}
                         ]
                     }))
@@ -282,7 +287,7 @@ async fn inventory_lists_versions_with_current_pin_and_actions() {
     let (s, html) = get_page(&app, "/ui/hts/terminology", "en", false).await;
     assert_eq!(s, StatusCode::OK);
     assert!(html.contains(">Loaded terminologies<"));
-    assert_eq!(html.matches("data-current=\"true\"").count(), 2);
+    assert_eq!(html.matches("data-current=\"true\"").count(), 3);
     assert!(
         html.contains("3.6 GB"),
         "measured growth preferred over the estimate"
@@ -312,6 +317,50 @@ async fn inventory_lists_versions_with_current_pin_and_actions() {
     assert!(zh.contains("術語總覽"));
     assert!(zh.contains("設為目前版本"));
     no_raw_keys(&zh);
+}
+
+/// The ICD-10-CM zh-Hant supplement row: its "supplement" tag was laid out
+/// inline right after a capped URL box the URL text overflowed, so the tag
+/// was painted over the URL. The URL and its tags now share a flex row
+/// (`.col-name__line`) in which only the URL shrinks (ellipsis, full value in
+/// its title), and the title line carries its own tooltip.
+#[tokio::test]
+async fn inventory_name_cell_keeps_tags_out_of_the_url() {
+    let (base, _) = start_mock(true).await;
+    let app = app(&base);
+    let (s, html) = get_page(&app, "/ui/hts/terminology", "en", false).await;
+    assert_eq!(s, StatusCode::OK);
+    let url = "https://terminology.healthymind.tw/CodeSystem/icd-10-cm-zh-hant";
+    let row_start = html
+        .find(&format!("data-system=\"{url}\""))
+        .expect("supplement row rendered");
+    let row = &html[row_start..row_start + html[row_start..].find("</tr>").unwrap()];
+    let cell = &row[row.find("class=\"col-name\"").unwrap()..row.find("</td>").unwrap()];
+    let line_at = cell
+        .find("<span class=\"col-name__line\">")
+        .expect("URL and tags share a flex line");
+    let line = &cell[line_at..];
+    let url_at = line
+        .find(&format!("<span class=\"url\" title=\"{url}\">{url}</span>"))
+        .expect("URL carries its full value as a tooltip");
+    let tag_at = line
+        .find("<span class=\"tag tag--muted\">supplement</span>")
+        .expect("supplement tag inside the same flex line");
+    assert!(url_at < tag_at, "tag follows the URL in the flex row");
+    assert!(
+        !cell[..line_at].contains("tag"),
+        "no tag shares the title's line box"
+    );
+    assert!(
+        cell.contains(
+            "class=\"col-name__title\" title=\"ICD-10-CM 中文名稱 (zh-Hant) supplement\""
+        ),
+        "truncated title has a tooltip"
+    );
+    assert!(
+        !cell.contains("<br>"),
+        "no inline line breaks between title, URL and tags"
+    );
 }
 
 #[tokio::test]
