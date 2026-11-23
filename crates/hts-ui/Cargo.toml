@@ -62,6 +62,12 @@ helios-ui-chrome = { path = "../ui-chrome", version = "0.2.9" }
 # Administrator sign-in for the terminology management pages (`/hts/login`,
 # the guard on `/hts/terminology`, `/hts/jobs`, `/hts/import`), shared with HFS.
 helios-admin-auth = { path = "../admin-auth", version = "0.2.9" }
+# The server's terminology service, when the console is embedded in hfs with
+# HFS_TERMINOLOGY=embedded (in-process upstream, `src/in_process.rs`).
+helios-terminology = { path = "../terminology", version = "0.2.9" }
+helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }
 
 # Typed htmx header handling: `HxRequest` extractor for the fragment-vs-page
 # branch, and `AutoVaryLayer` for correct HTTP caching (`Vary: HX-Request`).

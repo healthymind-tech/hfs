@@ -17,11 +17,17 @@
 //! * **Legacy URLs.** `/ui/hts/**` answers a permanent redirect
 //!   ([`helios_terminology::routes::legacy_console_redirect`]).
 //!
-//! Until the embedded terminology runtime lands (U2) the pages talk to the
-//! configured terminology server (`HFS_TERMINOLOGY_SERVER`) over HTTP, with
-//! `HFS_TERMINOLOGY_SERVER_TOKEN` as the administrator credential of the
-//! management pages; the browser admin API (`/ui/terminology/api/admin`) is
-//! proxied to that server's `/admin`.
+//! Where the pages get their data:
+//!
+//! * **Embedded terminology** (`HFS_TERMINOLOGY=embedded`): in-process, over
+//!   the server's own `TerminologyService` and the admin router mounted at
+//!   `/admin/terminology` ([`InProcessUpstream`]); the browser admin API
+//!   (`/ui/terminology/api/admin/**`) is that same router, called with the
+//!   signed-in console user (no proxy, no token).
+//! * **Remote terminology** (`HFS_TERMINOLOGY_SERVER`): over HTTP, with
+//!   `HFS_TERMINOLOGY_SERVER_TOKEN` as the administrator credential of the
+//!   management pages; the browser admin API is proxied to that server's
+//!   `/admin`.
 
 use std::sync::{Arc, OnceLock};
 
@@ -36,6 +42,8 @@ use axum::{
 };
 use helios_hts_ui::paths::{self, TerminologyPaths};
 use helios_terminology::access::{TerminologyAction, classify_console, required_role};
+
+pub use helios_hts_ui::in_process::InProcessUpstream;
 
 use crate::{I18n, RequestLocale, RequestTenant, RequestVersion, Status, WebState, current_status};
 
@@ -52,6 +60,9 @@ pub struct TerminologyConsoleConfig {
     pub fhir_version: &'static str,
     /// Server version.
     pub version: &'static str,
+    /// The server's embedded terminology service and admin router; when
+    /// set, `upstream_url` and `admin_token` are not used.
+    pub in_process: Option<InProcessUpstream>,
 }
 
 /// Terminology-scope role bindings (hm-0012, the U1 table
@@ -107,6 +118,30 @@ pub fn install(config: TerminologyConsoleConfig) -> bool {
         return false;
     }
     paths::configure(TerminologyPaths::EMBEDDED);
+    if let Some(local) = config.in_process {
+        let upstream = match helios_hts_ui::UpstreamClient::in_process(local.clone()) {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    "terminology console: in-process client failed to build"
+                );
+                return false;
+            }
+        };
+        let admin = local.has_admin();
+        let state = Arc::new(helios_hts_ui::HtsUiState {
+            fhir_version: config.fhir_version,
+            version: config.version,
+            upstream,
+            bundled_data_bytes: None,
+            metrics_ring: Default::default(),
+        });
+        helios_hts_ui::spawn_metrics_sampler(&state);
+        let router = helios_hts_ui::embedded_router(state, local.admin_router());
+        helios_hts_ui::register_nav(admin);
+        return INSTALLED.set(Installed { router, admin }).is_ok();
+    }
     let upstream_url = config.upstream_url.trim_end_matches('/').to_string();
     let token = config
         .admin_token
@@ -329,6 +364,10 @@ async fn section(
     let Some(frame) = frame else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "shell frame").into_response();
     };
+    let principal_subject = request
+        .extensions()
+        .get::<helios_endpoints::ConsolePrincipal>()
+        .map(|p| p.subject.clone());
     let (mut parts, body) = request.into_parts();
     let Some(internal) = paths::internal_path(&path) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -351,12 +390,20 @@ async fn section(
     *forwarded.headers_mut() = parts.headers;
     let request = forwarded;
     let router = installed.router.clone();
-    helios_ui_chrome::shell::scope_host_frame(Arc::new(frame), async move {
-        match tower::ServiceExt::oneshot(router, request).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        }
-    })
+    // Who acts, for in-process terminology calls (write guard, audit).
+    let user = principal_subject
+        .or_else(|| rt.admin_user.as_ref().map(|_| "admin".to_string()))
+        .or_else(|| rt.signed_in.as_ref().map(|p| format!("oidc:{}", p.subject)))
+        .unwrap_or_else(|| "anonymous".to_string());
+    helios_ui_chrome::shell::scope_host_frame(
+        Arc::new(frame),
+        helios_hts_ui::in_process::scope_caller(user, have, async move {
+            match tower::ServiceExt::oneshot(router, request).await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            }
+        }),
+    )
     .await
 }
 

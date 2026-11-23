@@ -2022,8 +2022,19 @@ fn mount_ui(
     // `/admin/packages` API (`HFS_ADMIN_UI`).
     helios_ui::set_package_admin(config.packages.admin_ui);
     // The Terminology section of the console (`/ui/terminology`, one
-    // sign-in with the rest of it), over the configured terminology server.
-    if let Some(url) = config.terminology_server.clone() {
+    // sign-in with the rest of it): in-process over the embedded
+    // terminology service, else over the configured terminology server.
+    if let Some(local) = terminology::console_upstream() {
+        helios_ui::terminology_console::install(
+            helios_ui::terminology_console::TerminologyConsoleConfig {
+                upstream_url: String::new(),
+                admin_token: None,
+                fhir_version: config.default_fhir_version.as_str(),
+                version: env!("CARGO_PKG_VERSION"),
+                in_process: Some(local),
+            },
+        );
+    } else if let Some(url) = config.terminology_server.clone() {
         helios_ui::terminology_console::install(
             helios_ui::terminology_console::TerminologyConsoleConfig {
                 upstream_url: url,
@@ -2034,6 +2045,7 @@ fn mount_ui(
                     .map(|t| t.expose().to_string()),
                 fhir_version: config.default_fhir_version.as_str(),
                 version: env!("CARGO_PKG_VERSION"),
+                in_process: None,
             },
         );
     }

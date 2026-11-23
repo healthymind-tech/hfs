@@ -20,6 +20,7 @@ fn app() -> Router {
             admin_token: Some("t".into()),
             fhir_version: "R4",
             version: "9.9.9",
+            in_process: None,
         },
     );
     helios_ui::mount_with_conformance_source(

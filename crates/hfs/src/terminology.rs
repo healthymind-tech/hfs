@@ -106,13 +106,22 @@ pub fn readonly(view: &EnvView) -> bool {
 
 /// Apply the unified server's fork migrations (`hm-0011`: terminology schema
 /// and `hfs_terminology_state`; `hm-0012`: console scope bindings) to the
-/// HFS PostgreSQL database. Only when terminology is embedded (U1 contract:
-/// not part of `init_schema`).
+/// HFS PostgreSQL database (U1 contract: not part of `init_schema`).
+/// Embedded terminology gets both; otherwise only `hm-0012`, the console's
+/// terminology-scope bindings (the Terminology section exists with a remote
+/// server too) — no `terminology` schema is created before the data move.
 #[cfg(feature = "postgres")]
 pub async fn apply_unified_migrations(
     backend: &helios_persistence::backends::postgres::PostgresBackend,
 ) -> anyhow::Result<()> {
     let Some(schema) = EMBEDDED_SCHEMA.get() else {
+        let applied = backend
+            .apply_console_fork_migrations()
+            .await
+            .map_err(|e| anyhow::anyhow!("console fork migration hm-0012: {e}"))?;
+        if !applied.is_empty() {
+            info!(?applied, "applied console fork migration");
+        }
         return Ok(());
     };
     let applied = backend
@@ -475,6 +484,20 @@ fn embedded_audit(
         middleware: Arc::new(middleware),
         search: None,
     }
+}
+
+/// The console's in-process upstream (`/ui/terminology` pages and their
+/// browser admin API) when the embedded service is running: the server's
+/// terminology service and the admin router mounted at
+/// `/admin/terminology`. `None` in remote / off mode.
+#[cfg(feature = "ui")]
+pub fn console_upstream() -> Option<helios_ui::terminology_console::InProcessUpstream> {
+    let mount = MOUNT.get()?;
+    let service = helios_rest::terminology::server_terminology()?;
+    Some(helios_ui::terminology_console::InProcessUpstream::new(
+        service,
+        mount.admin.clone(),
+    ))
 }
 
 /// Mount the embedded terminology API at `/tx` and its admin API at

@@ -51,6 +51,49 @@ pub struct UpstreamClient {
     /// console's own credential, so its management pages work for whoever
     /// signed in to the console.
     admin_authorization: Option<reqwest::header::HeaderValue>,
+    /// In-process terminology (unified server); `None` = HTTP.
+    local: Option<crate::in_process::InProcessUpstream>,
+}
+
+/// Sends a built request over HTTP, or in-process when the client is
+/// [`UpstreamClient::in_process`]; the answer is read in full.
+trait SendVia {
+    async fn send_via(
+        self,
+        client: &UpstreamClient,
+        op: &'static str,
+        url: &str,
+    ) -> Result<crate::in_process::UpResponse, UpstreamError>;
+}
+
+impl SendVia for reqwest::RequestBuilder {
+    async fn send_via(
+        self,
+        client: &UpstreamClient,
+        op: &'static str,
+        url: &str,
+    ) -> Result<crate::in_process::UpResponse, UpstreamError> {
+        match &client.local {
+            Some(local) => {
+                let request = self
+                    .build()
+                    .map_err(|e| UpstreamError::from_reqwest(op, url, e))?;
+                local.execute(request, op, url).await
+            }
+            None => {
+                let response = self
+                    .send()
+                    .await
+                    .map_err(|e| UpstreamError::from_reqwest(op, url, e))?;
+                let status = response.status();
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|e| UpstreamError::from_reqwest(op, url, e))?;
+                Ok(crate::in_process::UpResponse { status, body })
+            }
+        }
+    }
 }
 
 impl UpstreamClient {
@@ -95,7 +138,22 @@ impl UpstreamClient {
             client,
             base_url,
             admin_authorization: None,
+            local: None,
         })
+    }
+
+    /// A client over the server's own terminology service and admin router
+    /// (unified server, `HFS_TERMINOLOGY=embedded`): the same requests,
+    /// answered in-process instead of over HTTP ([`crate::in_process`]).
+    pub fn in_process(local: crate::in_process::InProcessUpstream) -> Result<Self, UpstreamError> {
+        let mut client = Self::new(crate::in_process::IN_PROCESS_BASE)?;
+        client.local = Some(local);
+        Ok(client)
+    }
+
+    /// Whether requests are answered in-process.
+    pub fn is_in_process(&self) -> bool {
+        self.local.is_some()
     }
 
     /// The same client, sending `value` as `Authorization` on admin API
@@ -118,12 +176,7 @@ impl UpstreamClient {
     /// comes from the `/metadata` fetch below (which does touch the backend).
     pub async fn health(&self) -> Result<UpstreamHealth, UpstreamError> {
         let url = format!("{}/health", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("health", &url, e))?;
+        let response = self.client.get(&url).send_via(self, "health", &url).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(UpstreamError::HttpStatus {
@@ -155,9 +208,8 @@ impl UpstreamClient {
             .client
             .get(&url)
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("metadata", &url, e))?;
+            .send_via(self, "metadata", &url)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             return Err(UpstreamError::HttpStatus {
@@ -1109,9 +1161,8 @@ impl UpstreamClient {
             .get(&url)
             .query(&query)
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("cs-search", &url, e))?;
+            .send_via(self, "cs-search", &url)
+            .await?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "cs-search",
@@ -1221,9 +1272,8 @@ impl UpstreamClient {
                 .client
                 .get(&list_url)
                 .header("Accept", "application/fhir+json")
-                .send()
-                .await
-                .map_err(|e| UpstreamError::from_reqwest(op, &list_url, e))?;
+                .send_via(self, op, &list_url)
+                .await?;
             let status = response.status();
             let raw = response.text().await.map_err(|e| UpstreamError::Decode {
                 op,
@@ -1295,9 +1345,8 @@ impl UpstreamClient {
             .get(&full_endpoint)
             .query(&[("url", canonical_url)])
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest(op, &full_endpoint, e))?;
+            .send_via(self, op, &full_endpoint)
+            .await?;
         let status = response.status();
         let raw = response.text().await.map_err(|e| UpstreamError::Decode {
             op,
@@ -2266,9 +2315,8 @@ impl UpstreamClient {
             .get(&url)
             .query(&query)
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("vs-search", &url, e))?;
+            .send_via(self, "vs-search", &url)
+            .await?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "vs-search",
@@ -2644,9 +2692,9 @@ impl UpstreamClient {
             request = request.header(name, value);
         }
         let response = request
-            .send()
+            .send_via(self, op, url)
             .await
-            .map_err(|e| fail(UpstreamError::from_reqwest(op, url, e), &exchange))?;
+            .map_err(|e| fail(e, &exchange))?;
         let status = response.status();
         let raw = response.text().await.map_err(|e| {
             fail(
@@ -3285,9 +3333,8 @@ impl UpstreamClient {
             .get(&url)
             .query(&query)
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("cm-search", &url, e))?;
+            .send_via(self, "cm-search", &url)
+            .await?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "cm-search",
@@ -4185,10 +4232,7 @@ impl UpstreamClient {
         if let Some(auth) = &self.admin_authorization {
             request = request.header(reqwest::header::AUTHORIZATION, auth.clone());
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("import", &url, e))?;
+        let response = request.send_via(self, "import", &url).await?;
         let status = response.status();
         let raw = response.text().await.map_err(|e| UpstreamError::Decode {
             op: "import",
@@ -4541,9 +4585,8 @@ impl UpstreamClient {
             .client
             .get(&url)
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("metadata", &url, e))?;
+            .send_via(self, "metadata", &url)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             return Err(UpstreamError::HttpStatus {
@@ -4576,9 +4619,8 @@ impl UpstreamClient {
             .client
             .get(&url)
             .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("metadata", &url, e))?;
+            .send_via(self, "metadata", &url)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             return Err(UpstreamError::HttpStatus {
@@ -4603,9 +4645,8 @@ impl UpstreamClient {
         let response = self
             .client
             .get(&url)
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("metrics", &url, e))?;
+            .send_via(self, "metrics", &url)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             return Err(UpstreamError::HttpStatus {
@@ -4695,15 +4736,12 @@ impl UpstreamClient {
         if let Some(b) = body {
             req = req.json(b);
         }
-        let response = req
-            .send()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("admin", &url, e))?;
+        let response = req.send_via(self, "admin", &url).await?;
         let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| UpstreamError::from_reqwest("admin", &url, e))?;
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(never) => match never {},
+        };
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Ok((status, value))
     }

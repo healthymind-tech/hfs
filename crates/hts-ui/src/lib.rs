@@ -56,6 +56,7 @@ mod concepts;
 mod home;
 mod i18n;
 mod import;
+pub mod in_process;
 mod login;
 mod metrics_parse;
 mod metrics_ring;
