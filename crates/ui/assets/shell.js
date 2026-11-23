@@ -313,12 +313,8 @@
       return;
     }
     // A request the old page still has in flight (a filter that fired on
-    // blur when the link was clicked) must not land after the new page:
-    // abort it, so it neither swaps nor pushes its URL.
-    var busy = document.querySelectorAll("#main .htmx-request");
-    for (var b = 0; b < busy.length; b++) {
-      if (busy[b] !== elt && window.htmx) window.htmx.trigger(busy[b], "htmx:abort");
-    }
+    // blur when the link was clicked) is dropped when it answers after the
+    // new page is in (see the beforeSwap guard below).
     startProgress();
     var xhr = detail.xhr;
     if (xhr) xhr.addEventListener("loadend", stopProgress);
@@ -429,22 +425,54 @@
     panel(data.msgNavOffline || "The server could not be reached.", cfg.path || location.href);
   });
 
-  // Body classes belong to the page, not to the #main snapshot htmx keeps.
-  var bodyClasses = {};
+  // What belongs to a page but is not inside the #main snapshot htmx keeps:
+  // body classes, the active entry, the sidebar context. And form values,
+  // which innerHTML does not carry: written into attributes first, so Back
+  // shows the filter the list was filtered by.
+  var pageState = {};
   document.addEventListener("htmx:beforeHistorySave", function () {
-    bodyClasses[location.href] = document.body.getAttribute("class") || "";
+    var main = document.getElementById("main");
+    if (main) {
+      var fields = main.querySelectorAll("input, select, textarea");
+      for (var i = 0; i < fields.length; i++) {
+        var el = fields[i];
+        if (el.type === "password" || el.type === "file") continue;
+        if (el.tagName === "SELECT") {
+          for (var o = 0; o < el.options.length; o++) {
+            if (el.options[o].selected) el.options[o].setAttribute("selected", "");
+            else el.options[o].removeAttribute("selected");
+          }
+        } else if (el.type === "checkbox" || el.type === "radio") {
+          if (el.checked) el.setAttribute("checked", "");
+          else el.removeAttribute("checked");
+        } else if (el.tagName === "TEXTAREA") {
+          el.textContent = el.value;
+        } else {
+          el.setAttribute("value", el.value);
+        }
+      }
+    }
+    pageState[location.href] = {
+      bodyClass: document.body.getAttribute("class") || "",
+      active: main ? main.getAttribute("data-active-page") || "" : "",
+      navKey: document.body.getAttribute("data-nav-key") || "",
+    };
   });
 
   document.addEventListener("htmx:historyRestore", function () {
-    if (Object.prototype.hasOwnProperty.call(bodyClasses, location.href)) {
-      document.body.setAttribute("class", bodyClasses[location.href]);
-    }
+    var state = pageState[location.href];
     var main = document.getElementById("main");
-    var key = main && main.getAttribute("data-nav-key");
-    if (key && key !== document.body.getAttribute("data-nav-key")) {
-      // The page belongs to another sidebar (another endpoint or role).
-      location.reload();
-      return;
+    if (state) {
+      document.body.setAttribute("class", state.bodyClass);
+      if (main) main.setAttribute("data-active-page", state.active);
+      if (state.navKey && state.navKey !== document.body.getAttribute("data-nav-key")) {
+        // The page belongs to another sidebar (another endpoint or role).
+        location.reload();
+        return;
+      }
+    } else if (main) {
+      // Restored from the server: its own active entry is unknown here.
+      main.removeAttribute("data-active-page");
     }
     markActive();
     initPages(main);
