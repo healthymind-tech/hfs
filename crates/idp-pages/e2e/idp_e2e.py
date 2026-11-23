@@ -430,11 +430,15 @@ def run(shots):
         shot(page, shots, "08-csrf-dark")
         # Cross-site POST (another origin submits the form).
         evil = ctx.new_page()
-        evil.route("https://evil.example/**", lambda r: r.fulfill(status=200, content_type="text/html", body=(
+        # Same scheme as the server: an https page posting to a plain-http,
+        # non-localhost server trips Chrome's insecure-form interstitial
+        # before the request leaves the browser (no server answer to judge).
+        evil_origin = ("https" if BASE.startswith("https") else "http") + "://evil.example"
+        evil.route(f"{evil_origin}/**", lambda r: r.fulfill(status=200, content_type="text/html", body=(
             f"<form id=f method=post action='{BASE}/idp/clinic/login'>"
             "<input name=ix value=x><input name=csrf value=x><input name=username value=alice>"
             "<input name=password value=alice-password-1></form><script>f.submit()</script>")))
-        evil.goto("https://evil.example/attack")
+        evil.goto(f"{evil_origin}/attack")
         evil.wait_for_load_state()
         check("cross-site form post refused", evil.url.startswith(BASE) and "/consent" not in evil.url
               and not evil.is_visible("text=Allow Growth Chart"), evil.url)

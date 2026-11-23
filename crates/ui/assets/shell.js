@@ -113,6 +113,10 @@
     if (url.searchParams.has("lang")) return true;
     if (/\/download(\/|$)|\.(ndjson|json|csv|zip|parquet|tgz)$/i.test(url.pathname)) return true;
     if (elt && elt.closest && elt.closest("[data-full-load]")) return true;
+    // A link to a fragment of another page ("Go to field" on the IdP and
+    // Verify reports): the in-place swap scrolls to the top and the
+    // response URL has no fragment, so the target field would be lost.
+    if (url.hash.length > 1 && (url.pathname !== location.pathname || url.search !== location.search)) return true;
     if (elt && elt.hasAttribute && (elt.hasAttribute("download") || elt.getAttribute("target") === "_blank")) return true;
     return learned().indexOf(pattern(url.pathname)) >= 0;
   }
