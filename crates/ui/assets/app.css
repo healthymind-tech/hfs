@@ -14638,3 +14638,710 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     border-radius: var(--r-sm);
   }
 }
+
+/* ==========================================================================
+   Console redesign — page header, inherit pattern, segmented modes, save
+   bar, Verify beside the form (REDESIGN.md §6, Phase 3).
+   ========================================================================== */
+@layer pages {
+  /* Breadcrumbs: 13px caption colour, chevron separators. */
+  .crumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin: 0 0 var(--s2);
+    font-size: var(--fs-sm);
+    color: var(--text-3);
+  }
+
+  .crumbs a {
+    color: var(--text-2);
+  }
+
+  .crumbs [aria-current="page"] {
+    color: var(--text-3);
+    font-weight: 400;
+  }
+
+  .crumbs__sep {
+    display: inline-flex;
+    color: var(--text-3);
+  }
+
+  .crumbs__sep svg {
+    width: 12px;
+    height: 12px;
+    transform: rotate(-90deg);
+  }
+
+  /* Endpoint header: title, then ONE meta line. */
+  .ep-head {
+    margin-bottom: var(--s5);
+  }
+
+  .ep-head__row {
+    gap: var(--s4);
+  }
+
+  .ep-head__main {
+    gap: 6px;
+  }
+
+  .meta-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 0;
+    margin: 0;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .meta-line > * + *::before {
+    content: "·";
+    margin: 0 8px;
+    color: var(--text-3);
+  }
+
+  .meta-line__inh {
+    margin-left: 4px;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  .ep-head__updated {
+    color: var(--text-3);
+  }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .status--ok { color: var(--ok); }
+  .status--warn { color: var(--warn); }
+  .status--danger { color: var(--danger); }
+  .status--muted { color: var(--text-2); }
+  .status--info { color: var(--accent-text); }
+
+  .status svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  /* Copy: inline mono text with a 24px ghost button. */
+  .copy {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .copy__value {
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .copy__btn {
+    display: inline-grid;
+    flex: none;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-3);
+    cursor: pointer;
+    transition: background-color var(--dur-1) var(--ease-std), color var(--dur-1) var(--ease-std);
+  }
+
+  .copy__btn:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .copy__btn.is-copied {
+    color: var(--ok);
+  }
+
+  .copy__btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .btn--ghost {
+    border-color: transparent;
+    background: transparent;
+    color: var(--text-2);
+  }
+
+  .btn--ghost:hover {
+    border-color: transparent;
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .menu--actions {
+    position: relative;
+  }
+
+  .menu--actions > summary {
+    list-style: none;
+  }
+
+  .menu--actions > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .menu--actions > .menu__panel {
+    left: auto;
+    right: 0;
+    width: 220px;
+    padding: var(--s1);
+    transform-origin: top right;
+    animation: hm-pop var(--dur-2) var(--ease-out) both;
+  }
+
+  .menu__panel button.menu__option {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .menu__panel .menu__option--danger,
+  .menu__panel .menu__option--danger .icon {
+    color: var(--danger);
+  }
+
+  .menu__option svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+    flex: none;
+  }
+
+  /* Form sections: one card, the inherit switch in its head. */
+  .form-section {
+    position: relative;
+    margin-bottom: var(--s4);
+  }
+
+  .form-section__head {
+    padding: var(--s4) var(--s5) 0;
+  }
+
+  .form-section__title {
+    font-size: 15px;
+  }
+
+  .form-section__desc {
+    margin-top: 2px;
+    color: var(--text-2);
+  }
+
+  .form-section__body {
+    padding: var(--s4) var(--s5) var(--s5);
+  }
+
+  .form-section:has(> .form-section__body > .inherit) > .form-section__head {
+    padding-right: 220px;
+  }
+
+  .inherit {
+    display: block;
+    margin: 0 0 var(--s4);
+    padding: 0;
+    border: 0;
+    background: none;
+  }
+
+  .inherit__switch {
+    position: absolute;
+    top: var(--s4);
+    right: var(--s5);
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+  }
+
+  .inherit__label {
+    font-size: var(--fs-sm);
+    font-weight: 500;
+    color: var(--text-2);
+  }
+
+  .inherit__input {
+    width: 32px;
+    height: 18px;
+    border: 0;
+    background: var(--border-strong);
+    transition: background-color var(--dur-2) var(--ease-std);
+  }
+
+  .inherit__input::after {
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 25%);
+    transition: transform var(--dur-2) var(--ease-out);
+  }
+
+  .inherit__input:checked {
+    background: var(--accent);
+  }
+
+  .inherit__input:checked::after {
+    transform: translateX(14px);
+  }
+
+  /* The read-only summary while inheriting: a quiet inset, no border. */
+  .inherit__summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .inherit__summary svg {
+    width: 14px;
+    height: 14px;
+    color: var(--text-3);
+  }
+
+  .inherit:has(.inherit__input:not(:checked)) .inherit__summary {
+    padding: 0;
+    background: none;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  /* Security shows the full inherited values instead (verify-effective). */
+  .inherit:has(~ .verify-effective:not([hidden])) .inherit__summary {
+    display: none;
+  }
+
+  .verify-effective {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font-size: var(--fs-sm);
+  }
+
+  .verify-effective > strong {
+    display: none;
+  }
+
+  .verify-effective dl {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 0;
+    margin: 0;
+  }
+
+  .verify-effective dt,
+  .verify-effective dd {
+    margin: 0;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .verify-effective dt {
+    padding-right: var(--s5);
+    color: var(--text-2);
+  }
+
+  .verify-effective dd {
+    overflow-wrap: anywhere;
+    color: var(--text);
+  }
+
+  .verify-effective dd code {
+    font-size: 12.5px;
+  }
+
+  .verify-effective dd .muted {
+    margin-left: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+
+  .verify-effective dt:last-of-type,
+  .verify-effective dd:last-of-type {
+    border-bottom: 0;
+  }
+
+  .verify-effective > .mfield__hint {
+    margin: var(--s3) 0 0;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  /* While inheriting, the form is hidden, not greyed out (its inputs stay
+     in the DOM: disabled, so they do not post — as before). */
+  .inherit-target:disabled {
+    display: none;
+  }
+
+  /* Modes: a segmented control over the real radios; the chosen option's
+     description on one line below. */
+  .config-form .radio-cards__grid {
+    display: grid;
+    grid-template-columns: repeat(var(--seg-n, 3), max-content) 1fr;
+    align-items: center;
+    gap: 0;
+    margin: 6px 0 var(--s4);
+  }
+
+  .config-form .radio-cards__grid:has(> .radio-card:nth-child(2):last-child) { --seg-n: 2; }
+  .config-form .radio-cards__grid:has(> .radio-card:nth-child(4)) { --seg-n: 4; }
+
+  .config-form .radio-card {
+    display: contents;
+  }
+
+  .config-form .radio-card input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .config-form .radio-card__title {
+    grid-row: 1;
+    display: inline-flex;
+    align-items: center;
+    height: 34px;
+    padding: 3px;
+    background: var(--surface-2);
+    font-size: var(--fs-sm);
+    font-weight: 500;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+
+  .config-form .radio-card:first-child .radio-card__title {
+    border-radius: 8px 0 0 8px;
+  }
+
+  .config-form .radio-card:last-child .radio-card__title {
+    border-radius: 0 8px 8px 0;
+  }
+
+  .config-form .radio-card__title {
+    position: relative;
+    padding: 0 14px;
+    border: 3px solid var(--surface-2);
+    border-width: 3px 1px;
+    transition: color var(--dur-1) var(--ease-std), background-color var(--dur-2) var(--ease-out),
+      box-shadow var(--dur-2) var(--ease-out);
+  }
+
+  .config-form .radio-card:first-child .radio-card__title {
+    border-left-width: 3px;
+  }
+
+  .config-form .radio-card:last-child .radio-card__title {
+    border-right-width: 3px;
+  }
+
+  .config-form .radio-card:hover .radio-card__title {
+    color: var(--text);
+  }
+
+  .config-form .radio-card:has(input:checked) .radio-card__title {
+    border-radius: 6px;
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 0 0 1px var(--border);
+    color: var(--text);
+  }
+
+  .config-form .radio-card:has(input:focus-visible) .radio-card__title {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 1px;
+  }
+
+  .config-form .radio-card__desc {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    margin-top: 8px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .config-form .radio-card:not(:has(input:checked)) .radio-card__desc {
+    display: none;
+  }
+
+  /* Verify beside the form (sticky) on wide screens, above it on narrow. */
+  .config-layout--aside {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: var(--s5);
+    align-items: start;
+  }
+
+  .config-aside {
+    position: sticky;
+    top: calc(var(--topbar-h) + var(--s5));
+    min-width: 0;
+  }
+
+  .config-aside__fields {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+
+  .config-aside .verify {
+    margin: 0;
+    padding: var(--s4) var(--s5) var(--s5);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface);
+  }
+
+  .config-aside .verify__head {
+    flex-direction: column-reverse;
+    align-items: stretch;
+    gap: var(--s3);
+  }
+
+  .config-aside .verify__run {
+    justify-content: center;
+    width: 100%;
+  }
+
+  .config-aside .verify__intro {
+    flex: none;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  @media (max-width: 1100px) {
+    .config-layout--aside {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .config-aside {
+      position: static;
+      order: -1;
+    }
+  }
+
+  /* The save bar of an endpoint's settings: a floating pill, out of sight
+     until something changed (or a stale revision offers Overwrite). */
+  .config-form > .save-bar {
+    position: fixed;
+    left: calc(var(--sidebar-w) + (100vw - var(--sidebar-w)) / 2);
+    bottom: var(--s5);
+    z-index: 40;
+    width: min(720px, calc(100vw - var(--sidebar-w) - 48px));
+    margin: 0;
+    padding: 8px 8px 8px 16px;
+    border: 0;
+    border-radius: var(--r-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-2);
+    backdrop-filter: none;
+    transform: translate(-50%, 0);
+    transition: transform var(--dur-3) var(--ease-out), opacity var(--dur-2) var(--ease-std);
+  }
+
+  html.js .config-form:not(:has(.tag--unsaved:not([hidden]))):not(:has(#diff-preview:not(:empty))):not(:has(.save-bar .btn--danger)) > .save-bar {
+    opacity: 0;
+    pointer-events: none;
+    transform: translate(-50%, 140%);
+  }
+
+  .save-bar__preview:empty {
+    display: none;
+  }
+
+  .config-form {
+    padding-bottom: var(--s7);
+  }
+
+  @media (max-width: 1024px) {
+    .form-section:has(> .form-section__body > .inherit) > .form-section__head {
+      padding-right: var(--s4);
+    }
+
+    .form-section__head {
+      padding: var(--s4) var(--s4) 0;
+    }
+
+    .form-section__body {
+      padding: var(--s3) var(--s4) var(--s4);
+    }
+
+    .inherit__switch {
+      position: static;
+      margin-bottom: var(--s3);
+    }
+
+    .config-form > .save-bar {
+      left: 50%;
+      width: calc(100vw - 24px);
+      bottom: var(--s3);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .config-form > .save-bar,
+    .config-form .radio-card__title {
+      transition: none;
+    }
+  }
+}
+
+/* Overview (console redesign §6): server health as one line, calm endpoint
+   cards (title + state, URL with copy, a meta line, numbers, actions). */
+@layer pages {
+  .health-strip.health {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s2) var(--s5);
+    grid-template-columns: none;
+    margin: 0 0 var(--s5);
+    padding: 10px var(--s5);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .health__item {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .health__value {
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .health__figure {
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  .endpoint-card {
+    gap: var(--s4);
+    padding: var(--s5);
+  }
+
+  .endpoint-card__title {
+    font-size: var(--fs-lg);
+  }
+
+  .endpoint-card__title a {
+    color: var(--text);
+  }
+
+  .endpoint-card__name {
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+  }
+
+  .endpoint-card__desc {
+    margin: 0;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .endpoint-card__where {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .endpoint-card__badges {
+    margin: 0;
+  }
+
+  .endpoint-card__stats {
+    padding-top: var(--s4);
+    border-top: 1px solid var(--border);
+  }
+
+  .endpoint-card__stats dt {
+    font-size: var(--fs-xs);
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text-3);
+  }
+
+  .endpoint-card__stats dd {
+    font-size: var(--fs-lg);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .endpoint-card__actions {
+    align-items: center;
+    gap: var(--s2);
+  }
+
+  .endpoint-card__more {
+    margin-left: auto;
+  }
+
+  .endpoint-card__more > summary {
+    list-style: none;
+  }
+
+  .endpoint-card__more > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .endpoint-card__more > .menu__panel {
+    width: 220px;
+    padding: var(--s1);
+    animation: hm-pop var(--dur-2) var(--ease-out) both;
+    transform-origin: top right;
+  }
+
+  @media (max-width: 1024px) {
+    .health-strip.health {
+      flex-direction: column;
+      align-items: flex-start;
+      padding: var(--s3) var(--s4);
+    }
+
+    .endpoint-card {
+      padding: var(--s4);
+    }
+  }
+}

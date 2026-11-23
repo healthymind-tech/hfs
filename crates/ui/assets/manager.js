@@ -30,9 +30,30 @@
       box.hidden = !input.checked;
     });
   }
+  // Customising (console redesign §7): the section's form, hidden while
+  // inheriting, expands into place (260 ms) instead of appearing at once.
+  var reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function revealInherit(input) {
+    if (reducedMotion) return;
+    (input.getAttribute("data-inherit-target") || "").split(/\s+/).forEach(function (id) {
+      var target = id && document.getElementById(id);
+      if (!target || !target.animate || !target.offsetHeight) return;
+      target.style.overflow = "hidden";
+      var anim = target.animate(
+        [{ height: "0px", opacity: 0 }, { height: target.offsetHeight + "px", opacity: 1 }],
+        { duration: 260, easing: "cubic-bezier(.2,.7,.2,1)" }
+      );
+      anim.onfinish = anim.oncancel = function () {
+        target.style.overflow = "";
+      };
+    });
+  }
   document.addEventListener("change", function (e) {
     var t = e.target;
-    if (t && t.matches && t.matches("[data-inherit-target]")) syncInherit(t);
+    if (t && t.matches && t.matches("[data-inherit-target]")) {
+      syncInherit(t);
+      if (!t.checked) revealInherit(t);
+    }
     if (t && t.matches && t.matches("input[type=radio][data-reveal]")) syncReveal(t.name);
   });
 
@@ -271,6 +292,13 @@
       }
       var details = input.closest("details");
       if (details) details.open = true;
+      // A field of an inherited section is hidden (console redesign §6):
+      // point at that section's "Inherit from server" switch instead.
+      var inherited = input.closest("fieldset.inherit-target:disabled");
+      if (inherited) {
+        var sw = document.querySelector('[data-inherit-target~="' + inherited.id + '"]');
+        if (sw) input = sw;
+      }
       input.scrollIntoView({ block: "center" });
       input.focus({ preventScroll: true });
       var field = input.closest(".mfield");

@@ -53,6 +53,7 @@
 <form method="post" action="/ui/e/{{ head.name }}/{{ section }}" class="config-form" id="config-form" novalidate data-unsaved-form>
   {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
   <input type="hidden" name="revision" value="{{ revision }}">
+  <div class="config-layout{% if section == "security" || section == "terminology" %} config-layout--aside{% endif %}">
   <fieldset class="config-form__fields"{% if !can_edit %} disabled{% endif %}>
     <legend class="visually-hidden">{{ i18n.t(title_key) }}</legend>
     {% if section == "config" %}{% include "partials/manager/section-general.html" %}
@@ -61,6 +62,22 @@
     {% else %}{% include "partials/manager/section-terminology.html" %}
     {% endif %}
   </fieldset>
+  {#- The Verify panel (console redesign §6): a sticky card beside the form
+      on wide screens, above it on narrow ones. Outside the section
+      fieldsets, so it also checks inherited (server) settings (UX-07/11). -#}
+  {% if section == "security" || section == "terminology" %}
+  <aside class="config-aside">
+    <fieldset class="config-aside__fields"{% if !can_edit %} disabled{% endif %}>
+      <legend class="visually-hidden">{{ i18n.t("verify-run") }}</legend>
+      {% if section == "security" %}
+      {% call ui::verify_panel("verify-auth", "/ui/e/" ~ head.name ~ "/security/verify", "auth_inherit auth_mode auth_issuer auth_jwks_url auth_audience auth_algorithms", "verify-intro-auth", "verify-run", true, false) %}{% endcall %}
+      {% else %}
+      {% call ui::verify_panel("verify-terminology", "/ui/e/" ~ head.name ~ "/terminology/verify", "term_inherit term_server_url term_token term_timeout", "verify-intro-terminology", "verify-run-terminology", false, false) %}{% endcall %}
+      {% endif %}
+    </fieldset>
+  </aside>
+  {% endif %}
+  </div>
   {% if can_edit %}
   <div class="save-bar" role="region" aria-label="{{ i18n.t("mgr-save-bar") }}">
     <div class="save-bar__preview" id="diff-preview" aria-live="polite"></div>

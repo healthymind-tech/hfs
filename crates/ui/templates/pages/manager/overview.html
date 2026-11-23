@@ -9,7 +9,6 @@
 {% block title %}{{ i18n.t("mgr-overview-title") }} — {{ i18n.t("app-short-name") }}{% endblock %}
 
 {% block content %}
-<div class="brand-band" aria-hidden="true"></div>
 {% call ui::page_header(i18n.t("mgr-overview-title"), i18n.t("mgr-overview-lede")) %}
   {% if can_admin %}
   <a class="btn btn--primary" href="/ui/endpoints/new">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("mgr-action-new-endpoint") }}</a>
@@ -20,15 +19,15 @@
 <div class="notice notice--ok" role="status">{% call ui::icon("check-circle") %}{% endcall %}<span>{{ i18n.t_arg2(flash_key, "endpoint", flash_arg.clone(), "tenant", flash_tenant.clone()) }}</span></div>
 {% endif %}
 
-<section class="health-strip" aria-label="{{ i18n.t("mgr-health-title") }}">
+{#- Server health as ONE quiet line (console redesign §6): a state dot, the
+    label and the value; a problem turns its dot amber or red. -#}
+<section class="health-strip health" aria-label="{{ i18n.t("mgr-health-title") }}">
   {% for tile in health %}
-  <div class="health-tile health-tile--{{ tile.tone }}">
-    <span class="health-tile__icon" aria-hidden="true">{% call ui::icon(tile.icon) %}{% endcall %}</span>
-    <span class="health-tile__text">
-      <span class="health-tile__label">{{ i18n.t(tile.label_key) }}</span>
-      <span class="health-tile__value">{% if !tile.value_key.is_empty() %}{{ i18n.t(tile.value_key) }}{% endif %}{% if !tile.value.is_empty() %} <span class="health-tile__figure">{{ tile.value }}</span>{% endif %}</span>
-    </span>
-  </div>
+  <span class="health__item health-tile--{{ tile.tone }}">
+    <span class="dot dot--{{ tile.tone }}" aria-hidden="true"></span>
+    <span class="health__label">{{ i18n.t(tile.label_key) }}</span>
+    <b class="health__value">{% if !tile.value_key.is_empty() %}{{ i18n.t(tile.value_key) }}{% endif %}</b>{% if !tile.value.is_empty() %} <span class="health__figure">{{ tile.value }}</span>{% endif %}
+  </span>
   {% endfor %}
 </section>
 
@@ -69,16 +68,18 @@
           <h2 class="endpoint-card__title"><a href="/ui/e/{{ card.name }}" class="endpoint-card__link">{{ card.display_name }}</a></h2>
           <span class="endpoint-card__name">{% if card.is_default %}{{ i18n.t("mgr-default-endpoint") }}{% else %}/{{ card.name }}{% endif %}</span>
         </div>
-        {% call ui::pill(card.status) %}{% endcall %}
+        <span class="status status--{{ card.status.tone }}"><span class="dot dot--{{ card.status.tone }}" aria-hidden="true"></span>{{ i18n.t(card.status.key) }}</span>
       </div>
       {% if !card.description.is_empty() %}<p class="endpoint-card__desc">{{ card.description }}</p>{% endif %}
-      {% call ui::copy_field(card.base_url, i18n.t("mgr-copy-base-url")) %}{% endcall %}
-      <div class="endpoint-card__badges">
-        <span class="chip chip--version">FHIR {{ card.fhir_version }}</span>
-        {% call ui::pill(card.auth) %}{% endcall %}
-        {% call ui::pill(card.validation) %}{% endcall %}
-        {% if let Some(sync) = card.sync %}{% call ui::pill(sync) %}{% endcall %}{% endif %}
-        {% if card.env_managed %}{% call ui::pill_raw("warn", "lock", i18n.t("mgr-env-managed")) %}{% endcall %}{% endif %}
+      <div class="endpoint-card__where">
+        <span class="copy" title="{{ card.base_url }}"><code class="copy__value">{{ card.base_url }}</code><button type="button" class="copy__btn" data-copy="{{ card.base_url }}" aria-label="{{ i18n.t("mgr-copy-base-url") }}" title="{{ i18n.t("mgr-copy-base-url") }}">{% call ui::icon("copy") %}{% endcall %}</button></span>
+        <p class="meta-line endpoint-card__badges">
+          <span>FHIR {{ card.fhir_version }}</span>
+          <span>{{ i18n.t(card.auth.key) }}{% if card.auth.inherited %}<span class="meta-line__inh">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
+          <span>{{ i18n.t(card.validation.key) }}{% if card.validation.inherited %}<span class="meta-line__inh">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
+          {% if let Some(sync) = card.sync %}<span class="status status--{{ sync.tone }}">{{ i18n.t(sync.key) }}</span>{% endif %}
+          {% if card.env_managed %}<span class="status status--warn">{% call ui::icon("lock") %}{% endcall %}{{ i18n.t("mgr-env-managed") }}</span>{% endif %}
+        </p>
       </div>
       <dl class="endpoint-card__stats">
         <div><dt>{{ i18n.t("mgr-stat-resources") }}</dt><dd>{% if let Some(n) = card.resources %}{{ i18n.num(n) }}{% else %}—{% endif %}</dd></div>
@@ -97,14 +98,14 @@
       </ul>
       {% endif %}
       <div class="endpoint-card__actions">
-        <a class="btn btn--primary btn--small" href="/ui/e/{{ card.name }}">{{ i18n.t("mgr-action-open") }}</a>
-        <a class="btn btn--small" href="/ui/e/{{ card.name }}/data/resources">{{ i18n.t("mgr-action-browse-data") }}</a>
+        <a class="btn" href="/ui/e/{{ card.name }}">{{ i18n.t("mgr-action-open") }}</a>
+        <a class="btn btn--ghost" href="/ui/e/{{ card.name }}/data/resources">{{ i18n.t("mgr-action-browse-data") }}</a>
         {% if can_admin %}
         <details class="menu menu--end endpoint-card__more">
-          <summary class="icon-button" aria-label="{{ i18n.t_arg("mgr-more-actions", "endpoint", card.display_name.clone()) }}">{% include "icons/dots-vertical.svg" %}</summary>
+          <summary class="btn btn--ghost btn--icon" aria-label="{{ i18n.t_arg("mgr-more-actions", "endpoint", card.display_name.clone()) }}">{% include "icons/dots-vertical.svg" %}</summary>
           <div class="menu__panel">
-            <a class="menu__option" href="/ui/e/{{ card.name }}/config">{% call ui::icon("sliders") %}{% endcall %}{{ i18n.t("mgr-nav-config") }}</a>
-            <a class="menu__option" href="/ui/e/{{ card.name }}/duplicate">{% call ui::icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
+            <a class="menu__option" href="/ui/e/{{ card.name }}/config">{% call ui::icon("sliders") %}{% endcall %}<span class="menu__option-text">{{ i18n.t("mgr-nav-config") }}</span></a>
+            <a class="menu__option" href="/ui/e/{{ card.name }}/duplicate">{% call ui::icon("duplicate") %}{% endcall %}<span class="menu__option-text">{{ i18n.t("mgr-action-duplicate") }}</span></a>
             {% if card.can_toggle %}
             <form method="post" action="/ui/e/{{ card.name }}/status">
               {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
@@ -112,7 +113,7 @@
               <input type="hidden" name="back" value="/ui?changed={{ card.name }}">
               {% if card.status_slug == "enabled" %}
               <input type="hidden" name="action" value="disable">
-              <button type="submit" class="menu__option" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", card.name.clone()) }}">{% call ui::icon("power") %}{% endcall %}{{ i18n.t("mgr-action-disable") }}</button>
+              <button type="submit" class="menu__option menu__option--danger" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", card.name.clone()) }}">{% call ui::icon("power") %}{% endcall %}<span class="menu__option-text">{{ i18n.t("mgr-action-disable") }}</span></button>
               {% else %}
               <input type="hidden" name="action" value="enable">
               <button type="submit" class="menu__option">{% call ui::icon("power") %}{% endcall %}{{ i18n.t("mgr-action-enable") }}</button>

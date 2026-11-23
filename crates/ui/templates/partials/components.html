@@ -171,11 +171,16 @@
 {% endmacro %}
 
 {% macro inherit_toggle(name, checked, target, summary, disabled=false) %}
+{#- Console redesign §6 inherit pattern: the switch sits in the card head
+    (app.css), the summary is a quiet inset, and the section's form is
+    hidden — not greyed out — while the value is inherited. -#}
 <div class="inherit">
-  <input type="checkbox" class="inherit__input" role="switch" id="f-{{ name }}" name="{{ name }}" value="on"
-         data-inherit-target="{{ target }}"{% if checked %} checked{% endif %}{% if disabled %} disabled{% endif %}
-         aria-describedby="f-{{ name }}-summary">
-  <label class="inherit__label" for="f-{{ name }}">{{ i18n.t("mgr-inherit-label") }}</label>
+  <label class="inherit__switch" for="f-{{ name }}">
+    <input type="checkbox" class="inherit__input" role="switch" id="f-{{ name }}" name="{{ name }}" value="on"
+           data-inherit-target="{{ target }}"{% if checked %} checked{% endif %}{% if disabled %} disabled{% endif %}
+           aria-describedby="f-{{ name }}-summary">
+    <span class="inherit__label">{{ i18n.t("mgr-inherit-label") }}</span>
+  </label>
   <p class="inherit__summary" id="f-{{ name }}-summary">{% call icon("server") %}{% endcall %}<span>{{ summary }}</span></p>
 </div>
 {% endmacro %}
@@ -212,55 +217,62 @@
 {% endmacro %}
 
 {#
-  The identity header of every /ui/e/{endpoint} page: breadcrumb, the page
-  title, the endpoint's status / auth / validation pills, its public base URL
-  with a copy button, and (admins) quick actions.
+  The identity header of every /ui/e/{endpoint} page (console redesign §6
+  Page header): breadcrumb, the page title, then ONE meta line instead of
+  pills — state dot, the public base URL with a copy button, FHIR version,
+  auth and validation (an inherited value carries a small "server" suffix),
+  revision and last change — and at most one visible action plus a ⋯ menu.
 #}
 {% macro ep_head(head, title, is_home=false, can_admin=false, actions=true) %}
 <header class="ep-head">
   <nav class="crumbs" aria-label="{{ i18n.t("mgr-breadcrumb") }}">
     <a href="/ui">{{ i18n.t("mgr-all-endpoints") }}</a>
-    <span class="crumbs__sep" aria-hidden="true">/</span>
+    <span class="crumbs__sep" aria-hidden="true">{% call icon("chevron-down") %}{% endcall %}</span>
     {% if is_home %}
     <span aria-current="page">{{ head.display_name }}</span>
     {% else %}
     <a href="/ui/e/{{ head.name }}">{{ head.display_name }}</a>
-    <span class="crumbs__sep" aria-hidden="true">/</span>
+    <span class="crumbs__sep" aria-hidden="true">{% call icon("chevron-down") %}{% endcall %}</span>
     <span aria-current="page">{{ title }}</span>
     {% endif %}
   </nav>
   <div class="ep-head__row">
     <div class="ep-head__main">
       <h1 class="page-head__title">{{ title }}</h1>
-      <div class="ep-head__meta">
-        {% call pill(head.status) %}{% endcall %}
-        <span class="chip chip--version" title="{{ i18n.t("mgr-field-fhir-version") }}">FHIR {{ head.fhir_version }}</span>
-        {% call pill(head.auth) %}{% endcall %}
-        {% call pill(head.validation) %}{% endcall %}
-        {% if head.env_managed %}{% call pill_raw("warn", "lock", i18n.t("mgr-env-managed")) %}{% endcall %}{% endif %}
-      </div>
-      {% call copy_field(head.base_url, i18n.t("mgr-copy-base-url")) %}{% endcall %}
+      <p class="meta-line ep-head__meta">
+        <span class="status status--{{ head.status.tone }}"><span class="dot dot--{{ head.status.tone }}" aria-hidden="true"></span>{{ i18n.t(head.status.key) }}</span>
+        <span class="copy" title="{{ head.base_url }}"><code class="copy__value">{{ head.base_url }}</code><button type="button" class="copy__btn" data-copy="{{ head.base_url }}" aria-label="{{ i18n.t("mgr-copy-base-url") }}" title="{{ i18n.t("mgr-copy-base-url") }}">{% call icon("copy") %}{% endcall %}</button></span>
+        <span title="{{ i18n.t("mgr-field-fhir-version") }}">FHIR {{ head.fhir_version }}</span>
+        <span>{{ i18n.t(head.auth.key) }}{% if head.auth.inherited %}<span class="meta-line__inh">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
+        <span>{{ i18n.t(head.validation.key) }}{% if head.validation.inherited %}<span class="meta-line__inh">{{ i18n.t("mgr-inherited-short") }}</span>{% endif %}</span>
+        {% if head.env_managed %}<span class="status status--warn">{% call icon("lock") %}{% endcall %}{{ i18n.t("mgr-env-managed") }}</span>{% endif %}
+        <span class="ep-head__updated">r{{ head.revision }} · {{ i18n.t_arg("mgr-updated-at", "at", head.updated.clone()) }}{% if !head.updated_by.is_empty() %} · {{ head.updated_by }}{% endif %}</span>
+      </p>
       {% if is_home && !head.description.is_empty() %}<p class="ep-head__desc">{{ head.description }}</p>{% endif %}
-      <p class="ep-head__updated">{{ i18n.t_arg("mgr-updated-at", "at", head.updated.clone()) }}{% if !head.updated_by.is_empty() %} · {{ head.updated_by }}{% endif %} · r{{ head.revision }}</p>
     </div>
     {% if actions %}
     <div class="ep-head__actions">
-      <a class="btn" href="/ui/e/{{ head.name }}/data/resources">{% call icon("layers") %}{% endcall %}{{ i18n.t("mgr-action-browse-data") }}</a>
+      <a class="btn btn--ghost" href="/ui/e/{{ head.name }}/data/resources">{% call icon("layers") %}{% endcall %}{{ i18n.t("mgr-action-browse-data") }}</a>
       {% if can_admin %}
-      <a class="btn" href="/ui/e/{{ head.name }}/duplicate">{% call icon("duplicate") %}{% endcall %}{{ i18n.t("mgr-action-duplicate") }}</a>
-      {% if !head.is_default && !head.env_managed %}
-      <form method="post" action="/ui/e/{{ head.name }}/status" class="inline-form">
-        {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
-        <input type="hidden" name="revision" value="{{ head.revision }}">
-        {% if head.enabled %}
-        <input type="hidden" name="action" value="disable">
-        <button type="submit" class="btn" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", head.name.clone()) }}">{% call icon("power") %}{% endcall %}{{ i18n.t("mgr-action-disable") }}</button>
-        {% else %}
-        <input type="hidden" name="action" value="enable">
-        <button type="submit" class="btn btn--primary">{% call icon("power") %}{% endcall %}{{ i18n.t("mgr-action-enable") }}</button>
-        {% endif %}
-      </form>
-      {% endif %}
+      <details class="menu menu--actions">
+        <summary class="btn btn--ghost btn--icon" aria-label="{{ i18n.t_arg("mgr-more-actions", "endpoint", head.display_name.clone()) }}" title="{{ i18n.t_arg("mgr-more-actions", "endpoint", head.display_name.clone()) }}">{% call icon("dots-vertical") %}{% endcall %}</summary>
+        <div class="menu__panel">
+          <a class="menu__option" href="/ui/e/{{ head.name }}/duplicate">{% call icon("duplicate") %}{% endcall %}<span class="menu__option-text">{{ i18n.t("mgr-action-duplicate") }}</span></a>
+          {% if !head.is_default && !head.env_managed %}
+          <form method="post" action="/ui/e/{{ head.name }}/status" class="inline-form">
+            {% if let Some(token) = status.csrf_token() %}<input type="hidden" name="_csrf" value="{{ token }}">{% endif %}
+            <input type="hidden" name="revision" value="{{ head.revision }}">
+            {% if head.enabled %}
+            <input type="hidden" name="action" value="disable">
+            <button type="submit" class="menu__option menu__option--danger" data-confirm="{{ i18n.t_arg("mgr-confirm-disable", "endpoint", head.name.clone()) }}">{% call icon("power") %}{% endcall %}<span class="menu__option-text">{{ i18n.t("mgr-action-disable") }}</span></button>
+            {% else %}
+            <input type="hidden" name="action" value="enable">
+            <button type="submit" class="menu__option">{% call icon("power") %}{% endcall %}<span class="menu__option-text">{{ i18n.t("mgr-action-enable") }}</span></button>
+            {% endif %}
+          </form>
+          {% endif %}
+        </div>
+      </details>
       {% endif %}
     </div>
     {% endif %}

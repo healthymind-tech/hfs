@@ -10,8 +10,6 @@
     {% call ui::secret_field(i18n.t("mgr-term-token"), "term_token", v.term_token_set, i18n.t("mgr-term-token-hint")) %}{% endcall %}
     {% if self.bad("terminology.token") %}<p class="mfield__error">{{ self.err("terminology.token") }}</p>{% endif %}
   </fieldset>
-  {#- UX-07: outside the fieldset, so it also checks the inherited server. -#}
-  {% call ui::verify_panel("verify-terminology", "/ui/e/" ~ head.name ~ "/terminology/verify", "term_inherit term_server_url term_token term_timeout", "verify-intro-terminology", "verify-run-terminology", false, false) %}{% endcall %}
 {% endcall %}
 
 <section class="card form-section" aria-labelledby="sec-hts-title" id="sec-hts">
