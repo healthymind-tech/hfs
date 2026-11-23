@@ -249,10 +249,10 @@ impl BrowserRowsView {
             ("name", &self.filters.name),
             ("title", &self.filters.title),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         if !status.is_empty() {

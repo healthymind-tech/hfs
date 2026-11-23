@@ -31,7 +31,7 @@
 //!    interaction chips — the two improvements this page did not have while
 //!    it kept its own copy of the markup.
 //! 10. (sync) Every CSS class the page names — its own *and* the shared
-//!    cards' — has a real rule in the shared `crates/ui/assets/app.css`.
+//!     cards' — has a real rule in the shared `crates/ui/assets/app.css`.
 
 use axum::{
     Router,

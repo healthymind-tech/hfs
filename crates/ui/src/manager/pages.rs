@@ -1076,7 +1076,6 @@ fn enabled_versions() -> Vec<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn section_response(
     c: Ctx,
     section: Section,

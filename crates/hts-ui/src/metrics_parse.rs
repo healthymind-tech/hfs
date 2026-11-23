@@ -53,9 +53,9 @@ fn parse_line(line: &str) -> Option<(String, Sample)> {
     // Two shapes to handle:
     //   metric_name value [timestamp]
     //   metric_name{k="v",k2="v2"} value [timestamp]
-    let (name_part, rest) = match line.find(|c: char| c == '{' || c.is_whitespace()) {
-        Some(idx) => line.split_at(idx),
-        None => return None,
+    let (name_part, rest) = {
+        let idx = line.find(|c: char| c == '{' || c.is_whitespace())?;
+        line.split_at(idx)
     };
     if name_part.is_empty() {
         return None;

@@ -647,10 +647,10 @@ impl CsBrowserFilters {
             ("status", &self.status),
             ("sort", &self.sort),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         ser.append_pair("_count", &self.effective_count().to_string());
@@ -1765,10 +1765,8 @@ fn parse_lookup_property(param: &Value) -> Option<LookupProperty> {
                     }
                 }
             }
-            "description" => {
-                if p.value.is_empty() {
-                    p.value = value_obj_str(part, "valueString").to_owned();
-                }
+            "description" if p.value.is_empty() => {
+                p.value = value_obj_str(part, "valueString").to_owned();
             }
             _ => {}
         }
@@ -1862,10 +1860,10 @@ impl VsBrowserFilters {
             ("status", &self.status),
             ("sort", &self.sort),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         ser.append_pair("_count", &self.effective_count().to_string());
@@ -2900,10 +2898,10 @@ impl CmBrowserFilters {
             ("status", &self.status),
             ("sort", &self.sort),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         ser.append_pair("_count", &self.effective_count().to_string());
@@ -3589,14 +3587,14 @@ fn parse_translate_match(param: &Value) -> Option<(TranslateMatch, MappingKind)>
             // the coding's system and fall back to `valueUri` for tolerance.
             "source" => {
                 let mut v = value_obj_str(part, "valueUri").to_owned();
-                if v.is_empty() {
-                    if let Some(c) = part.get("valueCoding").and_then(|c| c.as_object()) {
-                        v = c
-                            .get("system")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_owned();
-                    }
+                if v.is_empty()
+                    && let Some(c) = part.get("valueCoding").and_then(|c| c.as_object())
+                {
+                    v = c
+                        .get("system")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_owned();
                 }
                 if !v.is_empty() && mat.origin.is_none() {
                     mat.origin = Some(v);
@@ -3622,10 +3620,10 @@ fn base_id(id: &str) -> &str {
 /// into one projection field.
 fn pick_first_str(resource: &Value, keys: &[&str]) -> String {
     for k in keys {
-        if let Some(v) = resource.get(*k).and_then(|v| v.as_str()) {
-            if !v.is_empty() {
-                return v.to_owned();
-            }
+        if let Some(v) = resource.get(*k).and_then(|v| v.as_str())
+            && !v.is_empty()
+        {
+            return v.to_owned();
         }
     }
     String::new()

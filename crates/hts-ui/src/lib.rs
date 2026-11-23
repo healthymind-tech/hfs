@@ -577,6 +577,18 @@ pub(crate) fn render_page(rendered: Result<String, askama::Error>) -> Response {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+fn test_state() -> Arc<HtsUiState> {
+    Arc::new(HtsUiState {
+        fhir_version: "R4",
+        version: "0.0.0-test",
+        upstream: UpstreamClient::new("http://127.0.0.1:1").expect("test client"),
+        bundled_data_bytes: None,
+        metrics_ring: Default::default(),
+    })
+}
+
 /// Cheap constructor for local mount tests: an [`HtsUiState`] pointed at a
 /// closed loopback port so upstream calls fail deterministically.
 #[cfg(test)]
@@ -606,16 +618,4 @@ mod topbar_tests {
         assert_eq!(initials("Jane Q Doe"), "JD");
         assert_eq!(initials(""), "");
     }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn test_state() -> Arc<HtsUiState> {
-    Arc::new(HtsUiState {
-        fhir_version: "R4",
-        version: "0.0.0-test",
-        upstream: UpstreamClient::new("http://127.0.0.1:1").expect("test client"),
-        bundled_data_bytes: None,
-        metrics_ring: Default::default(),
-    })
 }
