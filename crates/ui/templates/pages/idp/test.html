@@ -22,7 +22,7 @@
         </div>
       </div>
     </details>
-    <div class="form-actions form-actions--start">
+    <div class="form-actions form-actions--start idp-actions">
       <button type="submit" class="btn btn--primary">{% call ui::icon("activity") %}{% endcall %}{{ i18n.t("idpc-test-run") }}</button>
       {% if verify.is_some() %}<a class="btn" href="/ui/idp/{{ head.name }}/test/report.json" download>{{ i18n.t("idpc-test-download") }}</a>{% endif %}
       <span id="idp-running" class="htmx-indicator idp-running" role="status">{{ i18n.t("idpc-test-running") }}</span>

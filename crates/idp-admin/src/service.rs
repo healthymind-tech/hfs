@@ -415,6 +415,7 @@ impl IdpConsole {
             return Err(OpError::other(409, "only unfinished drafts can be discarded here; delete the authorization server from its settings"));
         }
         self.admin.delete_realm(&rec.id).await?;
+        self.forget(name);
         Ok(())
     }
 
@@ -472,6 +473,24 @@ impl IdpConsole {
 
     pub fn last_report(&self, name: &str) -> Option<Report> {
         self.history.lock().unwrap_or_else(|p| p.into_inner()).get(name).and_then(|q| q.front().cloned())
+    }
+
+    /// Drops a realm's run history (the realm was deleted; a new realm with
+    /// the same name must not inherit it).
+    pub fn forget(&self, name: &str) {
+        self.history.lock().unwrap_or_else(|p| p.into_inner()).remove(name);
+    }
+
+    /// Deletes a realm: unbinds its endpoints first (they return to the
+    /// server-wide auth settings), then removes it and its history.
+    pub async fn delete_realm(&self, name: &str, actor: &Actor) -> OpResult<()> {
+        let rec = self.realm(name).await?;
+        for e in rec.spec.endpoints.clone() {
+            self.unbind(name, &e, actor).await?;
+        }
+        self.admin.delete_realm(&rec.id).await?;
+        self.forget(name);
+        Ok(())
     }
 
     fn remember(&self, name: &str, r: &Report) {

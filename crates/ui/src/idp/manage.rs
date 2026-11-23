@@ -1049,14 +1049,9 @@ pub(crate) async fn settings_action(State(st): State<WebState>, locale: RequestL
                 let e = Errors::default().field("confirm", I18n::new(locale).t("idpc-delete-confirm-mismatch"));
                 return settings_render(&st, locale, &rv, &rt, &c, &rec, e, None).await;
             }
-            for e in rec.spec.endpoints.clone() {
-                if let Err(err) = c.unbind(&realm, &e, &who).await {
-                    return settings_render(&st, locale, &rv, &rt, &c, &rec, Errors::from_op(&err), None).await;
-                }
-            }
-            return match c.admin.delete_realm(&rec.id).await {
-                Ok(_) => see_other("/ui/idp?done=realm-deleted"),
-                Err(e) => settings_render(&st, locale, &rv, &rt, &c, &rec, Errors::from_op(&e.into()), None).await,
+            return match c.delete_realm(&realm, &who).await {
+                Ok(()) => see_other("/ui/idp?done=realm-deleted"),
+                Err(e) => settings_render(&st, locale, &rv, &rt, &c, &rec, Errors::from_op(&e), None).await,
             };
         }
         _ => return (StatusCode::NOT_FOUND, "unknown action").into_response(),

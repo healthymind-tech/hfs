@@ -242,12 +242,7 @@ async fn put_realm(Path(realm): Path<String>, h: HeaderMap, Json(spec): Json<Rea
 
 async fn delete_realm(Path(realm): Path<String>, Extension(actor): Extension<Actor>) -> ApiResult {
     let c = console()?;
-    let rec = op(c.realm(&realm).await)?;
-    // Endpoints first, so none keeps trusting a vanished issuer.
-    for e in rec.spec.endpoints.clone() {
-        op(c.unbind(&realm, &e, &actor).await)?;
-    }
-    idp(c.admin.delete_realm(&rec.id).await)?;
+    op(c.delete_realm(&realm, &actor).await)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

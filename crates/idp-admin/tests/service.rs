@@ -115,4 +115,7 @@ async fn diagnostic_cleans_up_its_fixture_even_when_unreachable() {
     assert!(clients.iter().all(|cl| !cl.spec.client_id.starts_with(DIAGNOSTIC_PREFIX)));
     let users = c.admin.list_users(&r.id).await.unwrap();
     assert!(users.iter().all(|u| !u.username.starts_with(DIAGNOSTIC_PREFIX)));
+    // A deleted realm's history is not inherited by a new realm of that name.
+    c.delete_realm("every", &actor()).await.unwrap();
+    assert!(c.history("every").is_empty());
 }

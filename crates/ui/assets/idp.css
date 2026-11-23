@@ -81,3 +81,6 @@
 }
 .idp-result { padding: 16px 18px; }
 .idp-result .notice { margin: 0 0 12px; }
+.idp-actions { flex-wrap: wrap; gap: 8px; }
+.idp-actions .btn { white-space: nowrap; }
+@media (max-width: 767px) { .idp-actions .btn { flex: 1 1 100%; justify-content: center; } }
