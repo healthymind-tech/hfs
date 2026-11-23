@@ -139,14 +139,22 @@ async fn brand_has_no_chinese_characters_in_chinese() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(html.contains(r#"<html lang="zh-Hant""#), "rendered in Chinese");
+    assert!(
+        html.contains(r#"<html lang="zh-Hant""#),
+        "rendered in Chinese"
+    );
     for class in ["brand", "topbar__brand"] {
         let open = format!(r#"<a class="{class}""#);
         let start = html.find(&open).expect("brand link");
-        let end = start + html[start..].find(r#"<span class="visually-hidden">"#).unwrap();
+        let end = start
+            + html[start..]
+                .find(r#"<span class="visually-hidden">"#)
+                .unwrap();
         let visible = &html[start..end];
         assert!(
-            !visible.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            !visible
+                .chars()
+                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
             "{class}: {visible}"
         );
     }

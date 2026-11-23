@@ -140,8 +140,9 @@ mod tests {
 
     /// Han ideographs (CJK Unified Ideographs and Extension A).
     fn has_han(s: &str) -> bool {
-        s.chars()
-            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3400}'..='\u{4dbf}').contains(&c))
+        s.chars().any(|c| {
+            ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3400}'..='\u{4dbf}').contains(&c)
+        })
     }
 
     struct Chinese;
@@ -160,7 +161,10 @@ mod tests {
     #[test]
     fn brand_is_the_heart_mark_and_an_english_wordmark() {
         let html = brand(&Keys, links()).unwrap();
-        assert!(html.contains(r#"<a class="brand" href="/ui/hts""#), "{html}");
+        assert!(
+            html.contains(r#"<a class="brand" href="/ui/hts""#),
+            "{html}"
+        );
         // Heart mark only, crisp at 1x/2x/3x; decorative (the name is text).
         assert!(html.contains(r#"src="/ui/hts/assets/brand/heart-mark.png""#));
         assert!(html.contains("/ui/hts/assets/brand/heart-mark@2x.png 2x"));
@@ -175,7 +179,10 @@ mod tests {
         assert!(!html.contains("brand__version"));
         // The link names itself by its visible text plus where it goes.
         assert!(html.contains("[hts-nav-home]"));
-        assert!(!html.contains("aria-label"), "visible text is the name: {html}");
+        assert!(
+            !html.contains("aria-label"),
+            "visible text is the name: {html}"
+        );
     }
 
     #[test]
@@ -194,7 +201,10 @@ mod tests {
     #[test]
     fn topbar_brand_is_the_same_link() {
         let html = topbar_brand(&Keys, links()).unwrap();
-        assert!(html.contains(r#"<a class="topbar__brand" href="/ui/hts""#), "{html}");
+        assert!(
+            html.contains(r#"<a class="topbar__brand" href="/ui/hts""#),
+            "{html}"
+        );
         assert!(html.contains("/ui/hts/assets/brand/heart-mark.png"));
         assert!(html.contains(r#"<span class="brand__name">HealthyMind</span>"#));
         assert!(html.contains(r#"<span class="brand__product">Terminology Server</span>"#));
