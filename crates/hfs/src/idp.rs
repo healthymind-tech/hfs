@@ -406,7 +406,7 @@ async fn seed(rt: &Arc<IdpRuntime>, path: &str) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("seed client: {e}"))?;
             if let Some(secret) = created.client_secret {
-                info!(client = %created.record.spec.client_id, "seeded client secret: {secret}");
+                record_seed_secret(created.record.spec.client_id.as_str(), &secret)?;
             }
         }
         for u in r.users {
@@ -418,6 +418,32 @@ async fn seed(rt: &Arc<IdpRuntime>, path: &str) -> anyhow::Result<()> {
         info!(realm = %rec.spec.name.as_str(), "seeded realm");
     }
     rt.reload().await?;
+    Ok(())
+}
+
+/// A generated client secret of the development seed. Never logged: with
+/// `HFS_IDP_DEV_SEED_SECRETS=<file>` it is appended to that file (created
+/// with mode 0600) as `client_id<TAB>secret`, for the test stack that seeded
+/// it; otherwise it is discarded (reset it in the console when needed).
+fn record_seed_secret(client_id: &str, secret: &str) -> anyhow::Result<()> {
+    let Some(path) = std::env::var_os("HFS_IDP_DEV_SEED_SECRETS").filter(|p| !p.is_empty()) else {
+        info!(
+            client = %client_id,
+            "seeded client secret generated (not logged; set HFS_IDP_DEV_SEED_SECRETS to keep it)"
+        );
+        return Ok(());
+    };
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    writeln!(file, "{client_id}\t{secret}")?;
+    info!(client = %client_id, file = %std::path::Path::new(&path).display(), "seeded client secret written to the seed secrets file");
     Ok(())
 }
 

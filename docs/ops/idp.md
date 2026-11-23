@@ -19,6 +19,7 @@ Crates: `helios-idp` (core, store), `helios-idp-server` (protocol endpoints),
 | `HFS_IDP_INTERNAL_URL` | `http://127.0.0.1:{HFS_SERVER_PORT}` | loopback base the patient picker uses to search the FHIR API as the signed-in practitioner |
 | `HFS_IDP_RATE_TOKEN_CLIENT` / `_TOKEN_IP` / `_INTERACTIVE_IP` / `_INTROSPECT_CLIENT` / `_REVOKE_CLIENT` | 60 / 300 / 20 / 600 / 60 | per-minute token buckets (0 = unlimited), per instance |
 | `HFS_IDP_DEV_SEED` | — | **test stacks only**: JSON file of realms/clients/users created at start-up when missing (`crates/idp-pages/e2e/seed.json`) |
+| `HFS_IDP_DEV_SEED_SECRETS` | — | **test stacks only**: file (created mode 0600) that receives the seed's generated client secrets as `client_id<TAB>secret`; without it they are discarded — never logged |
 
 With `HFS_IDP=off` nothing answers under `/idp` (404) and an endpoint whose
 auth provider is `internal` answers **503** to every token — closed, never open.
