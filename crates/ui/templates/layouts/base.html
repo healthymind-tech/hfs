@@ -9,6 +9,8 @@
   <!-- Fingerprinted, immutable asset URLs (persistent shell §9.4 item 8):
        a full page load costs the HTML and nothing else once cached. -->
   <link rel="stylesheet" href="{{ status.assets() }}/app.css">
+  <!-- The global search (topbar combobox, assets/search.js). -->
+  <link rel="stylesheet" href="{{ status.assets() }}/search.css">
   <meta name="hm-build" content="{{ status.build_id() }}">
   <!-- htmx settings for in-place navigation: history snapshots of #main
        only (the sidebar is never part of a snapshot), no inline styles. -->
@@ -63,6 +65,8 @@
   <script src="{{ status.assets() }}/capability-json.js" defer></script>
   <!-- Terminology lists: focus after "Load more". -->
   <script src="{{ status.assets() }}/list-paging.js" defer></script>
+  <!-- The global search: `/` or Ctrl/⌘+K, results that say where they live. -->
+  <script src="{{ status.assets() }}/search.js" defer></script>
 </head>
 <body class="{% block body_class %}{% endblock %}"
       data-msg-unsaved="{{ i18n.t("unsaved-changes") }}"
@@ -283,6 +287,7 @@
         {% include "icons/menu.svg" %}
       </button>
 {{ status.topbar_brand(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/brand.html #}
+      {% if status.manager_on() %}{% include "partials/shell/global-search.html" %}{% endif %}
       <div class="topbar__tools">
         <!-- The theme toggle stays in the topbar (#725): it is a one-click,
              instant-feedback control, and a click deeper behind the menu

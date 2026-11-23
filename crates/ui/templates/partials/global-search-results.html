@@ -1,0 +1,33 @@
+{% import "partials/components.html" as ui %}
+{#-
+  One half of the global search's results (crates/ui/src/global_search.rs):
+  `part` = "static" (pages, sections, fields) or "data" (endpoints, apps,
+  users, code systems…) inside the topbar listbox, or "page" on the
+  no-JavaScript results page. Each hit names where it lives as a path.
+-#}
+{%- let listbox = part != "page" -%}
+<div class="gs-part" data-gs-part="{{ part }}" data-gs-count="{{ self.count() }}">
+{%- for g in groups %}
+  <div class="gs-group"{% if listbox %} role="group" aria-labelledby="gs-{{ part }}-{{ g.id }}"{% endif %}>
+    <div class="gs-group__title" id="gs-{{ part }}-{{ g.id }}"{% if listbox %} role="presentation"{% endif %}>{{ i18n.t(g.title_key) }}</div>
+    {%- for h in g.hits %}
+    <a class="gs-hit" id="{{ h.dom_id }}" href="{{ h.href }}"{% if listbox %} role="option" tabindex="-1" aria-selected="false"{% endif %}
+       {%- if !h.target.is_empty() %} data-gs-target="{{ h.target }}"{% endif %}
+       {%- if !h.fallback.is_empty() %} data-gs-fallback="{{ h.fallback }}"{% endif %}
+       {%- if h.full_load %} data-gs-full{% endif %}>
+      <span class="gs-hit__icon" aria-hidden="true">{% call ui::icon(h.icon) %}{% endcall %}</span>
+      <span class="gs-hit__body">
+        <span class="gs-hit__label">{% for s in h.segs %}{% if s.mark %}<mark>{{ s.text }}</mark>{% else %}{{ s.text }}{% endif %}{% endfor %}</span>
+        {%- if !h.crumbs.is_empty() %}
+        <span class="gs-hit__path">{% for c in h.crumbs %}{% if !loop.first %}<span class="gs-hit__sep"> › </span>{% endif %}<span class="gs-hit__crumb">{{ c }}</span>{% endfor %}</span>
+        {%- endif %}
+        {%- if !h.note.is_empty() %}
+        <span class="gs-hit__note">{{ i18n.t_arg("gs-matched", "term", h.note.clone()) }}</span>
+        {%- endif %}
+      </span>
+      <span class="gs-hit__kind">{{ i18n.t(h.kind_key) }}</span>
+    </a>
+    {%- endfor %}
+  </div>
+{%- endfor %}
+</div>

@@ -29,7 +29,7 @@
 {% if let Some(message) = error %}<div class="notice notice--danger" role="alert" id="users-error">{% call ui::icon("alert") %}{% endcall %}{{ message }}</div>{% endif %}
 {% if !local_mode %}<div class="notice notice--info">{% call ui::icon("info") %}{% endcall %}{{ i18n.t("console-users-not-local") }}</div>{% endif %}
 
-<section class="card form-section">
+<section class="card form-section" id="users-list">
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-users-list") }}</h2></header>
   <div class="form-section__body">
   <div class="table-wrap">
@@ -70,28 +70,28 @@
 </div>
 </section>
 
-<section class="card form-section">
+<section class="card form-section" id="users-create">
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-users-create") }}</h2></header>
   <div class="form-section__body">
   <form method="post" action="/ui/settings/users" id="user-create-form" class="form-grid">
     {{ csrf_html|safe }}
     <label class="mfield"><span class="mfield__label">{{ i18n.t("admin-login-user") }}</span>
-      <input class="mfield__input" type="text" name="username" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+      <input class="mfield__input" type="text" id="uc-username" name="username" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
     <label class="mfield"><span class="mfield__label">{{ i18n.t("console-users-name") }}</span>
-      <input class="mfield__input" type="text" name="displayName" autocomplete="off"></label>
+      <input class="mfield__input" type="text" id="uc-displayName" name="displayName" autocomplete="off"></label>
     <label class="mfield"><span class="mfield__label">{{ i18n.t("console-users-email") }}</span>
-      <input class="mfield__input" type="email" name="email" autocomplete="off"></label>
+      <input class="mfield__input" type="email" id="uc-email" name="email" autocomplete="off"></label>
     <label class="mfield"><span class="mfield__label">{{ i18n.t("console-users-role") }}</span>
-      <select class="mfield__input" name="role">{% for r in ["viewer", "editor", "admin"] %}<option value="{{ r }}">{{ r }}</option>{% endfor %}</select></label>
+      <select class="mfield__input" id="uc-role" name="role">{% for r in ["viewer", "editor", "admin"] %}<option value="{{ r }}">{{ r }}</option>{% endfor %}</select></label>
     <label class="mfield"><span class="mfield__label">{{ i18n.t("console-users-initial-password") }}</span>
-      <input class="mfield__input" type="password" name="password" autocomplete="new-password">
+      <input class="mfield__input" type="password" id="uc-password" name="password" autocomplete="new-password">
       <span class="mfield__hint">{{ i18n.t_arg("console-users-initial-password-hint", "min", min_password_length) }}</span></label>
     <div class="form-actions form-actions--start form-grid__full"><button class="btn btn--primary" type="submit">{{ i18n.t("console-users-create") }}</button></div>
   </form>
 </div>
 </section>
 
-<section class="card form-section">
+<section class="card form-section" id="users-bindings">
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-bindings-title") }}</h2></header>
   <div class="form-section__body">
   <p class="muted form-lede">{{ i18n.t("console-bindings-lede") }}</p>
@@ -119,7 +119,7 @@
 </div>
 </section>
 
-<section class="card form-section">
+<section class="card form-section" id="users-sessions">
   <header class="form-section__head"><h2 class="form-section__title">{{ i18n.t("console-sessions-title") }}</h2></header>
   <div class="form-section__body">
   <div class="table-wrap">

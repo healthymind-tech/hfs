@@ -48,7 +48,7 @@
   <fieldset class="inherit-target" id="auth-fields-more"{% if v.auth_inherit %} disabled{% endif %}>
     <legend class="visually-hidden">{{ i18n.t("mgr-sec-advanced") }}</legend>
     <div data-show-when="auth_mode=write-protect|full">
-    <fieldset class="checks{% if self.bad("auth.scopes") %} checks--error{% endif %}">
+    <fieldset class="checks{% if self.bad("auth.scopes") %} checks--error{% endif %}" id="f-scopes">
       <legend class="mfield__label">{{ i18n.t("mgr-field-scopes") }}</legend>
       {% call ui::checkbox(i18n.t("mgr-scope-patient"), "scopes_allow_patient", v.scopes_allow_patient) %}{% endcall %}
       {% call ui::checkbox(i18n.t("mgr-scope-user"), "scopes_allow_user", v.scopes_allow_user) %}{% endcall %}
@@ -63,7 +63,7 @@
         </select>
       </div>
     </fieldset>
-    <details class="disclosure"{% if self.bad("auth.algorithms") || self.bad("auth.clockSkewSecs") || self.bad("auth.jwksMaxAgeSecs") %} open{% endif %}>
+    <details class="disclosure" id="sec-auth-advanced"{% if self.bad("auth.algorithms") || self.bad("auth.clockSkewSecs") || self.bad("auth.jwksMaxAgeSecs") %} open{% endif %}>
       <summary>{{ i18n.t("mgr-sec-advanced") }}</summary>
       <div class="disclosure__body">
         <div class="form-grid">
@@ -73,7 +73,7 @@
         </div>
       </div>
     </details>
-    <details class="disclosure">
+    <details class="disclosure" id="sec-smart">
       <summary>{{ i18n.t("mgr-sec-smart") }}</summary>
       <div class="disclosure__body">
         {% call ui::checkbox(i18n.t("mgr-smart-discover"), "smart_discover", v.smart_discover, i18n.t("mgr-smart-discover-hint")) %}{% endcall %}

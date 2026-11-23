@@ -29,7 +29,7 @@
   {% endif %}
 </section>
 <form method="post" action="/ui/idp/{{ head.name }}/clients" novalidate data-idp-track>
-  <details class="card disclosure idp-add"{% if open_form || rows.is_empty() %} open{% endif %}>
+  <details class="card disclosure idp-add" id="client-add"{% if open_form || rows.is_empty() %} open{% endif %}>
     <summary class="disclosure__summary">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpc-client-add") }}</summary>
     <div class="disclosure__body">
       {% include "partials/idp/client-form.html" %}

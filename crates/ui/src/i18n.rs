@@ -232,6 +232,17 @@ impl I18n {
         I18n { locale: locale.0 }
     }
 
+    /// The source locale (`en`): the global search also matches the
+    /// English label of every entry, so English terms work in any locale.
+    pub(crate) fn english() -> Self {
+        I18n { locale: &EN }
+    }
+
+    /// Whether the active locale is the source locale.
+    pub(crate) fn is_english(&self) -> bool {
+        *self.locale == EN
+    }
+
     /// Test-only constructor from a raw tag, for rendering templates in a
     /// specific locale without building a request.
     #[cfg(test)]

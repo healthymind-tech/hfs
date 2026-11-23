@@ -79,6 +79,9 @@ mod subscriptions;
 mod sync_pages;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
+/// The console-wide search (topbar, `/ui/find`).
+#[doc(hidden)]
+pub mod global_search;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
@@ -2465,7 +2468,8 @@ pub fn mount_with_conformance_source_and_runtime(
         // The manager console: overview at `/ui`, endpoint pages, About.
         Some(_) => router
             .merge(manager::pages::routes())
-            .merge(manager::verify_pages::routes()),
+            .merge(manager::verify_pages::routes())
+            .route("/ui/find", get(global_search::find)),
         None => router
             .route("/ui", get(index))
             .route("/ui/about", get(manager::pages::about)),

@@ -281,6 +281,19 @@ fn builtin() -> Vec<NavItem> {
     v
 }
 
+/// Every entry the sidebar can show (the manager's own merged with the
+/// registered ones, a registered id replacing a built-in one), unfiltered:
+/// the global search builds its page index from it.
+pub(crate) fn all_items() -> Vec<NavItem> {
+    let mut items = builtin();
+    for extra in helios_ui_chrome::nav::registered() {
+        items.retain(|i| i.id != extra.id);
+        items.push(extra);
+    }
+    items.sort_by_key(|i| (i.section, i.order));
+    items
+}
+
 /// The roles that decide what the sidebar of one request shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NavRoles {
