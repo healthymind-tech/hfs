@@ -57,10 +57,10 @@ mod home;
 mod i18n;
 mod import;
 mod login;
-/// Console paths (`/ui/hts` stand-alone, `/ui/terminology` embedded).
-pub mod paths;
 mod metrics_parse;
 mod metrics_ring;
+/// Console paths (`/ui/hts` stand-alone, `/ui/terminology` embedded).
+pub mod paths;
 mod raw_fold;
 mod raw_json_fragment;
 mod upstream;
@@ -253,8 +253,14 @@ pub fn register_nav(admin: bool) {
     );
     if admin {
         register(
-            item("tx-manage", "hts-nav-terminology", p.manage.to_string(), "sliders", 40)
-                .min_role(NavRole::Admin),
+            item(
+                "tx-manage",
+                "hts-nav-terminology",
+                p.manage.to_string(),
+                "sliders",
+                40,
+            )
+            .min_role(NavRole::Admin),
         );
         register(
             item(
@@ -268,8 +274,14 @@ pub fn register_nav(admin: bool) {
             .full_load(),
         );
         register(
-            item("tx-jobs", "hts-nav-jobs", format!("{}/jobs", p.ui), "sync", 60)
-                .min_role(NavRole::Admin),
+            item(
+                "tx-jobs",
+                "hts-nav-jobs",
+                format!("{}/jobs", p.ui),
+                "sync",
+                60,
+            )
+            .min_role(NavRole::Admin),
         );
     }
 }

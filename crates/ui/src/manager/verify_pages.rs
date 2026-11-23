@@ -66,11 +66,9 @@ fn answer(i18n: I18n, result: Result<VerifyReport, BackendError>, fields: FieldM
                 .join("; ");
             verify::unavailable(i18n.t_arg("verify-failed-to-run", "reason", reason))
         }
-        Err(e) => verify::unavailable(i18n.t_arg(
-            "verify-failed-to-run",
-            "reason",
-            backend_reason(&e),
-        )),
+        Err(e) => {
+            verify::unavailable(i18n.t_arg("verify-failed-to-run", "reason", backend_reason(&e)))
+        }
     };
     render(VerifyFragment { i18n, r })
 }
@@ -229,7 +227,11 @@ async fn sync_peer(
 ) -> Response {
     let i18n = I18n::new(locale);
     let form = Form::parse(&body);
-    let side = if q.side == "target" { "target" } else { "source" };
+    let side = if q.side == "target" {
+        "target"
+    } else {
+        "source"
+    };
     let f = |name: &str| form.get(&format!("{side}_{name}")).trim().to_string();
     let secret = f("secret");
     let auth = match f("auth").as_str() {

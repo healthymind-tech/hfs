@@ -70,7 +70,10 @@ pub fn install_ui(ctx: &ManagerContext) {
 struct PgScopeBindings {
     pool: helios_endpoints::pg::deadpool_postgres::Pool,
     cache: std::sync::Mutex<
-        std::collections::HashMap<String, (std::time::Instant, Option<helios_endpoints::ConsoleRole>)>,
+        std::collections::HashMap<
+            String,
+            (std::time::Instant, Option<helios_endpoints::ConsoleRole>),
+        >,
     >,
 }
 

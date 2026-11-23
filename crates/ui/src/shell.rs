@@ -121,7 +121,13 @@ pub(crate) async fn boosted_is_a_page(mut request: Request, next: Next) -> Respo
         || request.headers().contains_key("hx-history-restore-request")
     {
         let h = request.headers_mut();
-        for name in ["hx-request", "hx-target", "hx-trigger", "hx-trigger-name", "hx-current-url"] {
+        for name in [
+            "hx-request",
+            "hx-target",
+            "hx-trigger",
+            "hx-trigger-name",
+            "hx-current-url",
+        ] {
             h.remove(name);
         }
     }
@@ -179,7 +185,11 @@ mod tests {
             .route(
                 "/x",
                 get(|h: axum::http::HeaderMap| async move {
-                    if h.contains_key("hx-request") { "fragment" } else { "page" }
+                    if h.contains_key("hx-request") {
+                        "fragment"
+                    } else {
+                        "page"
+                    }
                 }),
             )
             .layer(axum::middleware::from_fn(boosted_is_a_page));

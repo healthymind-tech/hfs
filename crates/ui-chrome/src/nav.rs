@@ -222,10 +222,7 @@ pub fn unregister_section(section: NavSection) {
 
 /// A snapshot of every registered entry.
 pub fn registered() -> Vec<NavItem> {
-    REGISTERED
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
+    REGISTERED.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// One rendered entry.
@@ -370,7 +367,12 @@ mod tests {
     #[test]
     fn the_filter_hides_entries_and_registration_merges() {
         let viewer = build(builtin(), None, |i| i.min_role <= NavRole::Viewer);
-        assert!(viewer.iter().flat_map(|g| &g.links).all(|l| l.id != "users"));
+        assert!(
+            viewer
+                .iter()
+                .flat_map(|g| &g.links)
+                .all(|l| l.id != "users")
+        );
         register(
             NavItem::new(
                 NavSection::AuthorizationServers,

@@ -11,8 +11,8 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Extension, Router, routing::get, routing::post};
 use chrono::Utc;
 use helios_endpoints::{
-    Actor, AuthMode, ConsolePrincipal, ConsoleRole, Endpoint, EndpointAuth, EndpointSpec, EndpointStatus,
-    FhirRelease, ManagedBy,
+    Actor, AuthMode, ConsolePrincipal, ConsoleRole, Endpoint, EndpointAuth, EndpointSpec,
+    EndpointStatus, FhirRelease, ManagedBy,
 };
 use serde::Deserialize;
 
@@ -1103,7 +1103,12 @@ async fn verify_before_save(
     if auth.mode == helios_endpoints::AuthMode::Off {
         return None;
     }
-    let report = c.runtime.backend.verify_auth(endpoint, auth, None).await.ok()?;
+    let report = c
+        .runtime
+        .backend
+        .verify_auth(endpoint, auth, None)
+        .await
+        .ok()?;
     if auth.jwks_url.as_deref().is_none_or(|u| u.trim().is_empty())
         && let Some(jwks) = report.suggestions.get("jwksUrl")
     {
@@ -1112,7 +1117,11 @@ async fn verify_before_save(
     if report.failures() == 0 || overridden {
         return None;
     }
-    Some(super::verify::view(&c.i18n, &report, super::verify::AUTH_FIELDS))
+    Some(super::verify::view(
+        &c.i18n,
+        &report,
+        super::verify::AUTH_FIELDS,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1236,7 +1245,13 @@ pub(crate) async fn save_section(
     // fails verification is not saved silently; the JWKS URL left empty is
     // the one the issuer publishes (UX-03).
     let blocked = if section == Section::Security {
-        verify_before_save(&c, Some(&ep), spec.auth.as_mut(), form.checked("verify_override")).await
+        verify_before_save(
+            &c,
+            Some(&ep),
+            spec.auth.as_mut(),
+            form.checked("verify_override"),
+        )
+        .await
     } else {
         None
     };
@@ -1826,7 +1841,8 @@ pub(crate) async fn create(
     if form.get("auth_choice") == "custom" && !form.get("auth_issuer").is_empty() {
         let mut errs = FieldErrors::new();
         let mut auth = forms::parse_auth(&form, None, &mut errs);
-        let blocked = verify_before_save(&c, None, Some(&mut auth), form.checked("verify_override")).await;
+        let blocked =
+            verify_before_save(&c, None, Some(&mut auth), form.checked("verify_override")).await;
         if let Some(jwks) = auth.jwks_url.as_deref()
             && form.get("auth_jwks_url").is_empty()
         {
@@ -2030,16 +2046,36 @@ fn review_rows(i18n: &I18n, spec: &EndpointSpec) -> Vec<ReviewRow> {
                 format!("/{}", spec.path.as_str())
             },
         ),
-        row(1, "mgr-field-fhir-version", release_label(spec.fhir_version).to_string()),
+        row(
+            1,
+            "mgr-field-fhir-version",
+            release_label(spec.fhir_version).to_string(),
+        ),
     ];
     match &spec.auth {
         None => rows.push(row(2, "mgr-field-auth-mode", inherited.clone())),
         Some(a) => {
-            rows.push(row(2, "mgr-field-auth-mode", i18n.t(view::auth_mode_key(a.mode))));
+            rows.push(row(
+                2,
+                "mgr-field-auth-mode",
+                i18n.t(view::auth_mode_key(a.mode)),
+            ));
             if a.mode != AuthMode::Off {
-                rows.push(row(2, "mgr-field-issuer", a.issuer.clone().unwrap_or_default()));
-                rows.push(row(2, "mgr-field-audience", a.audience.clone().unwrap_or_else(|| "—".into())));
-                rows.push(row(2, "mgr-field-jwks", a.jwks_url.clone().unwrap_or_default()));
+                rows.push(row(
+                    2,
+                    "mgr-field-issuer",
+                    a.issuer.clone().unwrap_or_default(),
+                ));
+                rows.push(row(
+                    2,
+                    "mgr-field-audience",
+                    a.audience.clone().unwrap_or_else(|| "—".into()),
+                ));
+                rows.push(row(
+                    2,
+                    "mgr-field-jwks",
+                    a.jwks_url.clone().unwrap_or_default(),
+                ));
             }
         }
     }
@@ -2081,7 +2117,8 @@ impl DuplicatePage {
             .get(path)
             .map(|m| forms::error_message(&self.i18n, m))
             .unwrap_or_default()
-    }}
+    }
+}
 
 pub(crate) async fn duplicate_page(
     State(state): State<WebState>,

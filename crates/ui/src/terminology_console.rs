@@ -149,9 +149,7 @@ pub fn install(config: TerminologyConsoleConfig) -> bool {
     });
     let router = helios_hts_ui::embedded_router(state, proxy);
     helios_hts_ui::register_nav(admin);
-    INSTALLED
-        .set(Installed { router, admin })
-        .is_ok()
+    INSTALLED.set(Installed { router, admin }).is_ok()
 }
 
 /// Whether the section is installed.
@@ -294,7 +292,9 @@ async fn section(
         let need = required_role(action);
         let admin_page = matches!(
             action,
-            TerminologyAction::Import | TerminologyAction::Maintain | TerminologyAction::ViewOperations
+            TerminologyAction::Import
+                | TerminologyAction::Maintain
+                | TerminologyAction::ViewOperations
         );
         if have < need || (admin_page && !installed.admin) {
             let page = DeniedPage {
@@ -394,7 +394,12 @@ async fn admin_proxy(State(proxy): State<Arc<AdminProxy>>, request: Request) -> 
             outbound = outbound.header(name.as_str(), v);
         }
     }
-    for name in ["upload-offset", "upload-length", "x-upload-name", "x-forwarded-for"] {
+    for name in [
+        "upload-offset",
+        "upload-length",
+        "x-upload-name",
+        "x-forwarded-for",
+    ] {
         if let Some(v) = parts.headers.get(name)
             && let Ok(v) = v.to_str()
         {
@@ -403,7 +408,8 @@ async fn admin_proxy(State(proxy): State<Arc<AdminProxy>>, request: Request) -> 
     }
     match outbound.send().await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -429,10 +435,16 @@ mod tests {
     use super::*;
 
     async fn redirect(method: Method, uri: &str) -> (StatusCode, String) {
-        let app: Router = Router::new().route("/ui/hts/{*rest}", any(legacy_redirect)).route("/ui/hts", any(legacy_redirect));
+        let app: Router = Router::new()
+            .route("/ui/hts/{*rest}", any(legacy_redirect))
+            .route("/ui/hts", any(legacy_redirect));
         let response = tower::ServiceExt::oneshot(
             app,
-            Request::builder().method(method).uri(uri).body(Body::empty()).unwrap(),
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -453,15 +465,24 @@ mod tests {
         );
         assert_eq!(
             redirect(Method::GET, "/ui/hts/code-systems?sort=name").await,
-            (StatusCode::MOVED_PERMANENTLY, "/ui/terminology/code-systems?sort=name".into())
+            (
+                StatusCode::MOVED_PERMANENTLY,
+                "/ui/terminology/code-systems?sort=name".into()
+            )
         );
         assert_eq!(
             redirect(Method::GET, "/ui/hts/terminology?populated=true").await,
-            (StatusCode::MOVED_PERMANENTLY, "/ui/terminology/manage?populated=true".into())
+            (
+                StatusCode::MOVED_PERMANENTLY,
+                "/ui/terminology/manage?populated=true".into()
+            )
         );
         assert_eq!(
             redirect(Method::POST, "/ui/hts/import").await,
-            (StatusCode::PERMANENT_REDIRECT, "/ui/terminology/import".into())
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                "/ui/terminology/import".into()
+            )
         );
     }
 

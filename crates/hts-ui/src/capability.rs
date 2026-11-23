@@ -107,7 +107,9 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         // canonicalization in `home.rs`; GET is the only verb here.
         .route(
             "/hts/diagnostics",
-            get(|| async { Redirect::permanent(&crate::paths::link("/ui/hts/capability-statement")) }),
+            get(|| async {
+                Redirect::permanent(&crate::paths::link("/ui/hts/capability-statement"))
+            }),
         )
 }
 

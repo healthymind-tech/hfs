@@ -68,10 +68,10 @@ mod sql_export;
 /// — `editor.rs` included — keeps compiling unchanged.
 pub(crate) use helios_ui_chrome::capability_json;
 pub(crate) use helios_ui_chrome::json_view;
-mod sql_libraries;
-mod sql_views;
 /// Persistent-shell plumbing: build id, versioned assets, CSP.
 mod shell;
+mod sql_libraries;
+mod sql_views;
 mod subscriptions;
 mod sync_pages;
 // Public but hidden: the coordinator's counters and view are what #1849's
@@ -462,7 +462,9 @@ async fn resolve_prefs(
     // A terminology-scope binding (hm-0012) raises the Terminology section only.
     if let (Some(store), Some(principal)) = (
         terminology_console::scope_bindings(),
-        request.extensions().get::<helios_endpoints::ConsolePrincipal>(),
+        request
+            .extensions()
+            .get::<helios_endpoints::ConsolePrincipal>(),
     ) && let Some(bound) = store.role(&principal.subject).await
     {
         roles.terminology = roles.terminology.max(bound);
@@ -10627,12 +10629,9 @@ pub(crate) fn current_status(
             tenant.scope.as_deref(),
             &fhir_base_path(&state.public_base_url),
         ),
-        manager: state
-            .manager
-            .as_deref()
-            .map(|rt| {
-                manager::ManagerChrome::new(rt, tenant.scope.as_deref(), tenant.role, &tenant.nav)
-            }),
+        manager: state.manager.as_deref().map(|rt| {
+            manager::ManagerChrome::new(rt, tenant.scope.as_deref(), tenant.role, &tenant.nav)
+        }),
         csrf: tenant.csrf.clone(),
     }
 }

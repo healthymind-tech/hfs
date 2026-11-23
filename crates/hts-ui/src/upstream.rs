@@ -5188,13 +5188,19 @@ impl ConceptRef {
     /// `relations`). Used both as the htmx `hx-get` target and as the
     /// `<noscript>` `<a href>` so the panel is reachable without JavaScript.
     pub fn panel_url(&self, panel: &str) -> String {
-        crate::paths::link(&format!("/ui/hts/concepts/{panel}?{}", self.query_string(&[])))
+        crate::paths::link(&format!(
+            "/ui/hts/concepts/{panel}?{}",
+            self.query_string(&[])
+        ))
     }
 
     /// Panel URL with extra query pairs (the mappings direction toggle and
     /// the subsumption comparator field both need one).
     pub fn panel_url_with(&self, panel: &str, extra: &[(&str, &str)]) -> String {
-        crate::paths::link(&format!("/ui/hts/concepts/{panel}?{}", self.query_string(extra)))
+        crate::paths::link(&format!(
+            "/ui/hts/concepts/{panel}?{}",
+            self.query_string(extra)
+        ))
     }
 }
 

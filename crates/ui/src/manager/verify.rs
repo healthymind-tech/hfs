@@ -171,7 +171,11 @@ pub(crate) fn view(i18n: &I18n, report: &VerifyReport, fields: FieldMap) -> Repo
         )
     };
     let checked = chrono::DateTime::parse_from_rfc3339(&report.checked_at)
-        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|_| report.checked_at.clone());
     ReportView {
         unavailable: None,

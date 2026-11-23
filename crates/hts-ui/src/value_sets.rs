@@ -436,7 +436,10 @@ impl<'a> DetailPageTemplate<'a> {
 /// detail: facts block above the tab strip, Expand input as the active
 /// tab.
 async fn detail_page(Path(id): Path<String>) -> Response {
-    Redirect::permanent(&crate::paths::link(&format!("/ui/hts/value-sets/{id}/expand"))).into_response()
+    Redirect::permanent(&crate::paths::link(&format!(
+        "/ui/hts/value-sets/{id}/expand"
+    )))
+    .into_response()
 }
 
 // ── Workbench input (GET Expand tab handler) ────────────────────────────

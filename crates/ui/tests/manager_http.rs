@@ -243,7 +243,11 @@ async fn saving_a_section_validates_then_persists() {
          &auth_jwks_url=https%3A%2F%2Fidp.example%2Fc&auth_audience=tw&scopes_allow_user=on\
          &cors_inherit=on&rl_inherit=on";
     let (status, _, html) = post(&f.app, "/ui/e/twcore/security", body).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "failing verification blocks");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "failing verification blocks"
+    );
     assert!(html.contains("verify-block"), "the block explains why");
     assert!(html.contains(r#"name="verify_override" value="1""#));
     assert_eq!(f.store.get("twcore").await.unwrap().unwrap().revision, 1);
@@ -403,7 +407,10 @@ async fn disabling_and_deleting_with_typed_confirmation() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(headers[header::LOCATION], "/ui?deleted=twcore&tenant=twcore");
+    assert_eq!(
+        headers[header::LOCATION],
+        "/ui?deleted=twcore&tenant=twcore"
+    );
     assert!(f.store.get("twcore").await.unwrap().is_none());
     // The default endpoint can never be disabled from the console.
     let (status, _, _) = post(&f.app, "/ui/e/default/status", "action=disable").await;
@@ -532,7 +539,10 @@ async fn brand_block_is_the_heart_mark_and_an_english_wordmark_in_every_language
             assert!(a.contains(r#"href="/ui""#), "{class} [{lang}]: {a}");
             assert!(a.contains("/ui/assets/brand/heart-mark.png"), "{a}");
             assert!(a.contains("/ui/assets/brand/heart-mark@2x.png 2x"), "{a}");
-            assert!(a.contains(r#"<span class="brand__name">HealthyMind</span>"#), "{a}");
+            assert!(
+                a.contains(r#"<span class="brand__name">HealthyMind</span>"#),
+                "{a}"
+            );
             assert!(
                 a.contains(r#"<span class="brand__product">FHIR Server Manager</span>"#),
                 "{a}"
@@ -544,7 +554,9 @@ async fn brand_block_is_the_heart_mark_and_an_english_wordmark_in_every_language
                 None => a,
             };
             assert!(
-                !visible.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                !visible
+                    .chars()
+                    .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
                 "Chinese characters in the {class} brand [{lang}]: {a}"
             );
         }

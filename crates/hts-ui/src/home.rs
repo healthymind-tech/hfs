@@ -235,7 +235,11 @@ impl HomeQuery {
 /// options are real `<a href>`s pointing here, so both work with JavaScript
 /// off — a plain navigation re-renders the page with the new selection.
 fn page_href(window: ChartWindow, series: SeriesFilter) -> String {
-    crate::paths::link(&format!("/ui/hts?window={}&series={}", window.code(), series.code()))
+    crate::paths::link(&format!(
+        "/ui/hts?window={}&series={}",
+        window.code(),
+        series.code()
+    ))
 }
 
 /// The URL the cards region polls itself from.
@@ -667,7 +671,10 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         // used by every internal link in the UI. `Redirect::permanent` emits
         // 308 (preserves method + body); safe here since GET is the only
         // Home verb.
-        .route("/hts/", get(|| async { Redirect::permanent(&crate::paths::link("/ui/hts")) }))
+        .route(
+            "/hts/",
+            get(|| async { Redirect::permanent(&crate::paths::link("/ui/hts")) }),
+        )
         .route("/hts/home/cards", get(home_cards_fragment))
 }
 

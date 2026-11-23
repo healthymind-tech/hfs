@@ -39,7 +39,12 @@ impl HostFrame {
     pub fn from_rendered(html: &str) -> Option<Self> {
         let mut rest = html;
         let mut segments: Vec<String> = Vec::with_capacity(5);
-        for marker in [SLOT_TITLE, SLOT_BODY_CLASS, SLOT_CONTENT_CLASS, SLOT_CONTENT] {
+        for marker in [
+            SLOT_TITLE,
+            SLOT_BODY_CLASS,
+            SLOT_CONTENT_CLASS,
+            SLOT_CONTENT,
+        ] {
             let (head, tail) = rest.split_once(marker)?;
             segments.push(head.to_string());
             rest = tail;

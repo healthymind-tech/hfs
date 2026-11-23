@@ -460,7 +460,10 @@ impl<'a> DetailPageTemplate<'a> {
 /// tab. Redirecting instead of rendering keeps the browser URL and the
 /// `aria-current` tab always in sync.
 async fn detail_page(Path(id): Path<String>) -> Response {
-    Redirect::permanent(&crate::paths::link(&format!("/ui/hts/code-systems/{id}/lookup"))).into_response()
+    Redirect::permanent(&crate::paths::link(&format!(
+        "/ui/hts/code-systems/{id}/lookup"
+    )))
+    .into_response()
 }
 
 // ── Workbench inputs (GET tab handlers) ─────────────────────────────────

@@ -26,11 +26,11 @@ pub mod backend;
 pub(crate) mod forms;
 pub mod nav;
 pub(crate) mod pages;
+pub(crate) mod scope;
 /// Verify panels: the checklist view of a verification report.
 pub(crate) mod verify;
 /// Verify panels: their routes.
 pub(crate) mod verify_pages;
-pub(crate) mod scope;
 pub(crate) mod view;
 
 use std::sync::{Arc, RwLock};
@@ -41,8 +41,8 @@ use helios_endpoints::{
 };
 
 pub use backend::{
-    BackendError, DuplicateOutcome, EndpointStats, HealthState, ManagerBackend, PeerAuth,
-    PeerRole, ProbeLine, SecretChange, SecretChanges, ServerHealth, SnapshotBackend, StoreBackend,
+    BackendError, DuplicateOutcome, EndpointStats, HealthState, ManagerBackend, PeerAuth, PeerRole,
+    ProbeLine, SecretChange, SecretChanges, ServerHealth, SnapshotBackend, StoreBackend,
     SyncJobView, SyncPeerVerifyRequest, VerifyReport, VerifyStatus, VerifyStep, probe_terminology,
 };
 pub use scope::EndpointScope;

@@ -416,7 +416,11 @@ mod tests {
         let text = zh
             .t_args_opt("verify-issuer-mismatch", &args)
             .expect("message with placeables resolves");
-        assert!(text.contains("https://a") && text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "{text}");
+        assert!(
+            text.contains("https://a")
+                && text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "{text}"
+        );
         assert!(zh.t_args_opt("verify-no-such-message", &args).is_none());
     }
 

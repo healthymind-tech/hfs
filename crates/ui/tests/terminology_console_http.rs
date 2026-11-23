@@ -13,13 +13,15 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    helios_ui::terminology_console::install(helios_ui::terminology_console::TerminologyConsoleConfig {
-        // Nothing listens there: the pages render their degraded state.
-        upstream_url: "http://127.0.0.1:1".into(),
-        admin_token: Some("t".into()),
-        fhir_version: "R4",
-        version: "9.9.9",
-    });
+    helios_ui::terminology_console::install(
+        helios_ui::terminology_console::TerminologyConsoleConfig {
+            // Nothing listens there: the pages render their degraded state.
+            upstream_url: "http://127.0.0.1:1".into(),
+            admin_token: Some("t".into()),
+            fhir_version: "R4",
+            version: "9.9.9",
+        },
+    );
     helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -41,7 +43,10 @@ async fn get(uri: &str, headers: &[(&str, &str)]) -> (StatusCode, axum::http::He
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    let response = app().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    let response = app()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let status = response.status();
     let h = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -59,17 +64,37 @@ async fn terminology_pages_render_inside_the_console_shell() {
     ] {
         let (status, headers, html) = get(path, &[]).await;
         assert_eq!(status, StatusCode::OK, "{path}");
-        assert!(html.contains(r#"<aside class="sidebar" id="sidebar">"#), "{path}: the console sidebar");
-        assert!(html.contains(r#"id="nav-progress""#), "{path}: the console shell");
+        assert!(
+            html.contains(r#"<aside class="sidebar" id="sidebar">"#),
+            "{path}: the console sidebar"
+        );
+        assert!(
+            html.contains(r#"id="nav-progress""#),
+            "{path}: the console shell"
+        );
         assert!(html.contains(r#"hx-boost="true""#), "{path}");
-        assert!(!html.contains("product-switch"), "{path}: no product switcher");
-        assert!(!html.contains("/ui/hts/assets"), "{path}: assets from /ui/assets");
+        assert!(
+            !html.contains("product-switch"),
+            "{path}: no product switcher"
+        );
+        assert!(
+            !html.contains("/ui/hts/assets"),
+            "{path}: assets from /ui/assets"
+        );
         assert!(
             headers.contains_key(header::CONTENT_SECURITY_POLICY),
             "{path}: CSP"
         );
-        assert_eq!(html.matches("<html lang").count(), 1, "{path}: one document");
-        assert_eq!(html.matches(r#"id="sidebar""#).count(), 1, "{path}: one shell");
+        assert_eq!(
+            html.matches("<html lang").count(),
+            1,
+            "{path}: one document"
+        );
+        assert_eq!(
+            html.matches(r#"id="sidebar""#).count(),
+            1,
+            "{path}: one shell"
+        );
     }
 }
 
@@ -81,7 +106,10 @@ async fn a_boosted_request_gets_the_whole_page_not_a_fragment() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains(r#"id="main""#), "the page, so the shell can swap #main");
+    assert!(
+        html.contains(r#"id="main""#),
+        "the page, so the shell can swap #main"
+    );
     assert!(html.contains(r#"id="hts-cs-rows""#));
 }
 
