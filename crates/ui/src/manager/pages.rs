@@ -268,7 +268,6 @@ pub(crate) struct HealthTile {
     pub value: String,
     pub value_key: &'static str,
     pub tone: &'static str,
-    pub icon: &'static str,
 }
 
 fn health_tiles(h: &ServerHealth) -> Vec<HealthTile> {
@@ -291,14 +290,12 @@ fn health_tiles(h: &ServerHealth) -> Vec<HealthTile> {
                 .unwrap_or_default(),
             value_key: db_key,
             tone: db_tone,
-            icon: "database",
         },
         HealthTile {
             label_key: "mgr-health-terminology",
             value: String::new(),
             value_key: tx_key,
             tone: tx_tone,
-            icon: "book",
         },
         HealthTile {
             label_key: "mgr-health-instances",
@@ -309,7 +306,6 @@ fn health_tiles(h: &ServerHealth) -> Vec<HealthTile> {
                 "mgr-health-unknown"
             },
             tone: if h.instances.is_some() { "ok" } else { "muted" },
-            icon: "server",
         },
         HealthTile {
             label_key: "mgr-health-keyring",
@@ -320,7 +316,6 @@ fn health_tiles(h: &ServerHealth) -> Vec<HealthTile> {
                 "mgr-health-keyring-unset"
             },
             tone: if h.key_ring { "ok" } else { "warn" },
-            icon: "key",
         },
         HealthTile {
             label_key: "mgr-health-console",
@@ -331,7 +326,6 @@ fn health_tiles(h: &ServerHealth) -> Vec<HealthTile> {
                 helios_endpoints::ConsoleAuthMode::Local => "mgr-console-local",
             },
             tone: "info",
-            icon: "users",
         },
     ]
 }
@@ -2393,6 +2387,6 @@ mod tests {
         assert_eq!(v.path, "lab");
         let health = health_tiles(&ServerHealth::default());
         assert_eq!(health.len(), 5);
-        assert!(health.iter().all(|t| !t.icon.is_empty()));
+        assert!(health.iter().all(|t| !t.tone.is_empty()));
     }
 }
