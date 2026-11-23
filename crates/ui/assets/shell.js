@@ -437,7 +437,16 @@
     }
     var announcer = document.getElementById("nav-announcer");
     if (announcer) announcer.textContent = document.title;
+    rememberPage();
     document.dispatchEvent(new CustomEvent("hm:navigated", { detail: { main: main } }));
+  });
+
+  // A list filter that pushes its URL is the same page under a new address.
+  document.addEventListener("htmx:pushedIntoHistory", function () {
+    if (!navigated) rememberPage();
+  });
+  document.addEventListener("htmx:replacedInHistory", function () {
+    if (!navigated) rememberPage();
   });
 
   document.addEventListener("htmx:responseError", function (event) {
@@ -460,6 +469,14 @@
   // which innerHTML does not carry: written into attributes first, so Back
   // shows the filter the list was filtered by.
   var pageState = {};
+  function rememberPage() {
+    var main = document.getElementById("main");
+    pageState[location.href] = {
+      bodyClass: document.body.getAttribute("class") || "",
+      active: main ? main.getAttribute("data-active-page") || "" : "",
+      navKey: document.body.getAttribute("data-nav-key") || "",
+    };
+  }
   document.addEventListener("htmx:beforeHistorySave", function () {
     var main = document.getElementById("main");
     if (main) {
@@ -482,11 +499,8 @@
         }
       }
     }
-    pageState[location.href] = {
-      bodyClass: document.body.getAttribute("class") || "",
-      active: main ? main.getAttribute("data-active-page") || "" : "",
-      navKey: document.body.getAttribute("data-nav-key") || "",
-    };
+    // Not `rememberPage()` here: htmx also saves on popstate, when
+    // `location` already names the page being restored.
   });
 
   document.addEventListener("htmx:historyRestore", function () {
@@ -512,6 +526,7 @@
   window.addEventListener("pagehide", saveSidebarScroll);
 
   function start() {
+    rememberPage();
     restoreSidebarScroll();
     markActive();
     initPages(document.getElementById("main"));
