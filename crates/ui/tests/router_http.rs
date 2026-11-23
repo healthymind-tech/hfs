@@ -9452,7 +9452,14 @@ async fn shared_builder_asset_is_served_and_the_legacy_asset_is_absent() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(body_text(response).await.contains("/ui/resources/params"));
+    let script = body_text(response).await;
+    assert!(script.contains("/ui/resources/params"));
+    // Every settings write of the page goes through one queue, each PATCH
+    // with the ETag of its own read: no shared ETag that two concurrent
+    // cycles (rail click + recorded run) could race into a 412.
+    assert!(script.contains("var settingsQueue = Promise.resolve();"));
+    assert_eq!(script.matches("method: \"PATCH\"").count(), 1, "one PATCH site");
+    assert!(!script.contains("var etag"), "no page-wide ETag");
     let response = app()
         .oneshot(
             Request::get("/ui/assets/saved-queries.js")

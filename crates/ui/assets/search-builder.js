@@ -71,7 +71,6 @@
   if (!form || !messageHost || !window.fetch) return;
 
   var messages = messageHost.dataset;
-  var etag = null;
   var lang = document.documentElement.lang || undefined;
 
   /* Displayed counts follow the page's own locale (#1426), the same way
@@ -83,36 +82,69 @@
     return window.HfsNumber.format(value);
   }
 
-  function fetchDocument() {
+  /* Reads the settings document with the ETag of that read. */
+  function readDocument() {
     return fetch(SETTINGS, {
       headers: { Accept: "application/json" },
       credentials: "same-origin",
     }).then(function (response) {
       if (response.status === 501) throw { unavailable: true };
       if (!response.ok) throw new Error("settings fetch failed");
-      etag = response.headers.get("ETag");
-      return response.json();
+      var tag = response.headers.get("ETag");
+      return response.json().then(function (doc) {
+        return { doc: doc, etag: tag };
+      });
     });
   }
 
-  /* Merge-patches the document, conditional on the last ETag we saw; on 412
-   * re-reads and retries so an unrelated concurrent write (another tab, the
-   * theme toggle) never surfaces to the user. */
-  function patchDocument(patch, attempt) {
-    var headers = { "Content-Type": "application/json" };
-    if (etag) headers["If-Match"] = etag;
+  function fetchDocument() {
+    return readDocument().then(function (read) {
+      return read.doc;
+    });
+  }
 
+  /* Every write to the settings document goes through one queue: a
+   * read-modify-write cycle starts only once the previous one (and its
+   * retries) has settled, and each conditional PATCH carries the ETag of its
+   * own read. Two writes of this page (a rail click and a recorded run, a
+   * delete right after a run) therefore never race each other into a 412.
+   * A 412 can still come from another writer (another tab, the theme
+   * toggle); the cycle then re-reads, rebuilds its patch from the fresh
+   * document and retries, without surfacing anything to the user.
+   * `build(doc)` returns the merge patch, or null for nothing to write. */
+  var settingsQueue = Promise.resolve();
+
+  function updateDocument(build) {
+    var run = settingsQueue.then(function () {
+      return writeCycle(build, 0);
+    });
+    // The queue must stay resolved so a failed cycle never blocks the next.
+    settingsQueue = run.catch(function () {});
+    return run;
+  }
+
+  function writeCycle(build, attempt) {
+    return readDocument().then(function (read) {
+      var patch = build(read.doc);
+      if (!patch) return read.doc;
+      return sendPatch(patch, read.etag).then(function (result) {
+        if (!result.conflict) return result.doc;
+        if (attempt < MAX_RETRIES) return writeCycle(build, attempt + 1);
+        throw { conflict: true };
+      });
+    });
+  }
+
+  function sendPatch(patch, tag) {
+    var headers = { "Content-Type": "application/json" };
+    if (tag) headers["If-Match"] = tag;
     return fetch(SETTINGS, {
       method: "PATCH",
       headers: headers,
       credentials: "same-origin",
       body: JSON.stringify(patch),
     }).then(function (response) {
-      if (response.status === 412 && attempt < MAX_RETRIES) {
-        return fetchDocument().then(function () {
-          return patchDocument(patch, attempt + 1);
-        });
-      }
+      if (response.status === 412) return { conflict: true };
       if (!response.ok) {
         return response
           .json()
@@ -123,8 +155,9 @@
             throw { outcome: outcome };
           });
       }
-      etag = response.headers.get("ETag");
-      return response.json();
+      return response.json().then(function (doc) {
+        return { doc: doc };
+      });
     });
   }
 
@@ -2270,19 +2303,6 @@
     applyRailFilter();
   }
 
-  /* Serializes every `recordRailSelection` read-modify-write cycle behind
-   * the previous one: two rail clicks close enough together that the second
-   * fires before the first's PATCH has landed would otherwise both read the
-   * *same* pre-click document (racing on `fetchDocument`'s shared `etag`,
-   * exactly like `mutate`/`recordRecent`'s single retry-on-412 already can),
-   * each build its own `next` from that stale `recent`, and — since a JSON
-   * merge patch replaces the whole `recent` array — whichever PATCH lands
-   * last overwrites the other's write outright rather than merging with it.
-   * Chaining onto this promise instead of firing `fetchDocument` immediately
-   * guarantees the second cycle's read only starts once the first cycle's
-   * write (and any of its own 412 retries) has fully settled, so it always
-   * builds `next` from a document that already reflects the prior click. */
-  var railWriteChain = Promise.resolve();
 
   /* Records `type` as this page's rail selection with the same semantics
    * as `RailState::select` (front, no duplicates, capped,
@@ -2293,26 +2313,21 @@
    * simply is not remembered. */
   function recordRailSelection(type) {
     if (!railPage || !type) return;
-    railWriteChain = railWriteChain
-      .then(function () {
-        return fetchDocument();
-      })
-      .then(function (doc) {
-        var stored = (doc && doc.rails && doc.rails[railPage]) || {};
-        var recent = Array.isArray(stored.recent) ? stored.recent : [];
-        var next = recent.filter(function (entry) {
-          return !entry || entry.id !== type;
-        });
-        next.unshift({ id: type });
-        var patch = { rails: {} };
-        patch.rails[railPage] = { last: type, recent: next.slice(0, railMaxRecent) };
-        return patchDocument(patch, 0);
-      })
-      .catch(function () {
-        /* Unavailable store or a network error: nothing to remember. The
-         * chain itself must stay resolved (not rejected) so the *next*
-         * click's cycle still runs instead of being skipped forever. */
+    // Queued behind every other settings write of this page (two quick
+    // clicks build each `next` from a document that has the prior click).
+    updateDocument(function (doc) {
+      var stored = (doc && doc.rails && doc.rails[railPage]) || {};
+      var recent = Array.isArray(stored.recent) ? stored.recent : [];
+      var next = recent.filter(function (entry) {
+        return !entry || entry.id !== type;
       });
+      next.unshift({ id: type });
+      var patch = { rails: {} };
+      patch.rails[railPage] = { last: type, recent: next.slice(0, railMaxRecent) };
+      return patch;
+    }).catch(function () {
+      /* Unavailable store or a network error: nothing to remember. */
+    });
   }
 
   /* Shared by the scrollable list and the "Recently used" group: whichever
@@ -3504,16 +3519,13 @@
   /* Prepends a run to recentSearches: dedupe by query, newest first, capped.
    * Reads fresh state first so runs from other tabs are not clobbered. */
   function recordRecent(path) {
-    return fetchDocument().then(function (doc) {
+    return updateDocument(function (doc) {
       var list = recentSearches(doc).filter(function (item) {
         return item.query !== path;
       });
       list.unshift({ query: path, at: new Date().toISOString() });
-      return patchDocument(
-        { recentSearches: list.slice(0, MAX_RECENT) },
-        0
-      ).then(render);
-    });
+      return { recentSearches: list.slice(0, MAX_RECENT) };
+    }).then(render);
   }
 
   function render(doc) {
@@ -3602,8 +3614,16 @@
           }
           return;
         }
-        list.splice(Number(del.dataset.recentDelete), 1);
-        patchDocument({ recentSearches: list }, 0).then(render);
+        var gone = list[Number(del.dataset.recentDelete)];
+        updateDocument(function (fresh) {
+          // Remove the clicked entry from the document as it is now.
+          var current = recentSearches(fresh).filter(function (item) {
+            return !gone || item.query !== gone.query;
+          });
+          return { recentSearches: current };
+        })
+          .then(render)
+          .catch(function () {});
       });
     });
   }
