@@ -396,7 +396,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
             let back_link = &localized_html[start..end];
 
             assert!(back_link.contains(
-                r#"<span aria-hidden="true"><svg width="5" height="8" viewBox="0 0 5 8""#
+                r#"<span aria-hidden="true"><svg class="i" width="16" height="16" viewBox="0 0 24 24""#
             ));
             assert!(back_link.contains(&format!("<span>{label}</span>")));
             assert_eq!(back_link.matches("<span").count(), 2);
