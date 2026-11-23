@@ -314,8 +314,9 @@
     document.documentElement.style.setProperty("--save-bar-h", barHeight + "px");
     var first = result.querySelector(".verify-step--fail") ||
       result.querySelector(".verify-step--warn") || summary;
-    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    first.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
+    // Instant: a smooth scroll can still be under way when the reader (or
+    // a screenshot) looks, with the step half under the bar.
+    first.scrollIntoView({ block: "nearest", behavior: "auto" });
   }
 
   // Elements wired once each (pages swapped in place bring new elements).

@@ -785,6 +785,43 @@ mod pg {
         assert_same(&before, &public_snapshot(&admin).await);
     }
 
+    /// Remote terminology: only hm-0012 (console bindings), no terminology
+    /// schema; going embedded later adds hm-0011 alone.
+    #[tokio::test]
+    async fn console_migration_without_terminology_schema_then_embedded() {
+        let db = db_or_skip!("cm");
+        let hfs = hfs_public(&db).await;
+        let admin = db.client().await;
+        assert_eq!(
+            hfs.apply_console_fork_migrations().await.unwrap(),
+            vec!["hm-0012-console-terminology-bindings"]
+        );
+        assert!(hfs.apply_console_fork_migrations().await.unwrap().is_empty());
+        let schemas: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = 'terminology'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(schemas, 0, "no terminology schema before the data move");
+        let bindings: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_schema = 'public' AND table_name = 'hfs_console_scope_bindings'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(bindings, 1);
+        assert_eq!(
+            hfs.apply_unified_migrations(SCHEMA).await.unwrap(),
+            vec!["hm-0011-terminology-schema"]
+        );
+    }
+
     #[tokio::test]
     async fn unified_migrations_preflight_and_terminology_state() {
         let db = db_or_skip!("st");
