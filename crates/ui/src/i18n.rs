@@ -272,8 +272,18 @@ impl I18n {
     /// [`Self::t_args`], or `None` when no catalog defines `key` (optional
     /// messages such as a Verify step's "how to fix").
     pub(crate) fn t_args_opt(&self, key: &str, args: &BTreeMap<String, String>) -> Option<String> {
-        LOCALES.try_lookup(self.locale, key)?;
-        Some(self.t_args(key, args))
+        // Looked up *with* the arguments: a message with placeables does not
+        // resolve through the argument-less lookup.
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = args
+            .iter()
+            .map(|(name, value)| {
+                (
+                    Cow::Owned(name.clone()),
+                    FluentValue::String(Cow::Owned(value.clone())),
+                )
+            })
+            .collect();
+        LOCALES.try_lookup_with_args(self.locale, key, &args)
     }
 
     /// Look up a message with one named placeable, e.g.
@@ -395,6 +405,19 @@ mod tests {
             map.append(name.clone(), HeaderValue::from_str(value).unwrap());
         }
         map
+    }
+
+    #[test]
+    fn optional_messages_with_placeables_resolve_in_every_locale() {
+        let mut args = BTreeMap::new();
+        args.insert("stated".to_string(), "https://a".to_string());
+        args.insert("entered".to_string(), "https://b".to_string());
+        let zh = I18n::from_tag("zh-Hant").expect("zh-Hant");
+        let text = zh
+            .t_args_opt("verify-issuer-mismatch", &args)
+            .expect("message with placeables resolves");
+        assert!(text.contains("https://a") && text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "{text}");
+        assert!(zh.t_args_opt("verify-no-such-message", &args).is_none());
     }
 
     #[test]
