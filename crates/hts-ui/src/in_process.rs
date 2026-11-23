@@ -284,11 +284,11 @@ impl UpResponse {
         serde_json::from_slice(&self.body)
     }
 
-    pub(crate) async fn text(self) -> Result<String, std::convert::Infallible> {
+    pub(crate) async fn text(self) -> Result<String, std::io::Error> {
         Ok(String::from_utf8_lossy(&self.body).into_owned())
     }
 
-    pub(crate) async fn bytes(self) -> Result<bytes::Bytes, std::convert::Infallible> {
+    pub(crate) async fn bytes(self) -> Result<bytes::Bytes, std::io::Error> {
         Ok(self.body)
     }
 }

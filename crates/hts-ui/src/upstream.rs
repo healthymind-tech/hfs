@@ -4738,10 +4738,11 @@ impl UpstreamClient {
         }
         let response = req.send_via(self, "admin", &url).await?;
         let status = response.status().as_u16();
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(never) => match never {},
-        };
+        let bytes = response.bytes().await.map_err(|e| UpstreamError::Decode {
+            op: "admin",
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Ok((status, value))
     }

@@ -796,7 +796,12 @@ mod pg {
             hfs.apply_console_fork_migrations().await.unwrap(),
             vec!["hm-0012-console-terminology-bindings"]
         );
-        assert!(hfs.apply_console_fork_migrations().await.unwrap().is_empty());
+        assert!(
+            hfs.apply_console_fork_migrations()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let schemas: i64 = admin
             .query_one(
                 "SELECT count(*) FROM pg_namespace WHERE nspname = 'terminology'",
