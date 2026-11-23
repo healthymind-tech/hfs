@@ -116,9 +116,9 @@ impl NavSection {
             NavSection::Manager | NavSection::AuthorizationServers | NavSection::Server => {
                 NavBlock::Top
             }
-            NavSection::EndpointData | NavSection::EndpointOperate | NavSection::EndpointConfigure => {
-                NavBlock::Endpoint
-            }
+            NavSection::EndpointData
+            | NavSection::EndpointOperate
+            | NavSection::EndpointConfigure => NavBlock::Endpoint,
             NavSection::Terminology => NavBlock::Terminology,
             NavSection::Settings => NavBlock::Foot,
         }
@@ -209,7 +209,12 @@ impl NavItem {
 
     /// Puts the item in a sidebar group (`id`, label key, icon); see
     /// [`NavItem::group`].
-    pub const fn group(mut self, id: &'static str, label_key: &'static str, icon: &'static str) -> Self {
+    pub const fn group(
+        mut self,
+        id: &'static str,
+        label_key: &'static str,
+        icon: &'static str,
+    ) -> Self {
         self.group = Some((id, label_key, icon));
         self
     }
@@ -538,7 +543,11 @@ mod tests {
         let top = &admin[0];
         assert_eq!(top.block, NavBlock::Top);
         let ids: Vec<_> = top.links.iter().map(|l| l.id).collect();
-        assert_eq!(ids, ["overview", "test-idp-realms"], "IdP sits in the top block, under Overview");
+        assert_eq!(
+            ids,
+            ["overview", "test-idp-realms"],
+            "IdP sits in the top block, under Overview"
+        );
         assert_eq!(admin.last().unwrap().block, NavBlock::Foot);
         assert!(nav_key(None, NavRole::Admin, "").contains("idp"));
         unregister_section(NavSection::AuthorizationServers);
@@ -553,31 +562,69 @@ mod tests {
     #[test]
     fn sibling_pages_fold_into_one_entry_with_route_tabs() {
         let items = vec![
-            NavItem::new(NavSection::EndpointData, "batch", "b", "/ui/e/{ep}/data/batch")
-                .group("data-tools", "dt", "tool")
-                .order(20),
-            NavItem::new(NavSection::EndpointData, "validate", "v", "/ui/e/{ep}/data/validate")
-                .group("data-tools", "dt", "tool")
-                .order(30)
-                .full_load(),
-            NavItem::new(NavSection::EndpointData, "subs", "s", "/ui/e/{ep}/data/subs").order(40),
-            NavItem::new(NavSection::EndpointConfigure, "cfg", "c", "/ui/e/{ep}/config")
-                .group("settings", "st", "sliders"),
-            NavItem::new(NavSection::EndpointConfigure, "sec", "sc", "/ui/e/{ep}/security")
-                .group("settings", "st", "sliders")
-                .min_role(NavRole::Admin)
-                .order(10),
+            NavItem::new(
+                NavSection::EndpointData,
+                "batch",
+                "b",
+                "/ui/e/{ep}/data/batch",
+            )
+            .group("data-tools", "dt", "tool")
+            .order(20),
+            NavItem::new(
+                NavSection::EndpointData,
+                "validate",
+                "v",
+                "/ui/e/{ep}/data/validate",
+            )
+            .group("data-tools", "dt", "tool")
+            .order(30)
+            .full_load(),
+            NavItem::new(
+                NavSection::EndpointData,
+                "subs",
+                "s",
+                "/ui/e/{ep}/data/subs",
+            )
+            .order(40),
+            NavItem::new(
+                NavSection::EndpointConfigure,
+                "cfg",
+                "c",
+                "/ui/e/{ep}/config",
+            )
+            .group("settings", "st", "sliders"),
+            NavItem::new(
+                NavSection::EndpointConfigure,
+                "sec",
+                "sc",
+                "/ui/e/{ep}/security",
+            )
+            .group("settings", "st", "sliders")
+            .min_role(NavRole::Admin)
+            .order(10),
             NavItem::new(NavSection::Settings, "about", "a", "/ui/about").hidden(),
         ];
         // (another test registers an IdP entry in the shared registry meanwhile)
-        let all = build(items.clone(), Some("x"), |i| i.section.per_endpoint() || i.id == "about");
-        assert_eq!(all.len(), 1, "one endpoint block; hidden items draw nothing");
+        let all = build(items.clone(), Some("x"), |i| {
+            i.section.per_endpoint() || i.id == "about"
+        });
+        assert_eq!(
+            all.len(),
+            1,
+            "one endpoint block; hidden items draw nothing"
+        );
         let links = &all[0].links;
         assert_eq!(links.len(), 3);
         let tools = &links[0];
-        assert_eq!((tools.id, tools.label_key, tools.icon), ("data-tools", "dt", "tool"));
+        assert_eq!(
+            (tools.id, tools.label_key, tools.icon),
+            ("data-tools", "dt", "tool")
+        );
         assert_eq!(tools.href, "/ui/e/x/data/batch");
-        assert_eq!(tools.match_prefix, "/ui/e/x/data/batch /ui/e/x/data/validate");
+        assert_eq!(
+            tools.match_prefix,
+            "/ui/e/x/data/batch /ui/e/x/data/validate"
+        );
         assert!(tools.covers("validate") && tools.covers("data-tools") && !tools.covers("subs"));
         assert_eq!(tabs(&all, "validate").unwrap().len(), 2);
         assert!(tabs(&all, "subs").is_none());
