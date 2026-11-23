@@ -21,6 +21,96 @@ use super::backend::{SecretChange, SecretChanges};
 /// Field errors by JSON path (`""` = form level).
 pub type FieldErrors = BTreeMap<String, String>;
 
+/// One problem of a failed save, as the error summary shows it (UX-21):
+/// the field's label (never its key), the message, and a link to the input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorLink {
+    /// Translated field label ("" for a form-level error).
+    pub label: String,
+    /// Translated message.
+    pub message: String,
+    /// `#f-…` of the input.
+    pub href: String,
+    /// Id of the input (`f-…`).
+    pub id: String,
+    /// Wizard step (0-based) holding the field.
+    pub step: Option<usize>,
+}
+
+/// Where a field path (`auth.issuer`) lives in the forms: its label key,
+/// the input id and the wizard step.
+pub fn field_ref(path: &str) -> Option<(&'static str, &'static str, usize)> {
+    Some(match path {
+        "displayName" => ("mgr-field-display-name", "f-display_name", 0),
+        "name" => ("mgr-field-name", "f-name", 0),
+        "path" => ("mgr-field-path", "f-path", 0),
+        "storage.tenantId" => ("mgr-field-tenant", "f-tenant", 1),
+        "fhirVersion" => ("mgr-field-fhir-version", "f-fhir_version", 1),
+        "auth.mode" => ("mgr-field-auth-mode", "f-auth_mode", 2),
+        "auth.issuer" => ("mgr-field-issuer", "f-auth_issuer", 2),
+        "auth.jwksUrl" => ("mgr-field-jwks", "f-auth_jwks_url", 2),
+        "auth.audience" => ("mgr-field-audience", "f-auth_audience", 2),
+        "auth.algorithms" => ("mgr-field-algorithms", "f-auth_algorithms", 2),
+        "auth.scopes" => ("mgr-field-scopes", "f-scopes_allow_patient", 2),
+        "auth.clockSkewSecs" => ("mgr-field-clock-skew", "f-auth_clock_skew", 2),
+        "auth.jwksMaxAgeSecs" => ("mgr-field-jwks-max-age", "f-auth_jwks_max_age", 2),
+        "validation.requiredProfiles" => ("mgr-required-profiles", "f-val_required", 3),
+        "terminology.serverUrl" => ("mgr-term-server", "f-term_server_url", 3),
+        "terminology.publicUrl" => ("mgr-term-public", "f-term_public_url", 3),
+        "terminology.timeoutSecs" => ("mgr-term-timeout", "f-term_timeout", 3),
+        "terminology.token" => ("mgr-term-token", "f-term_token", 3),
+        "cors.allowedOrigins" => ("mgr-cors-origins", "f-cors_origins", 2),
+        "cors.allowCredentials" => ("mgr-cors-credentials", "f-cors_credentials", 2),
+        _ => return None,
+    })
+}
+
+/// A validation message from the endpoint model, in the request's language
+/// (the model speaks English; the few messages it has are mapped here).
+pub fn error_message(i18n: &crate::I18n, message: &str) -> String {
+    let key = match message {
+        "required when auth is on" => "mgr-err-required-auth",
+        "must be an absolute http(s) URL" => "mgr-err-url",
+        "must not contain credentials" => "mgr-err-url-credentials",
+        "at least one scope context must be allowed" => "mgr-err-scopes",
+        "must be 1-120 characters" => "mgr-err-display-name",
+        "required" => "mgr-err-required",
+        _ => {
+            if let Some(alg) = message.strip_prefix("unsupported algorithm ") {
+                return i18n.t_arg("mgr-err-algorithm", "alg", alg.to_string());
+            }
+            return message.to_string();
+        }
+    };
+    i18n.t(key)
+}
+
+/// The error summary of a failed save.
+pub fn error_links(i18n: &crate::I18n, errors: &FieldErrors) -> Vec<ErrorLink> {
+    errors
+        .iter()
+        .map(|(path, message)| {
+            let message = error_message(i18n, message);
+            match field_ref(path) {
+                Some((label, id, step)) => ErrorLink {
+                    label: i18n.t(label),
+                    message,
+                    href: format!("#{id}"),
+                    id: id.to_string(),
+                    step: Some(step),
+                },
+                None => ErrorLink {
+                    label: String::new(),
+                    message,
+                    href: String::new(),
+                    id: String::new(),
+                    step: None,
+                },
+            }
+        })
+        .collect()
+}
+
 /// A parsed `application/x-www-form-urlencoded` body.
 #[derive(Debug, Default, Clone)]
 pub struct Form {
@@ -58,6 +148,12 @@ impl Form {
         self.pairs
             .iter()
             .any(|(k, v)| k == name && !matches!(v.as_str(), "off" | "false" | "0"))
+    }
+
+    /// Replaces (or adds) the value of `name`.
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.pairs.retain(|(k, _)| k != name);
+        self.pairs.push((name.to_string(), value.to_string()));
     }
 
     /// Whether the field was sent at all.
@@ -533,6 +629,28 @@ pub fn parse_new(form: &Form) -> Result<NewEndpoint, FieldErrors> {
     }
 }
 
+/// The section a warning of [`warnings`] belongs to.
+pub fn warning_section(key: &str) -> Section {
+    match key {
+        "mgr-info-enforce" => Section::Validation,
+        _ => Section::Security,
+    }
+}
+
+/// Whether `url`'s host is in `HFS_OUTBOUND_ALLOW` (plain http is then
+/// fetched on purpose, so warning about it on every page is noise).
+fn outbound_allowed(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    std::env::var("HFS_OUTBOUND_ALLOW")
+        .ok()
+        .is_some_and(|v| v.split(',').any(|h| h.trim().eq_ignore_ascii_case(host)))
+}
+
 /// Non-blocking warnings about a spec (design §6 "Warnings surfaced by the
 /// console"), as Fluent keys.
 pub fn warnings(spec: &EndpointSpec, others: &[&EndpointSpec]) -> Vec<&'static str> {
@@ -556,7 +674,7 @@ pub fn warnings(spec: &EndpointSpec, others: &[&EndpointSpec]) -> Vec<&'static s
         if auth
             .jwks_url
             .as_deref()
-            .is_some_and(|u| u.starts_with("http://"))
+            .is_some_and(|u| u.starts_with("http://") && !outbound_allowed(u))
         {
             out.push("mgr-warn-http-jwks");
         }

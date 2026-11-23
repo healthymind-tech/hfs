@@ -39,6 +39,7 @@ pub mod provider;
 pub mod scope;
 pub mod session;
 pub mod verifier_cache;
+pub mod verify;
 
 // Re-export commonly used types
 pub use config::{AuthConfig, AuthMode, DEFAULT_PATIENT_SHARED_TYPES, NonCompartmentPolicy};

@@ -15,6 +15,8 @@
 //! | `GET /admin/endpoints/{name}/history` | revisions (redacted) |
 //! | `POST /admin/endpoints/{name}/$duplicate` | hand-off to the sync service → `202` |
 //! | `POST /admin/endpoints/{name}/$test-auth` | issuer discovery + JWKS probe |
+//! | `POST /admin/endpoints/{name}/$verify-auth`, `POST /admin/endpoints/$verify-auth` | step-by-step auth verification (`VerifyReport`) |
+//! | `POST /admin/endpoints/$verify-terminology` | terminology server verification (`VerifyReport`) |
 //! | `GET /admin/endpoints/{name}/stats` | counts by type, last write, traffic |
 //! | `GET\|POST /admin/endpoints/{name}/packages`, `GET\|DELETE …/packages/{pkg}/{ver}` | package API in the endpoint's tenant |
 //! | `GET /admin/endpoints/{name}/audit` | AuditEvents of the endpoint's tenant (Bundle) |

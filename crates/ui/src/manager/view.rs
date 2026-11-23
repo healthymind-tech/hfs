@@ -22,6 +22,8 @@ pub struct EnvDefaults {
     pub auth_issuer: Option<String>,
     /// `HFS_AUTH_AUDIENCE`.
     pub auth_audience: Option<String>,
+    /// `HFS_AUTH_JWKS_URL`.
+    pub auth_jwks_url: Option<String>,
     /// `HFS_VALIDATION_MODE`.
     pub validation_mode: ValidationMode,
     /// `HFS_VALIDATION_TERMINOLOGY`.
@@ -55,6 +57,7 @@ impl EnvDefaults {
             },
             auth_issuer: get("HFS_AUTH_ISSUER"),
             auth_audience: get("HFS_AUTH_AUDIENCE"),
+            auth_jwks_url: get("HFS_AUTH_JWKS_URL"),
             validation_mode: match get("HFS_VALIDATION_MODE").as_deref() {
                 Some("log") => ValidationMode::Log,
                 Some("enforce") => ValidationMode::Enforce,

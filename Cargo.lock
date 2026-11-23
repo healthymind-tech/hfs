@@ -3985,6 +3985,7 @@ dependencies = [
  "helios-endpoints",
  "helios-fhir",
  "helios-fhir-validator",
+ "helios-hts-ui",
  "helios-observability",
  "helios-persistence",
  "helios-sof",
@@ -4020,6 +4021,7 @@ dependencies = [
  "form_urlencoded",
  "intl-memoizer",
  "serde_json",
+ "tokio",
  "unic-langid",
  "url",
 ]

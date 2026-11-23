@@ -281,7 +281,7 @@ async fn inventory_lists_versions_with_current_pin_and_actions() {
     let app = app(&base);
     let (s, html) = get_page(&app, "/ui/hts/terminology", "en", false).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(html.contains(">Terminology inventory<"));
+    assert!(html.contains(">Loaded terminologies<"));
     assert_eq!(html.matches("data-current=\"true\"").count(), 2);
     assert!(
         html.contains("3.6 GB"),

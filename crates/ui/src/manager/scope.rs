@@ -70,6 +70,8 @@ impl EndpointScope {
 const UNSCOPED: &[&str] = &[
     "/ui/assets",
     "/ui/hts",
+    // The Terminology section: one per server, never an endpoint page.
+    "/ui/terminology",
     "/ui/e",
     "/ui/endpoints",
     "/ui/about",

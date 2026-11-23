@@ -22,24 +22,26 @@ const LOCALES: [&str; 4] = ["en", "es", "de", "zh-Hant"];
 
 /// Message and term identifiers defined by one catalog.
 fn key_set(locale: &str) -> BTreeSet<String> {
-    let path = format!("../../locales/{locale}/main.ftl");
-    let source =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-    // A `.ftl` with syntax errors still yields the entries it managed to
-    // parse; treat any error as fatal so a malformed catalog cannot quietly
-    // pass as a smaller one.
-    let resource = parser::parse(source.as_str()).unwrap_or_else(|(_, errors)| {
-        panic!("{path} failed to parse: {errors:?}");
-    });
-    resource
-        .body
-        .iter()
-        .filter_map(|entry| match entry {
+    // The terminology keys live in their own file of the one catalog
+    // (unified-server design §9.3); the parity rule covers both files.
+    let mut keys = BTreeSet::new();
+    for file in ["main.ftl", "terminology.ftl"] {
+        let path = format!("../../locales/{locale}/{file}");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
+        // A `.ftl` with syntax errors still yields the entries it managed to
+        // parse; treat any error as fatal so a malformed catalog cannot
+        // quietly pass as a smaller one.
+        let resource = parser::parse(source.as_str()).unwrap_or_else(|(_, errors)| {
+            panic!("{path} failed to parse: {errors:?}");
+        });
+        keys.extend(resource.body.iter().filter_map(|entry| match entry {
             ast::Entry::Message(m) => Some(m.id.name.to_string()),
             ast::Entry::Term(t) => Some(format!("-{}", t.id.name)),
             _ => None,
-        })
-        .collect()
+        }));
+    }
+    keys
 }
 
 #[test]

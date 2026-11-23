@@ -15,12 +15,15 @@
 //! for non-HTTP callers.
 
 use helios_audit::AuditAction;
+use helios_auth::OutboundGuard;
+use helios_auth::verify::{SyncPeerVerifyRequest, VerifyReport, VerifyStatus, VerifyStep};
 use helios_endpoints::model::{EndpointAuth, EndpointSpec, EndpointStatus, FhirRelease};
 use helios_endpoints::name::check_segment;
 use helios_endpoints::store::EndpointRevision;
 use helios_endpoints::sync::DuplicateRequest;
 use helios_endpoints::{Actor, Endpoint, ManagedBy, SecretInput, StoreError};
 use serde::Serialize;
+use std::sync::Arc;
 
 use super::audit::AdminEvent;
 use super::error::{ApiError, ApiResult, Issue};
@@ -653,6 +656,144 @@ impl AdminEndpointsState {
             }
         }
         i.auth_probe.test(&auth, managed_by, token).await
+    }
+
+    /// Verifies `auth` step by step (`helios_auth::verify`, kind
+    /// `endpoint-auth`), or, when `None`, the stored auth of `endpoint` —
+    /// its effective, server-level settings (`HFS_AUTH_*`) when it inherits
+    /// them. Unlike [`test_endpoint_auth`](Self::test_endpoint_auth) nothing
+    /// is refused up front: an outbound-policy refusal or a missing issuer
+    /// is a failed step of the report. Console-entered URLs go through the
+    /// outbound policy; env-managed endpoints and inherited settings are
+    /// operator-trusted. With auth on, an `audience-shared` warning step is
+    /// appended when another endpoint accepts the same tokens.
+    pub async fn verify_endpoint_auth(
+        &self,
+        endpoint: Option<&str>,
+        auth: Option<EndpointAuth>,
+        token: Option<&str>,
+    ) -> ApiResult<VerifyReport> {
+        let i = self.inner();
+        let current = match endpoint {
+            Some(name) => Some(self.get_endpoint(name).await?),
+            None => None,
+        };
+        let stored = auth.is_none();
+        let (auth, inherited) = match (auth, &current) {
+            (Some(a), _) => (a, false),
+            (None, Some(e)) => match &e.spec.auth {
+                Some(a) => (a.clone(), false),
+                None => (
+                    helios_auth::verify::endpoint_auth_from_config(
+                        &helios_auth::AuthConfig::from_env(),
+                    ),
+                    true,
+                ),
+            },
+            (None, None) => {
+                return Err(ApiError::invalid_field(
+                    "auth",
+                    "an auth section is required",
+                ));
+            }
+        };
+        let trusted = inherited
+            || matches!(&current, Some(e) if stored && e.spec.managed_by == ManagedBy::Env);
+        let guard = if trusted {
+            OutboundGuard::Trusted
+        } else {
+            OutboundGuard::Policy(Arc::new(i.outbound.clone()))
+        };
+        let mut report = helios_auth::EndpointAuthProbe::new(guard)
+            .verify(&auth, token)
+            .await;
+        if auth.mode != helios_endpoints::model::AuthMode::Off {
+            let me = endpoint.unwrap_or("");
+            let snapshot = i.registry.snapshot();
+            let others: Vec<String> = snapshot
+                .endpoints()
+                .iter()
+                .filter(|e| e.name() != me)
+                .filter_map(|e| {
+                    let theirs = e.spec.auth.as_ref()?;
+                    let warned = helios_auth::discovery::shared_audience_warnings([
+                        ("\u{0}self", &auth),
+                        (e.name(), theirs),
+                    ]);
+                    warned
+                        .iter()
+                        .any(|(n, _)| n == "\u{0}self")
+                        .then(|| e.name().to_string())
+                })
+                .collect();
+            if !others.is_empty() {
+                let other = others.join(", ");
+                report.push(
+                    VerifyStep::new(
+                        "audience-shared",
+                        VerifyStatus::Warn,
+                        "audience-shared",
+                        format!(
+                            "Endpoint {other} has the same issuer and its audience does not tell them apart: a token for one is accepted by the other."
+                        ),
+                    )
+                    .field("audience")
+                    .param("other", other),
+                );
+            }
+        }
+        Ok(report)
+    }
+
+    /// Verifies a terminology server (`helios_auth::verify`, kind
+    /// `terminology`). `timeout_secs` defaults to 10 (clamped 1..=120). The
+    /// URL goes through the outbound policy unless it is the server's own
+    /// `HFS_TERMINOLOGY_SERVER` (operator-trusted).
+    pub async fn verify_terminology(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> ApiResult<VerifyReport> {
+        let configured = std::env::var("HFS_TERMINOLOGY_SERVER").unwrap_or_default();
+        fn same(a: &str) -> &str {
+            a.trim().trim_end_matches('/')
+        }
+        let guard = if !configured.trim().is_empty() && same(&configured) == same(url) {
+            OutboundGuard::Trusted
+        } else {
+            OutboundGuard::Policy(Arc::new(self.inner().outbound.clone()))
+        };
+        let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(10).clamp(1, 120));
+        Ok(helios_auth::verify::verify_terminology_server(url, token, timeout, &guard).await)
+    }
+
+    /// Verifies the external side of a sync job (`helios_auth::verify`,
+    /// kinds `sync-source` / `sync-target`) through the outbound policy.
+    /// With `jobId`, an empty secret is taken from that job's stored side
+    /// (when the sync service is installed).
+    pub async fn verify_sync_peer(
+        &self,
+        request: &SyncPeerVerifyRequest,
+    ) -> ApiResult<VerifyReport> {
+        let mut filled;
+        let mut request = request;
+        if request.job_id.is_some()
+            && let Some(svc) = helios_sync::global()
+        {
+            filled = request.clone();
+            crate::handlers::admin_sync::fill_stored_secret(&mut filled, &svc).await;
+            request = &filled;
+        }
+        let guard = OutboundGuard::Policy(Arc::new(self.inner().outbound.clone()));
+        Ok(helios_auth::verify::verify_fhir_peer(
+            &request.peer(),
+            request.role,
+            request.fhir_version.as_deref(),
+            &request.resource_types,
+            &guard,
+        )
+        .await)
     }
 
     /// Counts, last write and this instance's traffic over `window` seconds

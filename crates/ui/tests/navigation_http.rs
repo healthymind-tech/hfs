@@ -117,24 +117,17 @@ async fn history_deep_link_names_the_instance_and_links_its_editor() {
 }
 
 #[tokio::test]
-async fn product_switcher_links_the_terminology_console() {
-    // An internal terminology host: the browser is sent to /ui/hts on this
-    // origin (HFS_TERMINOLOGY_PUBLIC_URL unset).
+async fn one_console_has_no_product_switcher() {
+    // The Terminology section is part of this console (unified-server
+    // design §9.1): no topbar switcher, with or without a terminology server.
     let (_, _, html) = page(app_with_terminology(Some("http://127.0.0.1:8090")), "/ui").await;
-    assert!(
-        html.contains(r#"<nav class="product-switch" aria-label="Switch console">"#),
-        "{html}"
-    );
-    assert!(html.contains(r#"href="/ui" aria-current="page">FHIR Server</a>"#));
-    assert!(html.contains(r#"href="/ui/hts">Terminology</a>"#));
-
-    // No terminology server: nothing to switch to.
+    assert!(!html.contains("product-switch"), "{html}");
     let (_, _, html) = page(app(), "/ui").await;
     assert!(!html.contains("product-switch"));
 }
 
 #[tokio::test]
-async fn pages_announce_the_console_to_a_same_origin_hts() {
+async fn pages_no_longer_set_the_product_switcher_cookie() {
     let (_, headers, _) = page(app(), "/ui").await;
     let cookies: Vec<_> = headers
         .get_all(header::SET_COOKIE)
@@ -142,43 +135,11 @@ async fn pages_announce_the_console_to_a_same_origin_hts() {
         .filter_map(|v| v.to_str().ok())
         .collect();
     assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("helios_hfs_console=1;") && c.contains("Path=/")),
+        !cookies.iter().any(|c| c.starts_with("helios_hfs_console=")),
         "{cookies:?}"
-    );
-
-    // Already known: not sent again.
-    let response = app()
-        .oneshot(
-            Request::get("/ui")
-                .header(header::COOKIE, "helios_hfs_console=1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        !response
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .any(|c| c.to_str().unwrap_or("").starts_with("helios_hfs_console"))
-    );
-
-    // Not on assets.
-    let (_, headers, _) = page(app(), "/ui/assets/app.css").await;
-    assert!(
-        !headers
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .any(|c| c.to_str().unwrap_or("").starts_with("helios_hfs_console"))
     );
 }
 
-/// UI/UX review §3.2: the natural-language setup notes are for whoever
-/// configures the server; they start collapsed instead of taking the top of
-/// the Resources card on every visit.
 #[tokio::test]
 async fn resources_natural_language_setup_notes_start_collapsed() {
     let (status, _, html) = page(app(), "/ui/resources").await;

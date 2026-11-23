@@ -420,7 +420,7 @@ async fn browser_renders_full_page_with_translated_heading() {
         "hard nav must render a full HTML page",
     );
     assert!(
-        html.contains(">ConceptMaps<"),
+        html.contains(">Concept maps<"),
         "browser heading must be Fluent-resolved (en value: ConceptMaps)",
     );
     assert!(

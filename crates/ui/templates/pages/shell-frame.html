@@ -1,0 +1,11 @@
+{% extends "layouts/base.html" %}
+{#-
+  The console shell with four slot markers instead of a page: the embedded
+  terminology console (crates/hts-ui) writes its title, body class, main
+  class and content into the slots, so its pages have this exact shell
+  (crates/ui/src/terminology_console.rs, helios_ui_chrome::shell).
+-#}
+{% block title %}{{ self.slot_title()|safe }}{% endblock %}
+{% block body_class %}{{ self.slot_body()|safe }}{% endblock %}
+{% block content_class %}{{ self.slot_main()|safe }}{% endblock %}
+{% block content %}{{ self.slot_content()|safe }}{% endblock %}

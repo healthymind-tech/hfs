@@ -87,10 +87,21 @@ async fn render(
         Ok(u) => (u, error),
         Err(e) => (Vec::new(), error.or_else(|| Some(error_text(&i18n, &e)))),
     };
-    let (bindings, bindings_error) = match c.store().list_role_bindings().await {
+    let (mut bindings, bindings_error) = match c.store().list_role_bindings().await {
         Ok(b) => (b, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
     };
+    // Terminology-scope bindings (hm-0012) are listed with the others, under
+    // the scope name.
+    if let Some(store) = crate::terminology_console::scope_bindings()
+        && let Ok(scoped) = store.list().await
+    {
+        bindings.extend(scoped.into_iter().map(|(subject, role)| RoleBinding {
+            subject,
+            endpoint: crate::terminology_console::TERMINOLOGY_SCOPE.to_string(),
+            role,
+        }));
+    }
     let current = ctx.resolved.as_ref().map(|r| r.key.clone());
     let sessions = match c.list_sessions().await {
         Ok(list) => list
@@ -302,11 +313,24 @@ pub(crate) async fn delete(
     Path(id): Path<String>,
 ) -> Response {
     let ctx = ctx!(state, locale, rv, rt, console, resolved, csrf);
+    // The user's terminology-scope binding goes with the account.
+    let username = ctx
+        .console
+        .list_users()
+        .await
+        .ok()
+        .and_then(|users| users.into_iter().find(|u| u.id == id).map(|u| u.username));
     let result = ctx
         .console
         .delete_user(&actor(&ctx), &id)
         .await
         .map(|_| "console-users-deleted".to_string());
+    if result.is_ok()
+        && let (Some(store), Some(name)) = (crate::terminology_console::scope_bindings(), username)
+        && let Err(e) = store.remove(&format!("local:{name}")).await
+    {
+        tracing::warn!(error = %e, "removing the terminology binding of a deleted user failed");
+    }
     outcome(&ctx, result, None).await
 }
 
@@ -356,6 +380,15 @@ pub(crate) async fn bind(
     let Some(role) = f.get("role").and_then(|r| ConsoleRole::parse(r)) else {
         return outcome(&ctx, Err(ConsoleError::NotFound), None).await;
     };
+    if endpoint == crate::terminology_console::TERMINOLOGY_SCOPE
+        && let Some(store) = crate::terminology_console::scope_bindings()
+    {
+        let result = match store.set(&subject, role, &actor(&ctx)).await {
+            Ok(()) => Ok("console-bindings-saved".to_string()),
+            Err(e) => Err(ConsoleError::Unavailable(e)),
+        };
+        return outcome(&ctx, result, None).await;
+    }
     let result = ctx
         .console
         .set_binding(&actor(&ctx), &subject, &endpoint, role)
@@ -381,6 +414,15 @@ pub(crate) async fn unbind(
     let f = form(&body);
     let subject = f.get("subject").cloned().unwrap_or_default();
     let endpoint = f.get("endpoint").cloned().unwrap_or_default();
+    if endpoint == crate::terminology_console::TERMINOLOGY_SCOPE
+        && let Some(store) = crate::terminology_console::scope_bindings()
+    {
+        let result = match store.remove(&subject).await {
+            Ok(()) => Ok("console-bindings-saved".to_string()),
+            Err(e) => Err(ConsoleError::Unavailable(e)),
+        };
+        return outcome(&ctx, result, None).await;
+    }
     let result = ctx
         .console
         .remove_binding(&actor(&ctx), &subject, &endpoint)

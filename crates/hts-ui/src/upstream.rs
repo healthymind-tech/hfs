@@ -647,15 +647,15 @@ impl CsBrowserFilters {
             ("status", &self.status),
             ("sort", &self.sort),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         ser.append_pair("_count", &self.effective_count().to_string());
         ser.append_pair("_offset", &next_offset.to_string());
-        format!("/ui/hts/code-systems/rows?{}", ser.finish())
+        crate::paths::link(&format!("/ui/hts/code-systems/rows?{}", ser.finish()))
     }
 
     /// The browser *page* URL at `offset` with every active filter carried
@@ -687,9 +687,9 @@ impl CsBrowserFilters {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/code-systems".to_owned()
+            crate::paths::link("/ui/hts/code-systems")
         } else {
-            format!("/ui/hts/code-systems?{query}")
+            crate::paths::link(&format!("/ui/hts/code-systems?{query}"))
         }
     }
 }
@@ -1765,10 +1765,8 @@ fn parse_lookup_property(param: &Value) -> Option<LookupProperty> {
                     }
                 }
             }
-            "description" => {
-                if p.value.is_empty() {
-                    p.value = value_obj_str(part, "valueString").to_owned();
-                }
+            "description" if p.value.is_empty() => {
+                p.value = value_obj_str(part, "valueString").to_owned();
             }
             _ => {}
         }
@@ -1862,15 +1860,15 @@ impl VsBrowserFilters {
             ("status", &self.status),
             ("sort", &self.sort),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         ser.append_pair("_count", &self.effective_count().to_string());
         ser.append_pair("_offset", &next_offset.to_string());
-        format!("/ui/hts/value-sets/rows?{}", ser.finish())
+        crate::paths::link(&format!("/ui/hts/value-sets/rows?{}", ser.finish()))
     }
 
     /// The browser *page* URL at `offset` with every active filter carried
@@ -1902,9 +1900,9 @@ impl VsBrowserFilters {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/value-sets".to_owned()
+            crate::paths::link("/ui/hts/value-sets")
         } else {
-            format!("/ui/hts/value-sets?{query}")
+            crate::paths::link(&format!("/ui/hts/value-sets?{query}"))
         }
     }
 }
@@ -2900,15 +2898,15 @@ impl CmBrowserFilters {
             ("status", &self.status),
             ("sort", &self.sort),
         ] {
-            if let Some(v) = value {
-                if !v.is_empty() {
-                    ser.append_pair(field, v);
-                }
+            if let Some(v) = value
+                && !v.is_empty()
+            {
+                ser.append_pair(field, v);
             }
         }
         ser.append_pair("_count", &self.effective_count().to_string());
         ser.append_pair("_offset", &next_offset.to_string());
-        format!("/ui/hts/concept-maps/rows?{}", ser.finish())
+        crate::paths::link(&format!("/ui/hts/concept-maps/rows?{}", ser.finish()))
     }
 
     /// The browser *page* URL at `offset` with every active filter carried
@@ -2941,9 +2939,9 @@ impl CmBrowserFilters {
         }
         let query = ser.finish();
         if query.is_empty() {
-            "/ui/hts/concept-maps".to_owned()
+            crate::paths::link("/ui/hts/concept-maps")
         } else {
-            format!("/ui/hts/concept-maps?{query}")
+            crate::paths::link(&format!("/ui/hts/concept-maps?{query}"))
         }
     }
 }
@@ -3589,14 +3587,14 @@ fn parse_translate_match(param: &Value) -> Option<(TranslateMatch, MappingKind)>
             // the coding's system and fall back to `valueUri` for tolerance.
             "source" => {
                 let mut v = value_obj_str(part, "valueUri").to_owned();
-                if v.is_empty() {
-                    if let Some(c) = part.get("valueCoding").and_then(|c| c.as_object()) {
-                        v = c
-                            .get("system")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_owned();
-                    }
+                if v.is_empty()
+                    && let Some(c) = part.get("valueCoding").and_then(|c| c.as_object())
+                {
+                    v = c
+                        .get("system")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_owned();
                 }
                 if !v.is_empty() && mat.origin.is_none() {
                     mat.origin = Some(v);
@@ -3622,10 +3620,10 @@ fn base_id(id: &str) -> &str {
 /// into one projection field.
 fn pick_first_str(resource: &Value, keys: &[&str]) -> String {
     for k in keys {
-        if let Some(v) = resource.get(*k).and_then(|v| v.as_str()) {
-            if !v.is_empty() {
-                return v.to_owned();
-            }
+        if let Some(v) = resource.get(*k).and_then(|v| v.as_str())
+            && !v.is_empty()
+        {
+            return v.to_owned();
         }
     }
     String::new()
@@ -5181,20 +5179,26 @@ impl ConceptRef {
 
     /// The concept's permalink — the page a `$lookup` result links into.
     pub fn permalink(&self) -> String {
-        format!("/ui/hts/concepts?{}", self.query_string(&[]))
+        crate::paths::link(&format!("/ui/hts/concepts?{}", self.query_string(&[])))
     }
 
     /// Standalone URL for one lazy panel (`identity`, `mappings`,
     /// `relations`). Used both as the htmx `hx-get` target and as the
     /// `<noscript>` `<a href>` so the panel is reachable without JavaScript.
     pub fn panel_url(&self, panel: &str) -> String {
-        format!("/ui/hts/concepts/{panel}?{}", self.query_string(&[]))
+        crate::paths::link(&format!(
+            "/ui/hts/concepts/{panel}?{}",
+            self.query_string(&[])
+        ))
     }
 
     /// Panel URL with extra query pairs (the mappings direction toggle and
     /// the subsumption comparator field both need one).
     pub fn panel_url_with(&self, panel: &str, extra: &[(&str, &str)]) -> String {
-        format!("/ui/hts/concepts/{panel}?{}", self.query_string(extra))
+        crate::paths::link(&format!(
+            "/ui/hts/concepts/{panel}?{}",
+            self.query_string(extra)
+        ))
     }
 }
 

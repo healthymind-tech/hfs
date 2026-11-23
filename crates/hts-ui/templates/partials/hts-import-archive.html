@@ -5,17 +5,17 @@
 
     upload      — `assets/hts-admin.js` uploads the picked file in
                   `chunk_size` pieces straight to the admin API under
-                  `/ui/hts/api/admin` (resumable: re-picking the same file
+                  `{{ crate::paths::admin_api() }}` (resumable: re-picking the same file
                   after a reload continues where it stopped), then adds it to
                   the "uploaded files" radio list and selects it;
     import-dir  — files an operator copied into HTS_IMPORT_DIR;
     registry    — a FHIR package from the configured registry.
 
-  The submit posts the urlencoded form to `/ui/hts/import/job`, which queues
+  The submit posts the urlencoded form to `{{ crate::paths::ui() }}/import/job`, which queues
   the job and redirects to its progress page — no script needed for the
   import-dir and registry sources.
 -#}
-<form class="card" id="hts-admin-import" method="post" action="/ui/hts/import/job"
+<form class="card" id="hts-admin-import" method="post" action="{{ crate::paths::ui() }}/import/job"
       data-api="{{ a.api }}" data-chunk-size="{{ a.chunk_size }}"
       data-msg-uploading="{{ chrome.i18n.t("hts-up-uploading") }}"
       data-msg-paused="{{ chrome.i18n.t("hts-up-paused") }}"
@@ -129,7 +129,7 @@
         <label class="field">
           <span class="field__label">{{ chrome.i18n.t("hts-reg-search") }}</span>
           <input class="field__input" type="search" name="registry_q" placeholder="hl7.terminology"
-                 hx-get="/ui/hts/import/registry" hx-trigger="input changed delay:400ms, search" hx-target="#hts-registry-results" hx-swap="outerHTML"
+                 hx-get="{{ crate::paths::ui() }}/import/registry" hx-trigger="input changed delay:400ms, search" hx-target="#hts-registry-results" hx-swap="outerHTML"
                  hx-include="this" hx-params="registry_q" autocomplete="off" spellcheck="false" data-registry-q>
         </label>
         <label class="field">

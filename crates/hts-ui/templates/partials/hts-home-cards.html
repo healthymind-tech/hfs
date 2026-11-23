@@ -1,7 +1,7 @@
 {#-
   Home cards fragment (design doc §7.1).
   Rendered once on hard navigation as part of `pages/home.html`, and
-  again on every 15 s htmx refresh via `GET /ui/hts/home/cards`. Same
+  again on every 15 s htmx refresh via `GET {{ crate::paths::ui() }}/home/cards`. Same
   markup either way — the outer `#hts-home-cards` region is swapped
   wholesale, so a partial failure never blanks the healthy tiles.
 

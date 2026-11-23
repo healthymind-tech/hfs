@@ -31,10 +31,19 @@
 {% if self.bad("") %}
 <div class="notice notice--danger" role="alert">{% call ui::icon("alert") %}{% endcall %}<span>{{ self.err("") }}</span></div>
 {% endif %}
+{% let form_id = "config-form" %}{% let anyway_key = "verify-block-save-anyway" %}
+{% include "partials/manager/verify-block.html" %}
 {% if errors.len() > 0 %}
-<div class="notice notice--danger" role="alert" tabindex="-1" data-autofocus>
+<div class="notice notice--danger error-summary" role="alert" tabindex="-1" data-autofocus>
   {% call ui::icon("alert") %}{% endcall %}
-  <span>{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}</span>
+  <div>
+    <p>{{ i18n.t_arg("mgr-form-errors", "count", errors.len()) }}</p>
+    <ul class="error-summary__list">
+      {%- for e in self.error_links() %}
+      <li>{% if !e.href.is_empty() %}<a href="{{ e.href }}" data-verify-goto="{{ e.id }}">{{ e.label }}</a>: {% endif %}{{ e.message }}</li>
+      {%- endfor %}
+    </ul>
+  </div>
 </div>
 {% endif %}
 {% for w in warnings %}

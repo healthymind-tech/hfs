@@ -70,6 +70,7 @@ pub fn routes_with_scope(api: SyncApi, scope: AdminTokenScope) -> Router {
         )
         .route("/admin/sync/duplicates", post(h::duplicate))
         .route("/admin/sync/$rewrap", post(h::rewrap))
+        .route("/admin/sync/$verify-peer", post(h::verify_peer))
         .with_state(api)
         // `route_layer`: only these routes (a `layer` would also wrap the
         // fallback this router carries into the app).

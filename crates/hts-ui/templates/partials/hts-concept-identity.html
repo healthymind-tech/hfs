@@ -2,7 +2,7 @@
   Panel 1 — Identity. `POST /CodeSystem/$lookup` with `property=*`.
 
   Rendered server-side in the page shell (first paint must be meaningful) and
-  also served standalone at `/ui/hts/concepts/identity`, which is why the
+  also served standalone at `{{ crate::paths::ui() }}/concepts/identity`, which is why the
   markup lives here rather than inline in `pages/concept.html`.
 
   Fact rows follow the HFS `detail__field` contract exactly: the label is the

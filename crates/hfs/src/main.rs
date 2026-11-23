@@ -2005,6 +2005,22 @@ fn mount_ui(
     // IG Packages page and nav entry follow the same switch as the
     // `/admin/packages` API (`HFS_ADMIN_UI`).
     helios_ui::set_package_admin(config.packages.admin_ui);
+    // The Terminology section of the console (`/ui/terminology`, one
+    // sign-in with the rest of it), over the configured terminology server.
+    if let Some(url) = config.terminology_server.clone() {
+        helios_ui::terminology_console::install(
+            helios_ui::terminology_console::TerminologyConsoleConfig {
+                upstream_url: url,
+                admin_token: config
+                    .packages
+                    .terminology_token
+                    .as_ref()
+                    .map(|t| t.expose().to_string()),
+                fhir_version: config.default_fhir_version.as_str(),
+                version: env!("CARGO_PKG_VERSION"),
+            },
+        );
+    }
     helios_ui::mount_with_body_limit_and_tenant_routing(
         app,
         env!("CARGO_PKG_VERSION"),

@@ -38,7 +38,10 @@ use crate::upstream::UpstreamError;
 use crate::{Chrome, HtsUiState, render_page};
 
 /// Browser-side base of the admin API (same origin as the console).
-pub(crate) const BROWSER_API: &str = "/ui/hts/api/admin";
+#[allow(non_snake_case)]
+pub(crate) fn BROWSER_API() -> &'static str {
+    crate::paths::fixed("/ui/hts/api/admin")
+}
 
 const SLOW: Duration = Duration::from_secs(25);
 const FAST: Duration = Duration::from_secs(8);
@@ -202,7 +205,7 @@ async fn submit_job(
         .await
     {
         Ok((202, job)) => match job.get("id").and_then(|i| i.as_str()) {
-            Some(id) => see_other(&format!("/ui/hts/jobs/{}", enc(id))),
+            Some(id) => see_other(&crate::paths::link(&format!("/ui/hts/jobs/{}", enc(id)))),
             None => see_other(&with_param(back, "error", "no job id")),
         },
         Ok((_, v)) => see_other(&with_param(back, "error", &message_of(&v))),
@@ -470,7 +473,7 @@ pub(crate) fn inventory_urls(
     if !show_all {
         path.push_str("&populated=true");
     }
-    let mut back = format!("/ui/hts/terminology?q={}", enc(query));
+    let mut back = crate::paths::link(&format!("/ui/hts/terminology?q={}", enc(query)));
     if sort != "concepts" {
         back.push_str(&format!("&sort={sort}"));
     }
@@ -523,8 +526,8 @@ pub(crate) fn flatten(i18n: &I18n, systems: Vec<InvSystem>) -> Vec<InvRow> {
 async fn set_current(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
     let back = field(&f, "back")
-        .filter(|b| b.starts_with("/ui/hts/"))
-        .unwrap_or("/ui/hts/terminology")
+        .filter(|b| b.starts_with(&format!("{}/", crate::paths::ui())))
+        .unwrap_or(crate::paths::manage())
         .to_string();
     let Some(url) = field(&f, "url") else {
         return see_other(&with_param(&back, "error", "url is required"));
@@ -671,11 +674,11 @@ async fn delete_submit(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Byt
     let f = parse_form(&body);
     let url = field(&f, "url").unwrap_or("").to_string();
     let version = field(&f, "version").unwrap_or("").to_string();
-    let back = format!(
+    let back = crate::paths::link(&format!(
         "/ui/hts/terminology/delete?url={}&version={}",
         enc(&url),
         enc(&version)
-    );
+    ));
     if field(&f, "confirm") != Some(url.as_str()) {
         return see_other(&with_param(&back, "error", "confirm"));
     }
@@ -692,7 +695,7 @@ async fn delete_submit(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Byt
 
 async fn delete_resource(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
-    let back = "/ui/hts/terminology";
+    let back = crate::paths::manage();
     let Some(url) = field(&f, "url") else {
         return see_other(&with_param(back, "error", "url is required"));
     };
@@ -714,7 +717,7 @@ async fn compact(State(state): State<Arc<HtsUiState>>, fwd: Fwd) -> Response {
         reqwest::Method::POST,
         "/maintenance/compact",
         None,
-        "/ui/hts/terminology",
+        crate::paths::manage(),
     )
     .await
 }
@@ -856,13 +859,13 @@ pub(crate) async fn import_admin(
             .map(String::from),
         incomplete,
         completed,
-        api: BROWSER_API,
+        api: BROWSER_API(),
     })
 }
 
 async fn start_import(State(state): State<Arc<HtsUiState>>, fwd: Fwd, body: Bytes) -> Response {
     let f = parse_form(&body);
-    let back = "/ui/hts/import";
+    let back = crate::paths::fixed("/ui/hts/import");
     let source = match field(&f, "admin_source") {
         Some("upload") => match field(&f, "upload_id") {
             Some(id) => json!({ "type": "upload", "upload_id": id }),
@@ -1323,7 +1326,7 @@ async fn cancel_job(
     fwd: Fwd,
     Path(id): Path<String>,
 ) -> Response {
-    let back = format!("/ui/hts/jobs/{}", enc(&id));
+    let back = crate::paths::link(&format!("/ui/hts/jobs/{}", enc(&id)));
     match state
         .upstream
         .admin_call(

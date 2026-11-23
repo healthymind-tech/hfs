@@ -1,7 +1,7 @@
 {% extends "layouts/base.html" %}
 
 {#
-  The "not found" page: every `/ui/hts/...` path no route answers renders this
+  The "not found" page: every `{{ crate::paths::ui() }}/...` path no route answers renders this
   inside the full shell — sidebar, topbar, language — with a way back to Home,
   instead of the bare 404 with an empty body the router used to return (a blank
   tab in the browser, no `<title>`, no `lang`). Same shape and the same catalog
@@ -16,7 +16,7 @@
   <h1 class="page-head__title">{{ chrome.i18n.t("not-found-title") }}</h1>
   <p class="error-page__text">{{ chrome.i18n.t("not-found-text") }}</p>
   <div class="error-page__actions">
-    <a class="btn btn--primary" href="/ui/hts">{{ chrome.i18n.t("hts-nav-home") }}</a>
+    <a class="btn btn--primary" href="{{ crate::paths::ui() }}">{{ chrome.i18n.t("hts-nav-home") }}</a>
   </div>
 </div>
 {% endblock %}

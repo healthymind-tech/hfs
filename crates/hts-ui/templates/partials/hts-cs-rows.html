@@ -37,7 +37,7 @@
     {#- Match count up front (UIF defect 3): it used to appear only in the
         foot, below 25 rows. -#}
     {% if let Some(page) = view.page() %}{% if let Some(total) = page.total %}
-    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}">{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}</span></div>
+    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}" data-searching="{{ chrome.i18n.t("tx-searching") }}">{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}</span></div>
     {% endif %}{% endif %}
     <div class="table-wrap" tabindex="0">
       <table class="data-table data-table--stack" aria-describedby="hts-cs-browser-heading">
@@ -65,7 +65,7 @@
                 <td class="col-name">
                   {#- CodeSystem ids carry a version pipe (`icd9cm|2015`),
                       so the path segment must be percent-encoded. -#}
-                  <a href="/ui/hts/code-systems/{{ row.id|urlencode_strict }}">
+                  <a href="{{ crate::paths::ui() }}/code-systems/{{ row.id|urlencode_strict }}">
                     {% if !row.name.is_empty() %}{{ row.name }}
                     {%- else %}{{ row.id }}
                     {%- endif %}
@@ -127,7 +127,7 @@
           </button>
           <a class="btn" href="{{ view.filters.page_url_at(next) }}" rel="next">{{ chrome.i18n.t("hts-browser-page-next") }}</a>
           {% endif %}
-          <form class="table-foot__goto" method="get" action="/ui/hts/code-systems">
+          <form class="table-foot__goto" method="get" action="{{ crate::paths::ui() }}/code-systems">
             <input type="hidden" name="url" value="{% if let Some(v) = view.filters.url %}{{ v }}{% endif %}">
             <input type="hidden" name="version" value="{% if let Some(v) = view.filters.version %}{{ v }}{% endif %}">
             <input type="hidden" name="name" value="{% if let Some(v) = view.filters.name %}{{ v }}{% endif %}">

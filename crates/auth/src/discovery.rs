@@ -278,9 +278,10 @@ impl reqwest::dns::Resolve for PolicyResolver {
                 })
                 .collect();
             if allowed.is_empty() {
-                let why = refused
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| format!("{host} did not resolve"));
+                let why = match refused {
+                    Some(e) => format!("{POLICY_RESOLVER_MARK} {e}"),
+                    None => format!("{host} did not resolve"),
+                };
                 return Err(why.into());
             }
             let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
@@ -292,7 +293,8 @@ impl reqwest::dns::Resolve for PolicyResolver {
 // ---------------------------------------------------------- issuer discovery
 
 /// The parts of an OpenID Provider configuration
-/// (`{issuer}/.well-known/openid-configuration`) SMART discovery uses.
+/// (`{issuer}/.well-known/openid-configuration`) SMART discovery and the
+/// configuration verifier ([`crate::verify`]) use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OidcMetadata {
     /// `issuer` as the IdP states it.
@@ -319,6 +321,15 @@ pub struct OidcMetadata {
     /// `end_session_endpoint`.
     #[serde(default)]
     pub end_session_endpoint: Option<String>,
+    /// `grant_types_supported` (empty when not stated).
+    #[serde(default)]
+    pub grant_types_supported: Vec<String>,
+    /// `code_challenge_methods_supported` (empty when not stated).
+    #[serde(default)]
+    pub code_challenge_methods_supported: Vec<String>,
+    /// `id_token_signing_alg_values_supported` (empty when not stated).
+    #[serde(default)]
+    pub id_token_signing_alg_values_supported: Vec<String>,
 }
 
 /// The discovery document URL of an issuer.
@@ -329,36 +340,277 @@ pub fn openid_configuration_url(issuer: &str) -> String {
     )
 }
 
+/// Why an outbound fetch failed, classified so a caller can tell the
+/// operator what to fix (DNS, refused connection, timeout, TLS, a web page
+/// where JSON was expected, …). Every `url` is redacted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FetchError {
+    /// The outbound policy refused the URL or every address of its host.
+    #[error("{url} refused by the outbound policy: {reason}")]
+    Blocked {
+        /// The URL.
+        url: String,
+        /// The policy's reason.
+        reason: String,
+    },
+    /// The host name did not resolve.
+    #[error("fetching {url}: the host name did not resolve ({reason})")]
+    Dns {
+        /// The URL.
+        url: String,
+        /// Resolver error.
+        reason: String,
+    },
+    /// Nothing listens at the address.
+    #[error("fetching {url}: connection refused")]
+    Refused {
+        /// The URL.
+        url: String,
+    },
+    /// No answer in time.
+    #[error("fetching {url}: timed out")]
+    Timeout {
+        /// The URL.
+        url: String,
+    },
+    /// The TLS handshake failed (certificate, protocol).
+    #[error("fetching {url}: TLS handshake failed ({reason})")]
+    Tls {
+        /// The URL.
+        url: String,
+        /// Handshake error.
+        reason: String,
+    },
+    /// Another transport error.
+    #[error("fetching {url}: {reason}")]
+    Connect {
+        /// The URL.
+        url: String,
+        /// The error.
+        reason: String,
+    },
+    /// A non-success HTTP status.
+    #[error("{url} answered HTTP {status}")]
+    Status {
+        /// The URL.
+        url: String,
+        /// The status code.
+        status: u16,
+    },
+    /// An HTML page where JSON was expected.
+    #[error("{url} answered with a web page, not JSON")]
+    Html {
+        /// The URL.
+        url: String,
+    },
+    /// The body is not the JSON document expected.
+    #[error("{url} is not valid JSON of the expected shape: {reason}")]
+    NotJson {
+        /// The URL.
+        url: String,
+        /// Parser error.
+        reason: String,
+    },
+    /// The body exceeds 1 MiB.
+    #[error("{url} is larger than 1 MiB")]
+    TooLarge {
+        /// The URL.
+        url: String,
+    },
+}
+
+impl FetchError {
+    /// Whether the request never got an HTTP answer (policy, DNS,
+    /// connection, timeout, TLS).
+    pub fn is_transport(&self) -> bool {
+        matches!(
+            self,
+            FetchError::Blocked { .. }
+                | FetchError::Dns { .. }
+                | FetchError::Refused { .. }
+                | FetchError::Timeout { .. }
+                | FetchError::Tls { .. }
+                | FetchError::Connect { .. }
+        )
+    }
+
+    /// Classifies a reqwest transport error for `url`.
+    pub fn from_reqwest(url: &str, e: &reqwest::Error) -> Self {
+        let url = redact_url(url);
+        if e.is_timeout() {
+            return FetchError::Timeout { url };
+        }
+        let mut texts = Vec::new();
+        let mut refused = false;
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+        while let Some(err) = source {
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                match io.kind() {
+                    std::io::ErrorKind::ConnectionRefused => refused = true,
+                    std::io::ErrorKind::TimedOut => return FetchError::Timeout { url },
+                    _ => {}
+                }
+            }
+            texts.push(err.to_string());
+            source = err.source();
+        }
+        let reason = texts.last().cloned().unwrap_or_default();
+        let all = texts.join(" | ").to_ascii_lowercase();
+        if all.contains(POLICY_RESOLVER_MARK) {
+            let reason = texts
+                .iter()
+                .find(|t| t.contains(POLICY_RESOLVER_MARK))
+                .map(|t| t.replace(POLICY_RESOLVER_MARK, "").trim().to_string())
+                .unwrap_or_default();
+            return FetchError::Blocked { url, reason };
+        }
+        if refused || all.contains("connection refused") {
+            return FetchError::Refused { url };
+        }
+        if all.contains("dns error")
+            || all.contains("failed to lookup address")
+            || all.contains("name or service not known")
+            || all.contains("no such host")
+            || all.contains("nodename nor servname")
+            || all.contains("did not resolve")
+        {
+            return FetchError::Dns { url, reason };
+        }
+        if all.contains("certificate")
+            || all.contains("tls")
+            || all.contains("handshake")
+            || all.contains("rustls")
+            || all.contains("corrupt message")
+            || all.contains("invalidcontenttype")
+        {
+            return FetchError::Tls { url, reason };
+        }
+        if all.contains("timed out") {
+            return FetchError::Timeout { url };
+        }
+        FetchError::Connect { url, reason }
+    }
+}
+
+/// Marker the policy resolver puts in its errors, so a refusal at
+/// connection time is reported as the policy's, not as a DNS failure.
+pub(crate) const POLICY_RESOLVER_MARK: &str = "[outbound-policy]";
+
+/// One HTTP answer, body read (at most 1 MiB).
+#[derive(Debug, Clone)]
+pub(crate) struct RawResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    /// Time until the response headers arrived.
+    pub headers_ms: u64,
+    /// Time until the body was read.
+    pub total_ms: u64,
+}
+
+impl RawResponse {
+    /// Whether the body looks like an HTML page.
+    pub fn is_html(&self) -> bool {
+        if self.content_type.contains("text/html") {
+            return true;
+        }
+        let head =
+            String::from_utf8_lossy(&self.body[..self.body.len().min(64)]).to_ascii_lowercase();
+        let head = head.trim_start();
+        head.starts_with("<!doctype html") || head.starts_with("<html")
+    }
+
+    /// The body as `T`: `Status` for non-2xx answers, `Html` for a web page,
+    /// `NotJson` otherwise.
+    pub fn json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, FetchError> {
+        if !(200..300).contains(&self.status) {
+            return Err(FetchError::Status {
+                url: redact_url(url),
+                status: self.status,
+            });
+        }
+        if self.is_html() {
+            return Err(FetchError::Html {
+                url: redact_url(url),
+            });
+        }
+        serde_json::from_slice(&self.body).map_err(|e| FetchError::NotJson {
+            url: redact_url(url),
+            reason: e.to_string(),
+        })
+    }
+}
+
+/// Sends `request` (built on `url`) and reads the answer; transport errors
+/// are classified ([`FetchError::from_reqwest`]).
+pub(crate) async fn send_raw(
+    url: &str,
+    request: reqwest::RequestBuilder,
+) -> Result<RawResponse, FetchError> {
+    let started = Instant::now();
+    let response = request
+        .send()
+        .await
+        .map_err(|e| FetchError::from_reqwest(url, &e))?;
+    let headers_ms = started.elapsed().as_millis() as u64;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| FetchError::from_reqwest(url, &e))?;
+    // CapabilityStatements of servers with many profiles run to megabytes
+    // (this server's own: ~2.6 MB with the core packages).
+    if body.len() > 32 * 1024 * 1024 {
+        return Err(FetchError::TooLarge {
+            url: redact_url(url),
+        });
+    }
+    Ok(RawResponse {
+        status,
+        content_type,
+        body: body.to_vec(),
+        headers_ms,
+        total_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// GETs `url` (JSON accepted) through `guard`: the policy's syntax check,
+/// then the guarded client.
+pub(crate) async fn get_raw(
+    url: &str,
+    guard: &OutboundGuard,
+    timeout: Duration,
+    bearer: Option<&str>,
+) -> Result<RawResponse, FetchError> {
+    guard.check_url(url).map_err(|reason| FetchError::Blocked {
+        url: redact_url(url),
+        reason,
+    })?;
+    let mut request = guard.client(timeout).get(url).header(
+        reqwest::header::ACCEPT,
+        "application/json, application/fhir+json",
+    );
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    send_raw(url, request).await
+}
+
 /// Fetches an issuer's OpenID configuration through `guard`.
 pub async fn fetch_oidc_metadata(
     issuer: &str,
     guard: &OutboundGuard,
-) -> Result<OidcMetadata, String> {
+) -> Result<OidcMetadata, FetchError> {
     let url = openid_configuration_url(issuer);
-    guard.check_url(&url)?;
-    let response = guard
-        .client(Duration::from_secs(10))
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("fetching {}: {}", redact_url(&url), e.without_url()))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "{} answered {}",
-            redact_url(&url),
-            response.status()
-        ));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("reading {}: {}", redact_url(&url), e.without_url()))?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(format!("{} is larger than 1 MiB", redact_url(&url)));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| format!("{} is not an OpenID configuration: {e}", redact_url(&url)))
+    get_raw(&url, guard, Duration::from_secs(10), None)
+        .await?
+        .json(&url)
 }
 
 /// How long a discovered (or failed) issuer configuration is reused.
@@ -404,7 +656,10 @@ impl IssuerDiscovery {
                 }
             }
         }
-        let result = fetch_oidc_metadata(issuer, guard).await.map(Arc::new);
+        let result = fetch_oidc_metadata(issuer, guard)
+            .await
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
         if let Err(e) = &result {
             tracing::warn!(error = %e, "issuer discovery failed");
         }
@@ -493,19 +748,30 @@ impl ProbeCheck {
 
 /// Algorithms the token verifier implements (`EndpointAuth::algorithms`
 /// may name others the model accepts, e.g. `PS256`; those never verify).
-const VERIFIER_ALGORITHMS: &[&str] = &["RS256", "RS384", "RS512", "ES256", "ES384"];
+pub(crate) const VERIFIER_ALGORITHMS: &[&str] = &["RS256", "RS384", "RS512", "ES256", "ES384"];
 
 /// Probes an endpoint's auth configuration (package P2's contract for the
 /// admin API's `$test-auth`, package P4).
 #[derive(Debug, Clone)]
 pub struct EndpointAuthProbe {
-    guard: OutboundGuard,
+    pub(crate) guard: OutboundGuard,
+    /// Per-request timeout of [`verify`](Self::verify) (default 10 s).
+    pub(crate) timeout: Duration,
 }
 
 impl EndpointAuthProbe {
     /// A probe fetching through `guard`.
     pub fn new(guard: OutboundGuard) -> Self {
-        Self { guard }
+        Self {
+            guard,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Sets the per-request timeout of [`verify`](Self::verify).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Runs the probe.
@@ -660,7 +926,7 @@ impl EndpointAuthProbe {
                     )
                 }
             }
-            Err(e) => step(false, Some(&url), e, None, started),
+            Err(e) => step(false, Some(&url), e.to_string(), None, started),
         }
     }
 
@@ -872,13 +1138,16 @@ mod tests {
     async fn the_policy_refuses_internal_addresses_before_connecting() {
         let (server, issuer) = idp(None).await;
         let strict = OutboundGuard::Policy(Arc::new(OutboundPolicy::strict()));
-        let err = fetch_oidc_metadata(&issuer, &strict).await.unwrap_err();
+        let err = fetch_oidc_metadata(&issuer, &strict)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("outbound policy"), "{err}");
         // A host name resolving to loopback is refused by the resolver too.
         let by_name = issuer.replace("127.0.0.1", "localhost");
         let https = by_name.replace("http://", "https://");
         let err = fetch_oidc_metadata(&https, &strict).await.unwrap_err();
-        assert!(!err.is_empty());
+        assert!(err.is_transport(), "{err}");
         assert!(server.received_requests().await.unwrap().is_empty());
         assert!(OutboundGuard::Trusted.check_url("http://anything/").is_ok());
         assert!(strict.check_url("https://user:pw@idp.example/").is_err());

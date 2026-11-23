@@ -41,6 +41,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/endpoints/{name}/history"),
     ("POST", "/admin/endpoints/{name}/$duplicate"),
     ("POST", "/admin/endpoints/{name}/$test-auth"),
+    ("POST", "/admin/endpoints/{name}/$verify-auth"),
+    ("POST", "/admin/endpoints/$verify-auth"),
+    ("POST", "/admin/endpoints/$verify-terminology"),
     ("GET", "/admin/endpoints/{name}/stats"),
     ("GET", "/admin/endpoints/{name}/audit"),
     ("GET", "/admin/endpoints/{name}/packages"),
@@ -123,6 +126,18 @@ pub fn routes(state: AdminEndpointsState) -> Router {
         .route(
             "/admin/endpoints/{name}/$test-auth",
             post(h::test_auth_handler),
+        )
+        .route(
+            "/admin/endpoints/{name}/$verify-auth",
+            post(h::verify_auth_handler),
+        )
+        .route(
+            "/admin/endpoints/$verify-auth",
+            post(h::verify_new_auth_handler),
+        )
+        .route(
+            "/admin/endpoints/$verify-terminology",
+            post(h::verify_terminology_handler),
         )
         .route("/admin/endpoints/{name}/stats", get(h::stats_handler))
         .route("/admin/endpoints/{name}/audit", get(h::audit_handler))

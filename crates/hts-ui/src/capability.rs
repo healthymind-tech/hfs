@@ -68,17 +68,26 @@ const JSON_FRAGMENT_ROUTE: &str = "/hts/capability-statement/json-fragment";
 /// The public URL the raw fold's `data-fragment-url` and pagination links
 /// point at. Must stay `/ui` + [`JSON_FRAGMENT_ROUTE`] in sync with the mount
 /// point [`crate::router`] documents.
-const JSON_FRAGMENT_URL: &str = "/ui/hts/capability-statement/json-fragment";
+#[allow(non_snake_case)]
+fn JSON_FRAGMENT_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/capability-statement/json-fragment")
+}
 const JSON_EXPAND_ROUTE: &str = "/hts/capability-statement/json-expand";
-const JSON_EXPAND_URL: &str = "/ui/hts/capability-statement/json-expand";
+#[allow(non_snake_case)]
+fn JSON_EXPAND_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/capability-statement/json-expand")
+}
 /// The no-JS fallback link: the page itself, requested with the plain-text
 /// query flag. HTS carries no filter or version query params to preserve, so
 /// (unlike HFS's `capability_raw_url`) this needs no builder.
-const PAGE_RAW_URL: &str = "/ui/hts/capability-statement?raw=1";
+#[allow(non_snake_case)]
+fn PAGE_RAW_URL() -> &'static str {
+    crate::paths::fixed("/ui/hts/capability-statement?raw=1")
+}
 
 fn fragment_endpoint(state: &HtsUiState) -> FragmentEndpoint<'_> {
     FragmentEndpoint {
-        base_path: JSON_FRAGMENT_URL,
+        base_path: JSON_FRAGMENT_URL(),
         version: state.fhir_version,
         extra_query: "",
     }
@@ -98,7 +107,9 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
         // canonicalization in `home.rs`; GET is the only verb here.
         .route(
             "/hts/diagnostics",
-            get(|| async { Redirect::permanent("/ui/hts/capability-statement") }),
+            get(|| async {
+                Redirect::permanent(&crate::paths::link("/ui/hts/capability-statement"))
+            }),
         )
 }
 
@@ -217,8 +228,8 @@ async fn build_view(
             cards.raw(
                 raw_requested,
                 &raw_text,
-                PAGE_RAW_URL,
-                JSON_EXPAND_URL,
+                PAGE_RAW_URL(),
+                JSON_EXPAND_URL(),
                 initial_outline.as_ref(),
             )
         })
