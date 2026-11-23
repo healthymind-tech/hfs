@@ -618,8 +618,6 @@ fn design_tokens_in_the_stylesheet_match_the_asserted_ones() {
             theme.warn_pill.1,
             theme.danger_pill.0,
             theme.danger_pill.1,
-            theme.info_pill.0,
-            theme.info_pill.1,
             theme.muted_pill.0,
             theme.muted_pill.1,
             theme.focus,

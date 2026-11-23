@@ -291,11 +291,6 @@
   --color-primary: #2f5be0;
   --color-on-primary: #ffffff;
   --on-accent-strong: #ffffff;
-  --color-accent: #2f5be0;
-  --color-accent-soft: rgb(47 91 224 / 9%);
-  --color-info: #2449b8;
-  --color-info-soft: #e3f1f9;
-  --color-info-text: #07618f;
   --ok-text: #17663f;
   --warn-text: #7f4b00;
   --danger-text: #a81f1f;
@@ -426,11 +421,6 @@
   --accent-soft: rgb(92 184 255 / 12%);
   --accent-strong: #5cb8ff;
   --on-accent-strong: #0b1320;
-  --color-accent: #5cb8ff;
-  --color-accent-soft: rgb(92 184 255 / 12%);
-  --color-info: #8fd0ff;
-  --color-info-soft: #12293d;
-  --color-info-text: #7dd6ff;
   --ok-text: #74dca8;
   --warn-text: #f5c66a;
   --danger-text: #ff9696;
@@ -621,8 +611,6 @@ a.nav-item:not([aria-current]):hover {
 .nav-item__label {
   white-space: nowrap;
 }
-
-
 
 /* ---------- Menus (tenant selector, shared popover panel) ---------- */
 
@@ -1369,12 +1357,6 @@ html.theme-fade *::after {
   color: var(--accent-text);
 }
 
-.stat__unit {
-  font-size: var(--fs-lg);
-  letter-spacing: -0.3px;
-  vertical-align: 12px;
-}
-
 .stat__sub {
   display: block;
   margin-top: 6px;
@@ -1843,7 +1825,6 @@ button.pill {
 html.js .needs-js {
   display: flex;
 }
-
 
 .stat-grid--5 {
   grid-template-columns: repeat(5, 1fr);
@@ -2592,22 +2573,6 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   margin-bottom: 16px;
 }
 
-/* One combined "Type / id" reference field, like Brett's editor — the slash
-   lives inside the field, not between two separate boxes. */
-.history__ref {
-  display: flex;
-  align-items: center;
-  height: 42px;
-  padding: 0 4px;
-  background: var(--input-bg);
-  border: 1px solid var(--surface-border);
-  border-radius: var(--r-md);
-}
-
-.history__ref:focus-within {
-  border-color: var(--accent);
-}
-
 .history__type,
 .history__id {
   height: 38px;
@@ -3217,7 +3182,7 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
 .notice--warn {
   color: var(--text);
   background: var(--warn-soft);
-  border: 1px solid var(--warn);
+  border: 0;
 }
 
 /* The shell's own notice (#1560), between the topbar and the page: aligned
@@ -3230,8 +3195,8 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   font-size: var(--fs-sm);
   color: var(--text);
   background: var(--warn-soft);
-  border: 1px solid var(--warn);
-  border-radius: var(--r-md);
+  border: 0;
+  border-radius: var(--r-sm);
 }
 
 /* The HTS OperationOutcome box (`crates/hts-ui/templates/partials/
@@ -3518,16 +3483,6 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   overflow-wrap: anywhere;
 }
 
-.detail-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.detail-stack > .form-actions {
-  margin-top: 0;
-}
-
 .kv-grid--flush {
   --kv-grid-margin-bottom: 0;
 }
@@ -3628,19 +3583,6 @@ details.json-fold[open] > summary .icon {
   flex-direction: column;
   gap: 14px;
   min-width: 0;
-}
-
-/* HTS Phase-5 filter-rail field group: label above a row of
-   mode-select + text-input. Input skin comes from
-   `.builder-row__value` / `.builder-row__modifier`; rules below
-   only handle the stacked layout and the sticky action row. */
-.filter-rail__field { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
-.filter-rail__field-label { margin: 0 2px; font-size: 11px; font-weight: 600; color: var(--muted); }
-.filter-rail__field-row { display: flex; gap: 6px; align-items: center; }
-.filter-rail__field-row .builder-row__value { flex: 1; min-width: 0; }
-.filter-rail__actions {
-  display: flex; gap: 8px; padding: 10px 4px 0; margin-top: 4px;
-  border-top: 1px solid var(--surface-border);
 }
 /* HTS browsers: bound Name column so long computer-friendly names
    (`hl7.terminology.r4.CodeSystem-*`) don't crowd Title. */
@@ -3877,7 +3819,6 @@ details.json-fold[open] > summary .icon {
   text-align: center;
   padding: 32px 12px;
 }
-
 
 /* Merge of two independent intents, 2026-08-28:
    - main excluded the empty-state row from hover highlighting, so "no
@@ -4671,16 +4612,6 @@ tr:hover .result-id__copy,
   }
 }
 
-@media (max-width: 520px) {
-  .bulk-import-manifests-card {
-    padding-top: 14px;
-  }
-
-  .bulk-import-manifest-row {
-    gap: 7px;
-    padding: 8px;
-  }
-}
 
 /* Detail panel (right rail on the SearchParameter viewer) */
 
@@ -4693,15 +4624,6 @@ tr:hover .result-id__copy,
   max-height: calc(100vh - 110px);
   padding: 16px;
   overflow-y: auto;
-}
-
-/* Full-width form sections (bulk export): the flex/gap/padding of .detail
-   without its sticky sidebar behavior (#608). */
-.form-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 16px;
 }
 
 /* Vertical gap between the stacked .form-panel/table-card sections of the
@@ -5946,7 +5868,6 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .editor-json__act:hover { color: var(--text); }
-.editor-json__act--on { color: var(--accent); border-color: var(--accent); }
 
 /* The Format button of the two JSON editor cards (#1757): it reuses
    `.editor-json__act`; the hint and the invalid-JSON status sit before it
@@ -6107,7 +6028,6 @@ details.card > summary.card-head::-webkit-details-marker {
   color: #cf222e;
 }
 .editor-validity--ok { color: var(--accent); }
-
 
 .alert code {
   display: block;
@@ -6571,35 +6491,12 @@ details.card > summary.card-head::-webkit-details-marker {
   margin: 8px 14px 12px;
 }
 
-.editor__side {
-  padding: 14px;
-  background: var(--surface);
-  border: 1px solid var(--surface-border);
-  border-radius: var(--r-md);
-  box-shadow: var(--surface-shadow);
-}
-
-.editor__validity {
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
-.editor__validity--ok {
-  color: var(--accent);
-}
-
 .editor__orphan {
   margin: 8px 0 0;
   font-size: var(--fs-xs);
   color: #cf222e;
 }
 
-@media (max-width: 1100px) {
-  .editor__panes {
-    grid-template-columns: 1fr;
-  }
-}
 
 }
 @layer components {
@@ -6639,11 +6536,6 @@ details.card > summary.card-head::-webkit-details-marker {
     flex: 1 1 100%;
     min-width: 0;
   }
-}
-
-.filter-rail__item--on {
-  background: var(--accent-soft);
-  color: var(--text-strong);
 }
 }
 
@@ -7723,7 +7615,6 @@ button.batch-check__at {
 #batch-preflight:focus {
   outline: none;
 }
-
 
 .batch-json {
   margin: 0;
@@ -9917,7 +9808,6 @@ body.app-shell .pane {
   top: 12px;
 }
 
-
 .muted {
   color: var(--muted);
 }
@@ -9957,8 +9847,8 @@ body.app-shell .pane {
 .status-pill--ok { background: var(--ok-soft); color: var(--ok-text); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
 .status-pill--warn { background: var(--warn-soft); color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
 .status-pill--danger { background: var(--danger-soft); color: var(--danger-text); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
-.status-pill--info { background: var(--color-info-soft); color: var(--color-info-text); border-color: color-mix(in srgb, var(--color-info) 30%, transparent); }
-.status-pill--accent { background: var(--color-accent-soft); color: var(--color-accent); border-color: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+.status-pill--info { background: var(--accent-soft); color: var(--accent-text); border-color: transparent; }
+.status-pill--accent { background: var(--accent-soft); color: var(--accent-text); border-color: transparent; }
 .status-pill--muted { background: var(--muted-soft); color: var(--muted-text); border-color: var(--surface-border); }
 
 .status-pill__note {
@@ -9970,18 +9860,9 @@ body.app-shell .pane {
 }
 
 .tag--ok { background: var(--ok-soft); color: var(--ok-text); }
-.tag--info { background: var(--color-info-soft); color: var(--color-info-text); }
+.tag--info { background: var(--surface-2); color: var(--text-2); }
 .tag--warn { background: var(--warn-soft); color: var(--warn-text); }
-.tag--accent { background: var(--color-accent-soft); color: var(--color-accent); }
-
-.chip--version {
-  font-family: ui-monospace, monospace;
-  font-weight: 600;
-  color: var(--accent-text);
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
-  background: var(--accent-soft);
-}
-
+.tag--accent { background: var(--accent-soft); color: var(--accent-text); }
 
 .btn svg {
   width: 14px;
@@ -9999,8 +9880,6 @@ body.app-shell .pane {
   border-color: var(--danger);
 }
 
-
-
 .notice:has(> svg) {
   display: flex;
   align-items: flex-start;
@@ -10014,11 +9893,11 @@ body.app-shell .pane {
   margin-top: 2px;
 }
 
-.notice--info { color: var(--text); background: var(--color-info-soft); border: 1px solid color-mix(in srgb, var(--color-info) 35%, transparent); }
-.notice--ok { color: var(--text); background: var(--ok-soft); border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent); }
-.notice--danger { color: var(--text); background: var(--danger-soft); border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent); }
+.notice--info { color: var(--text); background: var(--surface-2); border: 0; }
+.notice--ok { color: var(--text); background: var(--ok-soft); border: 0; }
+.notice--danger { color: var(--text); background: var(--danger-soft); border: 0; }
 .notice--warn > svg { color: var(--warn-text); }
-.notice--info > svg { color: var(--color-info-text); }
+.notice--info > svg { color: var(--accent); }
 .notice--ok > svg { color: var(--ok-text); }
 .notice--danger > svg { color: var(--danger-text); }
 
@@ -10606,17 +10485,6 @@ html.js .reveal:not(.is-shown) {
   font-family: ui-monospace, monospace;
 }
 
-.avatar--brand {
-  background: var(--brand-gradient);
-  color: #0e1726;
-  font-weight: 600;
-}
-
-.avatar--brand svg {
-  width: 16px;
-  height: 16px;
-}
-
 /* Verify results never sit under the sticky save bar: scrolling to a step
    (manager.js revealVerifyResult, Go to field) keeps the bar's height free
    below it, and the result ends with room to scroll past the bar. */
@@ -10844,8 +10712,6 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   }
 }
 
-
-
 .nav-item[aria-current="page"],
 .nav-item[aria-current="true"] {
   position: relative;
@@ -10871,7 +10737,6 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   outline-offset: 2px;
 }
 
-
 .endpoint-switch .selector__label {
   display: flex;
   flex-direction: column;
@@ -10885,15 +10750,6 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   font-weight: 600;
   color: var(--text-strong);
 }
-
-.endpoint-switch__path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-family: ui-monospace, monospace;
-  font-size: var(--fs-xs);
-  color: var(--muted);
-}
-
 
 @media (max-width: 1024px) {
   .topbar .product-switch {
@@ -10944,12 +10800,9 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 }
 
-
-
 .page-head__actions:empty {
   display: none;
 }
-
 
 /* ---------- Overview ---------- */
 .health-strip {
@@ -10957,56 +10810,6 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
   gap: 12px;
   margin-bottom: 20px;
-}
-
-.health-tile {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--surface-border);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-}
-
-.health-tile__icon {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  flex: none;
-  border-radius: var(--r-md);
-}
-
-.health-tile--ok .health-tile__icon { background: var(--ok-soft); color: var(--ok-text); }
-.health-tile--warn .health-tile__icon { background: var(--warn-soft); color: var(--warn-text); }
-.health-tile--danger .health-tile__icon { background: var(--danger-soft); color: var(--danger-text); }
-.health-tile--info .health-tile__icon { background: var(--color-info-soft); color: var(--color-info-text); }
-.health-tile--muted .health-tile__icon { background: var(--muted-soft); color: var(--muted-text); }
-
-.health-tile__text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.health-tile__label {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  color: var(--muted);
-}
-
-.health-tile__value {
-  font-size: var(--fs-md);
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
-.health-tile__figure {
-  font-family: ui-monospace, monospace;
-  font-weight: 500;
-  color: var(--muted);
 }
 
 .filter-bar {
@@ -11475,11 +11278,6 @@ form:has(.save-bar) .verify:has(.verify__result:not(:empty)) {
   align-items: flex-start;
   gap: 12px;
   margin-bottom: 16px;
-}
-
-.probe__result {
-  flex: 1 1 240px;
-  font-size: var(--fs-sm);
 }
 
 .probe__lines {
@@ -12281,7 +12079,7 @@ body.auth-page {
 
 .auth-policy__dot--info {
   border: 0;
-  color: var(--color-info-text);
+  color: var(--accent-text);
 }
 
 .auth-policy__dot--info svg {
@@ -12326,9 +12124,9 @@ body.auth-page {
 }
 
 .auth-status--lock {
-  color: var(--color-accent);
-  background: var(--color-accent-soft);
-  border-color: color-mix(in srgb, var(--color-accent) 25%, transparent);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: transparent;
 }
 
 .auth-status--warn {
@@ -12625,14 +12423,6 @@ body.auth-page {
     grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 10px;
   }
-
-  .health-tile {
-    padding: 10px 12px;
-  }
-
-  .health-tile__icon {
-    display: none;
-  }
 }
 
 /* Tablets: the same panels (and the dashboard's type picker, which ran
@@ -12827,20 +12617,6 @@ select.ctl {
     gap: 8px;
   }
 
-  .health-tile {
-    gap: 10px;
-    padding: 10px;
-  }
-
-  .health-tile__icon {
-    width: 30px;
-    height: 30px;
-  }
-
-  .health-tile:last-child:nth-child(odd) {
-    grid-column: 1 / -1;
-  }
-
   /* Data dashboard figures: two per row (five full-width cards before). */
   .stat-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
@@ -12937,9 +12713,6 @@ select.ctl {
      .form-actions block (12px top margin, even when empty) above Delete. */
   .data-table .row-actions {
     align-items: center;
-  }
-  .data-table .row-actions--start {
-    justify-content: flex-start;
   }
   /* The inventory is wide (eight columns): keep the source file short so
      the actions column stays on screen at 1440 px. */
@@ -13100,10 +12873,6 @@ html.theme-vt .content {
   }
   .verify__result {
     margin-top: 12px;
-  }
-  .verify.is-running .verify__run {
-    pointer-events: none;
-    opacity: 0.7;
   }
   .verify__progress {
     margin: 8px 0 0;
@@ -14304,11 +14073,6 @@ details.card[open] > summary.card-head > .disclosure__chevron {
   .empty-state__icon svg {
     width: 22px;
     height: 22px;
-  }
-
-  .avatar--brand {
-    background: var(--accent-soft);
-    color: var(--accent-text);
   }
 
   .endpoint-card {

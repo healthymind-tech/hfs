@@ -35,9 +35,9 @@ pub struct Theme {
     pub primary: &'static str,
     /// Text on primary buttons (`--color-on-primary`).
     pub on_primary: &'static str,
-    /// Accent (`--color-accent`).
+    /// Accent (`--accent`; the violet `--color-accent` is retired).
     pub accent: &'static str,
-    /// Info text (`--color-info`).
+    /// Info text (`--accent-text`; `--color-info` is retired).
     pub info: &'static str,
     /// Success / warning / danger (`--ok`, `--warn`, `--danger`).
     pub ok: &'static str,
@@ -51,8 +51,6 @@ pub struct Theme {
     pub warn_pill: (&'static str, &'static str),
     /// Danger pill.
     pub danger_pill: (&'static str, &'static str),
-    /// Info pill (`--color-info-soft`, `--color-info-text`).
-    pub info_pill: (&'static str, &'static str),
     /// Muted pill (`--muted-soft`, `--muted-text`).
     pub muted_pill: (&'static str, &'static str),
     /// Focus ring (`--color-focus-ring`).
@@ -81,7 +79,6 @@ pub const LIGHT: Theme = Theme {
     ok_pill: ("#e3f3ea", "#17663f"),
     warn_pill: ("#fbf0dc", "#7f4b00"),
     danger_pill: ("#fbe7e7", "#a81f1f"),
-    info_pill: ("#e3f1f9", "#07618f"),
     muted_pill: ("#f1f4f9", "#4a5568"),
     focus: "#1a8cff",
     surface_2: "#f1f4f9",
@@ -106,7 +103,6 @@ pub const DARK: Theme = Theme {
     ok_pill: ("#123026", "#74dca8"),
     warn_pill: ("#2f2612", "#f5c66a"),
     danger_pill: ("#3a1f27", "#ff9696"),
-    info_pill: ("#12293d", "#7dd6ff"),
     muted_pill: ("#162133", "#b4bfd0"),
     focus: "#49c6ff",
     surface_2: "#162133",
@@ -196,7 +192,6 @@ pub fn text_pairs(t: &Theme) -> Vec<(&'static str, &'static str, &'static str)> 
         ("ok-pill", t.ok_pill),
         ("warn-pill", t.warn_pill),
         ("danger-pill", t.danger_pill),
-        ("info-pill", t.info_pill),
         ("muted-pill", t.muted_pill),
     ] {
         v.push((label, fg, bg));
