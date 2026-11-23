@@ -609,7 +609,8 @@ impl IdpAdmin {
                 "must differ from the username",
             ));
         }
-        if pw.chars().all(|c| Some(c) == pw.chars().next()) {
+        let first = pw.chars().next().unwrap_or_default();
+        if pw.chars().all(|c| c == first) {
             return Err(IdpError::invalid(
                 "password",
                 "must not repeat one character",
@@ -800,6 +801,43 @@ impl IdpAdmin {
             .await?;
         self.rt.reload().await?;
         Ok(r)
+    }
+
+    // ------------------------------------------------------------ maintenance
+
+    /// One maintenance pass: purge expired one-time artefacts, sessions and
+    /// grants, then apply the key rotation planner to every realm. Run it
+    /// under a cluster lease (`cluster_jobs`) so one instance does it at a
+    /// time; every step is safe to repeat. Returns (rows purged, rotation
+    /// actions taken).
+    pub async fn run_maintenance(&self, now: DateTime<Utc>) -> Result<(u64, usize), IdpError> {
+        let purged = self.store().purge_expired(now).await?;
+        let mut actions = 0;
+        for r in self.store().list_realms().await? {
+            match self.run_rotation(&r.id, now).await {
+                Ok(a) => actions += a.len(),
+                Err(e) => {
+                    tracing::error!(realm = %r.spec.name.as_str(), error = %e, "IdP key rotation failed")
+                }
+            }
+        }
+        Ok((purged, actions))
+    }
+
+    /// Runs [`IdpAdmin::run_maintenance`] every `every` (single-node use; a
+    /// cluster wraps the call in its lease instead).
+    pub fn spawn_maintenance(&self, every: std::time::Duration) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if let Err(e) = me.run_maintenance(Utc::now()).await {
+                    tracing::warn!(error = %e, "IdP maintenance failed");
+                }
+            }
+        })
     }
 
     // ------------------------------------------------------------ EHR launch

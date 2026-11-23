@@ -262,19 +262,39 @@ async fn authorize(s: IdpServer, realm_name: String, p: Params) -> Response {
         return fail(OAuthError::invalid_request("parameter too long"));
     }
 
-    // Audience: SMART `aud` (required); RFC 8707 `resource` as a synonym.
+    // Audience: SMART `aud` (required for SMART launches); RFC 8707
+    // `resource` as a synonym. A pure OpenID Connect sign-in (only
+    // identity scopes: openid, profile, email, offline_access) needs no FHIR
+    // audience; its access token is then only good for userinfo.
     let aud = match (p.get("aud"), p.get("resource")) {
         (Some(a), Some(r)) if a.trim_end_matches('/') != r.trim_end_matches('/') => {
             return fail(OAuthError::invalid_request("aud and resource differ"));
         }
-        (Some(a), _) => a,
-        (None, Some(r)) => r,
-        (None, None) => return fail(OAuthError::invalid_request("aud is required")),
+        (Some(a), _) => Some(a),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
     };
-    let Some((endpoint, aud_url)) = realm.endpoint_for_aud(aud).cloned() else {
-        return fail(OAuthError::invalid_request(
-            "aud is not a FHIR endpoint served by this authorization server",
-        ));
+    let identity_only = p.get("scope").is_some_and(|sc| {
+        let toks = scope::split_scopes(sc);
+        toks.iter().any(|t| t == "openid")
+            && toks.iter().all(|t| {
+                matches!(
+                    t.as_str(),
+                    "openid" | "profile" | "email" | "offline_access"
+                )
+            })
+    });
+    let (endpoint, aud_url) = match aud {
+        Some(a) => match realm.endpoint_for_aud(a).cloned() {
+            Some(e) => e,
+            None => {
+                return fail(OAuthError::invalid_request(
+                    "aud is not a FHIR endpoint served by this authorization server",
+                ));
+            }
+        },
+        None if identity_only && p.get("launch").is_none() => (String::new(), issuer.clone()),
+        None => return fail(OAuthError::invalid_request("aud is required")),
     };
 
     // Scopes: requested ∩ realm features ∩ client policy.

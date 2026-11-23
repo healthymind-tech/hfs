@@ -340,10 +340,10 @@ impl IdpRuntime {
                 tick.tick().await;
                 let current = me.store.config_epoch().await.unwrap_or(None);
                 let seen = me.snap.load().epoch;
-                if current.is_none() || current != seen {
-                    if let Err(e) = me.reload().await {
-                        tracing::warn!(error = %e, "IdP runtime reload failed");
-                    }
+                if (current.is_none() || current != seen)
+                    && let Err(e) = me.reload().await
+                {
+                    tracing::warn!(error = %e, "IdP runtime reload failed");
                 }
             }
         })
