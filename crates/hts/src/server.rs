@@ -506,6 +506,18 @@ where
     let admin_config = crate::admin::AdminConfig::from_hts(config);
     let ops: Arc<dyn crate::admin::TerminologyAdmin> = state.backend.clone();
     let importer: Arc<dyn BundleImportBackend> = state.importing_backend().clone();
+    // Embedded in hfs: admin-job imports are paced so FHIR traffic on the
+    // same database keeps its latency (`HFS_TERMINOLOGY_IMPORT_*`).
+    let importer: Arc<dyn BundleImportBackend> = match &state.import_throttle {
+        Some(policy) => {
+            tracing::info!(?policy, "terminology admin imports are throttled");
+            Arc::new(crate::import::throttle::ThrottledBackend::new(
+                importer,
+                policy.clone(),
+            ))
+        }
+        None => importer,
+    };
     let on_change = {
         let st = state.clone();
         Arc::new(move || {

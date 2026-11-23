@@ -78,6 +78,11 @@ pub struct EmbeddedOptions {
     /// `HFS_TERMINOLOGY_IMPORT_PG_POOL_SIZE`, default 4). 0: imports share
     /// the serving pool.
     pub import_pool_size: usize,
+    /// Pacing of admin-job imports; the PostgreSQL store adds a probe on
+    /// the serving pool (adaptive back-off).
+    pub import_throttle: crate::import::throttle::ThrottlePolicy,
+    /// `synchronous_commit=off` for the import pool's sessions only.
+    pub import_async_commit: bool,
 }
 
 /// The running embedded terminology service.
@@ -141,6 +146,52 @@ pub async fn ensure_schema(database_url: &str, schema: &str) -> anyhow::Result<(
     drop(client);
     let _ = conn.await;
     Ok(())
+}
+
+/// The import pool's connection string: `url` plus
+/// `-c synchronous_commit=off` (import sessions only; FHIR and terminology
+/// reads keep durable commits) appended to any `options` already there.
+pub fn import_url(url: &str, async_commit: bool) -> String {
+    if !async_commit {
+        return url.to_string();
+    }
+    let extra = "-c synchronous_commit=off";
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let Ok(mut parsed) = url::Url::parse(url) else {
+            return url.to_string();
+        };
+        let mut pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        match pairs.iter_mut().find(|(k, _)| k == "options") {
+            Some((_, v)) => {
+                v.push(' ');
+                v.push_str(extra);
+            }
+            None => pairs.push(("options".into(), extra.into())),
+        }
+        let query: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, pct(v)))
+            .collect();
+        parsed.set_query(Some(&query.join("&")));
+        parsed.to_string()
+    } else {
+        format!("{url} options='{extra}'")
+    }
+}
+
+/// libpq-style percent encoding (space as `%20`).
+fn pct(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// Run `fut` on the import runtime when there is one.
@@ -247,7 +298,7 @@ async fn start_postgres(options: EmbeddedOptions) -> anyhow::Result<EmbeddedHts>
     let import_backend = if options.import_pool_size > 0 {
         Some(
             PostgresTerminologyBackend::with_pool_settings(
-                &url,
+                &import_url(&url, options.import_async_commit),
                 options.import_pool_size,
                 pool.wait_timeout_secs,
                 pool.connect_timeout_secs,
@@ -274,9 +325,24 @@ async fn start_postgres(options: EmbeddedOptions) -> anyhow::Result<EmbeddedHts>
         });
     }
 
+    // Adaptive pacing: how long a trivial query takes on the *serving* pool.
+    let mut throttle = options.import_throttle.clone();
+    if throttle.probe.is_none() && throttle.probe_slow > Duration::ZERO {
+        let probe_backend = backend.clone();
+        throttle.probe = Some(Arc::new(move || {
+            let b = probe_backend.clone();
+            Box::pin(async move {
+                let t0 = std::time::Instant::now();
+                let _ = b.terminology_epoch().await;
+                t0.elapsed()
+            })
+        }));
+    }
+
     let (changes_tx, changes_rx) = tokio::sync::watch::channel(0u64);
     let state = AppState::new(backend.clone())
         .with_import_backend(import_backend)
+        .with_import_throttle(Some(throttle))
         .with_resource_store_pg(resource_store)
         .with_terminology_importer(Arc::new(backend.clone()))
         .with_max_expansion_size(config.max_expansion_size)
@@ -490,6 +556,11 @@ mod tests {
             call_timeout: Duration::from_secs(30),
             readonly: false,
             import_pool_size: 0,
+            import_throttle: crate::import::throttle::ThrottlePolicy {
+                duty: 1.0,
+                ..Default::default()
+            },
+            import_async_commit: false,
         }
     }
 
@@ -822,5 +893,24 @@ mod tests {
             admin.oneshot(post).await.unwrap().status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn import_url_adds_async_commit_to_existing_options() {
+        let u = import_url(
+            "postgres://hfs:pw@db:5432/hfs?options=-c%20search_path%3Dterminology%2Cpublic",
+            true,
+        );
+        assert!(
+            u.contains(
+                "options=-c%20search_path%3Dterminology%2Cpublic%20-c%20synchronous_commit%3Doff"
+            ),
+            "{u}"
+        );
+        assert_eq!(
+            import_url("postgres://db/hts", true),
+            "postgres://db/hts?options=-c%20synchronous_commit%3Doff"
+        );
+        assert_eq!(import_url("postgres://db/hts", false), "postgres://db/hts");
     }
 }

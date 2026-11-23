@@ -308,6 +308,10 @@ pub struct AppState<B: TerminologyBackend> {
     /// pool instead of holding the connections `$validate-code` and
     /// `$expand` need. `None`: [`Self::backend`].
     pub import_backend: Option<Arc<B>>,
+
+    /// Pacing of admin-job imports (`HFS_TERMINOLOGY_IMPORT_*`): see
+    /// [`crate::import::throttle`]. `None`: unthrottled.
+    pub import_throttle: Option<crate::import::throttle::ThrottlePolicy>,
 }
 
 /// Default for [`AppState::import_finalize_wait`]: comfortably inside the
@@ -349,6 +353,7 @@ impl<B: TerminologyBackend> AppState<B> {
             changes: None,
             import_runtime: None,
             import_backend: None,
+            import_throttle: None,
         }
     }
 
@@ -427,6 +432,15 @@ impl<B: TerminologyBackend> AppState<B> {
     /// Imports write through `backend` (see [`Self::import_backend`]).
     pub fn with_import_backend(mut self, backend: Option<B>) -> Self {
         self.import_backend = backend.map(Arc::new);
+        self
+    }
+
+    /// Pace admin-job imports with `policy` (inactive policies are dropped).
+    pub fn with_import_throttle(
+        mut self,
+        policy: Option<crate::import::throttle::ThrottlePolicy>,
+    ) -> Self {
+        self.import_throttle = policy.filter(|p| p.is_active());
         self
     }
 

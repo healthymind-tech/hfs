@@ -297,6 +297,15 @@ async fn start_embedded(
         bearer,
         call_timeout: settings.timeout,
         readonly: readonly(view),
+        import_throttle: import_throttle(view),
+        import_async_commit: !view
+            .get("HFS_TERMINOLOGY_IMPORT_SYNC_COMMIT")
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            }),
         import_pool_size: view
             .get("HFS_TERMINOLOGY_IMPORT_PG_POOL_SIZE")
             .and_then(|v| v.trim().parse().ok())
@@ -337,6 +346,33 @@ async fn start_embedded(
     Err(ConfigError::EmbeddedNotBuilt.into())
 }
 
+/// Default write duty cycle of admin-job imports (half the wall time).
+pub const DEFAULT_IMPORT_DUTY: f64 = 0.5;
+/// Default import batch size of the embedded service (standalone HTS: 5000).
+pub const DEFAULT_IMPORT_BATCH_SIZE: usize = 2000;
+
+/// Pacing of admin-job imports (design §8.2, U3 follow-up):
+/// `HFS_TERMINOLOGY_IMPORT_DUTY` (0.05–1, default 0.5; 1 = no pacing),
+/// `HFS_TERMINOLOGY_IMPORT_MAX_PAUSE_MS` (default 2000),
+/// `HFS_TERMINOLOGY_IMPORT_PROBE_SLOW_MS` (serving-pool latency that makes
+/// the import back off; default 25, 0 = no probe).
+#[cfg(feature = "terminology")]
+pub fn import_throttle(view: &EnvView) -> helios_hts::import::throttle::ThrottlePolicy {
+    let num = |k: &str| view.get(k).and_then(|v| v.trim().parse::<f64>().ok());
+    helios_hts::import::throttle::ThrottlePolicy {
+        duty: num("HFS_TERMINOLOGY_IMPORT_DUTY")
+            .unwrap_or(DEFAULT_IMPORT_DUTY)
+            .clamp(0.05, 1.0),
+        max_pause: Duration::from_millis(
+            num("HFS_TERMINOLOGY_IMPORT_MAX_PAUSE_MS").unwrap_or(2000.0) as u64,
+        ),
+        probe_slow: Duration::from_millis(
+            num("HFS_TERMINOLOGY_IMPORT_PROBE_SLOW_MS").unwrap_or(25.0) as u64,
+        ),
+        probe: None,
+    }
+}
+
 /// The HTS settings of the embedded service, from the `HFS_TERMINOLOGY_*`
 /// view (legacy `HTS_*` already folded in). Anything not named keeps the
 /// standalone server's default, so embedded answers match it exactly.
@@ -350,10 +386,6 @@ pub fn hts_config(
         ("HFS_TERMINOLOGY_MAX_EXPANSION_SIZE", "--max-expansion-size"),
         ("HFS_TERMINOLOGY_AUTO_SUPPLEMENTS", "--auto-supplements"),
         ("HFS_TERMINOLOGY_BOOTSTRAP_DIR", "--bootstrap-dir"),
-        (
-            "HFS_TERMINOLOGY_BOOTSTRAP_BATCH_SIZE",
-            "--bootstrap-batch-size",
-        ),
         (
             "HFS_TERMINOLOGY_CACHE_SYNC_INTERVAL_MS",
             "--cache-sync-interval-ms",
@@ -383,6 +415,15 @@ pub fn hts_config(
         format!("--database-url={database_url}"),
         format!("--storage-backend={storage}"),
     ];
+    // Embedded imports write in smaller transactions than standalone HTS so
+    // FHIR commits on the same database wait less behind them.
+    let batch = view
+        .get("HFS_TERMINOLOGY_IMPORT_BATCH_SIZE")
+        .or_else(|| view.get("HFS_TERMINOLOGY_BOOTSTRAP_BATCH_SIZE"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_IMPORT_BATCH_SIZE)
+        .max(1);
+    args.push(format!("--bootstrap-batch-size={batch}"));
     for (name, flag) in FLAGS {
         if let Some(value) = view.get(name) {
             let value = match *flag {
@@ -734,6 +775,15 @@ mod tests {
         // Defaults the embedded service must share with standalone HTS.
         assert_eq!(hts.max_expansion_size, 3500);
         assert_eq!(hts.cache_sync_interval_ms, 1000);
+        assert_eq!(hts.bootstrap_batch_size, DEFAULT_IMPORT_BATCH_SIZE);
+        let t = import_throttle(&r.view);
+        assert_eq!(t.duty, DEFAULT_IMPORT_DUTY);
+        let tuned = import_throttle(&view(&[
+            ("HFS_TERMINOLOGY_IMPORT_DUTY", "0.25"),
+            ("HFS_TERMINOLOGY_IMPORT_PROBE_SLOW_MS", "0"),
+        ]));
+        assert_eq!(tuned.duty, 0.25);
+        assert!(tuned.probe_slow.is_zero());
         assert!(r.view.deprecations.len() >= 5);
         for d in &r.view.deprecations {
             assert!(!d.message().contains("secret"));
