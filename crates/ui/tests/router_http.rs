@@ -3281,6 +3281,17 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     let html = body_text(response).await;
     // The type filter rail, the search builder, and the Create button.
     assert!(html.contains(r#"id="type-rail-list""#));
+    // The rail is handled in place by search-builder.js, never boosted by
+    // the persistent shell (a boosted reload raced its settings write).
+    let aside = html
+        .split(r#"<aside class="filter-rail""#)
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or_default();
+    assert!(
+        aside.contains(r#"hx-boost="false""#),
+        "rail opts out of hx-boost: {aside}"
+    );
     assert!(html.contains(r#"id="saved-query-form""#));
     assert!(html.contains(r#"id="resource-create""#));
     assert!(html.contains(r#"data-create-eligible="true""#));
@@ -9458,7 +9469,11 @@ async fn shared_builder_asset_is_served_and_the_legacy_asset_is_absent() {
     // with the ETag of its own read: no shared ETag that two concurrent
     // cycles (rail click + recorded run) could race into a 412.
     assert!(script.contains("var settingsQueue = Promise.resolve();"));
-    assert_eq!(script.matches("method: \"PATCH\"").count(), 1, "one PATCH site");
+    assert_eq!(
+        script.matches("method: \"PATCH\"").count(),
+        1,
+        "one PATCH site"
+    );
     assert!(!script.contains("var etag"), "no page-wide ETag");
     let response = app()
         .oneshot(

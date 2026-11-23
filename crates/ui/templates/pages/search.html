@@ -20,7 +20,11 @@
     classes shared across Resources, Search, and Search
     Parameters — no bordered card around it here.
   -->
-  <aside class="filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}"
+  {#- hx-boost="false": search-builder.js handles a rail click in place
+      (select, pushState, one queued settings write). Boosted, the persistent
+      shell would also reload the page — a second, server-side settings write
+      racing the client's into a 412. -#}
+  <aside class="filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}" hx-boost="false"
          data-selected-type="{{ selected_type }}">
     <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
     <div class="filter-rail__search">
