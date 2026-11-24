@@ -18,7 +18,7 @@
     <input class="gsearch__input" id="gsearch-input" type="search" name="q" autocomplete="off" spellcheck="false"
            role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="gsearch-list" aria-haspopup="listbox"
            aria-label="{{ i18n.t("gs-label") }}" aria-describedby="gsearch-hint" placeholder="{{ i18n.t("gs-placeholder") }}" maxlength="100">
-    <kbd class="gsearch__kbd" aria-hidden="true" data-gs-kbd>Ctrl K</kbd>
+    <kbd class="gsearch__kbd" aria-hidden="true" data-gs-kbd><span class="kbd-other">Ctrl K</span><span class="kbd-mac">⌘K</span></kbd>
     <button type="button" class="gsearch__close" data-gs-close aria-label="{{ i18n.t("gs-close") }}">{% include "icons/x.svg" %}</button>
   </form>
   <span class="visually-hidden" id="gsearch-hint">{{ i18n.t("gs-help-navigate") }}, {{ i18n.t("gs-help-open") }}, {{ i18n.t("gs-help-close") }}</span>

@@ -6,8 +6,10 @@
   paint, without waiting on a network round trip, or a dark preference
   flashes light. It only *reads* the preference (shared cookie, then the
   pre-cookie localStorage cache) and stamps `data-theme-pref` (system |
-  light | dark) and the effective `data-theme` (light | dark) on <html>.
+  light | dark) and the effective `data-theme` (light | dark) on <html> --
+  and `data-kbd="mac"` on Apple platforms, so shortcut hints (⌘K vs
+  Ctrl K) are right from the first paint and never swapped afterwards.
   Everything else -- cycling, persistence, migration, cross-tab and
   cross-console sync, animation -- lives in `crates/ui/assets/theme.js`.
-#}<script>(function(d,w){var e=d.documentElement,p=null;e.classList.add("js");try{var m=d.cookie.match(/(?:^|;\s*){{ cookie }}=(system|light|dark)(?:;|$)/);p=m&&m[1];if(!p){var l=w.localStorage.getItem("{{ legacy_key }}");if(l==="light"||l==="dark")p=l}}catch(x){}p=p||"system";var k=p==="dark"||(p==="system"&&!!w.matchMedia&&w.matchMedia("(prefers-color-scheme: dark)").matches);e.setAttribute("data-theme-pref",p);e.setAttribute("data-theme",k?"dark":"light")})(document,window);</script>
+#}<script>(function(d,w){var e=d.documentElement,p=null;e.classList.add("js");try{var m=d.cookie.match(/(?:^|;\s*){{ cookie }}=(system|light|dark)(?:;|$)/);p=m&&m[1];if(!p){var l=w.localStorage.getItem("{{ legacy_key }}");if(l==="light"||l==="dark")p=l}}catch(x){}p=p||"system";var k=p==="dark"||(p==="system"&&!!w.matchMedia&&w.matchMedia("(prefers-color-scheme: dark)").matches);if(/Mac|iPhone|iPad/.test(w.navigator.platform||w.navigator.userAgent||""))e.setAttribute("data-kbd","mac");e.setAttribute("data-theme-pref",p);e.setAttribute("data-theme",k?"dark":"light")})(document,window);</script>
 {#- -#}

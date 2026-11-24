@@ -420,3 +420,9 @@
     }
   }
 }
+
+/* ⌘K on Apple platforms, Ctrl K elsewhere — decided before first paint. */
+html[data-kbd="mac"] .kbd-other,
+html:not([data-kbd="mac"]) .kbd-mac {
+  display: none;
+}
