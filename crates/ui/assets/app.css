@@ -15826,3 +15826,30 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     margin-top: var(--s4);
   }
 }
+
+/* The endpoint path prefix truncates inside its own box (a flex box cannot
+   ellipsize its text); a sync job's definition sits inside its card. */
+@layer pages {
+  .input-prefix__text {
+    display: block;
+    flex: 0 1 auto;
+    min-width: 0;
+    line-height: 38px;
+  }
+
+  .input-prefix .mfield__input {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .card > .code-block,
+  .code-block {
+    margin: 0;
+    padding: var(--s4) var(--s5);
+    overflow: auto;
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    line-height: 1.6;
+    color: var(--text-2);
+  }
+}
