@@ -88,7 +88,10 @@
   // Confirmations through the shared in-page dialog.
   document.addEventListener("click", function (e) {
     var btn = e.target.closest && e.target.closest("button[data-confirm]");
-    if (!btn || btn.hasAttribute("data-confirmed")) return;
+    // conformance-crud.js asks for its own Delete buttons (View Definitions,
+    // SQL Queries/Views...): asking here too opened a second dialog that
+    // superseded the first, and the delete never ran.
+    if (!btn || btn.hasAttribute("data-confirmed") || btn.hasAttribute("data-crud-delete")) return;
     if (!window.HfsConfirm) return;
     e.preventDefault();
     window.HfsConfirm.ask(btn.getAttribute("data-confirm"), { danger: true }).then(function (ok) {

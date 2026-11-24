@@ -1,5 +1,6 @@
 {% extends "layouts/base.html" %}
 {% import "partials/rail_recent.html" as recent %}
+{% import "partials/workspace.html" as ws %}
 
 {#
   View Definitions playground (#649, Figma 420-2; #752 re-focus): rail of
@@ -78,9 +79,16 @@
 
 {#- `hx-history="false"`: the rail filter replaces the URL (#1275); htmx must not
     snapshot this page — editor text, `$sql-run` rows — into localStorage for it. -#}
-<div class="filter-layout filter-layout--two" hx-history="false">
-  <aside class="filter-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
-    <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
+{#- `data-ws` (hm/vd-layout): the collapsible rail, quick switcher, and
+    resizable editor/form split (`partials/workspace.html`, `workspace.js`).
+    `data-rail-few`: a short, unfiltered, single-page list starts collapsed
+    until the user opens the rail themselves. -#}
+<div class="filter-layout filter-layout--two" hx-history="false" data-ws{% if rail.len() <= 3 && filter.is_empty() && prev_href.is_none() && next_href.is_none() %} data-rail-few{% endif %}>
+  <aside class="filter-rail" id="ws-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
+    <div class="filter-rail__top">
+      <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
+      {% call ws::rail_toggle("ws-rail") %}{% endcall %}
+    </div>
     <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
       {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
       {% if is_new %}
@@ -132,11 +140,15 @@
          matching SQL Queries / SQL Views) and the view's name left; Duplicate / Delete /
          Create New right. Duplicate submits the form below with its own
          intent, so it stays inside the form via the `form` attribute. -->
-    <section class="page-head page-head--row">
+    <section class="page-head page-head--row ws-head">
+      <div class="ws-title">
       <h2 class="page-head__title page-head__title--kind">
         <span class="icon" aria-hidden="true">{% include "icons/grid.svg" %}</span>
-        {% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}
+        <span class="ws-title__name">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</span>
       </h2>
+      {% call ws::switcher("ws-rail", i18n.t("ws-switch-vd")) %}{% endcall %}
+      </div>
+      {% call ws::pane_switch("vd-editor-grid") %}{% endcall %}
       <div class="page-head__actions">
         {#- Implicit-submission guard (#1754). Enter in a one-line field of the
             editor form clicks the form's *default button*: its first submit
@@ -199,7 +211,8 @@
          actually completed. `vd-editor.js` substitutes it and picks the
          singular/plural form itself before handing the result to the
          shared in-page confirmation (`confirm.js`, #1667). -->
-    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
+    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid" data-ws-pair="fill"
+         data-ws-split-label="{{ i18n.t("ws-split-label") }}"
          data-msg-required="{{ i18n.t("vd-complete-required") }}"
          data-msg-quickfix="{{ i18n.t("vd-quickfix-menu") }}"
          data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
@@ -216,7 +229,7 @@
           <h3>{{ i18n.t("vd-json-heading") }}</h3>
           <div class="card-head__tools card-head__tools--wrap">
             <p class="editor-legend">
-              <span class="editor-legend__live">{{ i18n.t("vd-run-hint") }}</span>
+              <span class="editor-legend__live" title="{{ i18n.t("vd-run-hint") }}">{{ i18n.t("vd-run-hint") }}</span>
             </p>
             <span class="editor-format__status" role="status" data-editor-format-status
                   data-msg-invalid="{{ i18n.t("editor-format-invalid") }}"></span>
@@ -299,4 +312,5 @@
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/vd-editor.js" defer></script>
+<script src="/ui/assets/workspace.js" defer></script>
 {% endblock %}

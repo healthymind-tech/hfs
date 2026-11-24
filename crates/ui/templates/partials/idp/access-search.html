@@ -1,0 +1,20 @@
+{#- Add picker results (crate::idp::access::SearchResults): a listbox the
+    picker script moves through with the arrow keys. -#}
+{% if let Some(m) = message %}
+<p class="access-pick__msg" role="status">{{ i18n.t(m) }}</p>
+{% else %}
+<ul class="access-pick__list" id="access-pick-list" role="listbox" aria-multiselectable="true" aria-label="{{ i18n.t("idpa-results") }}">
+  {% for o in options %}
+  <li class="access-pick__opt{% if o.granted.is_some() %} is-granted{% endif %}" role="option" id="access-opt-{{ loop.index }}"
+      data-key="{{ o.key }}" aria-selected="false"{% if o.granted.is_some() %} aria-disabled="true"{% endif %}>
+    <span class="access-pick__box" aria-hidden="true"></span>
+    <span class="access-pick__main">
+      <span class="access-pick__name" title="{{ o.reference }}">{% if o.name.is_empty() %}{{ o.reference }}{% else %}{{ o.name }}{% endif %}</span>
+      {% if !o.name.is_empty() || !o.detail.is_empty() %}<span class="access-pick__sub">{% if !o.name.is_empty() %}<code>{{ o.reference }}</code>{% endif %}{% if !o.name.is_empty() && !o.detail.is_empty() %} · {% endif %}{{ o.detail }}</span>{% endif %}
+    </span>
+    {% if let Some(k) = o.granted %}<span class="tag">{{ i18n.t("idpa-already") }} · {{ i18n.t(k) }}</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% if more %}<p class="access-pick__more">{{ i18n.t("idpa-search-more") }}</p>{% endif %}
+{% endif %}

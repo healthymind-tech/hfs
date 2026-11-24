@@ -127,8 +127,20 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
 /// * everything else — creating or deleting endpoints, `$rewrap`, console
 ///   users and settings, packages, tenants, sync — **global** admin.
 ///
+/// * `/admin/idp/realms/{realm}/users/{user}/links` (a user's resource
+///   access in bulk) — viewer to read (copy, export), editor to change,
+///   the same as the console's resource-access editor;
+///
 /// Returns `(role, endpoint)`; `endpoint = None` means the global role.
 pub fn admin_api_requirement(method: &Method, path: &str) -> (ConsoleRole, Option<String>) {
+    if is_idp_user_links(path) {
+        let role = if is_read_only(method) {
+            ConsoleRole::Viewer
+        } else {
+            ConsoleRole::Editor
+        };
+        return (role, None);
+    }
     let endpoint = path
         .strip_prefix("/admin/endpoints/")
         .map(|rest| rest.split('/').next().unwrap_or_default())
@@ -142,6 +154,15 @@ pub fn admin_api_requirement(method: &Method, path: &str) -> (ConsoleRole, Optio
         return (ConsoleRole::Admin, endpoint);
     }
     (ConsoleRole::Admin, None)
+}
+
+/// `/admin/idp/realms/{realm}/users/{user}/links` (exactly).
+fn is_idp_user_links(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/admin/idp/realms/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    matches!(parts.as_slice(), [realm, "users", user, "links"] if !realm.is_empty() && !user.is_empty())
 }
 
 /// Whether `principal` may make this admin API request.
@@ -290,5 +311,46 @@ mod tests {
             "/admin/endpoints/lab"
         ));
         assert!(admin_api_allows(&p, &Method::GET, "/admin/console/users"));
+    }
+
+    #[test]
+    fn idp_user_links_follow_the_console_roles() {
+        use helios_endpoints::console::{ConsolePrincipal, ConsoleVia};
+        let links = "/admin/idp/realms/demo/users/u_1/links";
+        let mut p = ConsolePrincipal {
+            subject: "local:v".into(),
+            display_name: "v".into(),
+            role: Viewer,
+            endpoint_roles: Default::default(),
+            via: ConsoleVia::Local,
+        };
+        assert!(admin_api_allows(&p, &Method::GET, links));
+        assert!(!admin_api_allows(&p, &Method::PUT, links));
+        assert!(!admin_api_allows(&p, &Method::PATCH, links));
+        // The rest of the IdP API stays administrator-only.
+        assert!(!admin_api_allows(
+            &p,
+            &Method::GET,
+            "/admin/idp/realms/demo/users/u_1"
+        ));
+        assert!(!admin_api_allows(
+            &p,
+            &Method::GET,
+            "/admin/idp/realms/demo/users/u_1/links/x"
+        ));
+        assert!(!admin_api_allows(
+            &p,
+            &Method::GET,
+            "/admin/idp/realms/demo/users//links"
+        ));
+        p.role = Editor;
+        assert!(admin_api_allows(&p, &Method::PUT, links));
+        assert!(admin_api_allows(&p, &Method::PATCH, links));
+        assert!(!admin_api_allows(
+            &p,
+            &Method::PUT,
+            "/admin/idp/realms/demo/users/u_1"
+        ));
+        assert!(!admin_api_allows(&p, &Method::POST, "/admin/idp/realms"));
     }
 }

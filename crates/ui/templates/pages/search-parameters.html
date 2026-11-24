@@ -28,7 +28,10 @@
 <p class="notice notice--warn" id="sp-empty">{{ i18n.t("sp-empty") }}</p>
 {% endif %}
 
-<div class="filter-layout" hx-boost="true" data-md="search-parameters">
+{#- The detail column exists only while a parameter is selected
+    (`data-md-open`): with nothing selected the list takes the whole width;
+    shell.js `mdSwap` slides the panel in and out around a selection. -#}
+<div class="filter-layout" hx-boost="true" data-md="search-parameters"{% if view.detail.is_some() %} data-md-open{% endif %}>
   <!--
     Resource Filter rail: a search box over resource types, an "All types"
     row, a server-rendered Recently-used group, and a live count next
@@ -105,9 +108,9 @@
           <thead>
             <tr>
               <th>{{ i18n.t("sp-col-code") }}</th>
-              <th>{{ i18n.t("sp-col-type") }}</th>
-              <th>{{ i18n.t("sp-col-base") }}</th>
-              <th>{{ i18n.t("sp-col-expression") }}</th>
+              <th class="md-col-type">{{ i18n.t("sp-col-type") }}</th>
+              <th class="md-col-base">{{ i18n.t("sp-col-base") }}</th>
+              <th class="md-col-expr">{{ i18n.t("sp-col-expression") }}</th>
               <th>{{ i18n.t("sp-col-source") }}</th>
             </tr>
           </thead>
@@ -120,9 +123,9 @@
                   <span class="url">{{ row.url }}</span>
                 </a>
               </td>
-              <td><span class="tag tag--type">{{ row.type_label }}</span></td>
-              <td>{{ row.bases }}</td>
-              <td><span class="url">{{ row.expression }}</span></td>
+              <td class="md-col-type"><span class="tag tag--type">{{ row.type_label }}</span></td>
+              <td class="md-col-base">{{ row.bases }}</td>
+              <td class="md-col-expr"><span class="url">{{ row.expression }}</span></td>
               <td>
                 <span class="tag tag--{{ row.source }}">{{ i18n.t(row.source_key) }}</span>
                 {% for chip in row.chips %}
@@ -153,11 +156,15 @@
     </section>
   </div>
 
-  <aside class="card detail" aria-label="{{ i18n.t("sp-detail-label") }}" data-md-detail>
-    {% if let Some(d) = view.detail %}
-    <h2 class="detail__title">{{ d.code }}
-      <span class="tag tag--{{ d.source }}">{{ i18n.t(d.source_key) }}</span>
-    </h2>
+  {% if let Some(d) = view.detail %}
+  <aside class="card detail" id="sp-detail" aria-label="{{ i18n.t("sp-detail-label") }}" data-md-detail>
+    <div class="detail__head">
+      <h2 class="detail__title">{{ d.code }}
+        <span class="tag tag--{{ d.source }}">{{ i18n.t(d.source_key) }}</span>
+      </h2>
+      <a class="btn btn--icon detail__close" href="{{ view.close_href }}" data-md-close
+         aria-label="{{ i18n.t("sp-detail-close") }}" title="{{ i18n.t("sp-detail-close") }}">{% include "icons/x.svg" %}</a>
+    </div>
     {% if d.source == "embedded" %}
     <p class="detail__hint">{{ i18n.t("sp-detail-readonly") }}</p>
     {% endif %}
@@ -219,11 +226,8 @@
       {% endfor %}
     </div>
     {% endif %}
-    {% else %}
-    <h2 class="detail__title" data-md-empty>{{ i18n.t("sp-detail-empty") }}</h2>
-    <p class="detail__hint">{{ i18n.t("sp-detail-empty-hint") }}</p>
-    {% endif %}
   </aside>
+  {% endif %}
 </div>
 
 <script src="/ui/assets/resource-filter.js" defer data-swap-safe></script>

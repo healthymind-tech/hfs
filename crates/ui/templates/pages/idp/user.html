@@ -19,24 +19,11 @@
         </select>
       </div>
     </div>
-    <fieldset class="idp-link">
-      <legend class="mfield__label">{{ i18n.t("idpc-user-link") }}</legend>
-      <p class="mfield__hint">{{ i18n.t("idpc-user-link-hint") }}</p>
-      <div class="form-grid">
-        <div class="mfield">
-          <label class="mfield__label" for="f-user_endpoint">{{ i18n.t("idpc-user-endpoint") }}</label>
-          <select class="mfield__input" id="f-user_endpoint" name="user_endpoint">
-            <option value="">{{ i18n.t("idpc-user-endpoint-none") }}</option>
-            {% for e in endpoint_names %}<option value="{{ e }}"{% if self.v("user_endpoint") == e.as_str() %} selected{% endif %}>{{ e }}</option>{% endfor %}
-          </select>
-        </div>
-        {% call ui::field_text(i18n.t("idpc-user-reference"), "user_reference", self.v("user_reference"), self.err("user_reference"), i18n.t("idpc-user-reference-hint"), "text", false, "Patient/123", false, true) %}{% endcall %}
-      </div>
-    </fieldset>
     {% call ui::checkbox(i18n.t("idpc-user-disabled"), "disabled", user.disabled, i18n.t("idpc-user-disabled-hint")) %}{% endcall %}
   {% endcall %}
   <div class="form-actions"><a class="btn" href="/ui/idp/{{ head.name }}/users">{{ i18n.t("idpc-cancel") }}</a><button type="submit" class="btn btn--primary">{{ i18n.t("idpc-save") }}</button></div>
 </form>
+{% include "partials/idp/access-card.html" %}
 <form method="post" action="/ui/idp/{{ head.name }}/users/{{ user.id }}/password" novalidate>
   {% call ui::form_section("password", i18n.t("idpc-user-set-password"), i18n.t_arg("idpc-user-password-hint", "min", password_min.to_string())) %}
     <div class="form-grid">{% call ui::field_text(i18n.t("idpc-user-password"), "user_password", "", self.err("user_password"), "", "password", true, "", false, false, "new-password") %}{% endcall %}</div>

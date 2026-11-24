@@ -123,6 +123,21 @@ pub enum IdpEvent {
         /// `created`, `promoted`, `retired`, `emergency`, `imported`.
         action: String,
     },
+    /// The FHIR resources a user may access changed in bulk (console
+    /// resource-access editor, `/admin/idp/…/users/{user}/links`).
+    UserAccessChanged {
+        realm: String,
+        user_id: String,
+        /// Console user or API caller (`local:admin`, `oidc:…`).
+        actor: String,
+        /// `add`, `remove`, `replace`, `patch`, `undo`.
+        action: String,
+        added: usize,
+        removed: usize,
+        changed: usize,
+        /// Entries after the change.
+        total: usize,
+    },
 }
 
 /// Receives events. Synchronous and fire-and-forget: implementations

@@ -1,5 +1,7 @@
 {% extends "layouts/base.html" %}
 
+{% import "partials/workspace.html" as ws %}
+
 {% block title %}{{ i18n.t("cmp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
 {% block content %}
@@ -18,9 +20,12 @@
   {% endif %}
 </section>
 
-<div class="filter-layout filter-layout--two" hx-boost="true">
-  <aside class="card filter-rail" aria-label="{{ i18n.t("cmp-rail-label") }}">
-    <div class="filter-rail__heading">{{ i18n.t("cmp-rail-heading") }}</div>
+<div class="filter-layout filter-layout--two" hx-boost="true" data-ws>
+  <aside class="card filter-rail" id="ws-rail" aria-label="{{ i18n.t("cmp-rail-label") }}">
+    <div class="filter-rail__top">
+      <div class="filter-rail__heading">{{ i18n.t("cmp-rail-heading") }}</div>
+      {% call ws::rail_toggle("ws-rail") %}{% endcall %}
+    </div>
     <div class="filter-rail__list">
       {% for item in view.rail %}
       <a class="filter-rail__item" href="{{ item.href }}"{% if item.current %} aria-current="true"{% endif %}>
@@ -162,4 +167,5 @@
 </div>
 
 <script src="/ui/assets/conformance-crud.js" defer></script>
+<script src="/ui/assets/workspace.js" defer></script>
 {% endblock %}

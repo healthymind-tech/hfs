@@ -346,8 +346,7 @@ sp-pagination-label = Pages
 sp-page-prev = Previous
 sp-page-next = Next
 sp-detail-label = Parameter detail
-sp-detail-empty = No parameter selected
-sp-detail-empty-hint = Select a row to inspect its definition, expression, and how it resolves against the registry.
+sp-detail-close = Close detail
 sp-detail-readonly = Spec parameter (compiled in from the data file) — read-only.
 sp-field-url = Canonical URL
 sp-field-name = Name
@@ -1890,3 +1889,21 @@ activity-running = { $count ->
    *[other] { $count } jobs running
 }
 activity-detail = Terminology imports running: { $imports } · Sync runs: { $syncs }
+
+## List-and-editor workspace (hm/vd-layout): rail toggle, quick switcher, editor/form split.
+ws-rail-collapse = Collapse list
+ws-rail-expand = Show list
+ws-switch-vd = Switch view definition
+ws-switch-lib = Switch to another item
+ws-switch-filter = Filter by name
+ws-switch-none = No matches
+ws-switch-more = Open the full list
+ws-pane-label = Editor layout
+ws-pane-json = JSON
+ws-pane-both = Both
+ws-pane-form = Form
+ws-split-label = Resize the editor and the form
+sb-collapse = Collapse sidebar
+sb-expand = Expand sidebar
+sb-collapsed = Sidebar collapsed
+sb-expanded = Sidebar expanded

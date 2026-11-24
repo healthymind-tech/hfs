@@ -96,6 +96,9 @@ pub const ROUTES: &[(&str, &str)] = &[
         "POST",
         "/admin/idp/realms/{realm}/users/{user}/$set-password",
     ),
+    ("GET", "/admin/idp/realms/{realm}/users/{user}/links"),
+    ("PUT", "/admin/idp/realms/{realm}/users/{user}/links"),
+    ("PATCH", "/admin/idp/realms/{realm}/users/{user}/links"),
     ("GET", "/admin/idp/realms/{realm}/sessions"),
     ("DELETE", "/admin/idp/realms/{realm}/sessions/{session}"),
     ("GET", "/admin/idp/realms/{realm}/grants"),
@@ -144,6 +147,15 @@ pub fn router(auth: Option<Authorize>) -> Router {
         .route(
             &format!("{r}/users/{{user}}/$set-password"),
             post(set_password),
+        )
+        .route(
+            &format!("{r}/users/{{user}}/links"),
+            get(crate::access::get_links)
+                .put(crate::access::put_links)
+                .patch(crate::access::patch_links)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    helios_idp::access::MAX_TEXT_BYTES + 64 * 1024,
+                )),
         )
         .route(&format!("{r}/sessions"), get(list_sessions))
         .route(

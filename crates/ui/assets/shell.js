@@ -303,6 +303,21 @@
         });
       }
     },
+    // Grid tracks from one px list to another (a master-detail column
+    // opening or closing while its neighbour gives up or takes back the
+    // room). `from`/`to` are arrays of px widths with the same length. The
+    // end state is held until the caller's cleanup; `null` under reduced
+    // motion, else the Animation.
+    tracks: function (el, from, to, o) {
+      o = o || {};
+      if (!el || REDUCED || typeof el.animate !== "function") return null;
+      var px = function (a) { return a.map(function (v) { return Math.max(0, v) + "px"; }).join(" "); };
+      return el.animate([{ gridTemplateColumns: px(from) }, { gridTemplateColumns: px(to) }], {
+        duration: o.duration || 200,
+        easing: o.easing || MOTION.std,
+        fill: "forwards",
+      });
+    },
     // Slide a stand-in of `from`'s box to `to`'s (a selection highlight
     // moving between rail items).
     glide: function (from, to, cls) {
@@ -401,7 +416,9 @@
       c.removeAttribute("aria-current");
       c.removeAttribute("aria-selected");
     }
-    return c.innerHTML.replace(/\s+/g, " ");
+    // Links that only carry the selection (`sel=` on a pager) are the same
+    // region too: their hrefs move with the marks (mdCopySelection).
+    return c.innerHTML.replace(/\s+/g, " ").replace(/[?&](?:amp;)?sel=[^&"]*/g, "");
   }
 
   function mdSelected(root) {
@@ -413,7 +430,7 @@
     var a = cur.querySelectorAll("*"), b = nxt.querySelectorAll("*");
     if (a.length !== b.length) return false;
     for (var i = 0; i < a.length; i++) {
-      ["aria-current", "aria-selected"].forEach(function (attr) {
+      ["aria-current", "aria-selected", "href"].forEach(function (attr) {
         var v = b[i].getAttribute(attr);
         if (v === null) a[i].removeAttribute(attr);
         else if (a[i].getAttribute(attr) !== v) a[i].setAttribute(attr, v);
@@ -434,11 +451,120 @@
     return fresh;
   }
 
+  /* The detail column exists only while something is selected
+     (`data-md-open` on the container): it slides in from the right as the
+     list gives up the room, and back out as the list takes it again. The
+     grid tracks animate from the list's current width, so nothing jumps;
+     the panel keeps its final width while its track grows (the container
+     clips it), so it slides rather than reflows. */
+  var mdResizing = null;
+
+  function mdTracks(md) {
+    var v = getComputedStyle(md).gridTemplateColumns || "";
+    if (v === "none") return [];
+    return v.split(/\s+/).map(parseFloat).filter(function (n) { return !isNaN(n); });
+  }
+
+  // While the tracks move, the list's content is laid out once, at the
+  // width it ends at (`--md-list-w`, app.css): only the column's edge moves
+  // per frame, not 50 rows of wrapping text.
+  function mdHoldList(md, width) {
+    var list = md.querySelector("[data-md-list]");
+    if (!list) return function () {};
+    var cs = getComputedStyle(list);
+    var inner = width - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+    list.style.setProperty("--md-list-w", Math.max(0, inner) + "px");
+    return function () { list.style.removeProperty("--md-list-w"); };
+  }
+
+  function mdSettle() {
+    // Finish a running open/close at once (a new selection arrived).
+    if (mdResizing) mdResizing();
+    mdResizing = null;
+  }
+
+  function mdOpen(md, ndet) {
+    var t = mdTracks(md);
+    var gap = parseFloat(getComputedStyle(md).columnGap) || 0;
+    var fresh = document.importNode(ndet, true);
+    md.appendChild(fresh);
+    md.setAttribute("data-md-open", "");
+    if (window.htmx) window.htmx.process(fresh);
+    initPages(fresh);
+    var side = t.length === 3;
+    if (side) {
+      // Closed, the list spans the detail track and the gap before it.
+      var from = [t[0], t[1] + gap + t[2], 0];
+      fresh.style.width = t[2] + "px";
+      var release = mdHoldList(md, t[1]);
+      md.classList.add("md-resizing");
+      var anim = motion.tracks(md, from, t, { duration: 200, easing: MOTION.emph });
+      var end = function () {
+        if (anim) anim.cancel();
+        fresh.style.width = "";
+        release();
+        md.classList.remove("md-resizing");
+      };
+      if (anim) {
+        mdResizing = end;
+        anim.finished.then(function () { if (mdResizing === end) mdSettle(); }, function () {});
+      } else {
+        end();
+      }
+      motion.enter(fresh, { dx: 16, duration: 200 });
+    } else {
+      // Stacked (narrow): the panel rises under the list; bring it into view.
+      motion.enter(fresh, { dy: 8, duration: 200 });
+      // A long way down (under a full page of rows) jumps; a short one glides.
+      var far = Math.abs(fresh.getBoundingClientRect().top) > window.innerHeight * 1.5;
+      if (fresh.scrollIntoView) fresh.scrollIntoView({ block: "start", behavior: REDUCED || far ? "auto" : "smooth" });
+    }
+    return fresh;
+  }
+
+  function mdClose(md, det) {
+    var t = mdTracks(md);
+    var gap = parseFloat(getComputedStyle(md).columnGap) || 0;
+    var release = function () {};
+    var end = function () {
+      if (anim) anim.cancel();
+      if (det.isConnected) det.remove();
+      release();
+      md.removeAttribute("data-md-open");
+      md.classList.remove("md-resizing");
+    };
+    var anim = null;
+    det.setAttribute("inert", "");
+    det.removeAttribute("data-md-detail");
+    if (t.length === 3 && !REDUCED) {
+      det.style.width = t[2] + "px";
+      release = mdHoldList(md, t[1] + gap + t[2]);
+      md.classList.add("md-resizing");
+      anim = motion.tracks(md, t, [t[0], t[1] + gap + t[2], 0], { duration: 200, easing: MOTION.std });
+      motion.leave(det, { dx: 16, duration: 200 });
+    }
+    if (anim) {
+      mdResizing = end;
+      anim.finished.then(function () { if (mdResizing === end) mdSettle(); }, function () {});
+    } else {
+      end();
+    }
+  }
+
+  // The selected row a close (×, Esc, a second click on it) started from:
+  // focus goes back to it once the detail has gone.
+  var mdCloseRow = null;
+
+  function mdRows(list) {
+    return list ? list.querySelectorAll("tbody > tr, [data-md-item]") : [];
+  }
+
   function mdSwap(curMd, nextMd, nextMain) {
     if (!curMd.isConnected) return;
     var done = mdPending;
     mdPending = null;
     if (done) clearTimeout(done.timer);
+    mdSettle();
     var main = document.getElementById("main");
     // Regions outside the master-detail container that follow the
     // selection (a page head's counts, a version switch).
@@ -467,6 +593,13 @@
     // List: a new list re-renders with a short stagger; a moved selection
     // only moves the marks.
     var list = curMd.querySelector("[data-md-list]"), nlist = nextMd.querySelector("[data-md-list]");
+    var closing = !!(curMd.querySelector("[data-md-detail]") && !nextMd.querySelector("[data-md-detail]"));
+    var backTo = -1;
+    if (closing && list) {
+      var from = mdCloseRow && mdCloseRow.isConnected ? mdCloseRow : list.querySelector('[aria-selected="true"]');
+      backTo = Array.prototype.indexOf.call(mdRows(list), from);
+    }
+    mdCloseRow = null;
     if (list && nlist) {
       if (!(mdStrip(list) === mdStrip(nlist) && mdCopySelection(list, nlist))) {
         var wraps = list.querySelectorAll(".table-wrap");
@@ -482,7 +615,15 @@
     // Detail: slides in from the right when it opens, cross-fades when the
     // item changes, slides out when it closes.
     var det = curMd.querySelector("[data-md-detail]"), ndet = nextMd.querySelector("[data-md-detail]");
-    if (det && ndet) {
+    if (!det && ndet) {
+      det = mdOpen(curMd, ndet);
+      mdFocusHead(det);
+    } else if (det && !ndet) {
+      mdClose(curMd, det);
+      var back = mdRows(list)[backTo];
+      var link = back && back.querySelector("a[href]");
+      if (link) link.focus();
+    } else if (det && ndet) {
       det.classList.remove("md-pending");
       if (det.innerHTML !== ndet.innerHTML) {
         var wasEmpty = mdIsEmpty(det), nowEmpty = mdIsEmpty(ndet);
@@ -506,13 +647,7 @@
         }
         if (wasEmpty && !nowEmpty) motion.enter(det, { dx: 14, duration: 200 });
         else motion.fade(det, { duration: MOTION.d2 });
-        if (!nowEmpty) {
-          var head = det.querySelector("h2, h3, [data-md-heading]");
-          if (head) {
-            if (!head.hasAttribute("tabindex")) head.setAttribute("tabindex", "-1");
-            head.focus({ preventScroll: true });
-          }
-        }
+        if (!nowEmpty) mdFocusHead(det);
       }
     }
     var announcer = document.getElementById("nav-announcer");
@@ -521,6 +656,37 @@
     document.dispatchEvent(new CustomEvent("hm:navigated", { detail: { main: main, md: true } }));
   }
 
+  function mdFocusHead(det) {
+    var head = det.querySelector("h2, h3, [data-md-heading]");
+    if (head) {
+      if (!head.hasAttribute("tabindex")) head.setAttribute("tabindex", "-1");
+      head.focus({ preventScroll: true });
+    }
+  }
+
+  // Close the open detail (Esc, a second click on the selected row): its ×
+  // link, so the URL drops the selection the same way.
+  function mdCloseOpen(md) {
+    var x = md && md.querySelector("[data-md-detail] [data-md-close]");
+    if (!x) return false;
+    var list = md.querySelector("[data-md-list]");
+    mdCloseRow = list && list.querySelector('[aria-selected="true"]');
+    x.click();
+    return true;
+  }
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape" || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+    var md = document.querySelector("#main [data-md][data-md-open]");
+    if (!md) return;
+    var t = e.target;
+    var inDetail = t && t.closest && t.closest("[data-md-detail]");
+    // Escape in a field, a menu or a dialog is theirs.
+    if (!inDetail && t && t.closest && t.closest("input, textarea, select, [contenteditable], [role=combobox], [role=listbox], [role=menu]")) return;
+    if (document.querySelector("dialog[open], [aria-modal=true]:not([hidden]), body.nav-open")) return;
+    if (mdCloseOpen(md)) e.preventDefault();
+  });
+
   // Immediate feedback (< 100 ms): the clicked entry is selected at once;
   // a response slower than 120 ms dims the detail behind a skeleton.
   document.addEventListener("click", function (e) {
@@ -528,9 +694,23 @@
     var a = e.target.closest && e.target.closest("a[href]");
     if (!a) return;
     var md = a.closest("#main [data-md]");
-    if (!md || a.hasAttribute("data-md-full") || a.closest("[data-md-detail]")) return;
+    if (!md || a.hasAttribute("data-md-full")) return;
+    if (a.hasAttribute("data-md-close")) {
+      var sel = md.querySelector('[data-md-list] [aria-selected="true"]');
+      if (sel) mdCloseRow = sel;
+      return;
+    }
+    if (a.closest("[data-md-detail]")) return;
     var region = a.closest("[data-md-rail], [data-md-list]");
     if (!region) return;
+    // A second click on the selected row closes the detail.
+    var again = region.hasAttribute("data-md-list") && a.closest('[aria-selected="true"]');
+    if (again && md.hasAttribute("data-md-open") && md.querySelector("[data-md-detail] [data-md-close]")) {
+      e.preventDefault();
+      e.stopPropagation();
+      mdCloseOpen(md);
+      return;
+    }
     if (region.hasAttribute("data-md-rail")) {
       var was = mdSelected(region);
       if (was && was !== a && was.getAttribute("aria-current")) {

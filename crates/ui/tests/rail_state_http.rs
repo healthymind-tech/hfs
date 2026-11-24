@@ -144,7 +144,13 @@ fn vd_title_name(html: &str) -> Option<&str> {
         .split(r#"<h2 class="page-head__title page-head__title--kind">"#)
         .nth(1)?;
     let row = row.split("</h2>").next()?;
-    Some(row.split("</span>").nth(1)?.trim())
+    // hm/vd-layout: the name sits in its own truncating `.ws-title__name`.
+    Some(
+        row.split("</span>")
+            .nth(1)?
+            .trim()
+            .trim_start_matches(r#"<span class="ws-title__name">"#),
+    )
 }
 
 /// GET with the `X-Rail-Filter` header the SQL rails' inputs send while the

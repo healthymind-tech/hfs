@@ -1,0 +1,69 @@
+{#
+  The list-and-editor workspace controls (hm/vd-layout), shared by every page
+  built on `.filter-layout.filter-layout--two` with an `aside.filter-rail`:
+  View Definitions, SQL Queries, SQL Views and Compartments. Behaviour lives
+  in `assets/workspace.js`; layout in app.css ("List-and-editor workspace").
+
+  Everything here only works with JavaScript, so each control is hidden
+  until the first-paint boot script has marked `<html class="js">`
+  (`html:not(.js) .rail-toggle` etc., app.css) — without JavaScript the rail
+  stays open and the editor/guided-form pairing unchanged.
+
+  The preferences these controls change (rail collapsed or open, the
+  editor/form split, the JSON / both / form view) are kept in localStorage
+  and stamped on `<html>` by `helios_ui_chrome::theme_boot()` before first
+  paint, so a collapsed rail never flashes open.
+#}
+
+{#- The rail's collapse/expand button. `rail_id` is the `<aside>`'s id. -#}
+{% macro rail_toggle(rail_id) %}
+<button type="button" class="rail-toggle" data-rail-toggle aria-controls="{{ rail_id }}" aria-expanded="true"
+        aria-label="{{ i18n.t("ws-rail-collapse") }}" title="{{ i18n.t("ws-rail-collapse") }}"
+        data-label-collapse="{{ i18n.t("ws-rail-collapse") }}" data-label-expand="{{ i18n.t("ws-rail-expand") }}">
+  <span class="icon" aria-hidden="true">{% include "icons/panel-left.svg" %}</span>
+</button>
+{% endmacro %}
+
+{#- The quick switcher beside the selected item's title: a button that opens
+    a filterable list of the rail's own items (recently used first), so the
+    selection can change while the rail is collapsed. Activating an option
+    clicks the matching rail link, so the unsaved-changes guard and the
+    rail's own navigation apply unchanged. On phones the same row also
+    carries a button that opens the full rail as a sheet. -#}
+{% macro switcher(rail_id, label) %}
+<button type="button" class="rail-toggle ws-title__rail" data-rail-toggle aria-controls="{{ rail_id }}" aria-expanded="false"
+        aria-label="{{ i18n.t("ws-rail-expand") }}" title="{{ i18n.t("ws-rail-expand") }}"
+        data-label-collapse="{{ i18n.t("ws-rail-collapse") }}" data-label-expand="{{ i18n.t("ws-rail-expand") }}">
+  <span class="icon" aria-hidden="true">{% include "icons/panel-left.svg" %}</span>
+</button>
+<div class="ws-switch" data-ws-switch-for="{{ rail_id }}">
+  <button type="button" class="ws-switch__btn" data-ws-switch aria-haspopup="dialog" aria-expanded="false"
+          aria-label="{{ label }}" title="{{ label }}">
+    <span class="icon" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+  </button>
+  <div class="ws-switch__pop" role="dialog" aria-label="{{ label }}" hidden>
+    <div class="ws-switch__search">
+      <span class="icon" aria-hidden="true">{% include "icons/search.svg" %}</span>
+      <input type="search" class="ws-switch__input" role="combobox" aria-expanded="true" aria-autocomplete="list"
+             aria-controls="{{ rail_id }}-switch-list" aria-label="{{ i18n.t("ws-switch-filter") }}"
+             placeholder="{{ i18n.t("ws-switch-filter") }}" autocomplete="off" spellcheck="false">
+    </div>
+    <ul class="ws-switch__list" id="{{ rail_id }}-switch-list" role="listbox" aria-label="{{ label }}"></ul>
+    <p class="ws-switch__empty" hidden>{{ i18n.t("ws-switch-none") }}</p>
+    <button type="button" class="ws-switch__more" data-ws-switch-more>{{ i18n.t("ws-switch-more") }}</button>
+  </div>
+</div>
+{% endmacro %}
+
+{#- JSON only / both / form only, for the stretch pairing `grid_id`. -#}
+{% macro pane_switch(grid_id) %}
+<div class="seg ws-seg" role="group" aria-label="{{ i18n.t("ws-pane-label") }}" data-ws-view-for="{{ grid_id }}">
+  <button type="button" class="seg__btn" data-ws-view="json" aria-pressed="false">
+{{ i18n.t("ws-pane-json") }}
+  </button>
+  <button type="button" class="seg__btn ws-seg__both" data-ws-view="both" aria-pressed="true">{{ i18n.t("ws-pane-both") }}</button>
+  <button type="button" class="seg__btn" data-ws-view="form" aria-pressed="false">
+{{ i18n.t("ws-pane-form") }}
+  </button>
+</div>
+{% endmacro %}

@@ -1,5 +1,6 @@
 {% extends "layouts/base.html" %}
 {% import "partials/rail_recent.html" as recent %}
+{% import "partials/workspace.html" as ws %}
 
 {#
   SQL Queries / SQL Views workspace (#649): the editor-first layout (#839)
@@ -92,9 +93,13 @@
 
 {#- `hx-history="false"`: the rail filter replaces the URL (#1275); htmx must not
     snapshot this page — editor text, `$sql-run` rows — into localStorage for it. -#}
-<div class="filter-layout filter-layout--two" hx-history="false">
-  <aside class="filter-rail" aria-label="{{ i18n.t(title_key) }}">
-    <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
+{#- `data-ws`/`data-rail-few`: see `sql-view-definitions.html` (hm/vd-layout). -#}
+<div class="filter-layout filter-layout--two" hx-history="false" data-ws{% if rail.len() <= 3 && filter.is_empty() %} data-rail-few{% endif %}>
+  <aside class="filter-rail" id="ws-rail" aria-label="{{ i18n.t(title_key) }}">
+    <div class="filter-rail__top">
+      <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
+      {% call ws::rail_toggle("ws-rail") %}{% endcall %}
+    </div>
     <form class="filter-rail__search" method="get" action="{{ base_href }}" role="search">
       {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
       {% if is_new %}
@@ -138,13 +143,16 @@
         actions on the right. Duplicate submits the form below with its own
         intent, so it stays inside the form via the `form` attribute;
         nothing here is a rename control. -#}
-    <section class="page-head page-head--row">
+    <section class="page-head page-head--row ws-head">
+      <div class="ws-title">
       <h2 class="page-head__title page-head__title--kind">
         <span class="icon" aria-hidden="true">{{ icon_svg|safe }}</span>
-        {% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}
+        <span class="ws-title__name">{% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}</span>
         <span class="tag tag--type">{{ i18n.t(chip_key) }}</span>
         <span class="tag tag--{{ sel.status_class }}">{{ sel.status }}</span>
       </h2>
+      {% call ws::switcher("ws-rail", i18n.t("ws-switch-lib")) %}{% endcall %}
+      </div>
       <div class="page-head__actions">
         {#- Implicit-submission guard (#1754). Enter in a one-line field of the
             editor form clicks the form's *default button*: its first submit
@@ -197,11 +205,15 @@
         below reading as one document live, in both directions, on top of
         both editors above — typing in either updates the other, with no
         Save or Run needed to see it. -#}
-    <h2 class="form-legend">{{ i18n.t("lib-details-heading") }}</h2>
+    <div class="ws-pane-head">
+      <h2 class="form-legend">{{ i18n.t("lib-details-heading") }}</h2>
+      {% call ws::pane_switch("lib-details-grid") %}{% endcall %}
+    </div>
     {% if is_new %}
     <p class="page-head__lede">{{ i18n.t("lib-details-new-lede") }}</p>
     {% endif %}
-    <div class="editor__grid editor__grid--stretch" id="lib-details-grid">
+    <div class="editor__grid editor__grid--stretch" id="lib-details-grid" data-ws-pair
+         data-ws-split-label="{{ i18n.t("ws-split-label") }}">
       <section class="card">
         <div class="card-head">
           <h3>{{ i18n.t("lib-details-json-heading") }}</h3>
@@ -403,4 +415,5 @@
 <script src="/ui/assets/sql-library-details.js" defer></script>
 <script src="/ui/assets/sql-library-sync.js" defer></script>
 <script src="/ui/assets/sql-library-panels.js" defer></script>
+<script src="/ui/assets/workspace.js" defer></script>
 {% endblock %}

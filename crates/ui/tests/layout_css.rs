@@ -83,3 +83,122 @@ fn fieldsets_draw_no_browser_frame() {
     }
     assert!(rule(".idp-provider").contains("margin: 4px 0 20px"));
 }
+
+#[test]
+fn workspace_rail_is_narrower_and_collapses() {
+    // hm/vd-layout: the 280px rail left most of its column empty on View
+    // Definitions; it is 232px and collapses to a 44px strip.
+    let two = rule(".filter-layout--two");
+    assert!(two.contains("--rail-w: 232px"), "{two}");
+    assert!(two.contains("grid-template-columns: var(--rail-w) minmax(0, 1fr)"));
+    assert!(CSS.contains("--rail-w: 44px;"));
+    // The editor/form split and the view modes.
+    assert!(CSS.contains("flex: var(--ws-split, 50) 1 0;"));
+    assert!(CSS.contains("flex: calc(100 - var(--ws-split, 50)) 1 0;"));
+    assert!(CSS.contains(
+        r#"html[data-ws-view="json"] .editor__grid--stretch[data-ws-pair] > .editor-form"#
+    ));
+    assert!(CSS.contains(
+        ".editor__grid--stretch[data-ws-pair=\"fill\"] {\n    height: var(--ws-fill, 70vh);"
+    ));
+}
+
+#[test]
+fn collapsed_sidebar_is_a_64px_rail_that_never_moves_on_hover() {
+    let at = CSS
+        .find("Collapsible console sidebar (hm/vd-layout)")
+        .expect("sidebar collapse block");
+    let at = CSS[..at].rfind("/*").expect("the block's header comment");
+    let block = &CSS[at..];
+    assert!(block.contains(r#":root[data-sb="collapsed"] {"#));
+    assert!(block.contains("--sidebar-w: 64px;"));
+    // Hover only ever changes colours: no width/padding/transform under :hover.
+    for (i, _) in block.match_indices(":hover") {
+        // Skip mentions inside comments.
+        let before = &block[..i];
+        if before.rfind("/*") > before.rfind("*/") {
+            continue;
+        }
+        let open = i + block[i..].find('{').unwrap();
+        let close = open + block[open..].find('}').unwrap();
+        let body = &block[open + 1..close];
+        for prop in ["width", "padding", "margin", "transform", "gap", "display"] {
+            assert!(
+                !body
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{prop}:"))),
+                "a :hover rule in the sidebar block sets {prop}: {body}"
+            );
+        }
+    }
+    // The animation runs only while `.sb-anim` is set (a click or Ctrl+B),
+    // never on load or resize.
+    assert!(block.contains(":root.sb-anim body {"));
+}
+
+#[test]
+fn first_paint_boot_stamps_the_layout_preferences() {
+    let boot = include_str!("../../ui-chrome/templates/partials/theme-boot.html");
+    for needle in [
+        r#"getItem("hfs-sidebar")"#,
+        r#"e.setAttribute("data-sb",b)"#,
+        r#"w.innerWidth<1280?"collapsed":"expanded""#,
+        r#"getItem("hfs-ws-rail")"#,
+        r#"getItem("hfs-ws-view")"#,
+        r#""--ws-split""#,
+    ] {
+        assert!(boot.contains(needle), "theme-boot.html lacks {needle}");
+    }
+}
+
+/// The last block of app.css whose header comment names `marker`.
+fn block(marker: &str) -> &'static str {
+    let at = CSS
+        .rfind(marker)
+        .unwrap_or_else(|| panic!("no {marker} block in app.css"));
+    &CSS[at..]
+}
+
+#[test]
+fn master_detail_shows_no_detail_column_until_selected() {
+    // hm/md-detail: with nothing selected the list spans the detail track
+    // (no empty placeholder column); the open detail clips while its track
+    // animates; the list's columns follow its own width, never a scrollbar.
+    let css = block("Master-detail: detail column only when selected (hm/md-detail)");
+    assert!(css.contains(
+        ".filter-layout[data-md]:not([data-md-open]) > [data-md-list] {\n    grid-column: 2 / -1;"
+    ));
+    // Only side by side: the stacked layout (<= 1250px) keeps one column.
+    let span = css.find("grid-column: 2 / -1").unwrap();
+    assert!(css[..span].contains("@media (min-width: 1251px)"));
+    assert!(css.contains(".filter-layout[data-md].md-resizing {\n  overflow: clip;"));
+    assert!(
+        css.contains("[data-md] > [data-md-list] > .card {\n  container: md-list / inline-size;")
+    );
+    assert!(css.contains("width: var(--md-list-w, auto);"));
+    for (width, col) in [
+        ("720px", ".md-col-expr"),
+        ("560px", ".md-col-base"),
+        ("400px", ".md-col-type"),
+    ] {
+        let q =
+            format!("@container md-list (max-width: {width}) {{\n  {col} {{\n    display: none;");
+        assert!(css.contains(&q), "{q}");
+    }
+}
+
+#[test]
+fn master_detail_motion_goes_through_the_shared_helper() {
+    let js = include_str!("../assets/shell.js");
+    // The open/close animate the grid tracks through `HM.motion` (reduced
+    // motion → no animation), and the panel slides with `motion.enter` /
+    // `motion.leave`.
+    assert!(js.contains("tracks: function (el, from, to, o)"));
+    assert!(js.contains("if (!el || REDUCED || typeof el.animate !== \"function\") return null;"));
+    assert!(js.contains("function mdOpen(md, ndet)"));
+    assert!(js.contains("function mdClose(md, det)"));
+    assert!(js.contains("motion.tracks(md, from, t,"));
+    // Esc and a second click on the selected row close through the × link.
+    assert!(js.contains("e.key !== \"Escape\""));
+    assert!(js.contains("A second click on the selected row closes the detail."));
+}

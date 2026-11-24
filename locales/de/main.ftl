@@ -334,8 +334,7 @@ sp-pagination-label = Seiten
 sp-page-prev = Zurück
 sp-page-next = Weiter
 sp-detail-label = Parameterdetails
-sp-detail-empty = Kein Parameter ausgewählt
-sp-detail-empty-hint = Wähle eine Zeile, um Definition, Ausdruck und die Auflösung im Register zu prüfen.
+sp-detail-close = Details schließen
 sp-detail-readonly = Spezifikationsparameter (aus der Datendatei einkompiliert) — schreibgeschützt.
 sp-field-url = Kanonische URL
 sp-field-name = Name
@@ -1773,3 +1772,21 @@ activity-running = { $count ->
    *[other] { $count } Aufträge laufen
 }
 activity-detail = Laufende Terminologie-Importe: { $imports } · Synchronisationen: { $syncs }
+
+## List-and-editor workspace (hm/vd-layout): rail toggle, quick switcher, editor/form split.
+ws-rail-collapse = Liste einklappen
+ws-rail-expand = Liste anzeigen
+ws-switch-vd = View-Definition wechseln
+ws-switch-lib = Zu einem anderen Eintrag wechseln
+ws-switch-filter = Nach Name filtern
+ws-switch-none = Keine Treffer
+ws-switch-more = Vollständige Liste öffnen
+ws-pane-label = Editor-Layout
+ws-pane-json = JSON
+ws-pane-both = Beide
+ws-pane-form = Formular
+ws-split-label = Breite von Editor und Formular ändern
+sb-collapse = Seitenleiste einklappen
+sb-expand = Seitenleiste ausklappen
+sb-collapsed = Seitenleiste eingeklappt
+sb-expanded = Seitenleiste ausgeklappt

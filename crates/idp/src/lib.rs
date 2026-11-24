@@ -19,6 +19,7 @@
 //! | [`token`] | RFC 9068 access token / id_token claims, opaque handles, refresh rotation |
 //! | [`launch`] | SMART launch context and EHR launch handles |
 //! | [`user`] | realm users and their FHIR resource links |
+//! | [`access`] | a user's links as a flat list; copy/paste formats, import plans |
 //! | [`metadata`] | OIDC / RFC 8414 metadata and SMART configuration |
 //! | [`store`] | the store contract ([`memory`] in-memory, `pg` PostgreSQL) |
 //! | [`schema`] | fork migration SQL (`hm-0020-idp-core`) |
@@ -31,6 +32,7 @@
 //!
 //! Everything is inert unless `HFS_IDP=on` ([`FLAG_ENV`]).
 
+pub mod access;
 pub mod admin;
 pub mod client;
 pub mod error;

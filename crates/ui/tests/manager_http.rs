@@ -733,3 +733,39 @@ async fn switcher_initials_skip_punctuation_and_handle_cjk() {
         "a CJK name as written"
     );
 }
+
+/// hm/vd-layout: the collapsible sidebar. The toggle sits in the sidebar with
+/// its shortcut and both translated labels, the endpoint chip carries the
+/// avatar the icon rail shows, and the page loads the script that wires it.
+#[tokio::test]
+async fn the_manager_sidebar_carries_its_collapse_toggle_in_both_languages() {
+    let f = fixture().await;
+    for (lang, collapse, expand) in [
+        ("en", "Collapse sidebar", "Expand sidebar"),
+        ("zh-Hant", "收合側邊欄", "展開側邊欄"),
+    ] {
+        let (status, html) = get_lang(&f.app, "/ui/e/default", lang).await;
+        assert_eq!(status, StatusCode::OK);
+        let aside = &html[html.find(r#"<aside class="sidebar""#).unwrap()..];
+        let aside = &aside[..aside.find("</aside>").unwrap()];
+        assert!(
+            aside.contains("data-sb-toggle"),
+            "[{lang}] toggle inside the sidebar"
+        );
+        assert!(aside.contains(r#"aria-controls="sidebar""#));
+        assert!(aside.contains(r#"aria-keyshortcuts="Control+B Meta+B""#));
+        assert!(
+            aside.contains(&format!(r#"data-label-collapse="{collapse}""#)),
+            "[{lang}]"
+        );
+        assert!(
+            aside.contains(&format!(r#"data-label-expand="{expand}""#)),
+            "[{lang}]"
+        );
+        assert!(
+            aside.contains(r#"class="ep-chip__avatar""#),
+            "[{lang}] endpoint avatar"
+        );
+        assert!(html.contains("/sidebar-collapse.js"), "[{lang}] script");
+    }
+}
