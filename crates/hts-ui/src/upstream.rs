@@ -627,7 +627,11 @@ pub(crate) fn filter_misses(
             .filter(|f| !f.is_empty())
             .is_none_or(|f| v.to_lowercase().contains(&f.to_lowercase()))
     };
-    let eq = |f: &Option<String>, v: &str| f.as_deref().filter(|f| !f.is_empty()).is_none_or(|f| f == v);
+    let eq = |f: &Option<String>, v: &str| {
+        f.as_deref()
+            .filter(|f| !f.is_empty())
+            .is_none_or(|f| f == v)
+    };
     !(contains(name, row.0) && contains(title, row.1) && eq(status, row.2))
 }
 
