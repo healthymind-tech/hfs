@@ -136,6 +136,10 @@ impl VersionQuery {
 pub(crate) struct VersionsQuery {
     #[serde(default)]
     url: String,
+    /// The browser's own filters: the versions that match them are marked.
+    name: Option<String>,
+    title: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Template)]
@@ -144,6 +148,8 @@ struct OlderRows<'a> {
     chrome: Chrome<'a>,
     kind: Kind,
     rows: Vec<VersionChoice>,
+    /// Per row: it matches the browser's filters (only set when filtering).
+    matched: Vec<bool>,
     failed: bool,
 }
 
@@ -171,10 +177,26 @@ async fn older_rows(
             Err(_) => (Vec::new(), true),
         }
     };
+    let filtering = [&q.name, &q.title, &q.status]
+        .iter()
+        .any(|f| f.as_deref().is_some_and(|v| !v.is_empty()));
+    let matched = rows
+        .iter()
+        .map(|r| {
+            filtering
+                && !crate::upstream::filter_misses(
+                    &q.name,
+                    &q.title,
+                    &q.status,
+                    (&r.name, &r.title, &r.status),
+                )
+        })
+        .collect();
     match (OlderRows {
         chrome,
         kind,
         rows,
+        matched,
         failed,
     })
     .render()

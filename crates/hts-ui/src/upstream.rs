@@ -613,6 +613,43 @@ pub fn browser_sort_label_key(sort: &str) -> &'static str {
     }
 }
 
+/// Whether a grouped row's listed version fails the text / status filters
+/// the operator set (it is listed because another of its versions matches —
+/// that version is then highlighted under it).
+pub(crate) fn filter_misses(
+    name: &Option<String>,
+    title: &Option<String>,
+    status: &Option<String>,
+    row: (&str, &str, &str),
+) -> bool {
+    let contains = |f: &Option<String>, v: &str| {
+        f.as_deref()
+            .filter(|f| !f.is_empty())
+            .is_none_or(|f| v.to_lowercase().contains(&f.to_lowercase()))
+    };
+    let eq = |f: &Option<String>, v: &str| f.as_deref().filter(|f| !f.is_empty()).is_none_or(|f| f == v);
+    !(contains(name, row.0) && contains(title, row.1) && eq(status, row.2))
+}
+
+/// `&name=…&title=…&status=…` for the "+N older" request, so the versions
+/// that match are marked.
+pub(crate) fn filter_query(
+    name: &Option<String>,
+    title: &Option<String>,
+    status: &Option<String>,
+) -> String {
+    let mut q = String::new();
+    for (k, v) in [("name", name), ("title", title), ("status", status)] {
+        if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+            q.push('&');
+            q.push_str(k);
+            q.push('=');
+            q.push_str(&urlencoding_component(v));
+        }
+    }
+    q
+}
+
 /// Percent-encode one query-string component.
 pub(crate) fn urlencoding_component(raw: &str) -> String {
     form_urlencoded::byte_serialize(raw.as_bytes()).collect()
@@ -640,6 +677,16 @@ pub struct CsBrowserFilters {
 }
 
 impl CsBrowserFilters {
+    /// See [`filter_misses`].
+    pub fn misses(&self, name: &str, title: &str, status: &str) -> bool {
+        filter_misses(&self.name, &self.title, &self.status, (name, title, status))
+    }
+
+    /// See [`filter_query`].
+    pub fn match_query(&self) -> String {
+        filter_query(&self.name, &self.title, &self.status)
+    }
+
     /// Hard cap on `_count` per design doc §7.2. Above this the handler
     /// rejects the request; the form input's `max` attribute is the
     /// client-side mirror.
@@ -2077,6 +2124,16 @@ pub struct VsBrowserFilters {
 }
 
 impl VsBrowserFilters {
+    /// See [`filter_misses`].
+    pub fn misses(&self, name: &str, title: &str, status: &str) -> bool {
+        filter_misses(&self.name, &self.title, &self.status, (name, title, status))
+    }
+
+    /// See [`filter_query`].
+    pub fn match_query(&self) -> String {
+        filter_query(&self.name, &self.title, &self.status)
+    }
+
     pub const MAX_COUNT: u32 = 100;
     pub const DEFAULT_COUNT: u32 = 25;
 
@@ -3135,6 +3192,16 @@ pub struct CmBrowserFilters {
 }
 
 impl CmBrowserFilters {
+    /// See [`filter_misses`].
+    pub fn misses(&self, name: &str, title: &str, status: &str) -> bool {
+        filter_misses(&self.name, &self.title, &self.status, (name, title, status))
+    }
+
+    /// See [`filter_query`].
+    pub fn match_query(&self) -> String {
+        filter_query(&self.name, &self.title, &self.status)
+    }
+
     pub const MAX_COUNT: u32 = 100;
     pub const DEFAULT_COUNT: u32 = 25;
 

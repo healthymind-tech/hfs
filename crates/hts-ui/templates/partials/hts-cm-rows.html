@@ -77,7 +77,7 @@
                     {%- else %}{{ row.id }}
                     {%- endif %}
                   </a>
-                  {% if row.version_count.clone() > 1 %}<button type="button" class="versions-toggle" data-versions-toggle data-versions-src="{{ kind.older_href(row.url) }}" aria-expanded="false">{{ chrome.i18n.t_arg("hts-term-older", "count", (row.version_count.clone() - 1).to_string()) }}</button>{% endif %}
+                  {% if row.version_count.clone() > 1 %}<button type="button" class="versions-toggle" data-versions-toggle data-versions-src="{{ kind.older_href(row.url) }}{{ view.filters.match_query() }}"{% if view.filters.misses(row.name.as_str(), row.title.as_str(), row.status.as_str()) %} data-autoexpand{% endif %} aria-expanded="false">{{ chrome.i18n.t_arg("hts-term-older", "count", (row.version_count.clone() - 1).to_string()) }}</button>{% endif %}
                 </td>
                 <td data-label="{{ chrome.i18n.t("hts-cm-browser-column-title") }}">{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
                 <td data-label="{{ chrome.i18n.t("hts-cm-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url url--clip" title="{{ row.url }}">{{ row.url }}</span>{% endif %}</td>

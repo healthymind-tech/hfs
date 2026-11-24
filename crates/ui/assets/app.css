@@ -16357,3 +16357,20 @@ html[data-nav-dir]::view-transition-old(hm-main) {
     }
   }
 }
+
+/* Version grouping: the toggle sits on its own line under the name (never
+   clipped by the name cell); a version that matches the filters is marked. */
+@layer pages {
+  .data-table td.col-name > .versions-toggle {
+    display: flex;
+    width: max-content;
+  }
+
+  .data-table tr[data-older][data-match] > td {
+    background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  }
+
+  .data-table tr[data-older][data-match] > td:first-child {
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+}

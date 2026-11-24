@@ -1116,7 +1116,22 @@
     }
   });
 
+  // A filter that matches only an older version keeps its group: that
+  // version is shown, marked, under the listed one.
+  function autoExpand(root) {
+    var t = (root || document).querySelectorAll("[data-versions-toggle][data-autoexpand]:not([data-loaded])");
+    for (var i = 0; i < t.length && i < 25; i++) t[i].click();
+  }
+  document.addEventListener("hm:navigated", function (e) {
+    autoExpand(e.detail && e.detail.main);
+  });
+  document.addEventListener("htmx:afterSettle", function (e) {
+    var t = e.detail && e.detail.target;
+    if (t && t.querySelector) autoExpand(document.getElementById("main"));
+  });
+
   function start() {
+    autoExpand(document.getElementById("main"));
     rememberPage();
     restoreSidebarScroll();
     markActive();
