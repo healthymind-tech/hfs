@@ -218,6 +218,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_listed_version_misses_the_filters_its_group_matched_on() {
+        use crate::upstream::{filter_misses, filter_query};
+        let none = None;
+        let draft = Some("draft".to_string());
+        let alp = Some("ALP".to_string());
+        assert!(!filter_misses(&none, &none, &none, ("Alpha", "", "active")));
+        assert!(filter_misses(&none, &none, &draft, ("Alpha", "", "active")));
+        assert!(!filter_misses(&alp, &none, &draft, ("alpha", "", "draft")));
+        assert!(filter_misses(&alp, &none, &none, ("Beta", "", "draft")));
+        assert_eq!(filter_query(&alp, &none, &draft), "&name=ALP&status=draft");
+        assert_eq!(filter_query(&none, &none, &none), "");
+    }
+
+    #[test]
     fn hrefs_encode_ids_versions_and_canonicals() {
         assert_eq!(
             Kind::CodeSystem.detail_href("icd9cm", "2015|x"),
