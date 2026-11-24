@@ -373,6 +373,9 @@ pub(crate) struct SpView {
     pub next_href: Option<String>,
     pub pages: Vec<PageLink>,
     pub detail: Option<SpDetail>,
+    /// The same list without a selection: the detail's close (×) link, and
+    /// what Esc or a second click on the selected row navigates to.
+    pub close_href: String,
     pub spec_loaded: bool,
     /// See [`VersionSnapshot::listing_unsupported`].
     pub listing_unsupported: bool,
@@ -800,6 +803,7 @@ pub(crate) fn build_view(
         next_href,
         pages,
         detail,
+        close_href: query.href_current(page, None),
         spec_loaded: snapshot.spec_loaded,
         listing_unsupported: snapshot.listing_unsupported,
         listing_empty: snapshot.spec_loaded && snapshot.params.is_empty(),

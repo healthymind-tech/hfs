@@ -1925,6 +1925,62 @@ async fn search_parameters_selection_renders_the_detail_panel() {
     assert!(html.contains(r#"aria-selected="true""#));
     // The detail panel shows the FHIRPath expression of the spec parameter.
     assert!(html.contains("Patient.name"));
+    // hm/md-detail: a deep link opens with the detail column already there
+    // (no slide on first paint), and its × link drops only the selection.
+    assert!(html.contains(r#"data-md="search-parameters" data-md-open>"#));
+    assert_eq!(html.matches("data-md-detail").count(), 1);
+    assert!(html.contains(r#"<aside class="card detail" id="sp-detail""#));
+    let close = html
+        .split_once("data-md-close")
+        .map(|(before, _)| before)
+        .and_then(|before| before.rsplit_once(r#"href=""#))
+        .and_then(|(_, href)| href.split_once('"'))
+        .map(|(href, _)| href)
+        .expect("the detail's close link");
+    assert!(close.starts_with("/ui/search-parameters?"), "{close}");
+    assert!(close.contains("base=Patient"), "{close}");
+    assert!(!close.contains("sel="), "{close}");
+    assert!(html.contains(r#"aria-label="Close detail""#));
+}
+
+/// hm/md-detail: with nothing selected the page renders no detail column at
+/// all — no empty "No parameter selected" placeholder squeezing the list —
+/// and the list's columns carry the priority classes its container queries
+/// hide as it narrows.
+#[tokio::test]
+async fn search_parameters_without_a_selection_render_no_detail_column() {
+    for uri in [
+        "/ui/search-parameters?base=Patient",
+        // A selection that matches nothing is no selection either.
+        "/ui/search-parameters?base=Patient&sel=http%3A%2F%2Fexample.org%2Fnone",
+    ] {
+        let response = app()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"data-md="search-parameters">"#),
+            "{uri}: the container is closed"
+        );
+        assert!(!html.contains("data-md-open"), "{uri}");
+        assert!(!html.contains("data-md-detail"), "{uri}");
+        assert!(!html.contains(r#"class="card detail""#), "{uri}");
+        assert!(!html.contains("data-md-empty"), "{uri}");
+        assert!(!html.contains("No parameter selected"), "{uri}");
+        assert!(!html.contains(r#"aria-selected="true""#), "{uri}");
+        for col in ["md-col-type", "md-col-base", "md-col-expr"] {
+            assert!(
+                html.contains(&format!(r#"<th class="{col}">"#)),
+                "{uri}: {col}"
+            );
+            assert!(
+                html.contains(&format!(r#"<td class="{col}">"#)),
+                "{uri}: {col}"
+            );
+        }
+    }
 }
 
 /// #320: when the conformance self-fetch yields nothing (an outage, or auth

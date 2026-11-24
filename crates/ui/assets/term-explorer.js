@@ -403,6 +403,9 @@
   function Panel(shell, opts) {
     var card = null;
     var token = 0;
+    // The shell's shared motion helper (shell.js `HM.motion`): the panel
+    // slides in from the right when it opens; nothing under reduced motion.
+    var motion = window.HM && window.HM.motion;
     function close() {
       if (card) card.remove();
       card = null;
@@ -414,6 +417,7 @@
         card = el("aside", { class: "tx-card tx-panel", "aria-label": t("tx-explore-details") });
         shell.appendChild(card);
         shell.classList.add("has-panel");
+        if (motion) motion.enter(card, { dx: 16, duration: 200 });
       }
       return card;
     }
