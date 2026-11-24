@@ -87,17 +87,28 @@
 
   // Confirmations through the shared in-page dialog.
   document.addEventListener("click", function (e) {
-    var btn = e.target.closest && e.target.closest("button[data-confirm]");
+    // A button carrying the question, or a submit button of a form that
+    // carries it (`<form data-confirm>`: console user and sync job Delete).
+    var btn = e.target.closest && e.target.closest(
+      "button[data-confirm], form[data-confirm] button[type=submit], form[data-confirm] button:not([type])"
+    );
     // conformance-crud.js asks for its own Delete buttons (View Definitions,
     // SQL Queries/Views...): asking here too opened a second dialog that
     // superseded the first, and the delete never ran.
     if (!btn || btn.hasAttribute("data-confirmed") || btn.hasAttribute("data-crud-delete")) return;
-    if (!window.HfsConfirm) return;
+    var question = btn.getAttribute("data-confirm") || (btn.form && btn.form.getAttribute("data-confirm"));
+    if (!question || !window.HfsConfirm) return;
     e.preventDefault();
-    window.HfsConfirm.ask(btn.getAttribute("data-confirm"), { danger: true }).then(function (ok) {
+    window.HfsConfirm.ask(question, { danger: true }).then(function (ok) {
       if (!ok) return;
+      // The pass is for this one click: a page restored from the
+      // back/forward cache must ask again.
       btn.setAttribute("data-confirmed", "");
-      btn.click();
+      try {
+        btn.click();
+      } finally {
+        btn.removeAttribute("data-confirmed");
+      }
     });
   });
 
