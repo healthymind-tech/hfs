@@ -67,6 +67,20 @@ pub struct CreatedLaunch {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Result of [`IdpAdmin::set_user_access`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessChange {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    pub total: usize,
+    /// Fingerprint of the list now stored.
+    pub fingerprint: String,
+    /// The list before (for undo).
+    pub before: Vec<crate::access::AccessEntry>,
+}
+
 /// The admin service.
 #[derive(Clone)]
 pub struct IdpAdmin {
@@ -642,6 +656,17 @@ impl IdpAdmin {
                 "at most one fhirUser link per endpoint",
             ));
         }
+        if let Some(bad) = user
+            .links
+            .iter()
+            .flat_map(|l| l.accessible_patients.iter())
+            .find(|p| !crate::access::valid_id(p))
+        {
+            return Err(IdpError::invalid(
+                "links.accessiblePatients",
+                format!("{bad:?} is not a Patient id"),
+            ));
+        }
         for l in &user.links {
             let ok = l.reference.split_once('/').is_some_and(|(t, id)| {
                 matches!(
@@ -714,6 +739,82 @@ impl IdpAdmin {
             self.end_user_sessions(realm_id, &user.id).await?;
         }
         Ok(user)
+    }
+
+    /// Replaces a user's resource access (the flat list of
+    /// [`crate::access`]) in one store write, and records an audit event.
+    /// `expect` — the list's [`crate::access::fingerprint`] the caller
+    /// planned against; a different current list is a conflict.
+    pub async fn set_user_access(
+        &self,
+        realm_id: &str,
+        user_id: &str,
+        entries: Vec<crate::access::AccessEntry>,
+        expect: Option<&str>,
+        actor: &str,
+        action: &str,
+    ) -> Result<AccessChange, IdpError> {
+        use crate::access;
+        self.realm(realm_id).await?;
+        access::check(&entries).map_err(|e| IdpError::invalid("links", e.to_string()))?;
+        let mut user = self
+            .store()
+            .get_user(realm_id, user_id)
+            .await?
+            .ok_or_else(|| IdpError::NotFound(format!("user {user_id}")))?;
+        let before = access::flatten(&user.links);
+        if let Some(fp) = expect
+            && access::fingerprint(&before) != fp
+        {
+            return Err(IdpError::Conflict(
+                "the user's resource access changed since it was read; reload and try again".into(),
+            ));
+        }
+        let old: std::collections::HashMap<(String, String), access::AccessKind> =
+            before.iter().map(|e| (e.key(), e.kind)).collect();
+        let new_keys: std::collections::HashSet<(String, String)> =
+            entries.iter().map(access::AccessEntry::key).collect();
+        let change = AccessChange {
+            added: entries
+                .iter()
+                .filter(|e| !old.contains_key(&e.key()))
+                .count(),
+            removed: before
+                .iter()
+                .filter(|e| !new_keys.contains(&e.key()))
+                .count(),
+            changed: entries
+                .iter()
+                .filter(|e| old.get(&e.key()).is_some_and(|k| *k != e.kind))
+                .count(),
+            total: entries.len(),
+            fingerprint: access::fingerprint(&entries),
+            before,
+        };
+        if change.added + change.removed + change.changed == 0 {
+            return Ok(change);
+        }
+        user.links = access::to_links(&entries);
+        Self::check_user(&user)?;
+        self.store().put_user(realm_id, user).await?;
+        let realm = self
+            .rt
+            .realms()
+            .into_iter()
+            .find(|r| r.id == realm_id)
+            .map(|r| r.spec.name.as_str().to_string())
+            .unwrap_or_else(|| realm_id.to_string());
+        self.rt.emit(IdpEvent::UserAccessChanged {
+            realm,
+            user_id: user_id.to_string(),
+            actor: actor.to_string(),
+            action: action.to_string(),
+            added: change.added,
+            removed: change.removed,
+            changed: change.changed,
+            total: change.total,
+        });
+        Ok(change)
     }
 
     pub async fn set_password(

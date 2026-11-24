@@ -102,8 +102,41 @@ AuditEvent:
 | login success / failure / lockout | DCM 110114 / DCM 110122 | — (ATNA pattern; BALP has no login profile) |
 | logout | DCM 110114 / DCM 110123 | — |
 | consent withdrawn / denied, revocation, refresh reuse, code replay, client authentication failure, key change | DCM 110113 | — |
+| a user's resource access changed (console editor or `/admin/idp/…/links`) | DCM 110113 / `idp-event#user-access-change`, action `U`, details `action added removed changed total` | — |
 
 No event carries a token, code, verifier, password or client secret.
+
+## 5a. Users' resource access in bulk
+
+A user's FHIR resources (the `fhirUser` identity, accessible patients, other
+links) are edited on the user's page (**Resource access**: search the bound
+endpoint, paste or import lists, copy all, bulk remove, undo) or through the
+admin API — viewer role to read, editor to change:
+
+```
+GET   /admin/idp/realms/{realm}/users/{user}/links      JSON {links, entries, total, fingerprint};
+                                                         Accept text/csv | text/plain, or ?format=csv|lines|json
+PUT   /admin/idp/realms/{realm}/users/{user}/links      replace (JSON, text/csv, text/plain)
+PATCH /admin/idp/realms/{realm}/users/{user}/links      add, or JSON {"add": [...], "remove": [...]}
+      ?endpoint=  rows without one   ?dryRun=true  plan only   ?skipInvalid=true  apply the good rows
+      If-Match: "<fingerprint>"  (412 when the list changed meanwhile)
+```
+
+Formats: one reference per line (`Patient/123`, `endpoint/Patient/123`, or an
+absolute URL), CSV `endpoint,reference,kind` (`kind` = `fhirUser`, `patient`,
+`link`), JSON (the links array, entries, reference strings, or a FHIR search
+Bundle). At most 10,000 rows (4 MiB) per request, 20,000 entries per user;
+one store transaction each, audited as `user-access-change`. The stored model
+is unchanged: patients go into the identity link's `accessiblePatients` (or
+become plain `Patient/…` links on an endpoint without an identity), so the
+token, consent and patient-picker logic read the same links as before.
+
+The console shows each reference's name and whether it exists on the
+endpoint by reading the endpoint as the signed-in console user; on an
+endpoint with Internal security it mints a 60-second read-only token of that
+realm for the console user (`client_id hfs-console-resource-access`,
+`user/{Patient,Practitioner,PractitionerRole,RelatedPerson,Person}.rs`),
+like the hosted patient picker does. The API does not check existence.
 
 ## 6. nginx
 

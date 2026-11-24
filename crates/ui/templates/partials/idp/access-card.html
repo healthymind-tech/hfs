@@ -1,0 +1,195 @@
+{#- "Resource access" card of a realm user (crate::idp::access). Needs
+    `access: AccessCard`, `head`, `user`. Without JavaScript the filters are
+    a GET form and the pager real links; idp-access.js swaps the table in
+    place, and drives the add picker, Copy all, Paste/import and undo. -#}
+<script src="/ui/assets/idp-access.js" defer></script>
+<section class="card access" id="access" aria-labelledby="access-title"
+         data-access data-base="{{ access.base }}" data-page-href="/ui/idp/{{ head.name }}/users/{{ user.id }}"
+         data-can-edit="{% if access.can_edit %}1{% else %}0{% endif %}"
+         data-msg-copied="{{ i18n.t("idpa-copied") }}"
+         data-msg-copied-one="{{ i18n.t("idpa-copied-one") }}"
+         data-msg-select-all="{{ i18n.t("idpa-select-all-matching") }}"
+         data-msg-one-identity="{{ i18n.t("idpa-one-identity") }}"
+         data-msg-lines="{{ i18n.t("idpa-lines") }}"
+         data-msg-copy-failed="{{ i18n.t("idpa-copy-failed") }}"
+         data-msg-added="{{ i18n.t("idpa-toast-added") }}"
+         data-msg-removed="{{ i18n.t("idpa-toast-removed") }}"
+         data-msg-changed="{{ i18n.t("idpa-toast-changed") }}"
+         data-msg-nothing="{{ i18n.t("idpa-toast-nothing") }}"
+         data-msg-undo="{{ i18n.t("idpa-undo") }}"
+         data-msg-undone="{{ i18n.t("idpa-undone") }}"
+         data-msg-error="{{ i18n.t("idpa-error") }}"
+         data-msg-selected="{{ i18n.t("idpa-selected") }}"
+         data-msg-picked="{{ i18n.t("idpa-picked") }}"
+         data-msg-add-n="{{ i18n.t("idpa-add-n") }}"
+         data-msg-remove-confirm="{{ i18n.t("idpa-remove-confirm") }}"
+         data-msg-remove-all-confirm="{{ i18n.t("idpa-remove-all-confirm") }}"
+         data-msg-replace-confirm="{{ i18n.t("idpa-replace-confirm") }}"
+         data-msg-identity-confirm="{{ i18n.t("idpa-identity-confirm") }}"
+         data-msg-file-too-big="{{ i18n.t("idpa-file-too-big") }}"
+         data-msg-loading="{{ i18n.t("idpa-loading") }}"
+         data-msg-searching="{{ i18n.t("idpa-searching") }}"
+         data-max-bytes="4194304">
+  <header class="access__head">
+    <div class="access__heading">
+      <h2 class="access__title" id="access-title">{{ i18n.t("idpa-title") }} <span class="access__total" data-access-total>{{ access.total }}</span></h2>
+      <p class="access__desc">{{ i18n.t("idpa-desc") }}</p>
+    </div>
+    <div class="access__actions">
+      <details class="menu menu--end access__copy" data-access-copy-menu>
+        <summary class="btn" aria-haspopup="menu">{% call ui::icon("copy") %}{% endcall %}<span>{{ i18n.t("idpa-copy-all") }}</span>{% call ui::icon("chevron-down") %}{% endcall %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact access__menu" role="menu">
+          <p class="access__menu-label">{{ i18n.t("idpa-copy-as") }}</p>
+          <button type="button" class="menu__option" role="menuitem" data-access-copy="lines"><span class="menu__option-text">{{ i18n.t("idpa-format-lines") }}</span><span class="access__menu-eg">Patient/123</span></button>
+          <button type="button" class="menu__option" role="menuitem" data-access-copy="csv"><span class="menu__option-text">{{ i18n.t("idpa-format-csv") }}</span><span class="access__menu-eg">endpoint,reference,kind</span></button>
+          <button type="button" class="menu__option" role="menuitem" data-access-copy="json"><span class="menu__option-text">{{ i18n.t("idpa-format-json") }}</span><span class="access__menu-eg">[{"endpoint",…}]</span></button>
+          <p class="access__menu-label">{{ i18n.t("idpa-download-as") }}</p>
+          <a class="menu__option" role="menuitem" href="{{ access.base }}/export?format=csv&amp;download=1" download data-full-load><span class="menu__option-text">{{ i18n.t("idpa-download-csv") }}</span></a>
+          <a class="menu__option" role="menuitem" href="{{ access.base }}/export?format=json&amp;download=1" download data-full-load><span class="menu__option-text">{{ i18n.t("idpa-download-json") }}</span></a>
+        </div>
+      </details>
+      {% if access.can_edit %}
+      <button type="button" class="btn" data-access-open="paste">{% call ui::icon("import") %}{% endcall %}<span>{{ i18n.t("idpa-paste") }}</span></button>
+      <button type="button" class="btn btn--primary" data-access-open="add">{% call ui::icon("plus") %}{% endcall %}<span>{{ i18n.t("idpa-add") }}</span></button>
+      {% endif %}
+    </div>
+  </header>
+
+  <form class="access__filters" method="get" action="/ui/idp/{{ head.name }}/users/{{ user.id }}#access" role="search" aria-label="{{ i18n.t("idpa-filter-label") }}" data-access-filters{% if access.total == 0 %} hidden{% endif %}>
+    <div class="filter-bar__search access__search">
+      <label class="visually-hidden" for="access-q">{{ i18n.t("idpa-filter") }}</label>
+      <span class="filter-bar__icon" aria-hidden="true">{% call ui::icon("search") %}{% endcall %}</span>
+      <input id="access-q" class="mfield__input" type="search" name="q" value="{{ access.q.q }}" placeholder="{{ i18n.t("idpa-filter") }}" autocomplete="off" spellcheck="false">
+    </div>
+    <label class="visually-hidden" for="access-type">{{ i18n.t("idpa-col-type") }}</label>
+    <select id="access-type" class="mfield__input access__select" name="type">
+      <option value="">{{ i18n.t("idpa-all-types") }}</option>
+      {% for (t, n) in access.types %}<option value="{{ t }}" data-label="{{ t }}"{% if access.is_type(t) %} selected{% endif %}>{{ t }} ({{ n }})</option>{% endfor %}
+    </select>
+    <label class="visually-hidden" for="access-kind">{{ i18n.t("idpa-col-kind") }}</label>
+    <select id="access-kind" class="mfield__input access__select" name="kind">
+      <option value="">{{ i18n.t("idpa-all-kinds") }}</option>
+      {% for (k, key, n) in access.kinds %}<option value="{{ k }}" data-label="{{ i18n.t(key) }}"{% if access.is_kind(k) %} selected{% endif %}>{{ i18n.t(key) }} ({{ n }})</option>{% endfor %}
+    </select>
+    {% if access.endpoints.len() > 1 %}
+    <label class="visually-hidden" for="access-ep">{{ i18n.t("idpa-col-endpoint") }}</label>
+    <select id="access-ep" class="mfield__input access__select" name="ep">
+      <option value="">{{ i18n.t("idpa-all-endpoints") }}</option>
+      {% for e in access.endpoints %}<option value="{{ e }}"{% if access.is_ep(e) %} selected{% endif %}>{{ e }}</option>{% endfor %}
+    </select>
+    {% endif %}
+    <noscript><button type="submit" class="btn">{{ i18n.t("idpa-filter-apply") }}</button></noscript>
+  </form>
+
+  {% if access.can_edit %}
+  <div class="access__bulk" data-access-bulk hidden role="region" aria-label="{{ i18n.t("idpa-bulk-label") }}">
+    <span class="access__bulk-count" data-access-selected-text></span>
+    <button type="button" class="btn btn--ghost btn--small" data-access-select-matching hidden></button>
+    <span class="access__bulk-spacer"></span>
+    <button type="button" class="btn btn--small" data-access-clear>{{ i18n.t("idpa-clear-selection") }}</button>
+    <button type="button" class="btn btn--small btn--danger" data-access-remove-selected>{% call ui::icon("trash") %}{% endcall %}<span>{{ i18n.t("idpa-remove") }}</span></button>
+  </div>
+  {% endif %}
+
+  <div class="access__table" id="access-table" data-access-table aria-live="polite">{{ access.table|safe }}</div>
+
+  {% if access.can_edit %}
+  <dialog class="access-dialog" data-access-dialog="add" aria-labelledby="access-add-title">
+    <form class="access-dialog__form" data-access-add-form>
+      <header class="access-dialog__head">
+        <h2 class="access-dialog__title" id="access-add-title">{{ i18n.t("idpa-add-title") }}</h2>
+        <button type="button" class="addbox__x" data-access-close aria-label="{{ i18n.t("ui-close") }}">×</button>
+      </header>
+      <div class="access-dialog__body">
+        <div class="access-pick__opts">
+          {% if access.endpoints.len() > 1 %}
+          <label class="field access-pick__field"><span class="field__label">{{ i18n.t("idpa-col-endpoint") }}</span>
+            <select class="mfield__input" name="ep" data-access-pick-ep>{% for e in access.endpoints %}<option value="{{ e }}">{{ e }}</option>{% endfor %}</select></label>
+          {% else %}
+          {% for e in access.endpoints %}<input type="hidden" name="ep" value="{{ e }}" data-access-pick-ep>{% endfor %}
+          {% endif %}
+          <label class="field access-pick__field"><span class="field__label">{{ i18n.t("idpa-add-as") }}</span>
+            <select class="mfield__input" name="kind" data-access-pick-kind>
+              <option value="auto">{{ i18n.t("idpa-kind-auto") }}</option>
+              <option value="patient">{{ i18n.t("idpa-kind-patient") }}</option>
+              <option value="fhirUser">{{ i18n.t("idpa-kind-fhiruser") }}</option>
+              <option value="link">{{ i18n.t("idpa-kind-link") }}</option>
+            </select></label>
+        </div>
+        <div class="field" role="group" aria-labelledby="access-type-label">
+          <span class="field__label" id="access-type-label">{{ i18n.t("idpa-col-type") }}</span>
+          <div class="seg-radios access-pick__types">
+            {% for t in access.link_types %}<label><input type="radio" name="type" value="{{ t }}"{% if loop.first %} checked{% endif %} data-access-pick-type>{{ t }}</label>{% endfor %}
+          </div>
+        </div>
+        <div class="filter-bar__search access-pick__search">
+          <label class="visually-hidden" for="access-pick-q">{{ i18n.t("idpa-search") }}</label>
+          <span class="filter-bar__icon" aria-hidden="true">{% call ui::icon("search") %}{% endcall %}</span>
+          <input id="access-pick-q" class="mfield__input" type="search" autocomplete="off" spellcheck="false"
+                 placeholder="{{ i18n.t("idpa-search") }}" role="combobox" aria-expanded="true"
+                 aria-controls="access-pick-list" aria-autocomplete="list" data-access-pick-q>
+        </div>
+        <div class="access-pick__results" data-access-results aria-busy="false"></div>
+        <p class="access-pick__keys" aria-hidden="true">{{ i18n.t("idpa-pick-keys") }}</p>
+      </div>
+      <footer class="access-dialog__foot">
+        <span class="access-dialog__status" data-access-picked aria-live="polite"></span>
+        <button type="button" class="btn" data-access-close>{{ i18n.t("idpc-cancel") }}</button>
+        <button type="submit" class="btn btn--primary" data-access-add-submit disabled>{{ i18n.t("idpa-add") }}</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="access-dialog access-dialog--wide" data-access-dialog="paste" aria-labelledby="access-paste-title">
+    <form class="access-dialog__form" data-access-paste-form>
+      <header class="access-dialog__head">
+        <h2 class="access-dialog__title" id="access-paste-title">{{ i18n.t("idpa-paste-title") }}</h2>
+        <button type="button" class="addbox__x" data-access-close aria-label="{{ i18n.t("ui-close") }}">×</button>
+      </header>
+      <div class="access-dialog__body">
+        <div data-access-step="input">
+          <div class="access-drop" data-access-drop>
+            <label class="visually-hidden" for="access-paste-text">{{ i18n.t("idpa-paste-label") }}</label>
+            <textarea id="access-paste-text" class="mfield__input mono access-drop__text" name="text" rows="12" spellcheck="false" autocomplete="off"
+                      placeholder="{{ i18n.t("idpa-paste-placeholder") }}" data-access-paste-text></textarea>
+            <div class="access-drop__over" aria-hidden="true">{% call ui::icon("import") %}{% endcall %}<span>{{ i18n.t("idpa-drop") }}</span></div>
+          </div>
+          <div class="access-drop__row">
+            <label class="btn btn--small access-drop__file">{% call ui::icon("export") %}{% endcall %}<span>{{ i18n.t("idpa-choose-file") }}</span><input type="file" class="visually-hidden" accept=".txt,.csv,.json,text/plain,text/csv,application/json" data-access-file></label>
+            <span class="access-drop__name" data-access-file-name></span>
+            <span class="access-drop__lines" data-access-line-count aria-live="polite"></span>
+          </div>
+          <p class="mfield__hint">{{ i18n.t_arg("idpa-formats-hint", "max", access.max_import) }}</p>
+          <div class="access-paste__opts">
+            {% if access.endpoints.len() > 1 %}
+            <label class="field access-pick__field"><span class="field__label">{{ i18n.t("idpa-default-endpoint") }}</span>
+              <select class="mfield__input" name="ep">{% for e in access.endpoints %}<option value="{{ e }}">{{ e }}</option>{% endfor %}</select>
+              <span class="field__hint">{{ i18n.t("idpa-default-endpoint-hint") }}</span></label>
+            {% else %}
+            {% for e in access.endpoints %}<input type="hidden" name="ep" value="{{ e }}">{% endfor %}
+            {% endif %}
+            <div class="field" role="group" aria-labelledby="access-mode-label">
+              <span class="field__label" id="access-mode-label">{{ i18n.t("idpa-mode") }}</span>
+              <div class="seg-radios">
+                <label><input type="radio" name="mode" value="add" checked data-access-mode>{{ i18n.t("idpa-mode-add") }}</label>
+                <label><input type="radio" name="mode" value="replace" data-access-mode>{{ i18n.t("idpa-mode-replace") }}</label>
+              </div>
+              <span class="field__hint" data-access-mode-hint data-add="{{ i18n.t("idpa-mode-add-hint") }}" data-replace="{{ i18n.t("idpa-mode-replace-hint") }}">{{ i18n.t("idpa-mode-add-hint") }}</span>
+            </div>
+          </div>
+        </div>
+        <div data-access-step="preview" hidden>
+          <div data-access-preview aria-live="polite"></div>
+        </div>
+      </div>
+      <footer class="access-dialog__foot">
+        <span class="access-dialog__status" data-access-paste-status aria-live="polite"></span>
+        <button type="button" class="btn" data-access-close data-access-in="input">{{ i18n.t("idpc-cancel") }}</button>
+        <button type="submit" class="btn btn--primary" data-access-preview-btn data-access-in="input" disabled>{{ i18n.t("idpa-preview") }}</button>
+        <button type="button" class="btn" data-access-back data-access-in="preview" hidden>{{ i18n.t("idpa-back") }}</button>
+        <button type="button" class="btn btn--primary" data-access-apply data-access-in="preview" hidden disabled>{{ i18n.t("idpa-apply") }}</button>
+      </footer>
+    </form>
+  </dialog>
+  {% endif %}
+</section>

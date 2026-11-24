@@ -3,7 +3,7 @@
   "info": {
     "title": "HFS built-in authorization server — admin API",
     "version": "1.0.0",
-    "description": "Manage internal authorization servers (realms): settings, signing keys, apps, users, sessions, grants, EHR launches, endpoint binding, and the diagnostic. Requires an administrator (console session with role admin + X-CSRF-Token for writes, the administrator credential, or an admin token). Available only with HFS_IDP=on."
+    "description": "Manage internal authorization servers (realms): settings, signing keys, apps, users, sessions, grants, EHR launches, endpoint binding, and the diagnostic. Requires an administrator (console session with role admin + X-CSRF-Token for writes, the administrator credential, or an admin token). Available only with HFS_IDP=on. Exception: a user's resource access in bulk (/users/{user}/links) needs only the viewer role to read and editor to change, as in the console."
   },
   "servers": [
     {
@@ -396,6 +396,93 @@
             "items": {
               "$ref": "#/components/schemas/Step"
             }
+          }
+        }
+      },
+      "AccessEntry": {
+        "type": "object",
+        "required": [
+          "endpoint",
+          "reference",
+          "kind"
+        ],
+        "description": "One granted reference. kind fhirUser = the user is this resource on the endpoint (at most one per endpoint); patient = a Patient the user may select (stored in the fhirUser link's accessiblePatients); link = another linked resource.",
+        "properties": {
+          "endpoint": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string",
+            "pattern": "^(Patient|Practitioner|PractitionerRole|RelatedPerson|Person)/[A-Za-z0-9.-]{1,64}$"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "fhirUser",
+              "patient",
+              "link"
+            ]
+          }
+        }
+      },
+      "AccessList": {
+        "type": "object",
+        "properties": {
+          "links": {
+            "type": "array",
+            "description": "As stored (RealmUser.links)",
+            "items": {
+              "type": "object"
+            }
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessEntry"
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "Same as the ETag; send it as If-Match"
+          }
+        }
+      },
+      "AccessResult": {
+        "type": "object",
+        "description": "Applied change (or, with dryRun=true or on 422, the plan: rows, counts per status new|granted|changed|invalid|duplicate|conflict, the first 500 rejected rows with line, input, issue code and message).",
+        "properties": {
+          "added": {
+            "type": "integer"
+          },
+          "removed": {
+            "type": "integer"
+          },
+          "changed": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "fingerprint": {
+            "type": "string"
+          },
+          "counts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          },
+          "rejected": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "dryRun": {
+            "type": "boolean"
           }
         }
       }
@@ -2279,6 +2366,437 @@
                   "mustChange": {
                     "type": "boolean"
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/idp/realms/{realm}/users/{user}/links": {
+      "get": {
+        "summary": "A user's resource access (every granted reference)",
+        "description": "JSON by default; Accept text/csv or text/plain, or ?format=csv|lines|json (json = the links array alone), for the copy/export formats. Viewer role or above.",
+        "parameters": [
+          {
+            "name": "realm",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Realm name (the last path segment of its issuer)"
+          },
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "user id"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "csv",
+                "lines"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The list",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessList"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Replace a user's resource access in one transaction",
+        "description": "Editor role or above. Audited (user-access-change).",
+        "parameters": [
+          {
+            "name": "realm",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Realm name (the last path segment of its issuer)"
+          },
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "user id"
+          },
+          {
+            "name": "endpoint",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Endpoint for rows that name none (bare Patient/123 lines)"
+          },
+          {
+            "name": "dryRun",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Plan only; nothing is stored"
+          },
+          {
+            "name": "skipInvalid",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Store the accepted rows even when some are invalid, duplicated or conflicting (otherwise 422 and nothing is stored)"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            },
+            "description": "The list's fingerprint (ETag of GET); 412 when it changed meanwhile"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Up to 10,000 rows, 4 MiB. Any of: JSON — the links array, {\"links\":[…]}, entries [{endpoint,reference,kind}], {\"entries\":[…]}, an array of reference strings, or a FHIR searchset Bundle; text/csv — endpoint,reference,kind (header optional; comma, semicolon or tab); text/plain — one reference per line (Patient/123, endpoint/Patient/123 or an absolute URL; # comments).",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "text/csv": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Add to (or remove from) a user's resource access in one transaction",
+        "description": "Editor role or above. Audited (user-access-change).",
+        "parameters": [
+          {
+            "name": "realm",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Realm name (the last path segment of its issuer)"
+          },
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "user id"
+          },
+          {
+            "name": "endpoint",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Endpoint for rows that name none (bare Patient/123 lines)"
+          },
+          {
+            "name": "dryRun",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Plan only; nothing is stored"
+          },
+          {
+            "name": "skipInvalid",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Store the accepted rows even when some are invalid, duplicated or conflicting (otherwise 422 and nothing is stored)"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            },
+            "description": "The list's fingerprint (ETag of GET); 412 when it changed meanwhile"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Rows to add (same formats as PUT; rows already granted are kept, a kind given re-kinds them), or explicit changes {\"add\":[AccessEntry…],\"remove\":[{endpoint,reference}…]}.",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "text/csv": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }

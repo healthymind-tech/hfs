@@ -16,6 +16,7 @@
 // Page renderers take the request context pieces explicitly.
 #![allow(clippy::too_many_arguments)]
 
+pub(crate) mod access;
 pub(crate) mod manage;
 pub(crate) mod security;
 pub(crate) mod verify;
@@ -70,6 +71,36 @@ pub(crate) fn routes() -> Router<WebState> {
         .route(
             "/ui/idp/{realm}/users/{user}/{action}",
             post(manage::user_action),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/access",
+            get(access::table_fragment),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/access/export",
+            get(access::export),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/access/search",
+            get(access::search),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/access/preview",
+            post(access::preview).layer(axum::extract::DefaultBodyLimit::max(
+                helios_idp::access::MAX_TEXT_BYTES + 64 * 1024,
+            )),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/access/apply",
+            post(access::apply).layer(axum::extract::DefaultBodyLimit::max(
+                helios_idp::access::MAX_TEXT_BYTES + 64 * 1024,
+            )),
+        )
+        .route(
+            "/ui/idp/{realm}/users/{user}/access/patch",
+            post(access::patch).layer(axum::extract::DefaultBodyLimit::max(
+                helios_idp::access::MAX_TEXT_BYTES + 64 * 1024,
+            )),
         )
         .route("/ui/idp/{realm}/keys", get(manage::keys_page))
         .route("/ui/idp/{realm}/keys/{action}", post(manage::keys_action))

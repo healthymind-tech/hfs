@@ -9,7 +9,7 @@ use askama::Template;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use helios_endpoints::ConsolePrincipal;
@@ -725,6 +725,8 @@ pub(crate) struct UserRowFull {
     pub display: String,
     pub kind_key: &'static str,
     pub fhir_user: String,
+    /// Granted references besides the identity (Resource access).
+    pub more: usize,
     pub disabled: bool,
 }
 
@@ -767,7 +769,12 @@ fn source_key(s: &UserSource) -> &'static str {
 }
 
 fn user_row(u: RealmUser) -> UserRowFull {
+    let more = helios_idp::access::flatten(&u.links)
+        .iter()
+        .filter(|e| e.kind != helios_idp::access::AccessKind::FhirUser)
+        .count();
     UserRowFull {
+        more,
         fhir_user: u
             .links
             .iter()
@@ -925,12 +932,12 @@ pub(crate) struct UserPage {
     pub head: RealmHead,
     pub user: UserRowFull,
     pub form: HashMap<String, String>,
-    pub endpoint_names: Vec<String>,
     pub sessions: Vec<SessionRow>,
     pub grants: Vec<GrantRow>,
     pub errors: Errors,
     pub flash: Option<String>,
     pub password_min: u32,
+    pub access: super::access::AccessCard,
 }
 
 impl UserPage {
@@ -1015,6 +1022,9 @@ async fn render_user(
     user_id: &str,
     errors: Errors,
     flash: Option<String>,
+    headers: &HeaderMap,
+    q: super::access::TableQuery,
+    principal: Option<&ConsolePrincipal>,
 ) -> Response {
     let Ok(Some(u)) = c.admin.runtime().store().get_user(&rec.id, user_id).await else {
         return (StatusCode::NOT_FOUND, "no such user").into_response();
@@ -1032,11 +1042,9 @@ async fn render_user(
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default(),
     );
-    if let Some(l) = u.links.iter().find(|l| l.is_fhir_user) {
-        form.insert("user_endpoint".into(), l.endpoint.clone());
-        form.insert("user_reference".into(), l.reference.clone());
-    }
     let (sessions, grants) = sessions_of(c, rec, Some(user_id)).await;
+    let reader = super::access::Reader::new(st, headers, rt, principal);
+    let access = super::access::card(&reader, locale, rt, c, rec, user_id, q).await;
     let failed = !errors.is_empty();
     let mut r = render(UserPage {
         status: current_status(st, rv.0, rt),
@@ -1045,17 +1053,12 @@ async fn render_user(
         head: head(c, rec, "users"),
         user: user_row(u),
         form,
-        endpoint_names: c
-            .endpoint_views()
-            .await
-            .into_iter()
-            .map(|e| e.name)
-            .collect(),
         sessions,
         grants,
         errors,
         flash,
         password_min: rec.spec.security.password_min_length,
+        access,
     });
     if failed {
         *r.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
@@ -1068,10 +1071,13 @@ pub(crate) async fn user_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    headers: HeaderMap,
+    principal: Option<Extension<ConsolePrincipal>>,
     Path((realm, user)): Path<(String, String)>,
-    Query(q): Query<Done>,
+    Query(q): Query<super::access::TableQuery>,
 ) -> Response {
     let (c, rec) = ctx!(c, realm);
+    let flash = flash_key(q.done.as_deref());
     render_user(
         &st,
         locale,
@@ -1081,7 +1087,10 @@ pub(crate) async fn user_page(
         &rec,
         &user,
         Errors::default(),
-        flash_key(q.done.as_deref()),
+        flash,
+        &headers,
+        q,
+        principal.as_ref().map(|p| &p.0),
     )
     .await
 }
@@ -1091,6 +1100,8 @@ pub(crate) async fn user_save(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    headers: HeaderMap,
+    principal: Option<Extension<ConsolePrincipal>>,
     Path((realm, user)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
@@ -1103,8 +1114,7 @@ pub(crate) async fn user_save(
     u.display_name = edited.display_name;
     u.email = edited.email;
     u.kind = edited.kind;
-    u.links.retain(|l| !l.is_fhir_user);
-    u.links.extend(edited.links);
+    // Links are edited by the Resource access card (`super::access`).
     u.disabled = f.checked("disabled");
     match c.admin.update_user(&rec.id, u).await {
         Ok(_) => see_other(&format!("/ui/idp/{realm}/users/{user}?done=saved")),
@@ -1121,6 +1131,9 @@ pub(crate) async fn user_save(
                 &user,
                 Errors::from_op(&e),
                 None,
+                &headers,
+                Default::default(),
+                principal.as_ref().map(|p| &p.0),
             )
             .await
         }
@@ -1132,6 +1145,8 @@ pub(crate) async fn user_action(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    headers: HeaderMap,
+    principal: Option<Extension<ConsolePrincipal>>,
     Path((realm, user, action)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Response {
@@ -1162,6 +1177,9 @@ pub(crate) async fn user_action(
                     &user,
                     Errors::from_op(&e),
                     None,
+                    &headers,
+                    Default::default(),
+                    principal.as_ref().map(|p| &p.0),
                 )
                 .await
             }

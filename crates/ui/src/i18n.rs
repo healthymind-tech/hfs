@@ -788,15 +788,15 @@ mod tests {
         use std::collections::BTreeSet;
         use std::path::Path;
 
-        let keys = |locale: &str| -> BTreeSet<String> {
+        let keys_of = |locale: &str, file: &str| -> BTreeSet<String> {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../locales")
                 .join(locale)
-                .join("main.ftl");
+                .join(file);
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let resource = fluent_syntax::parser::parse(source)
-                .unwrap_or_else(|(_, errors)| panic!("{locale}/main.ftl: {errors:?}"));
+                .unwrap_or_else(|(_, errors)| panic!("{locale}/{file}: {errors:?}"));
             resource
                 .body
                 .iter()
@@ -808,13 +808,43 @@ mod tests {
                 .collect()
         };
 
-        let en = keys("en");
-        assert!(!en.is_empty());
-        for locale in ["es", "de", "zh-Hant"] {
-            assert_eq!(
-                en,
-                keys(locale),
-                "{locale}/main.ftl must define the same key set as en/main.ftl"
+        // Catalogs every locale carries (the console's other catalogs are
+        // en + zh-Hant only and fall back to English elsewhere).
+        for file in ["main.ftl", "idp-access.ftl"] {
+            let en = keys_of("en", file);
+            assert!(!en.is_empty());
+            for locale in ["es", "de", "zh-Hant"] {
+                assert_eq!(
+                    en,
+                    keys_of(locale, file),
+                    "{locale}/{file} must define the same key set as en/{file}"
+                );
+            }
+        }
+    }
+
+    /// Every resource-access key the templates and the handler use exists.
+    #[test]
+    fn resource_access_keys_resolve() {
+        for locale in ["en", "zh-Hant", "de", "es"] {
+            let i18n = I18n::new(RequestLocale(Box::leak(Box::new(
+                locale.parse::<LanguageIdentifier>().unwrap(),
+            ))));
+            for key in [
+                "idpa-title",
+                "idpa-kind-fhiruser",
+                "idpa-status-missing",
+                "idpa-issue-bad-reference",
+                "idpa-issue-kind-mismatch",
+                "idpa-issue-no-endpoint",
+                "idpa-gender-female",
+            ] {
+                assert_ne!(i18n.t(key), key, "{locale}: {key}");
+            }
+            let range = i18n.t_arg3("idpa-range", "from", 26, "to", 50, "count", 101);
+            assert!(
+                range.contains("26") && range.contains("50") && range.contains("101"),
+                "{range}"
             );
         }
     }
