@@ -19,7 +19,7 @@
         <td data-label="{{ i18n.t("idpc-user-username") }}"><a href="/ui/idp/{{ head.name }}/users/{{ u.id }}">{{ u.username }}</a></td>
         <td data-label="{{ i18n.t("idpc-user-display") }}">{{ u.display }}</td>
         <td data-label="{{ i18n.t("idpc-user-kind") }}">{{ i18n.t(u.kind_key) }}</td>
-        <td data-label="{{ i18n.t("idpc-user-link") }}">{% if u.fhir_user.is_empty() %}—{% else %}<code>{{ u.fhir_user }}</code>{% endif %}</td>
+        <td data-label="{{ i18n.t("idpc-user-link") }}">{% if u.fhir_user.is_empty() && u.more == 0 %}—{% else %}{% if !u.fhir_user.is_empty() %}<code>{{ u.fhir_user }}</code>{% endif %}{% if u.more > 0 %} <a class="tag" href="/ui/idp/{{ head.name }}/users/{{ u.id }}#access">{{ i18n.t_arg("idpa-users-more", "count", u.more.to_string()) }}</a>{% endif %}{% endif %}</td>
         <td data-label="{{ i18n.t("idpc-col-status") }}">{% if u.disabled %}{% call ui::pill_raw("muted", "lock", i18n.t("idpc-status-disabled")) %}{% endcall %}{% else %}{% call ui::pill_raw("ok", "check-circle", i18n.t("idpc-status-enabled")) %}{% endcall %}{% endif %}</td>
       </tr>
       {% endfor %}

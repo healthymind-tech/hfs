@@ -1,0 +1,68 @@
+{#- The resource-access table (crate::idp::access::AccessTable): one page of
+    granted references, their names and status from the endpoint. -#}
+{% import "partials/components.html" as ui %}
+<div class="access-grid stack--joined" data-access-grid data-fingerprint="{{ fingerprint }}" data-total="{{ total }}" data-matching="{{ matching }}" data-query="{{ query_string() }}" data-counts="{{ counts }}">
+{% if total == 0 %}
+  {% call ui::empty_state("users", i18n.t("idpa-empty-title"), i18n.t("idpa-empty-text")) %}
+    {% if can_edit %}<button type="button" class="btn btn--primary" data-access-open="add">{% call ui::icon("plus") %}{% endcall %}{{ i18n.t("idpa-add") }}</button>
+    <button type="button" class="btn" data-access-open="paste">{% call ui::icon("import") %}{% endcall %}{{ i18n.t("idpa-paste") }}</button>{% endif %}
+  {% endcall %}
+{% else if matching == 0 %}
+  {% call ui::empty_state("search", i18n.t("idpa-nomatch-title"), i18n.t("idpa-nomatch-text")) %}
+    <a class="btn" href="{{ page_href }}#access" data-access-clear-filters>{{ i18n.t("idpa-clear-filters") }}</a>
+  {% endcall %}
+{% else %}
+  {% if name_search_failed %}<p class="access__note">{% call ui::icon("info") %}{% endcall %}{{ i18n.t("idpa-name-search-failed") }}</p>{% endif %}
+  <div class="table-wrap" tabindex="0">
+    <table class="data-table data-table--stack access-t">
+      <thead>
+        <tr>
+          {% if can_edit %}<th scope="col" class="access-t__check"><input type="checkbox" data-access-all aria-label="{{ i18n.t("idpa-select-page") }}"></th>{% endif %}
+          <th scope="col" aria-sort="{{ sorted("resource") }}"><a class="access-t__sort" href="{{ sort_href("resource") }}#access" data-access-nav>{{ i18n.t("idpa-col-resource") }}</a></th>
+          <th scope="col">{{ i18n.t("idpa-col-name") }}</th>
+          <th scope="col" aria-sort="{{ sorted("endpoint") }}"><a class="access-t__sort" href="{{ sort_href("endpoint") }}#access" data-access-nav>{{ i18n.t("idpa-col-endpoint") }}</a></th>
+          <th scope="col" aria-sort="{{ sorted("kind") }}"><a class="access-t__sort" href="{{ sort_href("kind") }}#access" data-access-nav>{{ i18n.t("idpa-col-kind") }}</a></th>
+          <th scope="col">{{ i18n.t("idpa-col-status") }}</th>
+          <th scope="col" class="col-actions"><span class="visually-hidden">{{ i18n.t("idpa-col-actions") }}</span></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        <tr data-key="{{ r.key }}" data-endpoint="{{ r.endpoint }}" data-reference="{{ r.reference }}" data-kind="{{ r.kind }}">
+          {% if can_edit %}<td class="access-t__check"><input type="checkbox" value="{{ r.key }}" data-access-row aria-label="{{ i18n.t_arg("idpa-select-row", "reference", r.reference.clone()) }}"></td>{% endif %}
+          <td data-label="{{ i18n.t("idpa-col-resource") }}" class="access-t__ref"><span class="access-t__cell"><span class="tag">{{ r.rtype }}</span> <code class="access-t__id" title="{{ r.reference }}">{{ r.id }}</code></span></td>
+          <td data-label="{{ i18n.t("idpa-col-name") }}" class="access-t__name"><span class="access-t__cell">{% if r.name.is_empty() %}<span class="access-t__none">—</span>{% else %}<span class="access-t__primary">{{ r.name }}</span>{% endif %}{% if !r.detail.is_empty() %}<span class="cell-sub">{{ r.detail }}</span>{% endif %}</span></td>
+          <td data-label="{{ i18n.t("idpa-col-endpoint") }}"><span class="access-t__ep">{{ r.endpoint }}</span></td>
+          <td data-label="{{ i18n.t("idpa-col-kind") }}">{% if r.kind == "fhirUser" %}<span class="tag tag--accent">{{ i18n.t(r.kind_key) }}</span>{% else %}<span class="access-t__kind">{{ i18n.t(r.kind_key) }}</span>{% endif %}</td>
+          <td data-label="{{ i18n.t("idpa-col-status") }}"><span class="status status--{{ r.seen.tone() }}"><span class="dot dot--{{ r.seen.tone() }}" aria-hidden="true"></span>{{ i18n.t(r.seen.key()) }}</span></td>
+          <td class="col-actions">
+            <details class="menu menu--actions row-menu">
+              <summary class="btn btn--ghost btn--icon btn--small" aria-label="{{ i18n.t_arg("idpa-row-actions", "reference", r.reference.clone()) }}" title="{{ i18n.t("idpa-col-actions") }}">⋯</summary>
+              <div class="menu__panel" role="menu">
+                <button type="button" class="menu__option" role="menuitem" data-access-copy-one="{{ r.reference }}"><span class="menu__option-text">{{ i18n.t("idpa-copy-reference") }}</span></button>
+                {% if can_edit %}
+                {% if r.kind != "fhirUser" %}<button type="button" class="menu__option" role="menuitem" data-access-identity><span class="menu__option-text">{{ i18n.t("idpa-make-identity") }}</span></button>{% endif %}
+                <button type="button" class="menu__option menu__option--danger" role="menuitem" data-access-remove-one><span class="menu__option-text">{{ i18n.t("idpa-remove") }}</span></button>
+                {% endif %}
+              </div>
+            </details>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-foot access-foot">
+    <span class="access-foot__range">{{ i18n.t_arg3("idpa-range", "from", from.to_string(), "to", to.to_string(), "count", matching.to_string()) }}{% if filtered() %} · {{ i18n.t_arg("idpa-filtered-from", "total", total.to_string()) }}{% endif %}</span>
+    <nav class="table-foot__pager" aria-label="{{ i18n.t("idpa-pager") }}">
+      <label class="access-foot__size"><span>{{ i18n.t("idpa-per-page") }}</span>
+        <select class="mfield__input" name="size" data-access-size>
+          {% for (n, sel) in sizes() %}<option value="{{ n }}"{{ sel }}>{{ n }}</option>{% endfor %}
+        </select></label>
+      {% if page > 1 %}<a class="btn btn--small" href="{{ href(page - 1) }}#access" rel="prev" data-access-nav>{{ i18n.t("idpa-prev") }}</a>{% else %}<span class="btn btn--small" aria-disabled="true">{{ i18n.t("idpa-prev") }}</span>{% endif %}
+      <span class="access-foot__page">{{ i18n.t_arg2("idpa-page-of", "page", page.to_string(), "pages", pages.to_string()) }}</span>
+      {% if page < pages %}<a class="btn btn--small" href="{{ href(page + 1) }}#access" rel="next" data-access-nav>{{ i18n.t("idpa-next") }}</a>{% else %}<span class="btn btn--small" aria-disabled="true">{{ i18n.t("idpa-next") }}</span>{% endif %}
+    </nav>
+  </div>
+{% endif %}
+</div>

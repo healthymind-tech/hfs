@@ -1,0 +1,39 @@
+{#- Paste / import preview (crate::idp::access::Preview). -#}
+{% import "partials/components.html" as ui %}
+{% if let Some(e) = error %}
+<div class="notice notice--danger access-pv__error" role="alert" data-access-pv-error>{% call ui::icon("alert") %}{% endcall %}<span>{{ e }}</span></div>
+{% else %}
+<div class="access-pv" data-access-pv data-base="{{ base }}" data-added="{{ added }}" data-removed="{{ removed }}" data-changed="{{ changed }}" data-mode="{{ mode }}"
+     data-label="{% if mode == "replace" %}{{ i18n.t_arg3("idpa-apply-replace", "added", added.to_string(), "removed", removed.to_string(), "total", result.to_string()) }}{% else %}{{ i18n.t_arg("idpa-apply-add", "count", added.to_string()) }}{% endif %}">
+  <textarea hidden data-access-skip>{{ skip }}</textarea>
+  <p class="access-pv__lead">{{ i18n.t_arg2("idpa-pv-lead", "rows", total_rows.to_string(), "format", format.to_string()) }}</p>
+  <div class="access-pv__chips" role="group" aria-label="{{ i18n.t("idpa-pv-filter") }}">
+    <button type="button" class="chip access-pv__chip" aria-pressed="true" data-access-pv-show="">{{ i18n.t("idpa-pv-all") }} <span class="count">{{ total_rows }}</span></button>
+    {% for (code, key, tone, n) in counts %}
+    <button type="button" class="chip access-pv__chip access-pv__chip--{{ tone }}" aria-pressed="false" data-access-pv-show="{{ code }}"><span class="dot dot--{{ tone }}" aria-hidden="true"></span>{{ i18n.t(key) }} <span class="count">{{ n }}</span></button>
+    {% endfor %}
+  </div>
+  {% if mode == "replace" && removed > 0 %}<p class="notice notice--warn access-pv__warn">{% call ui::icon("alert") %}{% endcall %}<span>{{ i18n.t_arg("idpa-pv-will-remove", "count", removed.to_string()) }}</span></p>{% endif %}
+  {% if !checked %}<p class="access__note">{{ i18n.t("idpa-pv-not-checked") }}</p>{% endif %}
+  {% if !skip.is_empty() %}
+  <label class="mcheck access-pv__missing"><input type="checkbox" data-access-include-missing><span>{{ i18n.t("idpa-pv-include-missing") }}</span></label>
+  {% endif %}
+  <div class="table-wrap access-pv__wrap" tabindex="0">
+    <table class="data-table access-pv__t">
+      <thead><tr><th scope="col">{{ i18n.t("idpa-pv-line") }}</th><th scope="col">{{ i18n.t("idpa-col-resource") }}</th><th scope="col">{{ i18n.t("idpa-col-endpoint") }}</th><th scope="col">{{ i18n.t("idpa-col-kind") }}</th><th scope="col">{{ i18n.t("idpa-col-status") }}</th></tr></thead>
+      <tbody>
+      {% for r in rows %}
+        <tr data-status="{{ r.status }}">
+          <td class="access-pv__line">{{ r.line }}</td>
+          <td class="access-pv__ref"><code title="{{ r.raw }}">{{ r.reference }}</code></td>
+          <td>{{ r.endpoint }}</td>
+          <td>{% if r.status == "invalid" %}—{% else %}{{ i18n.t(r.kind_key) }}{% endif %}</td>
+          <td><span class="status status--{{ r.tone }}"><span class="dot dot--{{ r.tone }}" aria-hidden="true"></span>{{ i18n.t(r.status_key) }}</span>{% if !r.note.is_empty() %}<span class="cell-sub">{{ r.note }}</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if shown < total_rows %}<p class="access__note">{{ i18n.t_arg2("idpa-pv-shown", "shown", shown.to_string(), "rows", total_rows.to_string()) }}</p>{% endif %}
+</div>
+{% endif %}

@@ -502,6 +502,40 @@ pub fn to_audit_json(event: &IdpEvent, observer: &str, public_base: &str) -> Val
             }]);
             ev
         }
+        IdpEvent::UserAccessChanged {
+            realm,
+            user_id,
+            actor,
+            action,
+            added,
+            removed,
+            changed,
+            total,
+        } => {
+            let o = origin(realm, &None);
+            let mut ev = security_alert(observer, "user-access-change", "0", &o);
+            ev["action"] = json!("U");
+            push_agent(
+                &mut ev,
+                json!({
+                    "type": {"coding": [coding(DCM, "110153", "Source Role ID")]},
+                    "who": {"identifier": {"value": actor}, "display": actor},
+                    "requestor": true,
+                }),
+            );
+            ev["entity"] = json!([{
+                "type": coding(ENTITY_TYPE, "2", "System Object"),
+                "what": ident(&format!("{}/users", o.issuer), user_id),
+                "detail": [
+                    detail("action", action),
+                    detail("added", &added.to_string()),
+                    detail("removed", &removed.to_string()),
+                    detail("changed", &changed.to_string()),
+                    detail("total", &total.to_string()),
+                ],
+            }]);
+            ev
+        }
     }
 }
 
@@ -859,6 +893,16 @@ mod tests {
                 client_id: "app".into(),
                 endpoint: Some("lab".into()),
                 ip: ip(),
+            },
+            IdpEvent::UserAccessChanged {
+                realm: "clinic".into(),
+                user_id: "u".into(),
+                actor: "local:admin".into(),
+                action: "replace".into(),
+                added: 3,
+                removed: 1,
+                changed: 0,
+                total: 120,
             },
             IdpEvent::ConsentDenied {
                 realm: "clinic".into(),

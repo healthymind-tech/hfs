@@ -616,7 +616,26 @@ impl IdpStore for PgStore {
         )
         .await
         .map_err(pe)?;
-        for l in &user.links {
+        // Links without patients (the bulk of a large access list) go in
+        // one statement; the few carrying an accessible-patient array one
+        // by one (a 2-D array does not UNNEST row by row).
+        let (plain, carriers): (Vec<&FhirLink>, Vec<&FhirLink>) = user
+            .links
+            .iter()
+            .partition(|l| l.accessible_patients.is_empty());
+        for chunk in plain.chunks(5_000) {
+            let endpoints: Vec<&str> = chunk.iter().map(|l| l.endpoint.as_str()).collect();
+            let references: Vec<&str> = chunk.iter().map(|l| l.reference.as_str()).collect();
+            let fhir_users: Vec<bool> = chunk.iter().map(|l| l.is_fhir_user).collect();
+            tx.execute(
+                "INSERT INTO hfs_idp_user_links (user_id, endpoint, reference, is_fhir_user)
+                 SELECT $1, e, r, f FROM UNNEST($2::text[], $3::text[], $4::bool[]) AS t(e, r, f)",
+                &[&user.id, &endpoints, &references, &fhir_users],
+            )
+            .await
+            .map_err(pe)?;
+        }
+        for l in carriers {
             tx.execute(
                 "INSERT INTO hfs_idp_user_links (user_id, endpoint, reference, is_fhir_user, accessible_patients)
                  VALUES ($1, $2, $3, $4, $5)",
