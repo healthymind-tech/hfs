@@ -1092,7 +1092,7 @@ async fn grouped_rows_offer_older_versions_and_count_both() {
     assert!(html.contains(">+2 older<"), "{html}");
     assert!(html.contains(">+1 older<"));
     assert!(html.contains(
-        "data-versions-src=\"/ui/hts/code-systems/versions?url=http%3A%2F%2Fx%2Fcs%2Falpha&status=draft\""
+        "data-versions-src=\"/ui/hts/code-systems/versions?url=http%3A%2F%2Fx%2Fcs%2Falpha&amp;status=draft\""
     ));
     // The listed version is active, the filter asks for draft: it opens itself.
     assert!(html.contains("data-autoexpand"));
