@@ -18,6 +18,7 @@
 
 pub(crate) mod access;
 pub(crate) mod manage;
+pub(crate) mod scopes;
 pub(crate) mod security;
 pub(crate) mod verify;
 pub(crate) mod wizard;
@@ -102,6 +103,7 @@ pub(crate) fn routes() -> Router<WebState> {
                 helios_idp::access::MAX_TEXT_BYTES + 64 * 1024,
             )),
         )
+        .route("/ui/idp/{realm}/scopes/check", get(scopes::check))
         .route("/ui/idp/{realm}/keys", get(manage::keys_page))
         .route("/ui/idp/{realm}/keys/{action}", post(manage::keys_action))
         .route("/ui/idp/{realm}/sessions", get(manage::sessions_page))

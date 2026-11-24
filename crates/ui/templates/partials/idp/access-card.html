@@ -34,7 +34,7 @@
   <header class="access__head">
     <div class="access__heading">
       <h2 class="access__title" id="access-title">{{ i18n.t("idpa-title") }} <span class="access__total" data-access-total>{{ access.total }}</span></h2>
-      <p class="access__desc">{{ i18n.t("idpa-desc") }}</p>
+      <p class="access__desc">{{ i18n.t("idpa-desc") }} <a href="#smart-how" data-smart-how>{{ i18n.t("idps-how-link") }}</a></p>
     </div>
     <div class="access__actions">
       <details class="menu menu--end access__copy" data-access-copy-menu>
@@ -193,4 +193,8 @@
     </form>
   </dialog>
   {% endif %}
+  <div class="access__how">
+    {% let how_link = "/ui/idp/{}/clients"|format(head.name) %}{% let how_link_key = "idps-how-to-clients" %}
+    {% include "partials/idp/smart-explainer.html" %}
+  </div>
 </section>
