@@ -2738,9 +2738,17 @@ async fn scope_request_authorization(
         .get::<manager::EndpointScope>()
         .map(|scope| scope.self_call_prefix())
         .unwrap_or_default();
+    let console_session = if authorization.is_none() {
+        conformance::ConsoleSessionCredential::from_headers(request.headers())
+    } else {
+        None
+    };
     conformance::with_endpoint_prefix(
         prefix,
-        conformance::with_request_authorization(authorization, next.run(request)),
+        conformance::with_request_authorization(
+            authorization,
+            conformance::with_console_session(console_session, next.run(request)),
+        ),
     )
     .await
 }
