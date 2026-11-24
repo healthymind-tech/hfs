@@ -15873,3 +15873,310 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     }
   }
 }
+
+/* ==========================================================================
+   Console redesign — ONE segmented control (REDESIGN.md §6 Forms) for every
+   2–4 option mode switch: Batch source and plan view, Resources NL/builder,
+   SQL Export subjects, the resource editor's Edit/History, the overview
+   status filter, the account menu's language, terminology import source.
+   A single 32px track; equal segments; the chosen one a filled surface with
+   a hairline elevation; no outline ring at rest — focus shows only on
+   :focus-visible; outline icons at 16px, muted.
+   ========================================================================== */
+@layer pages {
+  .seg,
+  .segmented,
+  .batch-tabs,
+  .modal__tabs,
+  .user-menu__seg,
+  .seg-radios {
+    display: inline-flex;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 2px;
+    max-width: 100%;
+    height: 32px;
+    margin-left: 0;
+    padding: 2px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--surface-2);
+    box-shadow: none;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .batch-tabs {
+    margin: 0 0 var(--s3);
+  }
+
+  .seg__btn,
+  .segmented__item,
+  .batch-tab,
+  .modal__tab,
+  .user-menu__seg a,
+  .seg-radios > label {
+    position: relative;
+    display: inline-flex;
+    flex: 1 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 28px;
+    min-height: 0;
+    margin: 0;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    box-shadow: none;
+    outline: none;
+    color: var(--text-2);
+    font: inherit;
+    font-size: var(--fs-sm);
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    text-decoration: none;
+    cursor: pointer;
+    transition: color var(--dur-1) var(--ease-std), background-color var(--dur-2) var(--ease-out),
+      box-shadow var(--dur-2) var(--ease-out);
+  }
+
+  .seg__btn:hover,
+  .segmented__item:hover,
+  .batch-tab:hover,
+  .modal__tab:hover,
+  .user-menu__seg a:hover,
+  .seg-radios > label:hover {
+    color: var(--text);
+    background: transparent;
+    text-decoration: none;
+  }
+
+  .seg__btn[aria-pressed="true"],
+  .segmented__item[aria-current="true"],
+  .batch-tab[aria-selected="true"],
+  .modal__tab[aria-selected="true"],
+  .modal__tab--on,
+  .user-menu__seg a[aria-current="true"],
+  .seg-radios > label:has(> input:checked) {
+    color: var(--text);
+    background: var(--surface);
+    border: 0;
+    outline: none;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 0 0 1px var(--border);
+  }
+
+  .seg__btn:focus-visible,
+  .segmented__item:focus-visible,
+  .batch-tab:focus-visible,
+  .modal__tab:focus-visible,
+  .user-menu__seg a:focus-visible,
+  .seg-radios > label:has(> input:focus-visible) {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 1px;
+  }
+
+  .seg__btn .icon,
+  .seg__btn svg,
+  .batch-tab .icon,
+  .batch-tab svg,
+  .segmented__item svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+  }
+
+  .seg__btn[aria-pressed="true"] svg,
+  .batch-tab[aria-selected="true"] svg {
+    color: var(--accent);
+  }
+
+  .segmented__count,
+  .seg__btn .count {
+    padding: 0;
+    background: none;
+    color: var(--text-3);
+    font-size: var(--fs-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Radio inputs inside a segment cover it, transparent, so pointer,
+     keyboard and automation act on the real input. */
+  .seg-radios > label > input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  /* Card-head icons: outline, muted, 16px. */
+  .card-head h2 .icon,
+  .card-head h3 .icon,
+  .card-head h2 > svg,
+  .card-head h3 > svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+  }
+
+  .card-head h2 .icon svg,
+  .card-head h3 .icon svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* Choice cards (SQL Export format, Bulk export scope) and the wizard's
+     simple radio cards become the same segmented control, the chosen
+     option's hint on one line below. */
+  .choice-grid,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) {
+    display: grid;
+    grid-template-columns: repeat(var(--seg-n, 3), max-content) 1fr;
+    align-items: center;
+    gap: 0;
+    margin: 6px 0 var(--s4);
+  }
+
+  .choice-grid:has(> .choice-card:nth-child(2):last-child),
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))):has(> .radio-card:nth-child(2):last-child) { --seg-n: 2; }
+  .choice-grid:has(> .choice-card:nth-child(4)),
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))):has(> .radio-card:nth-child(4)) { --seg-n: 4; }
+
+  .choice-grid > .choice-card {
+    display: contents;
+  }
+
+  .choice-grid > .choice-card > .choice-card__title,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > .radio-card__title {
+    position: relative;
+    grid-row: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 32px;
+    padding: 0 14px;
+    border: solid var(--surface-2);
+    border-width: 2px 1px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color var(--dur-1) var(--ease-std), background-color var(--dur-2) var(--ease-out),
+      box-shadow var(--dur-2) var(--ease-out);
+  }
+
+  .choice-grid > .choice-card:nth-child(1) > .choice-card__title { grid-column: 1; border-left-width: 2px; border-radius: 8px 0 0 8px; }
+  .choice-grid > .choice-card:nth-child(2) > .choice-card__title { grid-column: 2; }
+  .choice-grid > .choice-card:nth-child(3) > .choice-card__title { grid-column: 3; }
+  .choice-grid > .choice-card:nth-child(4) > .choice-card__title { grid-column: 4; }
+  .choice-grid > .choice-card:last-child > .choice-card__title { border-right-width: 2px; border-radius: 0 8px 8px 0; }
+
+  .choice-grid > .choice-card > .choice-card__title > input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  .choice-grid > .choice-card:has(input:checked) > .choice-card__title {
+    border-radius: 6px;
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 0 0 1px var(--border);
+    color: var(--text);
+  }
+
+  .choice-grid > .choice-card:has(input:focus-visible) > .choice-card__title {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 1px;
+  }
+
+  .choice-grid > .choice-card > .choice-card__hint {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    margin-top: 8px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .choice-grid > .choice-card:not(:has(input:checked)) > .choice-card__hint {
+    display: none;
+  }
+
+  /* The simple radio-card grids outside the endpoint settings form (the
+     new-endpoint wizard) take the settings form's segmented look. */
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card {
+    display: contents;
+  }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > input {
+    position: relative;
+    z-index: 2;
+    grid-row: 1;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(1) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(1) > .radio-card__title { grid-column: 1; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(2) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(2) > .radio-card__title { grid-column: 2; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(3) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(3) > .radio-card__title { grid-column: 3; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(4) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(4) > .radio-card__title { grid-column: 4; }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:first-child > .radio-card__title { border-left-width: 2px; border-radius: 8px 0 0 8px; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:last-child > .radio-card__title { border-right-width: 2px; border-radius: 0 8px 8px 0; }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:has(> input:checked) > .radio-card__title {
+    border-radius: 6px;
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 0 0 1px var(--border);
+    color: var(--text);
+  }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:has(> input:focus-visible) > .radio-card__title {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 1px;
+  }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > .radio-card__desc {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    margin-top: 8px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:not(:has(> input:checked)) > .radio-card__desc {
+    display: none;
+  }
+
+  @media (max-width: 560px) {
+    .choice-grid,
+    .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) {
+      grid-template-columns: repeat(var(--seg-n, 3), minmax(0, 1fr));
+    }
+
+    .choice-grid > .choice-card > .choice-card__title,
+    .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > .radio-card__title {
+      padding: 0 8px;
+      white-space: normal;
+      text-align: center;
+      line-height: 1.15;
+    }
+  }
+}

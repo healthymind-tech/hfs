@@ -38,7 +38,7 @@
 
     <div class="field" role="radiogroup" aria-labelledby="hts-archive-source-label">
       <span class="field__label" id="hts-archive-source-label">1 · {{ chrome.i18n.t("hts-import-step-source") }}</span>
-      <div class="facets facets--bare">
+      <div class="seg-radios">
         <label class="chip"><input type="radio" name="admin_source" value="upload" checked> {{ chrome.i18n.t("hts-import-src-upload") }}</label>
         {% if a.import_dir.is_some() %}<label class="chip"><input type="radio" name="admin_source" value="import-dir"> {{ chrome.i18n.t("hts-import-src-dir") }}</label>{% endif %}
         {% if a.registry.is_some() %}<label class="chip"><input type="radio" name="admin_source" value="registry"> {{ chrome.i18n.t("hts-import-src-registry") }}</label>{% endif %}
