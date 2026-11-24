@@ -10490,7 +10490,7 @@ html.js .reveal:not(.is-shown) {
    below it, and the result ends with room to scroll past the bar. */
 .verify__summary,
 .verify-step {
-  scroll-margin-top: 72px;
+  scroll-margin-top: calc(var(--topbar-h, 52px) + var(--s4, 16px));
   scroll-margin-bottom: calc(var(--save-bar-h, 88px) + 16px);
 }
 
@@ -16474,4 +16474,106 @@ html[data-nav-dir]::view-transition-old(hm-main) {
     max-width: 22ch;
     overflow-wrap: anywhere;
   }
+}
+
+/* ── Master-detail: detail column only when selected (hm/md-detail) ──
+   A master-detail container (`[data-md]`) shows its detail column only
+   while something is selected (`data-md-open`, rendered by the server and
+   toggled by shell.js `mdOpen`/`mdClose`). With nothing selected the list
+   spans the detail track and the gap before it, so the page shows no empty
+   placeholder and the list gets the whole width. The grid template itself
+   never changes, so whatever the rail width is, opening only moves the
+   list's end: shell.js animates the tracks from the spanning width
+   (`motion.tracks`, 200 ms) while `.md-resizing` clips the panel sliding in
+   from the right edge. Narrow layouts stack the columns as before. */
+@media (min-width: 1251px) {
+  .filter-layout[data-md]:not([data-md-open]) > [data-md-list] {
+    grid-column: 2 / -1;
+  }
+}
+
+.filter-layout[data-md].md-resizing {
+  overflow: clip;
+}
+
+/* The list's content holds its end width (shell.js `mdHoldList`) while the
+   column's edge moves over it: one layout, not one per frame. */
+.filter-layout[data-md].md-resizing > [data-md-list] {
+  overflow-x: hidden;
+}
+
+.filter-layout[data-md].md-resizing > [data-md-list] > * {
+  flex: none;
+  width: var(--md-list-w, auto);
+  max-width: none;
+}
+
+.filter-layout[data-md].md-resizing > [data-md-detail] {
+  /* Keeps its final width while its track grows or shrinks. */
+  justify-self: start;
+  max-width: none;
+}
+
+/* The list's columns follow its own width (it narrows when the detail
+   opens): the expression goes first, then the base types, then the type;
+   the code (with its URL) and the source always stay. No horizontal
+   scroll. The container is the list's card, not the column: during the
+   open/close the card already has its end width, so the columns change
+   once, at the start. */
+[data-md] > [data-md-list] > .card {
+  container: md-list / inline-size;
+}
+
+@container md-list (max-width: 720px) {
+  .md-col-expr {
+    display: none;
+  }
+}
+
+@container md-list (max-width: 560px) {
+  .md-col-base {
+    display: none;
+  }
+}
+
+@container md-list (max-width: 400px) {
+  .md-col-type {
+    display: none;
+  }
+}
+
+/* Its columns adapt instead, so the phone-width table floor (600px, which
+   scrolls sideways) does not apply to it. */
+[data-md] > [data-md-list] .table-wrap > .data-table {
+  min-width: 0;
+}
+
+/* Stacked (narrow), opening scrolls the panel into view: below the sticky
+   topbar, not under it. */
+[data-md] > [data-md-detail] {
+  scroll-margin-top: calc(var(--topbar-h, 52px) + var(--s4, 16px));
+}
+
+/* The open detail's heading row: title, then the close (×) link. */
+.detail__head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s2);
+}
+
+.detail__head > .detail__title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
+.detail__head > .detail__close {
+  flex: none;
+  height: 30px;
+  color: var(--muted);
+}
+
+.detail__head > .detail__close:hover,
+.detail__head > .detail__close:focus-visible {
+  color: var(--text-strong);
 }

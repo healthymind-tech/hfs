@@ -83,3 +83,55 @@ fn fieldsets_draw_no_browser_frame() {
     }
     assert!(rule(".idp-provider").contains("margin: 4px 0 20px"));
 }
+
+/// The last block of app.css whose header comment names `marker`.
+fn block(marker: &str) -> &'static str {
+    let at = CSS
+        .rfind(marker)
+        .unwrap_or_else(|| panic!("no {marker} block in app.css"));
+    &CSS[at..]
+}
+
+#[test]
+fn master_detail_shows_no_detail_column_until_selected() {
+    // hm/md-detail: with nothing selected the list spans the detail track
+    // (no empty placeholder column); the open detail clips while its track
+    // animates; the list's columns follow its own width, never a scrollbar.
+    let css = block("Master-detail: detail column only when selected (hm/md-detail)");
+    assert!(css.contains(
+        ".filter-layout[data-md]:not([data-md-open]) > [data-md-list] {\n    grid-column: 2 / -1;"
+    ));
+    // Only side by side: the stacked layout (<= 1250px) keeps one column.
+    let span = css.find("grid-column: 2 / -1").unwrap();
+    assert!(css[..span].contains("@media (min-width: 1251px)"));
+    assert!(css.contains(".filter-layout[data-md].md-resizing {\n  overflow: clip;"));
+    assert!(
+        css.contains("[data-md] > [data-md-list] > .card {\n  container: md-list / inline-size;")
+    );
+    assert!(css.contains("width: var(--md-list-w, auto);"));
+    for (width, col) in [
+        ("720px", ".md-col-expr"),
+        ("560px", ".md-col-base"),
+        ("400px", ".md-col-type"),
+    ] {
+        let q =
+            format!("@container md-list (max-width: {width}) {{\n  {col} {{\n    display: none;");
+        assert!(css.contains(&q), "{q}");
+    }
+}
+
+#[test]
+fn master_detail_motion_goes_through_the_shared_helper() {
+    let js = include_str!("../assets/shell.js");
+    // The open/close animate the grid tracks through `HM.motion` (reduced
+    // motion → no animation), and the panel slides with `motion.enter` /
+    // `motion.leave`.
+    assert!(js.contains("tracks: function (el, from, to, o)"));
+    assert!(js.contains("if (!el || REDUCED || typeof el.animate !== \"function\") return null;"));
+    assert!(js.contains("function mdOpen(md, ndet)"));
+    assert!(js.contains("function mdClose(md, det)"));
+    assert!(js.contains("motion.tracks(md, from, t,"));
+    // Esc and a second click on the selected row close through the × link.
+    assert!(js.contains("e.key !== \"Escape\""));
+    assert!(js.contains("A second click on the selected row closes the detail."));
+}
