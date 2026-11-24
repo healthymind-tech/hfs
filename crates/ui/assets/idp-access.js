@@ -95,11 +95,21 @@
       body: body.toString(),
     });
   }
+  // An answer that is not the expected one (a signed-out session's sign-in
+  // page, a refused CSRF token, a server error) is an error, never content
+  // or a success.
+  function okText(r) {
+    if (r.status === 401) { window.location.reload(); throw new Error("HTTP 401"); }
+    if (!r.ok) { var err = new Error("HTTP " + r.status); err.status = r.status; throw err; }
+    return r.text();
+  }
   function readJson(r) {
     return r.text().then(function (t) {
       var v = {};
-      try { v = t ? JSON.parse(t) : {}; } catch (e) { v = { error: t }; }
-      if (!r.ok) { var err = new Error(v.error || ("HTTP " + r.status)); err.status = r.status; throw err; }
+      var parsed = true;
+      try { v = t ? JSON.parse(t) : {}; } catch (e) { v = { error: t }; parsed = false; }
+      if (r.status === 401) window.location.reload();
+      if (!r.ok || !parsed) { var err = new Error((parsed && v.error) || ("HTTP " + r.status)); err.status = r.status; throw err; }
       return v;
     });
   }
@@ -517,7 +527,7 @@
     results.classList.add("is-loading");
     if (!results.firstChild) results.innerHTML = '<p class="access-pick__msg">' + this.msg("searching") + "</p>";
     fetch(this.base + "/search?" + new URLSearchParams({ ep: ep, type: type, q: q }).toString(), { credentials: "same-origin", headers: { "HX-Request": "true" } })
-      .then(function (r) { return r.text(); })
+      .then(okText)
       .then(function (html) {
         if (seq !== self.searchSeq) return;
         results.innerHTML = html;
@@ -673,7 +683,7 @@
     btn.classList.add("is-busy");
     $("[data-access-paste-status]", d).textContent = this.msg("loading");
     postForm(this.base + "/preview", data, "text/html")
-      .then(function (r) { return r.text(); })
+      .then(okText)
       .then(function (html) {
         $("[data-access-preview]", d).innerHTML = html;
         $("[data-access-paste-status]", d).textContent = "";

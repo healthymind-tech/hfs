@@ -215,11 +215,19 @@
 
     fetch("/ui/history/diff", { method: "POST", body: body })
       .then(function (response) {
+        // A signed-out session, a refused CSRF token or a server error
+        // must not land in the diff pane as if it were the diff.
+        if (response.status === 401) { window.location.reload(); throw new Error("401"); }
+        if (!response.ok) throw new Error("HTTP " + response.status);
         return response.text();
       })
       .then(function (html) {
         if (ticket !== diffTicket) return;
         diffEl.innerHTML = html;
+      })
+      .catch(function (error) {
+        if (ticket !== diffTicket) return;
+        diffEl.textContent = (document.body.getAttribute("data-msg-nav-error") || "This could not be loaded.") + " (" + error.message + ")";
       });
   }
 

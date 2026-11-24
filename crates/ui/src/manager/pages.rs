@@ -707,9 +707,13 @@ async fn fhir_get(
         .get(&url)
         .header("Accept", "application/fhir+json")
         .header("X-Tenant-ID", scope.endpoint.tenant_id());
-    request = match crate::conformance::current_request_authorization() {
-        Some(a) => request.header("Authorization", a),
-        None => state
+    request = match (
+        crate::conformance::current_request_authorization(),
+        crate::conformance::current_console_session(),
+    ) {
+        (Some(a), _) => request.header("Authorization", a),
+        (None, Some(session)) => session.apply(request, &state.self_base_url),
+        (None, None) => state
             .outbound_auth
             .authorize(request, &state.self_base_url)
             .await

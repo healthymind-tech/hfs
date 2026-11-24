@@ -2738,9 +2738,17 @@ async fn scope_request_authorization(
         .get::<manager::EndpointScope>()
         .map(|scope| scope.self_call_prefix())
         .unwrap_or_default();
+    let console_session = if authorization.is_none() {
+        conformance::ConsoleSessionCredential::from_headers(request.headers())
+    } else {
+        None
+    };
     conformance::with_endpoint_prefix(
         prefix,
-        conformance::with_request_authorization(authorization, next.run(request)),
+        conformance::with_request_authorization(
+            authorization,
+            conformance::with_console_session(console_session, next.run(request)),
+        ),
     )
     .await
 }
@@ -11340,6 +11348,42 @@ mod tests {
         let html = render_search_page("es");
         assert!(html.contains("Buscar"));
         assert!(html.contains(r#"data-msg-saved="Guardadas""#));
+    }
+
+    fn embedded(name: &str) -> String {
+        let file = Assets::get(name).unwrap_or_else(|| panic!("{name} embedded"));
+        String::from_utf8(file.data.to_vec()).expect("UTF-8 asset")
+    }
+
+    /// Bug-hunt regressions in the console's shared scripts (results-bughunt):
+    /// the wiring is guarded here, the behaviour by the `bh-*` journeys.
+    #[test]
+    fn bughunt_shell_and_confirm_wiring() {
+        let shell = embedded("shell.js");
+        // A full-load page stays out of htmx's snapshot cache and a cache
+        // miss reloads (its scripts never run twice in one document).
+        assert!(shell.contains("keepOutOfHistory"));
+        assert!(shell.contains(r#"main.setAttribute("hx-history", "false")"#));
+        let base = include_str!("../templates/layouts/base.html");
+        assert!(base.contains(r#""refreshOnHistoryMiss":true"#));
+        // An in-place endpoint switch carries the per-endpoint metas over.
+        for name in ["hfs-tenant", "hfs-fhir-base", "hfs-user-settings"] {
+            assert!(shell.contains(name), "{name}");
+        }
+        // Back/Forward asks before dropping an unsaved draft.
+        assert!(shell.contains("guardHistory") && shell.contains("confirmDiscard"));
+        // `<form data-confirm>` asks; a confirmation is good for one click.
+        let manager = embedded("manager.js");
+        assert!(manager.contains("form[data-confirm] button[type=submit]"));
+        assert!(manager.contains(r#"btn.removeAttribute("data-confirmed")"#));
+        // Updates carry the loaded version.
+        assert!(embedded("save-target.js").contains("function ifMatch"));
+        for page in ["editor.js", "resources.js"] {
+            assert!(embedded(page).contains("If-Match"), "{page}");
+        }
+        // Scripts that outlive an endpoint switch read the metas per call.
+        assert!(!embedded("conformance-crud.js").contains("var FHIR_BASE = ("));
+        assert!(embedded("theme.js").contains("function settingsUrl()"));
     }
 
     /// The shared search builder owns a structural read-modify-write against

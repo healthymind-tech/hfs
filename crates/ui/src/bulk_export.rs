@@ -383,6 +383,16 @@ fn base_url_with_segments<'a>(
     Ok(url)
 }
 
+/// `base` under the request's endpoint prefix (`/sandbox`; "" outside a
+/// named endpoint's pages).
+fn with_request_endpoint(base: &str) -> String {
+    format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        crate::conformance::endpoint_prefix()
+    )
+}
+
 /// Internal self-call URL. This is always based on the trusted loopback base,
 /// never a Host header or an advertised/public authority.
 ///
@@ -393,12 +403,12 @@ pub(crate) fn internal_api_url<'a>(
     tenant: &str,
     segments: impl IntoIterator<Item = &'a str>,
 ) -> Result<reqwest::Url, String> {
-    base_url_with_segments(
-        &state.self_base_url,
-        tenant,
-        state.tenant_path_routing,
-        segments,
-    )
+    // The request's endpoint prefix (`/sandbox`; "" for the root), as the
+    // conformance self-calls use: a tenant bound to a named endpoint is
+    // refused at the root door, so `/ui/e/{ep}/data/bulk-export` and the
+    // Patient/Group pickers must call the endpoint's own base.
+    let base = with_request_endpoint(&state.self_base_url);
+    base_url_with_segments(&base, tenant, state.tenant_path_routing, segments)
 }
 
 fn public_api_url<'a>(
@@ -407,12 +417,10 @@ fn public_api_url<'a>(
     tenant_path_routing: bool,
     segments: impl IntoIterator<Item = &'a str>,
 ) -> Result<reqwest::Url, String> {
-    base_url_with_segments(
-        &state.public_base_url,
-        tenant,
-        tenant_path_routing,
-        segments,
-    )
+    // The same endpoint prefix as `internal_api_url`: a named endpoint's
+    // kick-off answers with its own `…/{ep}/export-status/{id}`.
+    let base = with_request_endpoint(&state.public_base_url);
+    base_url_with_segments(&base, tenant, tenant_path_routing, segments)
 }
 
 /// The shared client for every UI call back into the FHIR API: the Bulk Export
@@ -567,6 +575,11 @@ pub(crate) async fn forward_credential(
     }
     if let Some(bearer) = crate::login::session_authorization(state, headers).await {
         return Ok(request.header("Authorization", bearer));
+    }
+    // The console sign-in session (see `ConsoleSessionCredential`): the
+    // export runs as the operator who started it, with their endpoint role.
+    if let Some(session) = crate::conformance::ConsoleSessionCredential::from_headers(headers) {
+        return Ok(session.apply(request, audience));
     }
     state
         .outbound_auth
@@ -2315,6 +2328,31 @@ mod tests {
     // Reference canonicalization/parsing now lives in crate::lookup, along
     // with its own test coverage (#836) — see
     // `reference_lists_accept_bare_and_canonical_ids_and_deduplicate`.
+
+    /// A named endpoint's export calls (and expects its status URLs under)
+    /// its own base: the root door refuses its tenant.
+    #[tokio::test]
+    async fn export_urls_carry_the_request_endpoint_prefix() {
+        let url = crate::conformance::with_endpoint_prefix("/sandbox".to_string(), async {
+            base_url_with_segments(
+                &with_request_endpoint("http://127.0.0.1:8080/"),
+                "sandbox",
+                false,
+                ["$export"],
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:8080/sandbox/$export");
+        let root = base_url_with_segments(
+            &with_request_endpoint("https://h/fhir"),
+            "default",
+            false,
+            ["export-status", "x"],
+        )
+        .unwrap();
+        assert_eq!(root.as_str(), "https://h/fhir/export-status/x");
+    }
 
     #[test]
     fn legacy_jobs_deserialize_without_patient_or_version_fields() {

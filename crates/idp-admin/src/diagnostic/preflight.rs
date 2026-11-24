@@ -37,6 +37,9 @@ pub struct EndpointView {
     /// `off` | `write-protect` | `full`.
     pub auth_mode: String,
     pub provider: EndpointProvider,
+    /// Default FHIR release (`R4`, `R4B`, `R5`, `R6`; empty = unknown).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fhir_version: String,
 }
 
 impl EndpointView {
@@ -456,6 +459,7 @@ mod tests {
             provider: EndpointProvider::External {
                 issuer: issuer.map(String::from),
             },
+            fhir_version: "R4".into(),
         }
     }
 

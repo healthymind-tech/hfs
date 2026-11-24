@@ -11,6 +11,8 @@
  *  - #hash / [data-idp-goto]     "Go to field": focus + highlight the field
  *  - [data-idp-app-select]       Test page: fill the app's redirect URI
  *  - [data-idp-busy]             finish button: busy text while the checks run
+ *  - a[data-smart-how]           opens "How SMART access works" (#smart-how)
+ *                                in place and scrolls to it
  *
  * Idempotent: safe to load twice (included by several partials) and after
  * boosted swaps.
@@ -116,7 +118,20 @@
     });
   }
 
+  function openHow() {
+    var box = document.getElementById("smart-how");
+    if (!box) return false;
+    box.open = true;
+    box.scrollIntoView({ block: "start", behavior: window.HM && window.HM.motion && window.HM.motion.reduced ? "auto" : "smooth" });
+    var s = box.querySelector("summary");
+    if (s && s.focus) s.focus({ preventScroll: true });
+    if (window.HM && window.HM.motion) window.HM.motion.enter(box.querySelector(".smart-how__body"), { dy: 6 });
+    return true;
+  }
+
   document.addEventListener("click", function (e) {
+    var how = e.target.closest && e.target.closest("a[data-smart-how]");
+    if (how && openHow()) { e.preventDefault(); return; }
     var a = e.target.closest && e.target.closest("[data-idp-goto]");
     if (a) { e.preventDefault(); goTo(a.getAttribute("data-idp-goto")); return; }
     var h = e.target.closest && e.target.closest("a[data-idp-goto-href]");
@@ -129,7 +144,8 @@
   window.HfsIdp = { init: init, goTo: goTo };
   function boot() {
     init(document);
-    if (location.hash.length > 1) goTo(decodeURIComponent(location.hash.slice(1)));
+    if (location.hash === "#smart-how") openHow();
+    else if (location.hash.length > 1) goTo(decodeURIComponent(location.hash.slice(1)));
     var summary = document.querySelector(".idp-errors[data-autofocus]");
     if (summary && location.hash.length <= 1) summary.focus();
   }

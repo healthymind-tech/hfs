@@ -1,0 +1,169 @@
+{#- SMART scope builder (crate::idp::scopes). Needs `sb: ScopeBuilder`.
+    The form posts only `scopes_text` (one scope per line) and `accept_v1`;
+    without JavaScript the text box is the editor. idp-scopes.js renders the
+    presets, toggles, the grouped type list and keeps both views in sync. -#}
+<script src="/ui/assets/idp-scopes.js" defer></script>
+<div class="scopeb" id="f-scopes_text-group" data-scopeb
+     data-check-url="{{ sb.check_url }}" data-kind="{{ sb.kind }}"
+     data-msg-applied="{{ i18n.t("idps-js-applied") }}"
+     data-msg-undo="{{ i18n.t("idpa-undo") }}"
+     data-msg-undone="{{ i18n.t("idpa-undone") }}"
+     data-msg-copied="{{ i18n.t("idps-js-copied") }}"
+     data-msg-copy-failed="{{ i18n.t("idpa-copy-failed") }}"
+     data-msg-pasted="{{ i18n.t("idps-js-pasted") }}"
+     data-msg-nothing="{{ i18n.t("idps-js-nothing") }}"
+     data-msg-remove-ctx="{{ i18n.t("idps-js-remove-ctx") }}"
+     data-msg-all-types="{{ i18n.t("idps-all-types") }}"
+     data-msg-type="{{ i18n.t("idps-col-type") }}"
+     data-msg-scope="{{ i18n.t("idps-col-scope") }}"
+     data-msg-quick="{{ i18n.t("idps-col-quick") }}"
+     data-msg-read-only="{{ i18n.t("idps-quick-read") }}"
+     data-msg-full="{{ i18n.t("idps-quick-full") }}"
+     data-msg-clear="{{ i18n.t("idps-quick-clear") }}"
+     data-msg-none="{{ i18n.t("idps-js-none") }}"
+     data-msg-covered="{{ i18n.t("idps-js-covered") }}"
+     data-msg-redundant="{{ i18n.t("idps-js-redundant") }}"
+     data-msg-v1="{{ i18n.t("idps-js-v1") }}"
+     data-msg-no-match="{{ i18n.t("idps-js-no-match") }}"
+     data-msg-selected="{{ i18n.t("idps-js-selected") }}"
+     data-msg-count="{{ i18n.t("idps-js-count") }}"
+     data-msg-remove="{{ i18n.t("idps-js-remove") }}"
+     data-msg-lines="{{ i18n.t("idps-js-lines") }}"
+     data-msg-group-signin="{{ i18n.t("idps-chips-signin") }}"
+     data-msg-group-other="{{ i18n.t("idps-chips-other") }}"
+     data-msg-invalid="{{ i18n.t("idps-js-invalid") }}"
+     data-msg-checking="{{ i18n.t("idps-js-checking") }}"
+     data-msg-all-good="{{ i18n.t("idps-js-all-good") }}"
+     data-msg-backend-kind="{{ i18n.t("idps-js-backend-kind") }}"
+     {% if !sb.error.is_empty() %}data-error="1"{% endif %}>
+  <div class="scopeb__head">
+    <div class="scopeb__heading">
+      <h3 class="scopeb__title">{{ i18n.t("idpc-client-scopes") }} <span class="scopeb__count" data-scopeb-count></span></h3>
+      <p class="scopeb__lede">{{ i18n.t("idps-lede") }} <a href="#smart-how" class="scopeb__how" data-smart-how>{{ i18n.t("idps-how-link") }}</a></p>
+    </div>
+    <div class="scopeb__actions" data-scopeb-actions hidden>
+      <details class="menu menu--end scopeb__copy">
+        <summary class="btn btn--small" aria-haspopup="menu">{% call ui::icon("copy") %}{% endcall %}<span>{{ i18n.t("idpa-copy-all") }}</span></summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact scopeb__menu" role="menu">
+          <button type="button" class="menu__option" role="menuitem" data-scopeb-copy="lines"><span class="menu__option-text">{{ i18n.t("idps-copy-lines") }}</span><span class="scopeb__menu-eg">openid⏎patient/*.rs</span></button>
+          <button type="button" class="menu__option" role="menuitem" data-scopeb-copy="space"><span class="menu__option-text">{{ i18n.t("idps-copy-space") }}</span><span class="scopeb__menu-eg">openid patient/*.rs</span></button>
+        </div>
+      </details>
+      <button type="button" class="btn btn--small" data-scopeb-paste-open>{% call ui::icon("import") %}{% endcall %}<span>{{ i18n.t("idpa-paste") }}</span></button>
+    </div>
+  </div>
+  <script type="application/json" data-scopeb-catalog>{{ sb.catalog_json|safe }}</script>
+
+  <div class="scopeb__ui" data-scopeb-ui hidden>
+    <section class="scopeb__sec" aria-labelledby="scopeb-presets-h">
+      <h4 class="scopeb__h" id="scopeb-presets-h">{{ i18n.t("idps-presets") }}</h4>
+      <div class="scopeb__presets">
+        {% for p in sb.presets %}
+        <button type="button" class="scopeb-preset" data-scopeb-preset="{{ p.scopes }}" data-preset-id="{{ p.id }}"{% if p.backend %} data-backend="1"{% endif %} aria-describedby="scopeb-preset-{{ p.id }}">
+          <span class="scopeb-preset__name">{{ p.label }}</span>
+          <span class="scopeb-preset__desc" id="scopeb-preset-{{ p.id }}">{{ p.desc }}</span>
+          <code class="scopeb-preset__scopes">{{ p.scopes }}</code>
+        </button>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="scopeb__sec" aria-labelledby="scopeb-signin-h">
+      <h4 class="scopeb__h" id="scopeb-signin-h">{{ i18n.t("idps-signin") }}</h4>
+      <div class="scopeb__toggles">
+        {% for t in sb.toggles %}
+        <label class="scopeb-toggle{% if t.off %} is-off{% endif %}">
+          <input type="checkbox" class="scopeb-toggle__input" data-scopeb-nr="{{ t.scope }}"{% if t.checked %} checked{% endif %}>
+          <span class="scopeb-toggle__box" aria-hidden="true">{% call ui::icon("check") %}{% endcall %}</span>
+          <span class="scopeb-toggle__text">
+            <span class="scopeb-toggle__name">{{ t.label }} <code>{{ t.scope }}</code></span>
+            <span class="scopeb-toggle__hint">{{ t.hint }}{% if t.off %} <span class="scopeb-off">{{ i18n.t("idps-not-offered") }}</span>{% endif %}</span>
+          </span>
+        </label>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="scopeb__sec" aria-labelledby="scopeb-data-h">
+      <h4 class="scopeb__h" id="scopeb-data-h">{{ i18n.t("idps-data") }}</h4>
+      <div class="scopeb__ctx">
+        <span class="scopeb__label" id="scopeb-ctx-label">{{ i18n.t("idps-ctx-label") }}</span>
+        <div class="seg scopeb-seg" role="group" aria-labelledby="scopeb-ctx-label" data-scopeb-ctxs>
+          <button type="button" class="seg__btn" aria-pressed="false" data-scopeb-ctx="patient"><span class="scopeb-seg__tick" aria-hidden="true">{% call ui::icon("check") %}{% endcall %}</span><code>patient/</code><span class="scopeb-seg__name">{{ i18n.t("idps-ctx-patient") }}</span><span class="scopeb-seg__n" data-scopeb-ctx-n="patient"></span></button>
+          <button type="button" class="seg__btn" aria-pressed="false" data-scopeb-ctx="user"><span class="scopeb-seg__tick" aria-hidden="true">{% call ui::icon("check") %}{% endcall %}</span><code>user/</code><span class="scopeb-seg__name">{{ i18n.t("idps-ctx-user") }}</span><span class="scopeb-seg__n" data-scopeb-ctx-n="user"></span></button>
+          <button type="button" class="seg__btn" aria-pressed="false" data-scopeb-ctx="system"><span class="scopeb-seg__tick" aria-hidden="true">{% call ui::icon("check") %}{% endcall %}</span><code>system/</code><span class="scopeb-seg__name">{{ i18n.t("idps-ctx-system") }}</span><span class="scopeb-seg__n" data-scopeb-ctx-n="system"></span></button>
+        </div>
+        <ul class="scopeb__ctx-help">
+          <li data-scopeb-ctx-help="patient"><code>patient/</code> {{ i18n.t("idps-ctx-patient-hint") }}</li>
+          <li data-scopeb-ctx-help="user"><code>user/</code> {{ i18n.t("idps-ctx-user-hint") }}</li>
+          <li data-scopeb-ctx-help="system"><code>system/</code> {{ i18n.t("idps-ctx-system-hint") }}</li>
+        </ul>
+      </div>
+      <div class="scopeb__tools">
+        <div class="filter-bar__search scopeb__search">
+          <label class="visually-hidden" for="scopeb-q">{{ i18n.t("idps-search") }}</label>
+          <span class="filter-bar__icon" aria-hidden="true">{% call ui::icon("search") %}{% endcall %}</span>
+          <input id="scopeb-q" class="mfield__input" type="search" placeholder="{{ i18n.t("idps-search") }}" autocomplete="off" spellcheck="false" data-scopeb-q>
+        </div>
+        <div class="seg scopeb-seg scopeb-seg--small" role="group" aria-label="{{ i18n.t("idps-show") }}">
+          <button type="button" class="seg__btn" aria-pressed="true" data-scopeb-show="all">{{ i18n.t("idps-show-all") }}</button>
+          <button type="button" class="seg__btn" aria-pressed="false" data-scopeb-show="selected">{{ i18n.t("idps-show-selected") }}</button>
+        </div>
+        <span class="scopeb__source">{{ sb.source_note }}</span>
+      </div>
+      <p class="scopeb__legend" aria-hidden="true">{{ i18n.t("idps-perm-legend") }}</p>
+      <div class="scopeb-table" data-scopeb-table></div>
+    </section>
+
+    <section class="scopeb__sec scopeb__result" aria-labelledby="scopeb-result-h">
+      <h4 class="scopeb__h" id="scopeb-result-h">{{ i18n.t("idps-result") }}</h4>
+      <div class="scopeb__chips" data-scopeb-chips aria-live="polite"></div>
+    </section>
+  </div>
+
+  <ul class="scopeb__findings" data-scopeb-findings aria-live="polite">
+    {% for f in sb.findings %}<li class="scopeb-finding scopeb-finding--{% if f.warn %}warn{% else %}info{% endif %}">{% if f.warn %}{% call ui::icon("alert") %}{% endcall %}{% else %}{% call ui::icon("info") %}{% endcall %}{% endif %}<span>{{ f.message }}</span></li>{% endfor %}
+  </ul>
+
+  <div class="mcheck scopeb__v1">
+    <input type="checkbox" class="mcheck__input" id="f-accept_v1" name="accept_v1"{% if sb.accept_v1 %} checked{% endif %} data-scopeb-v1>
+    <label class="mcheck__label" for="f-accept_v1">{{ i18n.t("idps-accept-v1") }}</label>
+    <p class="mcheck__hint">{{ i18n.t("idps-accept-v1-hint") }}</p>
+  </div>
+
+  <details class="disclosure scopeb__raw" data-scopeb-raw open>
+    <summary class="disclosure__summary">{% call ui::icon("code") %}{% endcall %}<span>{{ i18n.t("idps-raw") }}</span><span class="scopeb__raw-n" data-scopeb-raw-n></span></summary>
+    <div class="disclosure__body">
+      <label class="mfield__label" for="f-scopes_text">{{ i18n.t("idps-raw-label") }}</label>
+      <textarea id="f-scopes_text" name="scopes_text" class="mfield__input mono scopeb__text{% if !sb.error.is_empty() %} mfield__input--error{% endif %}" rows="8" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="openid&#10;fhirUser&#10;launch/patient&#10;patient/*.rs"{% if !sb.error.is_empty() %} aria-invalid="true" aria-describedby="f-scopes_text-error"{% endif %} data-scopeb-text>{{ sb.text }}</textarea>
+      <p class="mfield__hint">{{ i18n.t("idps-raw-hint") }}</p>
+      {% if !sb.error.is_empty() %}<p class="mfield__error" id="f-scopes_text-error">{{ sb.error }}</p>{% endif %}
+    </div>
+  </details>
+
+  {% let how_link = sb.users_href.clone() %}{% let how_link_key = "idps-how-to-users" %}
+  {% include "partials/idp/smart-explainer.html" %}
+
+  <dialog class="access-dialog" data-scopeb-paste aria-labelledby="scopeb-paste-title">
+    <div class="access-dialog__form">
+      <header class="access-dialog__head">
+        <h2 class="access-dialog__title" id="scopeb-paste-title">{{ i18n.t("idps-paste-title") }}</h2>
+        <button type="button" class="addbox__x" data-scopeb-close aria-label="{{ i18n.t("ui-close") }}">×</button>
+      </header>
+      <div class="access-dialog__body">
+        <label class="visually-hidden" for="scopeb-paste-text">{{ i18n.t("idps-paste-title") }}</label>
+        <textarea id="scopeb-paste-text" class="mfield__input mono" rows="8" spellcheck="false" autocomplete="off" placeholder="openid fhirUser launch/patient patient/*.rs" data-scopeb-paste-text></textarea>
+        <p class="mfield__hint">{{ i18n.t("idps-paste-hint") }}</p>
+        <div class="seg scopeb-seg scopeb-seg--small" role="group" aria-label="{{ i18n.t("idpa-mode") }}">
+          <button type="button" class="seg__btn" aria-pressed="true" data-scopeb-paste-mode="add">{{ i18n.t("idpa-mode-add") }}</button>
+          <button type="button" class="seg__btn" aria-pressed="false" data-scopeb-paste-mode="replace">{{ i18n.t("idpa-mode-replace") }}</button>
+        </div>
+      </div>
+      <footer class="access-dialog__foot">
+        <span class="access-dialog__status" data-scopeb-paste-status aria-live="polite"></span>
+        <button type="button" class="btn" data-scopeb-close>{{ i18n.t("idpc-cancel") }}</button>
+        <button type="button" class="btn btn--primary" data-scopeb-paste-apply disabled>{{ i18n.t("idpa-apply") }}</button>
+      </footer>
+    </div>
+  </dialog>
+</div>

@@ -740,6 +740,7 @@
   /* ---- swap handling ---------------------------------------------------- */
 
   var parser = new DOMParser();
+  var HEAD_METAS = ["hfs-tenant", "hfs-fhir-base", "hfs-user-settings"];
   var viewTransition = false;
   // List → detail ("forward") and back: the content column enters from the
   // right or the left instead of rising (REDESIGN.md §7, master-detail).
@@ -955,7 +956,17 @@
     if (navDir) document.documentElement.setAttribute("data-nav-dir", navDir);
     else document.documentElement.removeAttribute("data-nav-dir");
     detail.swapOverride = "outerHTML show:window:top" + (viewTransition ? " transition:true" : "");
+    // Per-endpoint values page scripts read from <head> (the FHIR base,
+    // the tenant, the settings document): an in-place switch to another
+    // endpoint must carry them over, or a Delete or a theme change would go
+    // to the endpoint the document was first loaded on.
+    var heads = {};
+    HEAD_METAS.forEach(function (name) {
+      var m = doc.querySelector('meta[name="' + name + '"]');
+      if (m) heads[name] = m.getAttribute("content");
+    });
     navigated = {
+      heads: heads,
       title: doc.title,
       bodyClass: doc.body ? doc.body.getAttribute("class") || "" : "",
       method: String((detail.requestConfig || {}).verb || "get"),
@@ -976,6 +987,10 @@
       nextNav = null;
     }
     if (info.title) document.title = info.title;
+    Object.keys(info.heads || {}).forEach(function (name) {
+      var m = document.head.querySelector('meta[name="' + name + '"]');
+      if (m && m.getAttribute("content") !== info.heads[name]) m.setAttribute("content", info.heads[name]);
+    });
     // Menus opened to navigate (endpoint switcher, account) close, as they
     // would on a fresh page.
     var menus = document.querySelectorAll("#sidebar details.menu[open], .topbar details[open]");
@@ -1043,7 +1058,9 @@
   // which innerHTML does not carry: written into attributes first, so Back
   // shows the filter the list was filtered by.
   var pageState = {};
+  var shownUrl = location.href;
   function rememberPage() {
+    shownUrl = location.href;
     var main = document.getElementById("main");
     pageState[location.href] = {
       bodyClass: document.body.getAttribute("class") || "",
@@ -1058,6 +1075,13 @@
       for (var i = 0; i < fields.length; i++) {
         var el = fields[i];
         if (el.type === "password" || el.type === "file") continue;
+        // Only filters (GET forms, loose fields) keep what was typed: an
+        // edit in a settings form (POST) is a draft that was either saved
+        // or discarded when the page was left — restoring it as the page's
+        // value would show a discarded edit as if it were saved, with no
+        // unsaved marker.
+        var owner = el.form;
+        if (owner && String(owner.getAttribute("method") || "get").toLowerCase() === "post") continue;
         if (el.tagName === "SELECT") {
           for (var o = 0; o < el.options.length; o++) {
             if (el.options[o].selected) el.options[o].setAttribute("selected", "");
@@ -1233,7 +1257,12 @@
         if (tog.getAttribute("aria-busy") === "true") return;
         tog.setAttribute("aria-busy", "true");
         fetch(src, { headers: { "HX-Request": "true" }, credentials: "same-origin" })
-          .then(function (r) { return r.text(); })
+          .then(function (r) {
+            // An error (a signed-out session) is not "no older versions":
+            // leave the toggle unloaded so the next click asks again.
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.text();
+          })
           .then(function (html) {
             var doc = new DOMParser().parseFromString(html, "text/html");
             var rows = doc.querySelectorAll("tr[data-older]");
@@ -1310,7 +1339,72 @@
     if (t && t.querySelector) autoExpand(document.getElementById("main"));
   });
 
+  /* ---- Back/Forward to a page that needs a fresh document --------------
+     A page loaded as a full document (its own `<script src>` in #main) must
+     not come back from htmx's history cache: restoring the snapshot re-runs
+     every page script in this document (a second, dead code editor; every
+     document listener bound twice — a Delete sent twice). Its snapshot is
+     never saved (`hx-history="false"` on #main while it is shown, also
+     dropping a snapshot saved before this rule), and a cache miss reloads
+     the address instead of fetching it into the live page
+     (`refreshOnHistoryMiss` in the layout's htmx-config). */
+
+  function needsFreshDocument(main) {
+    if (!main) return false;
+    var scripts = main.querySelectorAll("script[src]");
+    for (var i = 0; i < scripts.length; i++) {
+      if (!scripts[i].hasAttribute("data-swap-safe")) return true;
+    }
+    return false;
+  }
+
+  function keepOutOfHistory(main) {
+    if (!needsFreshDocument(main)) return;
+    main.setAttribute("hx-history", "false");
+    try {
+      var key = "htmx-history-cache";
+      var here = location.pathname + location.search;
+      var cache = JSON.parse(localStorage.getItem(key) || "[]");
+      var kept = cache.filter(function (item) { return item && item.url !== here; });
+      if (kept.length !== cache.length) localStorage.setItem(key, JSON.stringify(kept));
+    } catch (e) {}
+  }
+
+  /* Back/Forward with an unsaved draft asks first, like a link does: htmx
+     restores history in `window.onpopstate`, after the browser has already
+     moved; the page being left is put back on top until the operator
+     answers, then the move is replayed. */
+  function guardHistory() {
+    var restore = window.onpopstate;
+    if (typeof restore !== "function" || restore.__hmGuard) return;
+    var guarded = function (event) {
+      var U = window.HfsUnsaved;
+      var main = document.getElementById("main");
+      if (U && U.isDirty && U.isDirty(main) && shownUrl !== location.href) {
+        var target = location.href;
+        try {
+          history.pushState(history.state, "", shownUrl);
+        } catch (e) {
+          return restore.call(this, event);
+        }
+        U.confirmDiscard(main).then(function (leave) {
+          if (leave && location.href !== target) history.back();
+        });
+        return;
+      }
+      return restore.call(this, event);
+    };
+    guarded.__hmGuard = true;
+    window.onpopstate = guarded;
+  }
+
+  // htmx installs its handler when the document is ready (after this
+  // deferred script ran): wrap it once it exists.
+  document.addEventListener("htmx:load", guardHistory);
+
   function start() {
+    guardHistory();
+    keepOutOfHistory(document.getElementById("main"));
     autoExpand(document.getElementById("main"));
     rememberPage();
     restoreSidebarScroll();

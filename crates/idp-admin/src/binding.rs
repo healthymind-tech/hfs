@@ -223,6 +223,7 @@ impl StoreBinder {
                     issuer: auth.and_then(|a| a.issuer.clone()),
                 },
             },
+            fhir_version: format!("{:?}", e.spec.fhir_version),
         }
     }
 

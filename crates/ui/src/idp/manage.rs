@@ -297,7 +297,7 @@ pub(crate) struct ClientsPage {
     pub head: RealmHead,
     pub rows: Vec<wizard::ClientRow>,
     pub client_kinds: Vec<Opt>,
-    pub scope_presets: Vec<Opt>,
+    pub sb: super::scopes::ScopeBuilder,
     pub errors: Errors,
     pub form: HashMap<String, String>,
     pub new_secret: Option<(String, String)>,
@@ -343,6 +343,17 @@ pub(crate) async fn clients_page(
 ) -> Response {
     let (c, rec) = ctx!(c, realm);
     let i18n = I18n::new(locale);
+    let sb = super::scopes::builder(
+        &c,
+        &rec,
+        &i18n,
+        &super::scopes::default_scopes(&rec.spec.features),
+        false,
+        "",
+        &super::scopes::shape_for("public", &["standalone".into()], false),
+        String::new(),
+    )
+    .await;
     render(ClientsPage {
         status: current_status(&st, rv.0, &rt),
         i18n,
@@ -350,7 +361,7 @@ pub(crate) async fn clients_page(
         head: head(&c, &rec, "clients"),
         rows: client_rows(&c, &rec.id).await,
         client_kinds: kinds("public"),
-        scope_presets: wizard::scope_presets(&rec.spec, &[]),
+        sb,
         errors: Errors::default(),
         form: HashMap::new(),
         new_secret: None,
@@ -411,6 +422,32 @@ pub(crate) async fn client_create(
         }
     }
     let i18n = I18n::new(locale);
+    let (scopes, accept_v1, kind, launch) = if failed {
+        (
+            super::scopes::scopes_from_form(&body),
+            f.checked("accept_v1"),
+            f.get("client_kind").to_string(),
+            values(&body, "launch"),
+        )
+    } else {
+        (
+            super::scopes::default_scopes(&rec.spec.features),
+            false,
+            "public".to_string(),
+            vec!["standalone".to_string()],
+        )
+    };
+    let sb = super::scopes::builder(
+        &c,
+        &rec,
+        &i18n,
+        &scopes,
+        accept_v1,
+        "",
+        &super::scopes::shape_for(&kind, &launch, accept_v1),
+        errs.get("scopes_text"),
+    )
+    .await;
     let mut r = render(ClientsPage {
         status: current_status(&st, rv.0, &rt),
         i18n,
@@ -422,14 +459,7 @@ pub(crate) async fn client_create(
         } else {
             "public"
         }),
-        scope_presets: wizard::scope_presets(
-            &rec.spec,
-            &if failed {
-                values(&body, "scope")
-            } else {
-                vec![]
-            },
-        ),
+        sb,
         errors: errs,
         form,
         new_secret: secret,
@@ -456,7 +486,8 @@ pub(crate) struct ClientPage {
     pub form: HashMap<String, String>,
     pub launch_ehr: bool,
     pub launch_standalone: bool,
-    pub scope_presets: Vec<Opt>,
+    pub sb: super::scopes::ScopeBuilder,
+    pub chips: Vec<super::scopes::ChipGroup>,
     pub revision: i64,
     pub errors: Errors,
     pub new_secret: Option<String>,
@@ -476,28 +507,6 @@ fn client_form(spec: &ClientSpec) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("name".into(), spec.name.clone());
     m.insert("redirectUris".into(), spec.redirect_uris.join("\n"));
-    let presets = [
-        "openid",
-        "fhirUser",
-        "offline_access",
-        "launch",
-        "launch/patient",
-        "patient/*.rs",
-        "patient/*.cruds",
-        "user/*.rs",
-        "user/*.cruds",
-        "system/*.rs",
-    ];
-    m.insert(
-        "scopes_custom".into(),
-        spec.scopes
-            .allowed
-            .iter()
-            .filter(|s| !presets.contains(&s.as_str()))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
     if let ClientAuth::PrivateKeyJwt { jwks_uri, jwks, .. } = &spec.auth {
         m.insert("jwks_uri".into(), jwks_uri.clone().unwrap_or_default());
         m.insert(
@@ -526,6 +535,7 @@ async fn render_client(
     client: &str,
     errors: Errors,
     form_override: Option<HashMap<String, String>>,
+    posted: &[u8],
     secret: Option<String>,
     flash: Option<String>,
 ) -> Response {
@@ -541,9 +551,47 @@ async fn render_client(
     };
     let s = &cr.spec;
     let failed = !errors.is_empty();
+    let i18n = I18n::new(locale);
+    // After a failed save: what was posted; else the saved app.
+    let (scopes, accept_v1, launch) = match &form_override {
+        Some(_) if super::scopes::form_has(posted, "scopes_text") => (
+            super::scopes::scopes_from_form(posted),
+            Form::parse(posted).checked("accept_v1"),
+            values(posted, "launch"),
+        ),
+        _ => (
+            s.scopes.allowed.clone(),
+            s.scopes.accept_v1,
+            s.launch_types
+                .iter()
+                .filter_map(|l| match l {
+                    helios_idp::client::LaunchType::Ehr => Some("ehr".to_string()),
+                    helios_idp::client::LaunchType::Standalone => Some("standalone".to_string()),
+                    helios_idp::client::LaunchType::Backend => None,
+                })
+                .collect(),
+        ),
+    };
+    let kind = super::scopes::client_kind(s);
+    let mut shape = helios_idp::scope_catalog::ClientShape::of(s);
+    shape.accept_v1 = accept_v1;
+    shape.standalone = launch.iter().any(|l| l == "standalone");
+    shape.ehr = launch.iter().any(|l| l == "ehr");
+    let sb = super::scopes::builder(
+        c,
+        rec,
+        &i18n,
+        &scopes,
+        accept_v1,
+        kind,
+        &shape,
+        errors.get("scopes_text"),
+    )
+    .await;
+    let chips = super::scopes::effective_chips(&i18n, s, &rec.spec.features);
     let mut r = render(ClientPage {
         status: current_status(st, rv.0, rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "idp-realms",
         head: head(c, rec, "clients"),
         client_id: s.client_id.clone(),
@@ -557,7 +605,8 @@ async fn render_client(
         launch_standalone: s
             .launch_types
             .contains(&helios_idp::client::LaunchType::Standalone),
-        scope_presets: wizard::scope_presets(&rec.spec, &s.scopes.allowed),
+        sb,
+        chips,
         revision: cr.revision,
         errors,
         new_secret: secret,
@@ -588,6 +637,7 @@ pub(crate) async fn client_page(
         &client,
         Errors::default(),
         None,
+        &[],
         None,
         flash_key(q.done.as_deref()),
     )
@@ -631,15 +681,11 @@ pub(crate) async fn client_save(
             })
             .collect();
     }
-    let mut scopes = values(&body, "scope");
-    scopes.extend(
-        f.list("scopes_custom")
-            .into_iter()
-            .flat_map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>()),
-    );
-    scopes.sort();
-    scopes.dedup();
-    spec.scopes.allowed = scopes;
+    spec.scopes.allowed = super::scopes::scopes_from_form(&body);
+    if super::scopes::form_has(&body, "scopes_text") {
+        // The builder carries the v1 switch; older forms leave it alone.
+        spec.scopes.accept_v1 = f.checked("accept_v1");
+    }
     spec.trusted = f.checked("trusted");
     spec.disabled = f.checked("disabled");
     let mut errs = Errors::default();
@@ -658,7 +704,13 @@ pub(crate) async fn client_save(
     if errs.is_empty() {
         match c.admin.update_client(&rec.id, spec, rev).await {
             Ok(_) => return see_other(&format!("/ui/idp/{realm}/clients/{client}?done=saved")),
-            Err(e) => errs = Errors::from_op(&helios_idp_admin::service::OpError::from(e)),
+            Err(e) => {
+                let mut e = helios_idp_admin::service::OpError::from(e);
+                if e.field.as_deref() == Some("scopes") {
+                    e.field = Some("scopes_text".into());
+                }
+                errs = Errors::from_op(&e);
+            }
         }
     }
     let mut form = HashMap::new();
@@ -675,6 +727,7 @@ pub(crate) async fn client_save(
         &client,
         errs,
         Some(form),
+        &body,
         None,
         None,
     )
@@ -706,6 +759,7 @@ pub(crate) async fn client_action(
                     &client,
                     Errors::default(),
                     None,
+                    &[],
                     created.client_secret,
                     None,
                 )

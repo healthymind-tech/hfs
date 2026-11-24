@@ -146,7 +146,7 @@ pub(crate) struct WizardPage {
     pub clients: Vec<ClientRow>,
     pub new_secret: Option<(String, String)>,
     pub client_kinds: Vec<Opt>,
-    pub scope_presets: Vec<Opt>,
+    pub sb: super::scopes::ScopeBuilder,
     // step 5
     pub groups: Vec<ToggleGroup>,
     pub lifetimes: Vec<NumField>,
@@ -263,7 +263,7 @@ fn base_page(
                 checked: *k == "public",
             })
             .collect(),
-        scope_presets: vec![],
+        sb: Default::default(),
         groups: vec![],
         lifetimes: vec![],
         smart_preview: String::new(),
@@ -356,6 +356,21 @@ async fn load(
     p.issuer = c.issuer(&rec.spec);
     p.nav = nav(realm, step, reached);
     fill(&mut p, c, &rec.id, &rec.spec, w.as_ref()).await;
+    if step == 4 {
+        let shape = super::scopes::shape_for("public", &["standalone".into()], false);
+        let i18n = I18n::new(locale);
+        p.sb = super::scopes::builder(
+            c,
+            &rec,
+            &i18n,
+            &super::scopes::default_scopes(&rec.spec.features),
+            false,
+            "",
+            &shape,
+            String::new(),
+        )
+        .await;
+    }
     Ok(p)
 }
 
@@ -620,7 +635,6 @@ async fn fill(
             name: c.name,
         })
         .collect();
-    p.scope_presets = scope_presets(s, &[]);
     p.groups = feature_groups(s);
     p.lifetimes = lifetime_fields(s);
     p.smart_preview = smart_json(c, s);
@@ -724,43 +738,6 @@ async fn fill(
             edit_step: 6,
         },
     ];
-}
-
-pub(crate) fn scope_presets(s: &RealmSpec, selected: &[String]) -> Vec<Opt> {
-    let f = &s.features;
-    let mut v = vec![];
-    let mut add = |value: &str, key: &str, on: bool| {
-        if on {
-            v.push(Opt {
-                value: value.into(),
-                label_key: format!("idpc-scope-{key}"),
-                hint_key: String::new(),
-                checked: if selected.is_empty() {
-                    matches!(
-                        key,
-                        "openid" | "fhiruser" | "launch-patient" | "patient-read" | "offline"
-                    )
-                } else {
-                    selected.iter().any(|x| x == value)
-                },
-            });
-        }
-    };
-    add("openid", "openid", f.openid_connect);
-    add("fhirUser", "fhiruser", f.openid_connect);
-    add("offline_access", "offline", f.offline_access);
-    add("launch", "launch", f.launch_ehr);
-    add(
-        "launch/patient",
-        "launch-patient",
-        f.launch_standalone && f.permission_patient,
-    );
-    add("patient/*.rs", "patient-read", f.permission_patient);
-    add("patient/*.cruds", "patient-write", f.permission_patient);
-    add("user/*.rs", "user-read", f.permission_user);
-    add("user/*.cruds", "user-write", f.permission_user);
-    add("system/*.rs", "system-read", f.backend_services);
-    v
 }
 
 pub(crate) async fn step_page(
@@ -870,14 +847,7 @@ pub(crate) fn client_from_form(body: &[u8], f: &Form, errs: &mut Errors) -> Opti
     };
     let redirects = f.list("redirect_uris");
     let launch: Vec<String> = values(body, "launch");
-    let mut scopes = values(body, "scope");
-    scopes.extend(
-        f.list("scopes_custom")
-            .into_iter()
-            .flat_map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>()),
-    );
-    scopes.sort();
-    scopes.dedup();
+    let scopes = super::scopes::scopes_from_form(body);
     let jwks_source = || -> Option<ClientAuth> {
         let uri = f.opt("jwks_uri");
         let jwks = f
@@ -988,7 +958,7 @@ pub(crate) fn client_field(f: &str) -> String {
         "auth" | "auth.jwksUri" => "jwks_uri".into(),
         "auth.jwks" => "jwks".into(),
         "launchTypes" => "launch".into(),
-        "grantTypes" | "scopes" => "scopes_custom".into(),
+        "grantTypes" | "scopes" => "scopes_text".into(),
         other => other.to_string(),
     }
 }
@@ -1236,11 +1206,23 @@ pub(crate) async fn step_submit(
                 }
             }
             if step == 4 {
-                p.scope_presets = {
-                    let rec = c.realm(&realm).await.ok();
-                    rec.map(|r| scope_presets(&r.spec, &values(&body, "scope")))
-                        .unwrap_or_default()
-                };
+                if let Ok(rec) = c.realm(&realm).await {
+                    let i18n = I18n::new(locale);
+                    let launch = values(&body, "launch");
+                    let accept_v1 = f.checked("accept_v1");
+                    let shape = super::scopes::shape_for(f.get("client_kind"), &launch, accept_v1);
+                    p.sb = super::scopes::builder(
+                        &c,
+                        &rec,
+                        &i18n,
+                        &super::scopes::scopes_from_form(&body),
+                        accept_v1,
+                        "",
+                        &shape,
+                        all.get("scopes_text"),
+                    )
+                    .await;
+                }
                 for k in &mut p.client_kinds {
                     k.checked = k.value == f.get("client_kind");
                 }

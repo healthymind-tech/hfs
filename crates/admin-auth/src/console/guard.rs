@@ -118,7 +118,11 @@ async fn presented_token(request: Request) -> (Request, Option<String>) {
 pub async fn gate(console: &ConsoleAuth, request: Request) -> GateOutcome {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let Some(requirement) = access::requirement(&method, &path) else {
+    let scoped = request
+        .extensions()
+        .get::<access::ScopedEndpoint>()
+        .map(|s| s.0.clone());
+    let Some(requirement) = access::scoped_requirement(&method, &path, scoped.as_deref()) else {
         return GateOutcome::Pass(Box::new(request), GateInfo::default());
     };
     console.refresh_if_stale().await;

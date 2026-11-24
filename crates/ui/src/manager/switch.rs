@@ -215,6 +215,23 @@ pub(crate) struct SwitchQuery {
 /// Cookie the shell turns into a toast after the navigation (`shell.js`).
 pub(crate) const TOAST_COOKIE: &str = "hm_toast";
 
+/// The `Set-Cookie` remembering `ep` as the sidebar's endpoint, for a name
+/// that can be one (the path segment is decoded: `x%3B%20Max-Age%3D0` must
+/// not add cookie attributes).
+fn nav_cookie(ep: &str) -> Option<String> {
+    let valid = !ep.is_empty()
+        && ep.len() <= 64
+        && ep
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    valid.then(|| {
+        format!(
+            "{}={ep}; Path=/ui; Max-Age=31536000; SameSite=Lax",
+            super::NAV_ENDPOINT_COOKIE
+        )
+    })
+}
+
 async fn switch(
     locale: RequestLocale,
     rt: RequestTenant,
@@ -235,10 +252,9 @@ async fn switch(
     )
         .into_response();
     let headers = response.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&format!(
-        "{}={ep}; Path=/ui; Max-Age=31536000; SameSite=Lax",
-        super::NAV_ENDPOINT_COOKIE
-    )) {
+    if let Some(cookie) = nav_cookie(&ep)
+        && let Ok(v) = HeaderValue::from_str(&cookie)
+    {
         headers.append(header::SET_COOKIE, v);
     }
     if mapped.fell_back {
@@ -256,6 +272,18 @@ async fn switch(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_nav_cookie_takes_only_an_endpoint_name() {
+        assert!(
+            nav_cookie("sandbox")
+                .unwrap()
+                .starts_with("hm_ep=sandbox; Path=/ui")
+        );
+        assert!(nav_cookie("x; Max-Age=0").is_none());
+        assert!(nav_cookie("").is_none());
+    }
+
     use super::*;
     use helios_endpoints::ConsoleRole;
 

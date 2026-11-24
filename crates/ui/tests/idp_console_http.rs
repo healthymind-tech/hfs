@@ -104,7 +104,20 @@ async fn install() -> (Arc<IdpConsole>, Arc<dyn EndpointStore>) {
         jwks_via: None,
         realms: Arc::new(move || rt2.realms().iter().map(|r| r.spec.clone()).collect()),
     };
-    let mut c = IdpConsole::new(IdpAdmin::new(rt), Some(Arc::new(binder)));
+    let mut c = IdpConsole::new(IdpAdmin::new(rt), Some(Arc::new(binder))).with_type_provider(
+        Some(Arc::new(|_: &str| {
+            [
+                "Patient",
+                "Observation",
+                "Condition",
+                "MedicationRequest",
+                "Basic",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        })),
+    );
     c.timeout = std::time::Duration::from_secs(2);
     let c = Arc::new(c);
     service::install(c.clone());
@@ -373,6 +386,142 @@ async fn idp_console_end_to_end() {
     );
     let (_, _, html) = send(&app, get("/ui/idp/staff/clients/chart")).await;
     assert!(html.contains("data-confirm=\"Delete app chart?"), "{html}");
+
+    // --- SMART scope builder: on the app page, the add form, live check, save.
+    assert!(
+        html.contains("data-scopeb") && html.contains("name=\"scopes_text\""),
+        "{html}"
+    );
+    assert!(
+        html.contains("What this app can get"),
+        "effective-access chips"
+    );
+    assert!(
+        html.contains("EHR launch")
+            && html.contains("<code class=\"scope-chip__code\">launch</code>"),
+        "{html}"
+    );
+    assert!(html.contains("id=\"smart-how\"") && html.contains("How SMART access works"));
+    // The catalog carries the endpoint's types, grouped.
+    assert!(
+        html.contains(r#""id":"clinical","label":"Clinical","types":["Condition","Observation"]"#),
+        "{html}"
+    );
+    assert!(html.contains(r#""id":"medications""#) && html.contains(r#""id":"administrative""#));
+    // Saved scopes are the text box's content, one per line.
+    assert!(
+        html.contains(">launch\nopenid</textarea>") || html.contains(">openid\nlaunch</textarea>"),
+        "{html}"
+    );
+    let (_, _, html) = send(&app, get("/ui/idp/staff/clients")).await;
+    assert!(
+        html.contains(
+            "data-scopeb-preset=\"openid fhirUser launch/patient offline_access patient/*.rs\""
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Backend bulk export") && html.contains("data-backend=\"1\""));
+    assert!(
+        html.contains("Choose a patient") && html.contains("data-scopeb-nr=\"launch/patient\"")
+    );
+    // Default for a new app: the patient-facing preset.
+    assert!(
+        html.contains(">openid\nfhirUser\nlaunch/patient\noffline_access\npatient/*.rs</textarea>"),
+        "{html}"
+    );
+    let (s, _, body) = send(
+        &app,
+        get("/ui/idp/staff/scopes/check?scopes=system%2F*.rs+patient%2FObservation.rs+patient%2F*.rs+patient%2Fobservation.rs&kind=public&launch=standalone"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        codes,
+        ["system-public", "standalone-no-launch-patient"],
+        "{v}"
+    );
+    assert_eq!(v["redundant"][0]["scope"], "patient/Observation.rs");
+    assert_eq!(v["redundant"][0]["coveredBy"], "patient/*.rs");
+    assert!(
+        v["invalid"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("patient/observation.rs")
+    );
+    assert!(
+        v["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("system/*.rs")
+    );
+    let (_, _, body) = send(
+        &app,
+        get_lang(
+            "/ui/idp/staff/scopes/check?scopes=system%2F*.rs&kind=public",
+            "zh-TW",
+        ),
+    )
+    .await;
+    assert!(body.contains("公開 App"), "{body}");
+    // Save from the builder: kept exactly as written (granular + v1 switch).
+    let (s, h, html) = send(
+        &app,
+        post(
+            "/ui/idp/staff/clients/chart",
+            "name=Chart+viewer&redirectUris=https%3A%2F%2Fchart.example.org%2Fcb&launch=ehr&accept_v1=on&scopes_text=openid%0D%0Alaunch%0D%0Auser%2FObservation.rs%3Fcategory%3Dlaboratory%0D%0Auser%2F*.rs",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "{html}");
+    assert_eq!(location(&h), "/ui/idp/staff/clients/chart?done=saved");
+    let saved = c.admin.list_clients(&rec.id).await.unwrap().remove(0).spec;
+    assert_eq!(
+        saved.scopes.allowed,
+        [
+            "openid",
+            "launch",
+            "user/Observation.rs?category=laboratory",
+            "user/*.rs"
+        ]
+    );
+    assert!(saved.scopes.accept_v1);
+    let (_, _, html) = send(&app, get("/ui/idp/staff/clients/chart")).await;
+    assert!(html.contains("All types · Read, Search"), "{html}");
+    assert!(
+        html.contains("Observation · Read, Search · category=laboratory"),
+        "{html}"
+    );
+    assert!(
+        html.contains("is already covered by user/*.rs"),
+        "redundancy shown: {html}"
+    );
+    // An invalid scope is refused and anchored to the text box.
+    let (s, _, html) = send(
+        &app,
+        post(
+            "/ui/idp/staff/clients/chart",
+            "name=Chart+viewer&redirectUris=https%3A%2F%2Fchart.example.org%2Fcb&launch=ehr&scopes_text=openid%0APatient%2F*.rs",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(html.contains("href=\"#f-scopes_text\""), "{html}");
+    assert!(
+        html.contains(">openid\nPatient/*.rs</textarea>"),
+        "typed text kept: {html}"
+    );
+    let (_, _, html) = send(&app, get_lang("/ui/idp/staff/clients/chart", "zh-TW")).await;
+    assert!(
+        html.contains("SMART 存取如何運作") && html.contains("全部類型"),
+        "{html}"
+    );
     let (s, h, _) = send(&app, post("/ui/idp/staff/clients/chart/delete", "")).await;
     assert_eq!(
         (s, location(&h).as_str()),

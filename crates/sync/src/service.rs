@@ -370,7 +370,16 @@ impl SyncService {
         self.validate(&spec, Some(id)).await?;
         let rev = expected_revision.unwrap_or(current.revision);
         let disabled = current.spec.enabled && !spec.enabled;
-        let job = self.store().update_job(id, rev, spec).await?;
+        let retimed = current.spec.trigger != spec.trigger;
+        let mut job = self.store().update_job(id, rev, spec).await?;
+        // A new interval counts from now: the next run was scheduled with
+        // the old period (a daily job changed to every minute still waited
+        // for the rest of the day).
+        if retimed && let SyncTrigger::Interval { every_secs } = &job.spec.trigger {
+            let next = Utc::now() + chrono::Duration::seconds(i64::from(*every_secs));
+            self.store().set_next_run_at(id, Some(next)).await?;
+            job.next_run_at = Some(next);
+        }
         if disabled && let Some(r) = self.active_run(id).await? {
             self.runtime.cancel_run(&r, "job disabled").await?;
         }

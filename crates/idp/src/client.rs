@@ -129,6 +129,16 @@ impl ClientSpec {
                 "1-128 visible ASCII characters",
             ));
         }
+        // Empty entries never match a request (split_scopes drops them):
+        // tolerated, as clients registered before this check may carry one.
+        for s in self.scopes.allowed.iter().filter(|s| !s.is_empty()) {
+            if let Err(e) = crate::scope_catalog::check_syntax(s) {
+                return Err(IdpError::invalid(
+                    "scopes",
+                    format!("{s:?} is not a valid scope: {}", e.message()),
+                ));
+            }
+        }
         let uses_code = self.grant_types.contains(&GrantType::AuthorizationCode);
         if uses_code && self.redirect_uris.is_empty() {
             return Err(IdpError::invalid(
@@ -297,6 +307,19 @@ mod tests {
         assert!(validate_redirect_uri("myapp:/cb").is_err());
         assert!(validate_redirect_uri("https://*.example/cb").is_err());
         assert!(validate_redirect_uri("/relative").is_err());
+    }
+
+    #[test]
+    fn scopes_are_checked_on_save() {
+        let mut c = public_client();
+        c.scopes.allowed = vec![
+            "openid".into(),
+            "patient/Observation.rs?category=laboratory".into(),
+        ];
+        c.validate().unwrap();
+        c.scopes.allowed.push("patient/observation.read".into());
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("patient/observation.read"), "{e}");
     }
 
     #[test]

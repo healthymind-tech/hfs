@@ -477,3 +477,35 @@ async fn header_tenant_history_links_keep_unprefixed_public_base() {
     );
     assert!(!next.contains("/acme/"), "no tenant segment: {next}");
 }
+
+/// `Bundle.total` of a history page is the size of the whole history, never
+/// the page's own length: a history longer than `_count` leaves it out (the
+/// count is not known), one that fits on a page states it.
+#[tokio::test]
+async fn history_total_is_not_the_page_size() {
+    let (server, _) = server(
+        TenantRoutingMode::UrlPath,
+        "https://public.example/fhir/",
+        None,
+    )
+    .await;
+    put_patient_versions(&server, "/acme", "hist-total", 3, None).await;
+
+    let paged: Value = server
+        .get("/acme/Patient/hist-total/_history?_count=2")
+        .await
+        .json();
+    assert_eq!(paged["entry"].as_array().unwrap().len(), 2);
+    assert!(
+        paged.get("total").is_none() || paged["total"] == 3,
+        "a page of 2 out of 3 versions must not claim total=2: {}",
+        paged["total"]
+    );
+
+    let whole: Value = server
+        .get("/acme/Patient/hist-total/_history?_count=10")
+        .await
+        .json();
+    assert_eq!(whole["entry"].as_array().unwrap().len(), 3);
+    assert_eq!(whole["total"], 3);
+}

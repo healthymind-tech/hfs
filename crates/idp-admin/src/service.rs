@@ -257,6 +257,9 @@ pub struct IdpConsole {
     /// Test hook: shifts the diagnostic's own clock (simulated skew).
     #[doc(hidden)]
     pub clock_offset_secs: i64,
+    /// Resource types a FHIR release serves (`"R4"` → names), for the
+    /// scope builder; set by the server, which links the generated models.
+    pub type_provider: Option<crate::scopes::TypeProvider>,
     history: Mutex<HashMap<String, VecDeque<Report>>>,
 }
 
@@ -297,6 +300,7 @@ impl IdpConsole {
             fetch_via: None,
             timeout: Duration::from_secs(10),
             clock_offset_secs: 0,
+            type_provider: None,
             history: Mutex::new(HashMap::new()),
         }
     }

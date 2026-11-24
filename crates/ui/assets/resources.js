@@ -377,9 +377,14 @@
             : window.HfsSaveTarget.forCreate(current.type, doc);
           return confirmCreateOverExisting(target).then(function (go) {
             if (!go) return;
+            var saveHeaders = { "Content-Type": "application/fhir+json" };
+            // An update of the opened resource carries the version it was
+            // opened at (412 on a concurrent save, not a silent overwrite).
+            var precondition = current.id ? window.HfsSaveTarget.ifMatch(doc) : "";
+            if (precondition) saveHeaders["If-Match"] = precondition;
             return fetch(fhirUrl(target.url), {
               method: target.method,
-              headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+              headers: fhirHeaders(saveHeaders),
               body: JSON.stringify(doc),
             })
               .then(function (r) {

@@ -43,7 +43,19 @@
     return status === 200;
   }
 
+  /* The `If-Match` of an update of `doc` (`W/"<meta.versionId>"`), or "" when
+   * the document carries no version (a new resource, a pasted document).
+   * Saving an existing resource with the version it was loaded at turns a
+   * concurrent edit (another tab, another operator) into a 412 instead of
+   * silently overwriting it. */
+  function ifMatch(doc) {
+    var v = doc && doc.meta && doc.meta.versionId;
+    if (typeof v !== "string" || !/^[A-Za-z0-9.-]{1,64}$/.test(v)) return "";
+    return 'W/"' + v + '"';
+  }
+
   return {
+    ifMatch: ifMatch,
     isValidId: isValidId,
     forCreate: forCreate,
     notice: notice,

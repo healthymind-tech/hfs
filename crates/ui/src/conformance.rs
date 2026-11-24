@@ -26,7 +26,73 @@ use serde_json::Value;
 
 tokio::task_local! {
     static REQUEST_AUTHORIZATION: Option<String>;
+    static REQUEST_CONSOLE_SESSION: Option<ConsoleSessionCredential>;
     static REQUEST_ENDPOINT_PREFIX: String;
+}
+
+/// The console sign-in session of the request being served, carried on the
+/// console's loopback self-calls when the browser sent no `Authorization`
+/// (and there is no legacy login session): the FHIR API accepts the console
+/// cookie as the signed-in user, with that user's role **on the endpoint**
+/// and the endpoint's `consoleAccess` (design §7.3). Without it a self-call
+/// fell back to the outbound service credential — none in a typical
+/// deployment, so saving a View Definition, a saved query or starting a
+/// bulk export answered "401 Missing Authorization header" on any endpoint
+/// that requires a token for writes (`HFS_AUTH_MODE=write-protect`); and
+/// with one, the service credential ignored the user's endpoint role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleSessionCredential {
+    /// `hfs_console=…` (only the session cookie, never the others).
+    cookie: String,
+    /// The session's CSRF token (`hfs_csrf`), sent as `X-CSRF-Token` with
+    /// the self-call's `Origin` so its writes pass the console write checks.
+    csrf: Option<String>,
+}
+
+impl ConsoleSessionCredential {
+    /// The credential of a request carrying a console session cookie.
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
+        let session =
+            helios_auth::cookie_value(headers, helios_admin_auth::console::SESSION_COOKIE)?;
+        if session.is_empty() {
+            return None;
+        }
+        Some(Self {
+            cookie: format!("{}={session}", helios_admin_auth::console::SESSION_COOKIE),
+            csrf: helios_auth::cookie_value(headers, helios_admin_auth::console::CSRF_COOKIE)
+                .filter(|t| !t.is_empty()),
+        })
+    }
+
+    /// `request` (to `target`) carrying this session.
+    pub fn apply(&self, request: reqwest::RequestBuilder, target: &str) -> reqwest::RequestBuilder {
+        let mut request = request.header(reqwest::header::COOKIE, &self.cookie);
+        if let Ok(url) = reqwest::Url::parse(target) {
+            request = request.header(reqwest::header::ORIGIN, url.origin().ascii_serialization());
+        }
+        if let Some(csrf) = &self.csrf {
+            request = request.header("X-CSRF-Token", csrf);
+        }
+        request
+    }
+}
+
+/// Runs `fut` with `session` as the fallback credential of every self-call
+/// (after the request's own `Authorization`, before the outbound service
+/// credential).
+pub async fn with_console_session<F: std::future::Future>(
+    session: Option<ConsoleSessionCredential>,
+    fut: F,
+) -> F::Output {
+    REQUEST_CONSOLE_SESSION.scope(session, fut).await
+}
+
+/// The console session in scope ([`with_console_session`]).
+pub(crate) fn current_console_session() -> Option<ConsoleSessionCredential> {
+    REQUEST_CONSOLE_SESSION
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
 }
 
 /// Runs `fut` with every self-call addressed to the endpoint prefix
@@ -38,7 +104,7 @@ pub async fn with_endpoint_prefix<F: std::future::Future>(prefix: String, fut: F
     REQUEST_ENDPOINT_PREFIX.scope(prefix, fut).await
 }
 
-fn endpoint_prefix() -> String {
+pub(crate) fn endpoint_prefix() -> String {
     REQUEST_ENDPOINT_PREFIX
         .try_with(Clone::clone)
         .unwrap_or_default()
@@ -584,9 +650,10 @@ impl HttpConformanceSource {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, String> {
-        match request_authorization() {
-            Some(authorization) => Ok(request.header("Authorization", authorization)),
-            None => self
+        match (request_authorization(), current_console_session()) {
+            (Some(authorization), _) => Ok(request.header("Authorization", authorization)),
+            (None, Some(session)) => Ok(session.apply(request, &self.base_url)),
+            (None, None) => self
                 .outbound_auth
                 .authorize(request, &self.base_url)
                 .await
@@ -1785,6 +1852,55 @@ impl ConformanceSource for StaticConformanceSource {
             .expect("saved_resources mutex is never held across a panic")
             .push(resource.clone());
         Ok(resource)
+    }
+}
+
+#[cfg(test)]
+mod console_session_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    /// Console self-calls carry the operator's console session (only that
+    /// cookie), its CSRF token and the target's own origin — what the FHIR
+    /// API's console path needs to accept a write.
+    #[test]
+    fn a_console_session_rides_on_self_calls() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static(
+                "hfs_lang=zh-Hant; hfs_console=sess-1; hfs_csrf=tok-1; other=x",
+            ),
+        );
+        let cred = ConsoleSessionCredential::from_headers(&h).expect("a console session");
+        let request = cred
+            .apply(
+                reqwest::Client::new().post("http://127.0.0.1:8080/sandbox/ViewDefinition"),
+                "http://127.0.0.1:8080/",
+            )
+            .build()
+            .unwrap();
+        let hv = |n: &str| {
+            request
+                .headers()
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(hv("cookie").as_deref(), Some("hfs_console=sess-1"));
+        assert_eq!(hv("x-csrf-token").as_deref(), Some("tok-1"));
+        assert_eq!(hv("origin").as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(ConsoleSessionCredential::from_headers(&HeaderMap::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_session_is_in_scope_for_the_request() {
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_static("hfs_console=s2"));
+        let cred = ConsoleSessionCredential::from_headers(&h);
+        let seen = with_console_session(cred.clone(), async { current_console_session() }).await;
+        assert_eq!(seen, cred);
+        assert!(current_console_session().is_none());
     }
 }
 

@@ -45,8 +45,9 @@ pub fn install(rt: &Arc<IdpRuntime>, server_base: &str) {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .and_then(|v| url::Url::parse(v.trim()).ok());
-    let mut console =
-        IdpConsole::new(helios_idp::admin::IdpAdmin::new(rt.clone()), binder).with_fetch_via(via);
+    let mut console = IdpConsole::new(helios_idp::admin::IdpAdmin::new(rt.clone()), binder)
+        .with_fetch_via(via)
+        .with_type_provider(Some(Arc::new(resource_types)));
     if let Some(secs) = std::env::var("HFS_IDP_DIAGNOSTIC_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -60,6 +61,27 @@ pub fn install(rt: &Arc<IdpRuntime>, server_base: &str) {
         endpoint_binding = ENDPOINT_STORE.get().is_some(),
         "authorization server console on (/ui/idp, /admin/idp)"
     );
+}
+
+/// The resource types an endpoint of `release` serves (the generated
+/// models of this build; its CapabilityStatement lists the same), for the
+/// SMART scope builder. A release this build lacks serves nothing.
+fn resource_types(release: &str) -> Vec<String> {
+    use helios_fhir::FhirResourceTypeProvider;
+    let names: Vec<&'static str> = match release {
+        #[cfg(feature = "R4")]
+        "R4" => <helios_fhir::r4::Resource as FhirResourceTypeProvider>::get_resource_type_names(),
+        #[cfg(feature = "R4B")]
+        "R4B" => {
+            <helios_fhir::r4b::Resource as FhirResourceTypeProvider>::get_resource_type_names()
+        }
+        #[cfg(feature = "R5")]
+        "R5" => <helios_fhir::r5::Resource as FhirResourceTypeProvider>::get_resource_type_names(),
+        #[cfg(feature = "R6")]
+        "R6" => <helios_fhir::r6::Resource as FhirResourceTypeProvider>::get_resource_type_names(),
+        _ => vec![],
+    };
+    names.into_iter().map(str::to_string).collect()
 }
 
 /// `/admin/idp/**` (answers 503 until [`install`] ran).
