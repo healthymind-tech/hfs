@@ -81,6 +81,33 @@ pub const OPEN_WRITES: &[&str] = &[
 const ENDPOINT_ADMIN_SECTIONS: &[&str] =
     &["config", "security", "validation", "terminology", "sync"];
 
+/// The endpoint a console request acts on when its path does not name it:
+/// `/ui/e/{ep}/data/X` is rewritten to `/ui/X` before the gate sees it, and
+/// an htmx request to `/ui/X` from an endpoint page is scoped by its
+/// `Referer`. The console's endpoint dispatcher inserts this extension so
+/// the gate checks the role **on that endpoint** (bindings may raise or
+/// lower the global role) instead of the global one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedEndpoint(pub String);
+
+/// [`requirement`] for a request acting on `scoped` (see
+/// [`ScopedEndpoint`]): a viewer or editor requirement becomes the same
+/// role on that endpoint; server administration (global admin) and the
+/// requirements that name their endpoint already are unchanged.
+pub fn scoped_requirement(
+    method: &Method,
+    path: &str,
+    scoped: Option<&str>,
+) -> Option<Requirement> {
+    let need = requirement(method, path)?;
+    Some(match (need, scoped) {
+        (Requirement::Role(r), Some(ep)) if r < ConsoleRole::Admin && !ep.is_empty() => {
+            Requirement::EndpointRole(ep.to_string(), r)
+        }
+        (need, _) => need,
+    })
+}
+
 /// The requirement of `(method, path)`; `None` outside `/ui`.
 pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
     if !under(path, "/ui") {
@@ -287,6 +314,35 @@ mod tests {
             Some(Requirement::EndpointRole("lab".into(), Admin))
         );
         assert_eq!(req(Method::GET, "/ui/e/"), Some(Requirement::Role(Viewer)));
+    }
+
+    /// A data page reached as `/ui/e/{ep}/data/X` is checked against the
+    /// role on `ep` (the dispatcher rewrote the path to `/ui/X`).
+    #[test]
+    fn scoped_requests_use_the_endpoint_role() {
+        let sreq = |m: Method, p: &str, ep: Option<&str>| scoped_requirement(&m, p, ep);
+        assert_eq!(
+            sreq(Method::POST, "/ui/sql/view-definitions", Some("lab")),
+            Some(Requirement::EndpointRole("lab".into(), Editor))
+        );
+        assert_eq!(
+            sreq(Method::GET, "/ui/resources", Some("lab")),
+            Some(Requirement::EndpointRole("lab".into(), Viewer))
+        );
+        assert_eq!(
+            sreq(Method::POST, "/ui/sql/view-definitions", None),
+            Some(Requirement::Role(Editor))
+        );
+        // Server administration stays global.
+        assert_eq!(
+            sreq(Method::GET, "/ui/bulk-export", Some("lab")),
+            Some(Requirement::Role(Admin))
+        );
+        assert_eq!(
+            sreq(Method::POST, "/ui/sync/jobs", Some("lab")),
+            Some(Requirement::Role(Admin))
+        );
+        assert_eq!(sreq(Method::GET, "/ui/login", Some("lab")), Some(Requirement::Public));
     }
 
     /// The built-in authorization server's console is server administration

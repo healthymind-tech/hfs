@@ -280,6 +280,13 @@ pub(crate) async fn dispatch(
             rewrite_to,
         } => {
             if let Some(found) = snapshot.by_name(&endpoint) {
+                // The console gate checks the role on this endpoint (the
+                // path it sees may no longer name it).
+                request
+                    .extensions_mut()
+                    .insert(helios_admin_auth::console::access::ScopedEndpoint(
+                        found.name().to_string(),
+                    ));
                 request.extensions_mut().insert(EndpointScope {
                     endpoint: found.clone(),
                     routing: runtime.routing,
