@@ -57,6 +57,65 @@ pub(crate) type BoolMap = HashMap<String, bool>;
 pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
 pub(crate) type ValidateCodeResponseMap = HashMap<String, Arc<ValidateCodeResponse>>;
 
+/// `_hm-current`: one row per canonical URL (or its older versions), grouped,
+/// ranked and paged in SQL ([`crate::backends::grouped`]).
+fn search_grouped(
+    conn: &rusqlite::Connection,
+    table: &str,
+    resource_type: &str,
+    query: &ResourceSearchQuery,
+) -> Result<Vec<serde_json::Value>, HtsError> {
+    let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Sqlite, query);
+    let limit = i64::from(query.count.unwrap_or(20));
+    let offset = i64::from(query.offset.unwrap_or(0));
+    let [a, b, c, d, e] = &g.params;
+    let mut statement = conn
+        .prepare_cached(&g.select)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![a, b, c, d, e, limit, offset],
+            |row| {
+                Ok(crate::backends::grouped::resource(
+                    resource_type,
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?.as_deref(),
+                    row.get::<_, Option<String>>(3)?.as_deref(),
+                    row.get::<_, Option<String>>(4)?.as_deref(),
+                    &row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?.as_deref(),
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?.as_deref(),
+                ))
+            },
+        )
+        .map_err(|error| HtsError::StorageError(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    Ok(rows)
+}
+
+impl SqliteTerminologyBackend {
+    /// Async wrapper around [`search_grouped`] for the per-type search traits.
+    pub(super) async fn search_grouped(
+        &self,
+        table: &'static str,
+        resource_type: &'static str,
+        query: ResourceSearchQuery,
+    ) -> Result<Vec<serde_json::Value>, HtsError> {
+        let pool = self.pool().clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            search_grouped(&conn, table, resource_type, &query)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+}
+
 /// Search metadata using backend-neutral FHIR string matching, then hydrate
 /// only the selected page. Exact URL/version/status predicates stay in SQL.
 fn search_resources(
@@ -220,6 +279,15 @@ fn count_resources(
     table: &str,
     query: &ResourceSearchQuery,
 ) -> Result<u64, HtsError> {
+    if query.group.is_some() {
+        let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Sqlite, query);
+        let [a, b, c, d, e] = &g.params;
+        let count: i64 = conn
+            .prepare_cached(&g.count)
+            .and_then(|mut statement| statement.query_row(rusqlite::params![a, b, c, d, e], |row| row.get(0)))
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        return Ok(count.max(0) as u64);
+    }
     let search = ResourceStringSearch::new(query);
     let params = rusqlite::params![
         query.url.as_deref(),

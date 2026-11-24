@@ -136,6 +136,20 @@ fn parse_search_query(
             "_summary" if modifier.is_none() => {
                 set_once(&mut query.summary, value, "_summary")?;
             }
+            // `_hm-current`: one row per canonical URL (or its other
+            // versions); see `backends::grouped`.
+            "_hm-current" if modifier.is_none() => {
+                let group = match value.as_str() {
+                    "true" => crate::types::VersionGroup::Current,
+                    "older" => crate::types::VersionGroup::Older,
+                    other => {
+                        return Err(HtsError::InvalidRequest(format!(
+                            "Search parameter `_hm-current` must be `true` or `older`, not `{other}`"
+                        )));
+                    }
+                };
+                set_once(&mut query.group, group, "_hm-current")?;
+            }
             // `_sort`: the first supported key wins; unsupported keys are
             // ignored, as FHIR allows.
             "_sort" if modifier.is_none() => {
@@ -166,6 +180,14 @@ fn parse_search_query(
                 Some(_) => {}
                 None => query.version = Some(piped.to_string()),
             }
+        }
+    }
+
+    if query.group.is_some() {
+        if let Some(parameter) = crate::backends::grouped::unsupported_filter(&query) {
+            return Err(HtsError::InvalidRequest(format!(
+                "Search parameter `{parameter}` cannot be combined with `_hm-current`"
+            )));
         }
     }
 

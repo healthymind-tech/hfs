@@ -200,6 +200,16 @@ async fn count_resources<C>(
 where
     C: GenericClient + Sync,
 {
+    if query.group.is_some() {
+        let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Postgres, query);
+        let [a, b, c, d, e] = &g.params;
+        let count: i64 = client
+            .query_one(&g.count, &[a, b, c, d, e])
+            .await
+            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+            .get(0);
+        return Ok(count.max(0) as u64);
+    }
     let search = ResourceStringSearch::new(query);
     let filter = "WHERE ($1::text IS NULL OR url = $1)
            AND ($2::text IS NULL OR version = $2)
@@ -279,6 +289,9 @@ async fn search_table(
     mut query: ResourceSearchQuery,
     synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
+    if query.group.is_some() {
+        return search_grouped(client, table, resource_type, &query).await;
+    }
     let string_search = ResourceStringSearch::new(&query);
     if string_search.is_empty() {
         query.name = None;
@@ -357,6 +370,41 @@ async fn search_table(
         results.push(resource);
     }
     Ok(results)
+}
+
+/// `_hm-current`: one row per canonical URL (or its older versions), grouped,
+/// ranked and paged in SQL ([`crate::backends::grouped`]).
+async fn search_grouped(
+    client: &mut deadpool_postgres::Object,
+    table: &str,
+    resource_type: &str,
+    query: &ResourceSearchQuery,
+) -> Result<Vec<serde_json::Value>, HtsError> {
+    let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Postgres, query);
+    let limit = i64::from(query.count.unwrap_or(20));
+    let offset = i64::from(query.offset.unwrap_or(0));
+    let [a, b, c, d, e] = &g.params;
+    let rows = (**client)
+        .query(&g.select, &[a, b, c, d, e, &limit, &offset])
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            crate::backends::grouped::resource(
+                resource_type,
+                &row.get::<_, String>(0),
+                &row.get::<_, String>(1),
+                row.get::<_, Option<String>>(2).as_deref(),
+                row.get::<_, Option<String>>(3).as_deref(),
+                row.get::<_, Option<String>>(4).as_deref(),
+                &row.get::<_, String>(5),
+                row.get::<_, Option<String>>(6).as_deref(),
+                row.get::<_, i64>(7),
+                row.get::<_, Option<String>>(8).as_deref(),
+            )
+        })
+        .collect())
 }
 
 /// Search metadata using backend-neutral FHIR string matching, then hydrate
