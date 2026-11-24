@@ -14,7 +14,7 @@
   </summary>
   <div class="menu__panel" role="list">
     {% for v in versions %}
-    <a role="listitem" class="menu__option" href="{{ kind.detail_href(id, v.version) }}"{% if v.version == summary.version %} aria-current="true"{% endif %}>
+    <a role="listitem" class="menu__option" href="{{ kind.detail_href(v.id, v.version) }}"{% if v.version == summary.version %} aria-current="true"{% endif %}>
       <span class="menu__option-text"><code>{{ v.version }}</code>{% if v.current %} <span class="status status--ok">{{ chrome.i18n.t("hts-version-switch-current") }}</span>{% endif %}</span>
       <span class="menu__option-meta">{% if !v.status.is_empty() %}{{ v.status }}{% endif %}{% if !v.date.is_empty() %} · {{ v.date }}{% endif %}</span>
     </a>

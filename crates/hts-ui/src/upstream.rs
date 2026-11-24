@@ -1459,7 +1459,10 @@ impl UpstreamClient {
                 entries.iter().find_map(|entry| {
                     let resource = entry.get("resource")?;
                     let entry_id = resource.get("id").and_then(|v| v.as_str())?;
-                    if base_id(entry_id) == want {
+                    // A version-qualified read: `url` + `version` already
+                    // name one row, whose id may be its own
+                    // (`account-status-5.0.0` next to `account-status`).
+                    if base_id(entry_id) == want || version.is_some_and(|v| !v.is_empty()) {
                         Some(resource.clone())
                     } else {
                         None
