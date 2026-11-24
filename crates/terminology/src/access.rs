@@ -44,7 +44,11 @@ pub fn classify_console(method: &http::Method, path: &str) -> Option<Terminology
     let write = method != http::Method::GET && method != http::Method::HEAD;
     Some(match first {
         "import" | "uploads" | "registry" => TerminologyAction::Import,
-        "manage" => {
+        // `/ui/terminology/manage/...` is served by the internal
+        // `/hts/terminology/...` routes, and `internal_path` maps
+        // `/ui/terminology/terminology/...` onto the very same routes: both
+        // spellings are the maintenance pages.
+        "manage" | "terminology" => {
             if write {
                 TerminologyAction::Maintain
             } else {
@@ -106,5 +110,27 @@ mod tests {
             Some(ConsoleRole::Admin)
         );
         assert_eq!(c(&get, "/ui/e/default/data"), None);
+    }
+
+    /// `/ui/terminology/terminology/...` reaches the same internal
+    /// maintenance routes as `/ui/terminology/manage/...` (hts-ui
+    /// `internal_path`): it must need the same administrator role, not an
+    /// editor's (delete-resource, compact, set current) or a viewer's
+    /// (the inventory).
+    #[test]
+    fn terminology_alias_of_manage_needs_admin() {
+        let c = |m: &Method, p: &str| classify_console(m, p).map(required_role);
+        for p in [
+            "/ui/terminology/terminology/delete-resource",
+            "/ui/terminology/terminology/compact",
+            "/ui/terminology/terminology/current",
+            "/ui/terminology/terminology/delete",
+        ] {
+            assert_eq!(c(&Method::POST, p), Some(ConsoleRole::Admin), "{p}");
+        }
+        assert_eq!(
+            c(&Method::GET, "/ui/terminology/terminology"),
+            Some(ConsoleRole::Admin)
+        );
     }
 }
