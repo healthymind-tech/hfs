@@ -511,6 +511,3 @@ mgr-nav-group-console = 主控台設定
 
 # Endpoint switcher: the same page on the other endpoint.
 mgr-switch-fallback = 此端點沒有該頁面 — 已改為顯示最接近的可用頁面。
-
-# Endpoint switcher: the same page on the other endpoint.
-mgr-switch-fallback = 此端點沒有該頁面 — 已改為顯示最接近的可用頁面。

@@ -992,6 +992,8 @@
       var on = tabs[k] === tab;
       tabs[k].setAttribute("aria-selected", on ? "true" : "false");
       tabs[k].tabIndex = on ? 0 : -1;
+      // The ink under the chosen tab grows only when the operator picks it.
+      tabs[k].classList.toggle("ink-in", on && !!animate);
       var panel = document.getElementById(tabs[k].getAttribute("aria-controls"));
       if (!panel) continue;
       panel.hidden = !on;
@@ -1070,17 +1072,12 @@
         return;
       }
       tog.setAttribute("aria-expanded", open ? "true" : "false");
-      var n = 0;
+      var opened = [];
       for (var r = row.nextElementSibling; r && r.hasAttribute("data-older"); r = r.nextElementSibling) {
         r.classList.toggle("is-open", open);
-        if (open && !REDUCED) {
-          r.style.animationDelay = Math.min(n, 14) * 30 + "ms";
-          r.classList.remove("row-in");
-          void r.offsetWidth;
-          r.classList.add("row-in");
-        }
-        n++;
+        if (open) opened.push(r);
       }
+      motion.stagger(opened, { max: 20, total: 240 });
     }
   });
   document.addEventListener("keydown", function (e) {
@@ -1094,23 +1091,20 @@
     next.focus();
     e.preventDefault();
   });
-  // Table rows rise in, staggered, on first render and after a filter swap.
+  // Table rows fade up, staggered (<= 20 rows, <= 240 ms), when a filter
+  // or a pager swaps them in — never on first paint, where the content
+  // column's own rise is the only motion.
   function staggerRows(root) {
     if (REDUCED) return;
     var bodies = (root || document).querySelectorAll("table.data-table > tbody");
     for (var b = 0; b < bodies.length; b++) {
-      var rows = bodies[b].rows;
-      if (rows.length > 400) continue;
-      for (var i = 0; i < rows.length && i < 40; i++) {
-        rows[i].style.animationDelay = Math.min(i, 14) * 18 + "ms";
-        rows[i].classList.add("row-in");
-      }
+      if (bodies[b].rows.length > 400) continue;
+      motion.stagger(bodies[b].rows, { max: 20, total: 240 });
     }
   }
   document.addEventListener("hm:navigated", function (e) {
     var main = e.detail && e.detail.main;
     initPageTabs(main);
-    staggerRows(main);
   });
   document.addEventListener("htmx:afterSwap", function (e) {
     var t = e.detail && e.detail.target;
@@ -1128,7 +1122,6 @@
     markActive();
     initPages(document.getElementById("main"));
     initPageTabs(document.getElementById("main"));
-    staggerRows(document.getElementById("main"));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
   else start();

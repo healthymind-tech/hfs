@@ -346,6 +346,18 @@
     // Instant: a smooth scroll can still be under way when the reader (or
     // a screenshot) looks, with the step half under the bar.
     first.scrollIntoView({ block: "nearest", behavior: "auto" });
+    // In the Verify aside (its own scroll box) the scroll margin is measured
+    // against the aside, not the floating bar: nudge whatever scrolls until
+    // the step clears the bar.
+    var top = bar ? bar.getBoundingClientRect().top : Infinity;
+    var limit = Math.min(window.innerHeight, top > 0 && top < window.innerHeight ? top - 8 : Infinity);
+    var over = first.getBoundingClientRect().bottom - limit;
+    var box = first.closest(".config-aside");
+    if (over > 0 && box && box.scrollHeight > box.clientHeight) {
+      box.scrollTop += over;
+      over = first.getBoundingClientRect().bottom - limit;
+    }
+    if (over > 0) window.scrollBy(0, over);
   }
 
   // Elements wired once each (pages swapped in place bring new elements).

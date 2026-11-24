@@ -14354,7 +14354,7 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     height: 2px;
     border-radius: 2px;
     background: var(--accent);
-    animation: hm-ink var(--dur-3) var(--ease-out) both;
+    /* no first-paint animation (motion audit): the ink is drawn */
   }
 
   .route-tab:focus-visible {
@@ -15253,6 +15253,10 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     height: 2px;
     border-radius: 2px;
     background: var(--accent);
+  }
+
+  /* The ink grows only when the operator picks the tab (shell.js). */
+  .page-tab.ink-in[aria-selected="true"]::after {
     animation: hm-ink var(--dur-3) var(--ease-out) both;
   }
 
@@ -15416,7 +15420,7 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     height: 2px;
     border-radius: 2px;
     background: var(--accent);
-    animation: hm-ink var(--dur-3) var(--ease-out) both;
+    /* no first-paint animation (motion audit): the ink is drawn */
   }
 
   .stat--link {
@@ -15504,27 +15508,34 @@ details.card[open] > summary.card-head > .disclosure__chevron {
    disclosures, phase stepper, log viewer, toast, live dots, press states.
    ========================================================================== */
 @layer pages {
-  /* Disclosures open and close with their height (Chromium; elsewhere they
+  /* Disclosures fade their content in and out (Chromium; elsewhere they
      snap as before). Menus are excluded: their panel floats. */
   :root {
     interpolate-size: allow-keywords;
   }
 
+  /* Opacity only (motion audit: transform / opacity, never layout). */
   details.disclosure::details-content,
   details.card::details-content,
   .verify__token::details-content {
-    block-size: 0;
-    overflow: hidden;
-    transition: block-size var(--dur-2) var(--ease-in), content-visibility var(--dur-2) allow-discrete;
+    opacity: 0;
+    transition: opacity var(--dur-1) var(--ease-std), content-visibility var(--dur-1) allow-discrete;
   }
 
   details.disclosure[open]::details-content,
   details.card[open]::details-content,
   .verify__token[open]::details-content {
-    block-size: auto;
-    overflow: visible;
-    transition-duration: var(--dur-3);
+    opacity: 1;
+    transition-duration: var(--dur-2);
     transition-timing-function: var(--ease-out);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    details.disclosure::details-content,
+    details.card::details-content,
+    .verify__token::details-content {
+      transition: none;
+    }
   }
 
   /* Phase stepper. */
@@ -15555,8 +15566,6 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     border: 2px solid var(--border-strong);
     border-radius: 50%;
     background: var(--surface);
-    animation: hm-node-pop 360ms var(--ease-out) backwards;
-    animation-delay: calc(var(--i, 0) * 70ms);
   }
 
   .phase--done .phase__node {
@@ -15576,8 +15585,6 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     border-radius: 2px;
     background: var(--border);
     transform-origin: left;
-    animation: hm-grow 420ms var(--ease-out) backwards;
-    animation-delay: calc(var(--i, 0) * 70ms + 120ms);
   }
 
   .phase--done .phase__line {
