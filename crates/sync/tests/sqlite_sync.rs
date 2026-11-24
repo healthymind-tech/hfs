@@ -719,14 +719,26 @@ async fn interval_change_reschedules_the_next_run() {
     body["trigger"] = json!({"type": "interval", "everySecs": 86400});
     let job = f.create_job(body).await;
     f.svc.runtime().schedule_once().await.unwrap();
-    let before = f.svc.job(&job).await.unwrap().next_run_at.expect("scheduled");
+    let before = f
+        .svc
+        .job(&job)
+        .await
+        .unwrap()
+        .next_run_at
+        .expect("scheduled");
     assert!(before > chrono::Utc::now() + chrono::Duration::hours(23));
 
     let j = f.svc.job(&job).await.unwrap();
     let mut spec = serde_json::to_value(&j.spec).unwrap();
     spec["trigger"] = json!({"type": "interval", "everySecs": 60});
     f.svc.update(&job, None, spec, "t").await.unwrap();
-    let after = f.svc.job(&job).await.unwrap().next_run_at.expect("rescheduled");
+    let after = f
+        .svc
+        .job(&job)
+        .await
+        .unwrap()
+        .next_run_at
+        .expect("rescheduled");
     assert!(
         after <= chrono::Utc::now() + chrono::Duration::seconds(61),
         "next run still a day away: {after}"

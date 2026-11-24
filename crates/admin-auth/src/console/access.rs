@@ -376,7 +376,10 @@ mod tests {
             sreq(Method::POST, "/ui/sync/jobs", Some("lab")),
             Some(Requirement::Role(Admin))
         );
-        assert_eq!(sreq(Method::GET, "/ui/login", Some("lab")), Some(Requirement::Public));
+        assert_eq!(
+            sreq(Method::GET, "/ui/login", Some("lab")),
+            Some(Requirement::Public)
+        );
     }
 
     /// The built-in authorization server's console is server administration

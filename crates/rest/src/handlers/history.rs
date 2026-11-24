@@ -712,9 +712,9 @@ where
     // this page: the page's length is that number only when the history fits
     // on one page; otherwise it is left out (unknown) rather than claiming
     // the page size (`_count=2` answered `total: 2` for a long history).
-    let total = page_info.total.or_else(|| {
-        (!page_info.has_next && !page_info.has_previous).then_some(items.len() as u64)
-    });
+    let total = page_info
+        .total
+        .or_else(|| (!page_info.has_next && !page_info.has_previous).then_some(items.len() as u64));
     let links = history_links(
         state,
         tenant,
