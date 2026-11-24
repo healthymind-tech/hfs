@@ -9,7 +9,7 @@
   <div class="menu__panel">
     <a class="menu__option" href="{{ kind.detail_href(m_id, m_version) }}"><span class="menu__option-text">{{ chrome.i18n.t("hts-browser-open") }}</span></a>
     {% if kind == crate::versions::Kind::CodeSystem %}
-    {% if !m_current && m_count > 1 %}
+    {% if !m_current && m_count.clone() > 1 %}
     <form method="post" action="{{ crate::paths::manage() }}/current">
       <input type="hidden" name="url" value="{{ m_url }}">
       <input type="hidden" name="version" value="{{ m_version }}">

@@ -5248,6 +5248,7 @@ mod tests {
                 total: Some(50),
                 has_next: Some(false),
             },
+            versions_total: None,
         };
         assert_eq!(page.next_offset(), None);
 
@@ -5259,6 +5260,7 @@ mod tests {
                 total: Some(80),
                 has_next: Some(true),
             },
+            versions_total: None,
         };
         assert_eq!(page.next_offset(), Some(50));
     }

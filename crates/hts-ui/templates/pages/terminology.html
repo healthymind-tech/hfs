@@ -61,7 +61,7 @@
     </article>
     <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-other") }}</span>
-      {% if let (Some(vsu), Some(cmu)) = (value_set_urls, concept_map_urls) %}
+      {% if let (Some(vsu), Some(cmu)) = (value_set_urls.as_ref(), concept_map_urls.as_ref()) %}
       <span class="stat__value">{{ vsu }} / {{ cmu }}</span>
       <span class="stat__sub">{{ chrome.i18n.t_arg2("hts-term-stat-other-versions", "vs", value_sets.clone(), "cm", concept_maps.clone()) }}</span>
       {% else %}
