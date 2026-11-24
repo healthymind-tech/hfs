@@ -202,7 +202,10 @@ impl SubscriptionEngine {
             .with_event_history_size(config.event_history_size),
         );
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
-        let rest_hook_channel = Arc::new(RestHookChannel::new());
+        let rest_hook_channel = Arc::new(match &config.outbound_policy {
+            Some(policy) => RestHookChannel::with_outbound_policy(policy.clone()),
+            None => RestHookChannel::new(),
+        });
         let ws_manager = Arc::new(WebSocketManager::new());
         let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
         let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
@@ -222,6 +225,11 @@ impl SubscriptionEngine {
             if resolve_default_message_source {
                 channel =
                     channel.with_source_endpoint_resolver(Arc::clone(&public_base_url_for_tenant));
+            }
+            if !settings.allow_private_endpoints
+                && let Some(policy) = &config.outbound_policy
+            {
+                channel = channel.with_outbound_policy(policy);
             }
             Arc::new(channel.with_private_endpoints_allowed(settings.allow_private_endpoints))
         });

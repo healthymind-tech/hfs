@@ -18,6 +18,7 @@ use crate::manager::{ActiveSubscription, PayloadContent};
 /// Supports custom headers and TLS enforcement for full-resource payloads.
 pub struct RestHookChannel {
     client: Client,
+    policy: Option<helios_endpoints::OutboundPolicy>,
 }
 
 impl RestHookChannel {
@@ -28,12 +29,33 @@ impl RestHookChannel {
             .build()
             .expect("failed to build HTTP client");
 
-        Self { client }
+        Self {
+            client,
+            policy: None,
+        }
     }
 
     /// Creates a new REST-hook channel with a custom HTTP client.
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            policy: None,
+        }
+    }
+
+    /// Delivers only where `policy` allows (SSRF guard): the endpoint URL is
+    /// checked, the client resolves through the guard and checks redirects.
+    pub fn with_outbound_policy(policy: helios_endpoints::OutboundPolicy) -> Self {
+        let client = helios_endpoints::http_guard::guard(
+            Client::builder().timeout(Duration::from_secs(30)),
+            &policy,
+        )
+        .build()
+        .expect("failed to build HTTP client");
+        Self {
+            client,
+            policy: Some(policy),
+        }
     }
 
     /// Sends a notification bundle to the given endpoint.
@@ -55,6 +77,20 @@ impl RestHookChannel {
             return Ok(DispatchResult::PermanentError(
                 "full-resource payload requires HTTPS endpoint".to_string(),
             ));
+        }
+
+        if let Some(policy) = &self.policy
+            && let Err(e) = helios_endpoints::http_guard::check(policy, endpoint)
+        {
+            warn!(
+                subscription_id = %subscription.id,
+                endpoint = %redact_url(endpoint),
+                error = %e,
+                "rest-hook endpoint refused by the outbound policy"
+            );
+            return Ok(DispatchResult::PermanentError(format!(
+                "endpoint refused: {e}"
+            )));
         }
 
         let mut request = self
@@ -103,6 +139,17 @@ impl RestHookChannel {
                     );
                     Ok(DispatchResult::RetryableError(format!("HTTP {status}")))
                 }
+            }
+            Err(e) if helios_endpoints::http_guard::is_refusal(&e) => {
+                let error = redact_urls_in(&e.to_string());
+                warn!(
+                    subscription_id = %subscription.id,
+                    error = %error,
+                    "rest-hook delivery refused by the outbound policy"
+                );
+                Ok(DispatchResult::PermanentError(format!(
+                    "endpoint refused: {error}"
+                )))
             }
             Err(e) => {
                 // reqwest's message ends with `for url (...)`, query included.
@@ -194,6 +241,58 @@ mod tests {
 
     fn test_bundle() -> serde_json::Value {
         json!({"resourceType": "Bundle", "type": "history", "entry": []})
+    }
+
+    /// A Subscription's endpoint is client-written: under the outbound policy
+    /// an internal address is refused (permanently) without being contacted,
+    /// directly or behind a redirect; allow-listed, it is delivered to.
+    #[tokio::test]
+    async fn test_outbound_policy_refuses_internal_endpoints() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let hook = format!("{}/hook", server.uri());
+        let strict =
+            RestHookChannel::with_outbound_policy(helios_endpoints::OutboundPolicy::strict());
+        for endpoint in [hook.as_str(), "http://169.254.169.254/latest/meta-data/"] {
+            let sub = test_subscription(endpoint, PayloadContent::IdOnly);
+            match strict.send(&sub, &test_bundle()).await.unwrap() {
+                DispatchResult::PermanentError(msg) => assert!(msg.contains("refused"), "{msg}"),
+                other => panic!("{endpoint}: expected a refusal, got {other:?}"),
+            }
+        }
+        // Behind a redirect from an allow-listed name.
+        let redirect = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", "http://169.254.169.254/x"),
+            )
+            .mount(&redirect)
+            .await;
+        let port = redirect.address().port();
+        let named = RestHookChannel::with_outbound_policy(helios_endpoints::OutboundPolicy::parse(
+            "localhost",
+        ));
+        let sub = test_subscription(
+            &format!("http://localhost:{port}/hook"),
+            PayloadContent::IdOnly,
+        );
+        match named.send(&sub, &test_bundle()).await.unwrap() {
+            DispatchResult::PermanentError(msg) => assert!(msg.contains("refused"), "{msg}"),
+            other => panic!("redirect: expected a refusal, got {other:?}"),
+        }
+        // Allow-listed: delivered (the mock expects exactly one POST).
+        let listed = RestHookChannel::with_outbound_policy(
+            helios_endpoints::OutboundPolicy::parse("127.0.0.1"),
+        );
+        let sub = test_subscription(&hook, PayloadContent::IdOnly);
+        assert!(matches!(
+            listed.send(&sub, &test_bundle()).await.unwrap(),
+            DispatchResult::Success
+        ));
     }
 
     #[tokio::test]

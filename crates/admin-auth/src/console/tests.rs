@@ -1404,6 +1404,73 @@ async fn oidc_code_pkce_flow_role_mapping_refresh_and_logout() {
     assert!(out.location.contains("id_token_hint="));
 }
 
+/// A changed role mapping takes effect on live OIDC sessions without waiting
+/// for the IdP token to expire: the role is re-mapped from the claim values
+/// the session signed in with; no role (or another claim path) ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn oidc_sessions_follow_a_changed_role_mapping() {
+    let idp_state = Arc::new(IdpState::default());
+    let idp = mock_idp(idp_state.clone()).await;
+    let rt = oidc_rt(&idp, &[]).await;
+    // The mock's access tokens live one second: a refresh keeps the editor role.
+    *idp_state.refresh_roles.lock().unwrap() = vec!["hfs-editor".into()];
+    let (pending, url) = rt.begin_oidc(&site_headers(), "/ui", None).await.unwrap();
+    let (code, st) = authorize(&idp_state, &url, &["hfs-editor"]);
+    let OidcOutcome::Success { cookies, .. } = rt
+        .complete_oidc(&with_cookie(&pending), None, Some(&code), Some(&st), None)
+        .await
+    else {
+        panic!()
+    };
+    let mut sh = HeaderMap::new();
+    sh.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&cookie_header(&cookies)).unwrap(),
+    );
+    let r = rt.resolve(&sh).await.unwrap();
+    assert_eq!(r.principal.role, ConsoleRole::Editor);
+    let tokens = r.session.oidc.clone().unwrap();
+    assert_eq!(tokens.role_claim.as_deref(), Some("groups"));
+    assert_eq!(tokens.role_values, vec!["hfs-editor".to_string()]);
+    assert!(tokens.mapping_fp.is_some());
+
+    // The session was mapped under another mapping (it said admin then);
+    // the IdP token is still valid, so no refresh happens.
+    let stale = |values: &[&str], claim: &str| {
+        let mut s = r.session.clone();
+        s.role = ConsoleRole::Admin;
+        let t = s.oidc.as_mut().unwrap();
+        t.access_expires_unix = i64::MAX / 2;
+        t.mapping_fp = Some("an-older-mapping".into());
+        t.role_claim = Some(claim.into());
+        t.role_values = values.iter().map(|v| v.to_string()).collect();
+        s
+    };
+    let refreshes = *idp_state.refreshes.lock().unwrap();
+    rt.put_session(&r.key, &stale(&["hfs-editor"], "groups"))
+        .await
+        .unwrap();
+    rt.cache_lock().clear();
+    let again = rt.resolve(&sh).await.unwrap();
+    assert_eq!(
+        again.principal.role,
+        ConsoleRole::Editor,
+        "re-mapped under the current mapping"
+    );
+    assert_eq!(
+        *idp_state.refreshes.lock().unwrap(),
+        refreshes,
+        "no IdP round trip"
+    );
+
+    // Values the current mapping does not map: the session ends.
+    rt.put_session(&r.key, &stale(&["staff"], "groups"))
+        .await
+        .unwrap();
+    rt.cache_lock().clear();
+    assert!(rt.resolve(&sh).await.is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oidc_without_a_matching_role_gets_no_access_unless_default_role() {
     let idp_state = Arc::new(IdpState::default());

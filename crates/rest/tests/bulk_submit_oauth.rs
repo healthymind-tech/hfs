@@ -66,7 +66,9 @@ async fn test_outbound_client_credentials_discovery_and_cache() {
 
     // --- Provider acquires + caches a read-scoped token. ---
     let provider = JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384")
-        .expect("parse ES384 key");
+        .expect("parse ES384 key")
+        .with_outbound_policy(loopback())
+        .unwrap();
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
 
     let t1 = provider.token(&discovery, "system/*.rs").await;
@@ -112,6 +114,41 @@ async fn test_outbound_client_credentials_discovery_and_cache() {
     assert_eq!(claims["sub"], "client-1");
     assert_eq!(claims["aud"], format!("{base}/token"));
     assert!(claims["jti"].is_string());
+}
+
+/// The test IdP listens on loopback, which the outbound policy refuses
+/// unless allow-listed.
+fn loopback() -> helios_endpoints::OutboundPolicy {
+    helios_endpoints::OutboundPolicy::parse("127.0.0.1,localhost")
+}
+
+/// The metadata URL comes from the submitting client: without an allow-list
+/// entry an internal address is not fetched at all.
+#[tokio::test]
+async fn test_outbound_internal_metadata_url_is_refused() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let app = Router::new().route(
+        "/.well-known/smart-configuration",
+        get(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"token_endpoint": "http://127.0.0.1:1/token"})) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384")
+        .unwrap()
+        .with_outbound_policy(helios_endpoints::OutboundPolicy::strict())
+        .unwrap();
+    let discovery = vec![format!("{base}/.well-known/smart-configuration")];
+    assert!(provider.token(&discovery, "system/*.rs").await.is_none());
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the internal URL was requested"
+    );
 }
 
 #[tokio::test]

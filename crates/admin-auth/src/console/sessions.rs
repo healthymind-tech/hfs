@@ -27,6 +27,17 @@ pub struct OidcSessionTokens {
     /// When the access token expires (Unix seconds); the session is
     /// refreshed (and the role re-mapped) after that.
     pub access_expires_unix: i64,
+    /// The role claim the role was mapped from (`realm_access.roles`), its
+    /// values at sign-in (or the last refresh), and the fingerprint of the
+    /// role mapping applied: when an administrator changes the mapping, the
+    /// session's role is re-mapped from these values at once instead of
+    /// keeping the old role until the IdP token expires.
+    #[serde(default)]
+    pub role_claim: Option<String>,
+    #[serde(default)]
+    pub role_values: Vec<String>,
+    #[serde(default)]
+    pub mapping_fp: Option<String>,
 }
 
 impl std::fmt::Debug for OidcSessionTokens {
@@ -370,6 +381,7 @@ mod tests {
             id_token: Some("idtok".into()),
             refresh_token: Some("rtok".into()),
             access_expires_unix: 1,
+            ..Default::default()
         };
         let shown = format!("{t:?}");
         assert!(!shown.contains("idtok") && !shown.contains("rtok"));

@@ -814,6 +814,23 @@ impl ReqwestTransport {
                 .expect("terminology HTTP client"),
         }
     }
+
+    /// The same transport under the outbound policy (SSRF guard): for the
+    /// terminology server an endpoint binds in the console, checked after
+    /// DNS resolution and on every redirect (the save-time check alone let a
+    /// name that later resolves internally, or a redirect, through).
+    pub fn guarded(policy: &helios_endpoints::OutboundPolicy) -> Self {
+        Self {
+            client: helios_endpoints::http_guard::guard(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(2))
+                    .no_proxy(),
+                policy,
+            )
+            .build()
+            .expect("terminology HTTP client"),
+        }
+    }
 }
 
 impl Default for ReqwestTransport {
@@ -888,6 +905,121 @@ fn shared_transport() -> Arc<dyn HttpTransport> {
     TRANSPORT
         .get_or_init(|| Arc::new(ReqwestTransport::new()))
         .clone()
+}
+
+fn guarded_transport() -> Arc<dyn HttpTransport> {
+    static TRANSPORT: std::sync::OnceLock<Arc<ReqwestTransport>> = std::sync::OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| {
+            Arc::new(ReqwestTransport::guarded(
+                &helios_endpoints::OutboundPolicy::from_env(),
+            ))
+        })
+        .clone()
+}
+
+/// The terminology service of an endpoint's own binding (`url` is not the
+/// server's installed service): over the guarded transport, and with the
+/// endpoint's sealed `terminology.token` (see [`endpoint_terminology_token`])
+/// sent as `Authorization: Bearer` on the server's own calls — validation,
+/// search expansion, SQL-on-FHIR — which are made on the endpoint's behalf.
+/// Without a token the calls stay anonymous, as before.
+pub fn endpoint_service(
+    url: &str,
+    token: Option<String>,
+    caller: TxCaller,
+) -> (String, Arc<dyn TerminologyService>) {
+    endpoint_service_over(url, token, caller, guarded_transport())
+}
+
+fn endpoint_service_over(
+    url: &str,
+    token: Option<String>,
+    caller: TxCaller,
+    transport: Arc<dyn HttpTransport>,
+) -> (String, Arc<dyn TerminologyService>) {
+    let base = url.trim_end_matches('/');
+    let remote: Arc<dyn TerminologyService> =
+        match RemoteTerminology::new(base, token.clone(), DEFAULT_REQUEST_TIMEOUT, transport) {
+            Ok(remote) => Arc::new(remote),
+            Err(e) => Arc::new(Unreachable(tx_error_text(&e))),
+        };
+    let service: Arc<dyn TerminologyService> = if token.is_some() {
+        Arc::new(OnBehalfOfEndpoint(remote))
+    } else {
+        remote
+    };
+    (base.to_string(), instrumented(service, caller))
+}
+
+/// Server-originated calls (no caller identity) to an endpoint's terminology
+/// server are made as the endpoint: the `System` principal, which the remote
+/// client turns into the endpoint's bearer token. A console user's calls keep
+/// their own principal (never the endpoint's credential).
+struct OnBehalfOfEndpoint(Arc<dyn TerminologyService>);
+
+#[async_trait::async_trait]
+impl TerminologyService for OnBehalfOfEndpoint {
+    fn kind(&self) -> helios_terminology::ServiceKind {
+        self.0.kind()
+    }
+    async fn call(&self, mut request: TxRequest) -> Result<TxResponse, TxError> {
+        if request.principal == helios_terminology::TxPrincipal::Anonymous {
+            request.principal = helios_terminology::TxPrincipal::System;
+        }
+        self.0.call(request).await
+    }
+}
+
+/// The plaintext of an endpoint's sealed `terminology.token` (AAD
+/// `endpoint:{id}:terminology.token`), opened with `HFS_SECRET_KEYS`. `None`
+/// without a token or a key ring, or when it cannot be opened (logged).
+pub fn endpoint_terminology_token(endpoint: &helios_endpoints::Endpoint) -> Option<String> {
+    endpoint.spec.terminology.as_ref()?.token.as_ref()?;
+    static RING: std::sync::OnceLock<Option<helios_endpoints::secret::SecretKeyRing>> =
+        std::sync::OnceLock::new();
+    let ring = RING
+        .get_or_init(|| {
+            helios_endpoints::secret::SecretKeyRing::from_env()
+                .ok()
+                .flatten()
+        })
+        .as_ref()?;
+    open_endpoint_token(endpoint, ring)
+}
+
+fn open_endpoint_token(
+    endpoint: &helios_endpoints::Endpoint,
+    ring: &helios_endpoints::secret::SecretKeyRing,
+) -> Option<String> {
+    let sealed = endpoint.spec.terminology.as_ref()?.token.as_ref()?;
+    match ring.open(
+        sealed,
+        &format!("endpoint:{}:terminology.token", endpoint.id),
+    ) {
+        Ok(plain) => plain
+            .expose_str()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        Err(e) => {
+            tracing::warn!(endpoint = %endpoint.id, error = %e, "endpoint terminology token cannot be opened");
+            None
+        }
+    }
+}
+
+/// A short, non-reversible fingerprint of a token for cache keys (a changed
+/// token must build a new client; the key must not hold the secret).
+pub fn token_fingerprint(token: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    match token {
+        None => String::new(),
+        Some(t) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            t.hash(&mut h);
+            format!("{:016x}", h.finish())
+        }
+    }
 }
 
 /// A remote terminology service for `base` (an endpoint's own server, or
@@ -1231,6 +1363,95 @@ impl helios_fhirpath::TerminologyTransport for FhirpathTransport {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ─── an endpoint's own terminology server (token, outbound guard) ─────
+
+    fn endpoint_with_token(
+        ring: &helios_endpoints::secret::SecretKeyRing,
+        url: &str,
+    ) -> helios_endpoints::Endpoint {
+        let id = "8d6f9b0e-0000-4000-8000-000000000001";
+        let sealed = ring.seal_str("tx-secret", &format!("endpoint:{id}:terminology.token"));
+        serde_json::from_value(json!({
+            "id": id, "revision": 1,
+            "name": "lab", "path": "lab", "displayName": "Lab",
+            "storage": {"kind": "tenant", "tenantId": "lab"},
+            "terminology": {"serverUrl": url, "token": sealed},
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+        }))
+        .expect("endpoint")
+    }
+
+    /// A token-protected terminology server bound to an endpoint answers the
+    /// server's calls once the endpoint's sealed token is opened and sent; an
+    /// endpoint without a token stays anonymous (and is refused there).
+    #[tokio::test]
+    async fn an_endpoint_terminology_token_is_sent_on_server_calls() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer tx-secret"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"resourceType": "Parameters"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let ring = helios_endpoints::secret::SecretKeyRing::parse(
+            &helios_endpoints::secret::SecretKeyRing::generate_spec("k1"),
+        )
+        .unwrap();
+        let endpoint = endpoint_with_token(&ring, &server.uri());
+        let token = open_endpoint_token(&endpoint, &ring);
+        assert_eq!(token.as_deref(), Some("tx-secret"));
+        // The loopback mock must be allow-listed for the guarded transport.
+        let transport: Arc<dyn HttpTransport> = Arc::new(ReqwestTransport::guarded(
+            &helios_endpoints::OutboundPolicy::parse("127.0.0.1"),
+        ));
+        let (_, with) =
+            endpoint_service_over(&server.uri(), token, TxCaller::Validator, transport.clone());
+        let ok = with
+            .call(TxRequest::get("CodeSystem/$lookup"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status, 200, "the endpoint token was not sent");
+        let (_, without) =
+            endpoint_service_over(&server.uri(), None, TxCaller::Validator, transport);
+        let refused = without
+            .call(TxRequest::get("CodeSystem/$lookup"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status, 401);
+        // A different ring (or a token sealed for another endpoint) does not open.
+        let other = helios_endpoints::secret::SecretKeyRing::parse(
+            &helios_endpoints::secret::SecretKeyRing::generate_spec("k1"),
+        )
+        .unwrap();
+        assert!(open_endpoint_token(&endpoint, &other).is_none());
+        // The cache key changes with the token and never holds it.
+        let fp = token_fingerprint(Some("tx-secret"));
+        assert!(
+            !fp.contains("tx-secret")
+                && fp != token_fingerprint(Some("other"))
+                && token_fingerprint(None).is_empty()
+        );
+    }
+
+    /// An endpoint's terminology URL is console-entered: its calls refuse an
+    /// internal address unless allow-listed (after resolution, not only at save).
+    #[tokio::test]
+    async fn an_endpoint_terminology_url_is_guarded() {
+        let transport: Arc<dyn HttpTransport> = Arc::new(ReqwestTransport::guarded(
+            &helios_endpoints::OutboundPolicy::strict(),
+        ));
+        let (_, service) =
+            endpoint_service_over("http://localhost:9/fhir", None, TxCaller::Search, transport);
+        assert!(service.call(TxRequest::get("metadata")).await.is_err());
+    }
 
     // ─── extract_expansion_codes ────────────────────────────────────────────
 

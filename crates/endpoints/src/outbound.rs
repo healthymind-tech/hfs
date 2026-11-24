@@ -141,6 +141,32 @@ impl OutboundPolicy {
         Ok(u)
     }
 
+    /// The check for a URL the **server** fetches on behalf of a request or
+    /// a stored definition (a `$bulk-submit` manifest, a Subscription's
+    /// rest-hook, a terminology server, a bulk-import recipient): like
+    /// [`check_url`](Self::check_url) but plain `http` is accepted for any
+    /// host (the guard is about where the request goes, not its transport)
+    /// and user-info is left to the caller. A host given as an IP literal is
+    /// checked here; a name is checked after resolution
+    /// ([`crate::http_guard`]).
+    pub fn check_fetch_url(&self, raw: &str) -> Result<url::Url, OutboundDenied> {
+        let u = url::Url::parse(raw).map_err(|_| OutboundDenied::Malformed)?;
+        let host = u.host_str().ok_or(OutboundDenied::Malformed)?.to_string();
+        if !matches!(u.scheme(), "https" | "http") {
+            return Err(OutboundDenied::Scheme(u.scheme().to_string()));
+        }
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let listed =
+            self.host_allowed(bare) || bare.parse::<IpAddr>().is_ok_and(|ip| self.ip_allowed(ip));
+        if METADATA_HOSTS.contains(&bare.to_ascii_lowercase().as_str()) && !listed {
+            return Err(OutboundDenied::Metadata(bare.to_string()));
+        }
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            self.check_ip(bare, ip)?;
+        }
+        Ok(u)
+    }
+
     /// Checks one resolved address of `host`. An allow-listed host name
     /// admits whatever it resolves to; otherwise the address must be public
     /// or inside an allow-listed CIDR.

@@ -76,6 +76,19 @@ impl MessagingChannel {
         self
     }
 
+    /// Resolves and redirects under the outbound policy (`HFS_OUTBOUND_ALLOW`):
+    /// closes the gap the literal-IP check leaves (a host *name* resolving to
+    /// a private address, a redirect to one).
+    pub fn with_outbound_policy(mut self, policy: &helios_endpoints::OutboundPolicy) -> Self {
+        self.client = helios_endpoints::http_guard::guard(
+            Client::builder().timeout(Duration::from_secs(30)),
+            policy,
+        )
+        .build()
+        .expect("failed to build HTTP client");
+        self
+    }
+
     /// Enable or disable dispatch to private/loopback IPs. Tests typically
     /// enable this to dispatch to `127.0.0.1` mock servers.
     pub fn with_private_endpoints_allowed(mut self, allowed: bool) -> Self {
@@ -179,6 +192,17 @@ impl MessagingChannel {
                     );
                     Ok(DispatchResult::RetryableError(format!("HTTP {status}")))
                 }
+            }
+            Err(e) if helios_endpoints::http_guard::is_refusal(&e) => {
+                let error = redact_urls_in(&e.to_string());
+                warn!(
+                    subscription_id = %subscription.id,
+                    error = %error,
+                    "message delivery refused by the outbound policy"
+                );
+                Ok(DispatchResult::PermanentError(format!(
+                    "endpoint refused: {error}"
+                )))
             }
             Err(e) => {
                 // reqwest's message ends with `for url (...)`, query included.
@@ -586,6 +610,28 @@ mod tests {
                 assert!(msg.contains("127.0.0.1"));
             }
             other => panic!("expected PermanentError, got {other:?}"),
+        }
+    }
+
+    /// A host *name* resolving to a private address passes the literal-IP
+    /// check; under the outbound policy it is refused at connect time.
+    #[tokio::test]
+    async fn outbound_policy_refuses_a_name_resolving_privately() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let channel = MessagingChannel::new(SOURCE.to_string(), Arc::new(NoOpOutboundAuthProvider))
+            .with_outbound_policy(&helios_endpoints::OutboundPolicy::strict());
+        let sub = test_subscription(
+            &format!("http://localhost:{port}/x"),
+            PayloadContent::IdOnly,
+        );
+        match channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap()
+        {
+            DispatchResult::PermanentError(msg) => assert!(msg.contains("refused"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

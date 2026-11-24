@@ -836,9 +836,44 @@ impl ConsoleAuth {
                 }
             }
             ConsoleVia::Oidc => {
-                let Some(tokens) = session.oidc.clone() else {
+                let Some(mut tokens) = session.oidc.clone() else {
                     return true;
                 };
+                // A changed role mapping takes effect now (no IdP round trip):
+                // the role is re-mapped from the claim values the session was
+                // signed in with. A changed claim path cannot be re-mapped from
+                // them, so that session must sign in again.
+                if let Some(current) = self.settings().oidc.clone() {
+                    let fp = oidc::mapping_fingerprint(&current);
+                    if tokens.mapping_fp.as_deref() != Some(fp.as_str()) {
+                        match tokens.role_claim.as_deref() {
+                            // Signed in before the values were recorded:
+                            // adopt the current mapping from now on.
+                            None => {}
+                            Some(claim) if claim == current.role_claim => {
+                                match current
+                                    .role_mapping
+                                    .resolve(&tokens.role_values, current.default_role)
+                                {
+                                    Some(role) => session.role = role,
+                                    None => {
+                                        tracing::info!(subject = %session.subject, "console OIDC role mapping changed: no role maps any more; session ended");
+                                        self.end_session(key).await;
+                                        return false;
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                tracing::info!(subject = %session.subject, "console OIDC role claim changed; session ended");
+                                self.end_session(key).await;
+                                return false;
+                            }
+                        }
+                        tokens.mapping_fp = Some(fp);
+                        session.oidc = Some(tokens.clone());
+                        let _ = self.put_session(key, session).await;
+                    }
+                }
                 if tokens.access_expires_unix > unix_now() + 30 {
                     return true;
                 }
@@ -862,7 +897,19 @@ impl ConsoleAuth {
                             return false;
                         };
                         session.role = role;
+                        let fresh = !(t.id_claims.is_null() && t.access_claims.is_null());
                         session.oidc = Some(sessions::OidcSessionTokens {
+                            role_values: if fresh {
+                                oidc::role_values(&t, &runtime.settings.role_claim)
+                            } else {
+                                tokens.role_values.clone()
+                            },
+                            role_claim: if fresh {
+                                Some(runtime.settings.role_claim.clone())
+                            } else {
+                                tokens.role_claim.clone()
+                            },
+                            mapping_fp: Some(oidc::mapping_fingerprint(&runtime.settings)),
                             id_token: t.id_token.or(tokens.id_token),
                             refresh_token: t.refresh_token.or(Some(refresh)),
                             access_expires_unix: unix_now() + t.expires_in.unwrap_or(300) as i64,
@@ -1360,6 +1407,9 @@ impl ConsoleAuth {
                 id_token: tokens.id_token.clone(),
                 refresh_token: tokens.refresh_token.clone(),
                 access_expires_unix: unix_now() + tokens.expires_in.unwrap_or(300) as i64,
+                role_claim: Some(runtime.settings.role_claim.clone()),
+                role_values: oidc::role_values(&tokens, &runtime.settings.role_claim),
+                mapping_fp: Some(oidc::mapping_fingerprint(&runtime.settings)),
             }),
             client: None,
             oidc_test_passed: None,

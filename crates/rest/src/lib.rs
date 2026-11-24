@@ -938,6 +938,7 @@ where
                     "HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS",
                     default_sub_config.status_write_timeout,
                 ),
+                outbound_policy: subscription_outbound_policy(|name| std::env::var(name).ok()),
                 ..default_sub_config
             };
             let sub_config =
@@ -1609,6 +1610,24 @@ fn subscription_dispatch_limit(name: &str, value: Option<&str>, default: usize) 
     }
 }
 
+/// The SSRF guard for rest-hook deliveries (`SubscriptionConfig::outbound_policy`):
+/// `HFS_OUTBOUND_ALLOW`'s policy, or none when
+/// `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` (local development, the same
+/// opt-out the message channel honours).
+#[cfg(feature = "subscriptions")]
+fn subscription_outbound_policy(
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<helios_endpoints::OutboundPolicy> {
+    let private = env("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+    if private {
+        return None;
+    }
+    Some(helios_endpoints::OutboundPolicy::parse(
+        &env(helios_endpoints::outbound::ALLOW_ENV).unwrap_or_default(),
+    ))
+}
+
 #[cfg(feature = "subscriptions")]
 fn subscription_dispatch_config(
     mut config: helios_subscriptions::SubscriptionConfig,
@@ -1918,6 +1937,33 @@ mod builder_tests {
 #[cfg(all(test, feature = "subscriptions"))]
 mod subscription_dispatch_config_tests {
     use super::*;
+
+    /// Rest-hook deliveries are guarded by `HFS_OUTBOUND_ALLOW` unless the
+    /// private-endpoint opt-out is set.
+    #[test]
+    fn rest_hooks_are_guarded_unless_private_endpoints_are_allowed() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let strict = subscription_outbound_policy(env(&[])).expect("guarded by default");
+        assert!(strict.check_fetch_url("http://169.254.169.254/").is_err());
+        assert!(strict.check_fetch_url("http://10.1.2.3/hook").is_err());
+        let listed =
+            subscription_outbound_policy(env(&[("HFS_OUTBOUND_ALLOW", "10.0.0.0/8")])).unwrap();
+        assert!(listed.check_fetch_url("http://10.1.2.3/hook").is_ok());
+        assert!(
+            subscription_outbound_policy(env(&[(
+                "HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS",
+                "true"
+            )]))
+            .is_none()
+        );
+    }
 
     #[test]
     fn dispatch_env_missing_preserves_defaults() {

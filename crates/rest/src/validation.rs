@@ -208,10 +208,38 @@ fn build_terminology_provider(
     timeout: Duration,
     version: helios_fhir::FhirVersion,
 ) -> Option<Arc<dyn TerminologyProvider>> {
+    build_endpoint_terminology_provider(mode, server, false, None, timeout, version)
+}
+
+/// [`build_terminology_provider`] for an endpoint: when `server` is the
+/// endpoint's own binding (`endpoint_bound`, a console-entered URL other than
+/// the server's installed service), the validator's calls go through the
+/// outbound guard and carry `token` (its opened `terminology.token`).
+fn build_endpoint_terminology_provider(
+    mode: &str,
+    server: Option<&str>,
+    endpoint_bound: bool,
+    token: Option<String>,
+    timeout: Duration,
+    version: helios_fhir::FhirVersion,
+) -> Option<Arc<dyn TerminologyProvider>> {
     // `server` names a remote server; `None` is the server's own
     // terminology service (embedded or remote) when one is installed.
-    let service =
-        crate::terminology::terminology_for(server, crate::terminology::TxCaller::Validator);
+    let installed = crate::terminology::server_terminology_url();
+    let service = match server {
+        Some(url)
+            if endpoint_bound
+                && installed.as_deref().map(|u| u.trim_end_matches('/'))
+                    != Some(url.trim_end_matches('/')) =>
+        {
+            Some(crate::terminology::endpoint_service(
+                url,
+                token,
+                crate::terminology::TxCaller::Validator,
+            ))
+        }
+        _ => crate::terminology::terminology_for(server, crate::terminology::TxCaller::Validator),
+    };
     match (mode, service) {
         ("remote", Some((label, service))) => Some(Arc::new(CompositeTerminologyProvider::new(
             helios_fhir_validator::core_terminology(version),
@@ -428,6 +456,18 @@ impl ValidationService {
             Some(binding) => binding.server_url.clone(),
             None => self.env_terminology_server.clone(),
         };
+        // The endpoint's own credential for its own server (sealed).
+        let token = spec
+            .terminology
+            .as_ref()
+            .and_then(|b| b.server_url.as_ref())
+            .and_then(|_| crate::terminology::endpoint_terminology_token(&endpoint));
+        let token_key = crate::terminology::token_fingerprint(token.as_deref());
+        let endpoint_bound = spec
+            .terminology
+            .as_ref()
+            .and_then(|b| b.server_url.as_deref())
+            .is_some_and(|u| Some(u) != self.env_terminology_server.as_deref());
         let timeout = spec
             .terminology
             .as_ref()
@@ -439,7 +479,7 @@ impl ValidationService {
             Some(v) => {
                 let tmode = crate::endpoint::effective::terminology_mode_str(v.terminology);
                 let key = format!(
-                    "{tmode}|{}|{}|{version:?}",
+                    "{tmode}|{}|{}|{version:?}|{token_key}",
                     server.as_deref().unwrap_or(""),
                     timeout.as_millis()
                 );
@@ -447,7 +487,14 @@ impl ValidationService {
                     .endpoint_terminology
                     .entry(key)
                     .or_insert_with(|| {
-                        build_terminology_provider(tmode, server.as_deref(), timeout, version)
+                        build_endpoint_terminology_provider(
+                            tmode,
+                            server.as_deref(),
+                            endpoint_bound,
+                            token.clone(),
+                            timeout,
+                            version,
+                        )
                     })
                     .clone();
                 (
@@ -470,14 +517,21 @@ impl ValidationService {
                 } else {
                     let tmode = self.terminology_mode_name();
                     let key = format!(
-                        "{tmode}|{}|{}|{version:?}",
+                        "{tmode}|{}|{}|{version:?}|{token_key}",
                         server.as_deref().unwrap_or(""),
                         timeout.as_millis()
                     );
                     self.endpoint_terminology
                         .entry(key)
                         .or_insert_with(|| {
-                            build_terminology_provider(tmode, server.as_deref(), timeout, version)
+                            build_endpoint_terminology_provider(
+                                tmode,
+                                server.as_deref(),
+                                endpoint_bound,
+                                token.clone(),
+                                timeout,
+                                version,
+                            )
                         })
                         .clone()
                 };

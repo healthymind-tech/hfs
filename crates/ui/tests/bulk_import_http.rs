@@ -1676,6 +1676,9 @@ async fn a_throttled_poll_backs_off_and_stays_out_of_the_log() {
 /// and nothing else in this binary reads the variable.
 #[tokio::test]
 async fn backend_services_auth_mints_and_attaches_tokens() {
+    // The mock token endpoint listens on loopback; the operator-typed token
+    // URL is fetched under the outbound policy, so allow loopback here.
+    unsafe { std::env::set_var("HFS_OUTBOUND_ALLOW", "127.0.0.1,localhost") };
     let ctx = ctx("http://localhost:9/");
     let token_url = mock_token_endpoint(StatusCode::OK, r#"{"access_token":"tok-123"}"#).await;
 

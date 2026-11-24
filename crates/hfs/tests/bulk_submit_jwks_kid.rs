@@ -127,6 +127,9 @@ async fn kid_from_the_ui_assertion() -> Option<String> {
         Some(backend),
     );
 
+    // The mock token endpoint listens on loopback; the UI fetches the
+    // operator-typed token URL under the outbound policy.
+    unsafe { std::env::set_var("HFS_OUTBOUND_ALLOW", "127.0.0.1,localhost") };
     let (token_url, seen) = mock_token_endpoint().await;
     let response = ui
         .oneshot(
