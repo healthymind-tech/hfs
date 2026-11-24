@@ -1017,7 +1017,7 @@ pub(crate) async fn search(
     };
     let out = |options, message, more| {
         render(SearchResults {
-            i18n: i18n.clone(),
+            i18n,
             options,
             message,
             more,
@@ -1212,7 +1212,7 @@ pub(crate) async fn preview(
     let check = f.get("check") != "0";
     let error_preview = |msg: String| {
         render(Preview {
-            i18n: i18n.clone(),
+            i18n,
             mode: "add",
             format: "",
             counts: vec![],
@@ -1496,10 +1496,11 @@ pub(crate) async fn patch(
         }
         remove.extend(m.iter().map(AccessEntry::key));
     }
-    let action = match b.action.as_deref() {
-        Some(a @ ("add" | "remove" | "undo" | "identity")) => a,
-        _ => "patch",
-    };
+    let action = b
+        .action
+        .as_deref()
+        .filter(|a| matches!(*a, "add" | "remove" | "undo" | "identity"))
+        .unwrap_or("patch");
     let who = actor(&rt, principal.as_ref().map(|p| &p.0));
     match ops::patch(
         &c,
@@ -1563,7 +1564,7 @@ mod tests {
             describe(&i18n, &r),
             ("Dr Wu".to_string(), "doctor · Clinic".to_string())
         );
-        assert_eq!(natural("10") > natural("9"), true);
+        assert!(natural("10") > natural("9"));
         assert!(natural("abc") > natural("99999"));
     }
 
