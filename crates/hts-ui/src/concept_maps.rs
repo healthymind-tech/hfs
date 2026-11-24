@@ -369,6 +369,7 @@ async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRows
                 filters: CmBrowserFilters::default(),
                 total: None,
                 paging: Default::default(),
+                versions_total: None,
             }),
             count_over_max: true,
         };
@@ -389,6 +390,9 @@ struct DetailPageTemplate<'a> {
     chrome: Chrome<'a>,
     id: String,
     detail: Result<ConceptMapSummary, UpstreamError>,
+    /// Every stored version of this canonical, for the switcher (empty
+    /// after a workbench POST: the switcher then shows the plain chip).
+    versions: Vec<crate::upstream::VersionChoice>,
     tab: CmTab,
     /// Current direction seed for the Translate tab input, echoed back
     /// so a re-render preserves the operator's toggle position. `None`
@@ -465,6 +469,8 @@ async fn detail_page(Path(id): Path<String>) -> Response {
 #[derive(Debug, Deserialize, Default)]
 struct TranslateInputForm {
     direction: Option<String>,
+    /// `?version=`: the stored version the page shows.
+    version: Option<String>,
     #[allow(dead_code)]
     lang: Option<String>,
 }
@@ -487,7 +493,11 @@ async fn translate_input(
         version: state.version,
     };
     let direction = TranslateDirection::from_form(form.direction.as_deref());
-    let summary = state.upstream.read_concept_map(&id).await.ok();
+    let summary = state
+        .upstream
+        .read_concept_map_at(&id, form.version.as_deref().filter(|v| !v.is_empty()))
+        .await
+        .ok();
     render_detail_with_tab(&state, chrome, id, CmTab::Translate, direction, summary).await
 }
 
@@ -503,10 +513,19 @@ async fn render_detail_with_tab<'a>(
         Some(s) => Ok(s),
         None => state.upstream.read_concept_map(&id).await,
     };
+    let versions = match &detail {
+        Ok(d) if !d.url.is_empty() => state
+            .upstream
+            .versions_of("ConceptMap", &d.url, false)
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     render(
         DetailPageTemplate {
             chrome,
             id,
+            versions,
             detail,
             tab,
             direction: Some(direction),
@@ -715,10 +734,12 @@ async fn respond_workbench<'a>(
     }
     let detail = state.upstream.read_concept_map(&id).await;
     let direction = view.direction;
+    let versions = Vec::new();
     render(
         DetailPageTemplate {
             chrome,
             id,
+            versions,
             detail,
             tab: CmTab::Translate,
             direction: Some(direction),

@@ -384,27 +384,26 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
     assert_auth_fieldset(&html);
 
-    let assert_back_link =
-        |localized_html: &str, label: &str| {
-            let marker = r#"<a class="back-link" href="/ui/bulk-import">"#;
-            let start = localized_html.find(marker).expect("shared back link");
-            let end = start
-                + localized_html[start..]
-                    .find("</a>")
-                    .expect("back link closing tag")
-                + "</a>".len();
-            let back_link = &localized_html[start..end];
+    let assert_back_link = |localized_html: &str, label: &str| {
+        let marker = r#"<a class="back-link" href="/ui/bulk-import">"#;
+        let start = localized_html.find(marker).expect("shared back link");
+        let end = start
+            + localized_html[start..]
+                .find("</a>")
+                .expect("back link closing tag")
+            + "</a>".len();
+        let back_link = &localized_html[start..end];
 
-            assert!(back_link.contains(
-                r#"<span aria-hidden="true"><svg width="5" height="8" viewBox="0 0 5 8""#
-            ));
-            assert!(back_link.contains(&format!("<span>{label}</span>")));
-            assert_eq!(back_link.matches("<span").count(), 2);
-            assert!(
-                !back_link.contains('‹'),
-                "spacing must come from CSS, not the former literal chevron and space"
-            );
-        };
+        assert!(back_link.contains(
+            r#"<span aria-hidden="true"><svg class="i" width="16" height="16" viewBox="0 0 24 24""#
+        ));
+        assert!(back_link.contains(&format!("<span>{label}</span>")));
+        assert_eq!(back_link.matches("<span").count(), 2);
+        assert!(
+            !back_link.contains('‹'),
+            "spacing must come from CSS, not the former literal chevron and space"
+        );
+    };
     assert_back_link(&html, "All Submissions");
     let header_start = html
         .find(r#"<header class="page-head page-head--back-link">"#)

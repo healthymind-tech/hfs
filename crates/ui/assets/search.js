@@ -198,7 +198,9 @@
     var endpoint = root.getAttribute("data-gs-url") || "/ui/find";
     var recentKey = "hm-gs-recent:" + (root.getAttribute("data-gs-user") || "local");
 
-    if (kbd && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "")) kbd.textContent = "⌘K";
+    // The ⌘K / Ctrl K hint is chosen before first paint (theme-boot stamps
+    // <html data-kbd="mac">; app.css shows one of the two); never rewritten.
+
 
     var state = { q: "", seq: 0, pending: 0, staticTimer: 0, dataTimer: 0, announceTimer: 0, ctrl: { static: null, data: null, tx: null }, active: null };
 

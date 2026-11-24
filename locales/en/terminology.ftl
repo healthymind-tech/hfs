@@ -691,3 +691,31 @@ hts-term-stat-concepts-shown = across all matching code systems
 
 tx-denied-current-role = You are signed in with the { $role } role.
 tx-searching = Searching…
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+hts-nav-overview = Overview
+hts-nav-group-browse = Browse
+hts-nav-group-loaded = Loaded & imports
+
+# Console redesign: grouped versions, row menu, Maintenance tab
+hts-term-tab-loaded = Loaded
+hts-term-tab-maint = Maintenance
+hts-term-older = +{ $count } older
+hts-term-older-version = older version
+hts-term-row-actions = Actions for { $system }
+hts-job-log-wrap = Wrap
+hts-job-log-copy = Copy
+
+## Version grouping (one row per canonical URL)
+hts-browser-open = Open
+hts-browser-delete-version = Delete version…
+hts-browser-delete-confirm = Delete version { $version } of { $url }?
+hts-browser-older-failed = Could not load the older versions.
+hts-cs-browser-total-grouped = { $total } code systems · { $versions } versions
+hts-vs-browser-total-grouped = { $total } value sets · { $versions } versions
+hts-cm-browser-total-grouped = { $total } concept maps · { $versions } versions
+hts-version-switch = Version
+hts-version-switch-count = { $count } versions
+hts-version-switch-current = current
+hts-term-stat-versions = { $versions } versions
+hts-term-stat-other-versions = { $vs } / { $cm } versions

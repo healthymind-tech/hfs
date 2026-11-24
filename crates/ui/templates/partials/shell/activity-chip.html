@@ -1,0 +1,7 @@
+{#- The topbar activity chip (partials/shell/activity-chip.html, src/activity.rs). -#}
+<a class="activity-chip{% if self.running() > 0 %} activity-chip--busy{% endif %}" id="activity-chip" href="{{ href }}"
+   hx-get="/ui/activity" hx-trigger="every 30s" hx-swap="outerHTML" hx-boost="false"
+   title="{{ i18n.t_arg2("activity-detail", "imports", imports, "syncs", syncs) }}">
+  <span class="dot{% if self.running() > 0 %} dot--info dot--live{% else %} dot--ok{% endif %}" aria-hidden="true"></span>
+  <span class="activity-chip__label">{% if self.running() > 0 %}{{ i18n.t_arg("activity-running", "count", self.running()) }}{% else %}{{ i18n.t("activity-idle") }}{% endif %}</span>
+</a>

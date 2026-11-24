@@ -289,6 +289,13 @@
 {{ status.topbar_brand(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/brand.html #}
       {% if status.manager_on() %}{% include "partials/shell/global-search.html" %}{% endif %}
       <div class="topbar__tools">
+        {% if status.manager_on() %}
+        <!-- Live activity (console redesign §5.2): running imports and sync
+             runs; the chip fills itself in after the page (src/activity.rs). -->
+        <a class="activity-chip" id="activity-chip" href="/ui/sync" hx-get="/ui/activity" hx-trigger="load delay:300ms" hx-swap="outerHTML" hx-boost="false">
+          <span class="dot" aria-hidden="true"></span><span class="activity-chip__label">{{ i18n.t("activity-jobs") }}</span>
+        </a>
+        {% endif %}
         <!-- The theme toggle stays in the topbar (#725): it is a one-click,
              instant-feedback control, and a click deeper behind the menu
              would slow the most common visit-time adjustment. -->
@@ -316,6 +323,16 @@
     <p class="shell-notice" id="auth-bearer-only">{{ i18n.t("auth-bearer-only") }}</p>
     {% endif %}
     <main class="content{% block content_class %}{% endblock %}" id="main" tabindex="-1" hx-history-elt data-nav-key="{{ status.nav_key() }}" data-active-page="{{ active_page }}">
+      {%- let tabs = status.route_tabs(active_page) %}
+      {%- if !tabs.is_empty() %}
+      <!-- Route tabs (console redesign §5.1): the sibling pages of this
+           page's sidebar entry, each a real link to its own route. -->
+      <nav class="route-tabs" aria-label="{{ i18n.t("nav-route-tabs") }}">
+        {%- for tab in tabs %}
+        <a class="route-tab" href="{{ tab.href }}" data-nav-id="{{ tab.id }}"{% if !tab.boost %} data-full-load{% endif %}{% if tab.id == active_page %} aria-current="page"{% endif %}>{{ i18n.t(tab.label_key) }}</a>
+        {%- endfor %}
+      </nav>
+      {%- endif %}
       {% block content %}{% endblock %}
 {{ status.site_footer(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/site-footer.html #}
     </main>

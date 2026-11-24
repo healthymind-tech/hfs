@@ -36,10 +36,10 @@ impl ChromeLabels for Stub {
 
 /// A distinctive slice of `templates/icons/user.svg` — present iff the generic
 /// avatar icon was rendered.
-const USER_ICON: &str = "M8 2.75C6.75736 2.75";
+const USER_ICON: &str = r#"<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>"#;
 
 /// The same, for `templates/icons/logout.svg`.
-const LOGOUT_ICON: &str = "M3.25 2.75C3.25 2.19772";
+const LOGOUT_ICON: &str = "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4";
 
 fn render(lang: &'static str, user: UserIdentity<'_>) -> String {
     user_menu(&Stub::new(lang), user).expect("the shared partial must render")

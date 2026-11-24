@@ -30,9 +30,30 @@
       box.hidden = !input.checked;
     });
   }
+  // Customising (console redesign §7): the section's form, hidden while
+  // inheriting, expands into place (260 ms) instead of appearing at once.
+  var reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function revealInherit(input) {
+    if (reducedMotion) return;
+    (input.getAttribute("data-inherit-target") || "").split(/\s+/).forEach(function (id) {
+      var target = id && document.getElementById(id);
+      if (!target || !target.animate || !target.offsetHeight) return;
+      target.style.overflow = "hidden";
+      var anim = target.animate(
+        [{ height: "0px", opacity: 0 }, { height: target.offsetHeight + "px", opacity: 1 }],
+        { duration: 260, easing: "cubic-bezier(.2,.7,.2,1)" }
+      );
+      anim.onfinish = anim.oncancel = function () {
+        target.style.overflow = "";
+      };
+    });
+  }
   document.addEventListener("change", function (e) {
     var t = e.target;
-    if (t && t.matches && t.matches("[data-inherit-target]")) syncInherit(t);
+    if (t && t.matches && t.matches("[data-inherit-target]")) {
+      syncInherit(t);
+      if (!t.checked) revealInherit(t);
+    }
     if (t && t.matches && t.matches("input[type=radio][data-reveal]")) syncReveal(t.name);
   });
 
@@ -53,6 +74,7 @@
       var msg = document.body.getAttribute("data-msg-copied") || "Copied";
       live.textContent = msg;
       btn.classList.add("is-copied");
+      if (window.HM && window.HM.toast) window.HM.toast(msg);
       setTimeout(function () {
         btn.classList.remove("is-copied");
         live.textContent = "";
@@ -271,6 +293,13 @@
       }
       var details = input.closest("details");
       if (details) details.open = true;
+      // A field of an inherited section is hidden (console redesign §6):
+      // point at that section's "Inherit from server" switch instead.
+      var inherited = input.closest("fieldset.inherit-target:disabled");
+      if (inherited) {
+        var sw = document.querySelector('[data-inherit-target~="' + inherited.id + '"]');
+        if (sw) input = sw;
+      }
       input.scrollIntoView({ block: "center" });
       input.focus({ preventScroll: true });
       var field = input.closest(".mfield");
@@ -317,6 +346,18 @@
     // Instant: a smooth scroll can still be under way when the reader (or
     // a screenshot) looks, with the step half under the bar.
     first.scrollIntoView({ block: "nearest", behavior: "auto" });
+    // In the Verify aside (its own scroll box) the scroll margin is measured
+    // against the aside, not the floating bar: nudge whatever scrolls until
+    // the step clears the bar.
+    var top = bar ? bar.getBoundingClientRect().top : Infinity;
+    var limit = Math.min(window.innerHeight, top > 0 && top < window.innerHeight ? top - 8 : Infinity);
+    var over = first.getBoundingClientRect().bottom - limit;
+    var box = first.closest(".config-aside");
+    if (over > 0 && box && box.scrollHeight > box.clientHeight) {
+      box.scrollTop += over;
+      over = first.getBoundingClientRect().bottom - limit;
+    }
+    if (over > 0) window.scrollBy(0, over);
   }
 
   // Elements wired once each (pages swapped in place bring new elements).

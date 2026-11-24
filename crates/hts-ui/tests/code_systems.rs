@@ -1026,3 +1026,87 @@ fn cs_detail_folds_never_reuse_the_markerless_field_label_summary() {
         }
     }
 }
+
+// ── Version grouping: one row per canonical URL, "+N older", counts ──────
+
+async fn start_grouped_mock() -> String {
+    let router: Router = Router::new()
+        .route(
+            "/__mock_ready",
+            axum::routing::get(|| async { (StatusCode::OK, "ok") }),
+        )
+        .route(
+            "/CodeSystem",
+            axum::routing::get(
+                |q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    let body = match q.get("_hm-current").map(String::as_str) {
+                        // The older-versions count behind "M versions".
+                        Some("older") => serde_json::json!({
+                            "resourceType": "Bundle", "type": "searchset", "total": 3
+                        }),
+                        _ => serde_json::json!({
+                            "resourceType": "Bundle", "type": "searchset", "total": 2,
+                            "entry": [
+                                {"resource": {"resourceType": "CodeSystem", "id": "alpha|2.0",
+                                    "meta": {"extension": [{"url": "https://healthymind.tech/fhir/StructureDefinition/hm-version-count", "valueInteger": 3}]},
+                                    "url": "http://x/cs/alpha", "version": "2.0", "name": "Alpha",
+                                    "status": "active", "date": "2022-01-01T10:00:00Z"}},
+                                {"resource": {"resourceType": "CodeSystem", "id": "beta",
+                                    "meta": {"extension": [{"url": "https://healthymind.tech/fhir/StructureDefinition/hm-version-count", "valueInteger": 2}]},
+                                    "url": "http://x/cs/beta", "version": "1", "name": "Beta", "status": "active"}}
+                            ]
+                        }),
+                    };
+                    (StatusCode::OK, axum::Json(body))
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream listener");
+    let addr: std::net::SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn grouped_rows_offer_older_versions_and_count_both() {
+    let base = start_grouped_mock().await;
+    let html = body_text(
+        app_pointing_at(&base)
+            .oneshot(
+                Request::get("/ui/hts/code-systems?status=draft")
+                    .header(header::ACCEPT_LANGUAGE, "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    // One row per canonical, with "+N older" fetching the other versions
+    // (with the filters, so the matching one is marked).
+    assert_eq!(html.matches("data-system=\"").count(), 2, "{html}");
+    assert!(html.contains(">+2 older<"), "{html}");
+    assert!(html.contains(">+1 older<"));
+    let src = html
+        .split("data-versions-src=\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or_default()
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&#x2f;", "/");
+    assert!(
+        src.ends_with("/code-systems/versions?url=http%3A%2F%2Fx%2Fcs%2Falpha&status=draft"),
+        "{src}"
+    );
+    // The listed version is active, the filter asks for draft: it opens itself.
+    assert!(html.contains("data-autoexpand"));
+    // "N code systems · M versions": 2 groups + 3 older versions.
+    assert!(html.contains("2 code systems · 5 versions"), "{html}");
+    // The listed version's day, not its second.
+    assert!(html.contains("2022-01-01<") && !html.contains("T10:00:00Z"));
+}

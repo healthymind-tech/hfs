@@ -525,3 +525,17 @@ verify-block-create-anyway = Create anyway
 verify-block-anyway-hint = Recorded in the configuration history like every change.
 mgr-copy = Copy
 mgr-review-edit = Edit
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+mgr-nav-section-endpoint = Endpoint
+mgr-nav-home = Overview
+mgr-nav-ep-home = Home
+mgr-nav-group-data-tools = Data tools
+mgr-nav-group-sql = SQL on FHIR
+mgr-nav-group-conformance = Conformance
+mgr-nav-group-activity = Activity
+mgr-nav-group-settings = Settings
+mgr-nav-group-console = Console settings
+
+# Endpoint switcher: the same page on the other endpoint.
+mgr-switch-fallback = That page isn't available on this endpoint — showing the nearest one that is.

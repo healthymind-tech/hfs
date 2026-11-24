@@ -196,6 +196,9 @@
 
   var ALIASES = { editor: "resources", history: "resources", queries: "resources", search: "resources", home: "ep-home" };
 
+  // Sidebar entries may stand for several pages (a group whose pages are
+  // route tabs): `data-nav-ids` lists their active-page ids and
+  // `data-match` their path prefixes, space-separated.
   function markActive() {
     var nav = document.getElementById("sidebar-nav");
     if (!nav) return;
@@ -204,18 +207,25 @@
     var active = main ? main.getAttribute("data-active-page") || "" : "";
     var chosen = null;
     if (active) {
-      chosen = nav.querySelector('a.nav-item[data-nav-id="' + (ALIASES[active] || active) + '"]');
+      var want = ALIASES[active] || active;
+      for (var a = 0; a < links.length && !chosen; a++) {
+        var ids = (links[a].getAttribute("data-nav-ids") || links[a].getAttribute("data-nav-id") || "").split(" ");
+        if (ids.indexOf(want) >= 0) chosen = links[a];
+      }
     }
     if (!chosen) {
       var path = location.pathname.replace(/\/$/, "") || "/ui";
       var best = -1;
       for (var i = 0; i < links.length; i++) {
-        var m = links[i].getAttribute("data-match");
-        if (!m) continue;
-        var hit = m === "/ui" ? path === "/ui" : path === m || path.indexOf(m + "/") === 0;
-        if (hit && m.length > best) {
-          best = m.length;
-          chosen = links[i];
+        var ms = (links[i].getAttribute("data-match") || "").split(" ");
+        for (var k = 0; k < ms.length; k++) {
+          var m = ms[k];
+          if (!m) continue;
+          var hit = m === "/ui" ? path === "/ui" : path === m || path.indexOf(m + "/") === 0;
+          if (hit && m.length > best) {
+            best = m.length;
+            chosen = links[i];
+          }
         }
       }
     }
@@ -223,7 +233,137 @@
       if (links[j] === chosen) links[j].setAttribute("aria-current", "page");
       else if (links[j].getAttribute("aria-current") === "page") links[j].removeAttribute("aria-current");
     }
+    placeIndicator(true);
   }
+
+  /* ---- the sliding current-entry fill (REDESIGN.md §5.2, §7) ----------- */
+
+  var REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---- motion: the one helper every console animation goes through ------
+     Durations and easings are the app.css tokens (120 / 180 / 240 ms;
+     standard and emphasized). Transform and opacity only, through the Web
+     Animations API; nothing runs under prefers-reduced-motion (each call
+     resolves at once, the element in its end state). */
+  var MOTION = {
+    d1: 120,
+    d2: 180,
+    d3: 240,
+    std: "cubic-bezier(0.4, 0, 0.2, 1)",
+    emph: "cubic-bezier(0.2, 0.7, 0.2, 1)",
+  };
+  function animate(el, frames, opts) {
+    if (!el || REDUCED || typeof el.animate !== "function") return Promise.resolve();
+    var a = el.animate(frames, {
+      duration: (opts && opts.duration) || MOTION.d2,
+      easing: (opts && opts.easing) || MOTION.std,
+      delay: (opts && opts.delay) || 0,
+      fill: "backwards",
+    });
+    return a.finished.catch(function () {});
+  }
+  var motion = {
+    tokens: MOTION,
+    reduced: REDUCED,
+    animate: animate,
+    // In from `dx`/`dy` px with a fade (emphasized easing).
+    enter: function (el, o) {
+      o = o || {};
+      return animate(el, [
+        { opacity: 0, transform: "translate(" + (o.dx || 0) + "px," + (o.dy || 0) + "px)" },
+        { opacity: 1, transform: "none" },
+      ], { duration: o.duration || MOTION.d2, easing: MOTION.emph, delay: o.delay });
+    },
+    // Out to `dx`/`dy` px with a fade (standard easing), the end state kept.
+    leave: function (el, o) {
+      o = o || {};
+      if (!el || REDUCED || typeof el.animate !== "function") return Promise.resolve();
+      return el.animate([
+        { opacity: 1, transform: "none" },
+        { opacity: 0, transform: "translate(" + (o.dx || 0) + "px," + (o.dy || 0) + "px)" },
+      ], { duration: o.duration || MOTION.d1, easing: MOTION.std, fill: "forwards" }).finished.catch(function () {});
+    },
+    fade: function (el, o) {
+      o = o || {};
+      return animate(el, [{ opacity: 0 }, { opacity: 1 }], { duration: o.duration || MOTION.d2, delay: o.delay });
+    },
+    // Rows fade up one after another: at most `max` rows (20), the whole
+    // run within `total` ms (240).
+    stagger: function (rows, o) {
+      o = o || {};
+      var max = Math.min(rows.length, o.max || 20);
+      var total = o.total || MOTION.d3;
+      var dur = MOTION.d1;
+      var step = max > 1 ? Math.max(0, Math.floor((total - dur) / (max - 1))) : 0;
+      for (var i = 0; i < max; i++) {
+        animate(rows[i], [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }], {
+          duration: dur,
+          easing: MOTION.emph,
+          delay: i * step,
+        });
+      }
+    },
+    // Slide a stand-in of `from`'s box to `to`'s (a selection highlight
+    // moving between rail items).
+    glide: function (from, to, cls) {
+      if (!from || !to || from === to || REDUCED) return;
+      var host = to.offsetParent;
+      if (!host) return;
+      var a = from.getBoundingClientRect(), b = to.getBoundingClientRect(), h = host.getBoundingClientRect();
+      var ink = document.createElement("div");
+      ink.className = cls || "md-ink";
+      ink.setAttribute("aria-hidden", "true");
+      ink.style.cssText = "position:absolute;pointer-events:none;left:" + (b.left - h.left + host.scrollLeft) + "px;top:" + (b.top - h.top + host.scrollTop) + "px;width:" + b.width + "px;height:" + b.height + "px;";
+      var cs = getComputedStyle(to);
+      ink.style.background = cs.backgroundColor;
+      ink.style.borderRadius = cs.borderRadius;
+      ink.style.zIndex = "0";
+      host.appendChild(ink);
+      to.classList.add("is-gliding");
+      animate(ink, [
+        { transform: "translate(" + (a.left - b.left) + "px," + (a.top - b.top) + "px)", opacity: 1 },
+        { transform: "none", opacity: 1 },
+      ], { duration: MOTION.d2, easing: MOTION.emph }).then(function () {
+        to.classList.remove("is-gliding");
+        ink.remove();
+      });
+    },
+  };
+  window.HM.motion = motion;
+
+  // One element under the entries of the sidebar's <nav>, moved to the
+  // current entry: it slides (240 ms) on in-place navigation instead of the
+  // highlight jumping. Entries outside the <nav> (the sidebar foot) and
+  // pages without JavaScript fill the entry itself (app.css).
+  function placeIndicator(animate) {
+    var nav = document.querySelector("#sidebar-nav .nav");
+    if (!nav) return;
+    var ind = nav.querySelector(":scope > .nav__indicator");
+    if (!ind) {
+      ind = document.createElement("div");
+      ind.className = "nav__indicator";
+      ind.setAttribute("aria-hidden", "true");
+      nav.insertBefore(ind, nav.firstChild);
+      animate = false;
+    }
+    var cur = nav.querySelector('a.nav-item[aria-current="page"]');
+    if (!cur || !cur.offsetHeight) {
+      ind.classList.remove("is-placed");
+      return;
+    }
+    var move = animate && !REDUCED && ind.classList.contains("is-placed");
+    if (!move) ind.style.transition = "none";
+    ind.style.height = cur.offsetHeight + "px";
+    ind.style.transform = "translateY(" + cur.offsetTop + "px)";
+    ind.classList.add("is-placed");
+    if (!move) {
+      void ind.offsetWidth;
+      ind.style.transition = "";
+    }
+  }
+  window.addEventListener("resize", function () {
+    placeIndicator(false);
+  });
 
   /* ---- sidebar scroll across full loads --------------------------------- */
 
@@ -244,9 +384,199 @@
     } catch (e) {}
   }
 
+  /* ---- master-detail: swap the regions, not the page -------------------- */
+
+  var mdPending = null;
+
+  function mdStrip(el) {
+    // A region's markup without its selection marks: equal means only the
+    // selection moved.
+    var c = el.cloneNode(true);
+    var marked = c.querySelectorAll("[aria-current],[aria-selected]");
+    for (var i = 0; i < marked.length; i++) {
+      marked[i].removeAttribute("aria-current");
+      marked[i].removeAttribute("aria-selected");
+    }
+    if (c.removeAttribute) {
+      c.removeAttribute("aria-current");
+      c.removeAttribute("aria-selected");
+    }
+    return c.innerHTML.replace(/\s+/g, " ");
+  }
+
+  function mdSelected(root) {
+    return root.querySelector('[aria-current="true"], [aria-current="page"], [aria-selected="true"]');
+  }
+
+  function mdCopySelection(cur, nxt) {
+    // Move the selection marks in place, element for element.
+    var a = cur.querySelectorAll("*"), b = nxt.querySelectorAll("*");
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      ["aria-current", "aria-selected"].forEach(function (attr) {
+        var v = b[i].getAttribute(attr);
+        if (v === null) a[i].removeAttribute(attr);
+        else if (a[i].getAttribute(attr) !== v) a[i].setAttribute(attr, v);
+      });
+    }
+    return true;
+  }
+
+  function mdIsEmpty(region) {
+    return !region || region.hasAttribute("data-md-empty") || !!region.querySelector("[data-md-empty]");
+  }
+
+  function mdReplace(cur, nxt) {
+    var fresh = document.importNode(nxt, true);
+    cur.replaceWith(fresh);
+    if (window.htmx) window.htmx.process(fresh);
+    initPages(fresh);
+    return fresh;
+  }
+
+  function mdSwap(curMd, nextMd, nextMain) {
+    if (!curMd.isConnected) return;
+    var done = mdPending;
+    mdPending = null;
+    if (done) clearTimeout(done.timer);
+    var main = document.getElementById("main");
+    // Regions outside the master-detail container that follow the
+    // selection (a page head's counts, a version switch).
+    var syncs = nextMain.querySelectorAll("[data-md-sync]");
+    for (var k = 0; k < syncs.length; k++) {
+      var id = syncs[k].id;
+      var here = id && document.getElementById(id);
+      if (here) mdReplace(here, syncs[k]);
+    }
+    // Rail: only the selection moved → move the marks and glide the
+    // highlight; otherwise replace it, keeping its scroll position.
+    var rail = curMd.querySelector("[data-md-rail]"), nrail = nextMd.querySelector("[data-md-rail]");
+    if (rail && nrail) {
+      var before = mdSelected(rail);
+      if (mdStrip(rail) === mdStrip(nrail) && mdCopySelection(rail, nrail)) {
+        motion.glide(before, mdSelected(rail), "md-ink");
+      } else {
+        var lists = rail.querySelectorAll("[data-md-scroll], .filter-rail__list");
+        var tops = [];
+        for (var li = 0; li < lists.length; li++) tops.push(lists[li].scrollTop);
+        rail = mdReplace(rail, nrail);
+        var nlists = rail.querySelectorAll("[data-md-scroll], .filter-rail__list");
+        for (var lj = 0; lj < nlists.length && lj < tops.length; lj++) nlists[lj].scrollTop = tops[lj];
+      }
+    }
+    // List: a new list re-renders with a short stagger; a moved selection
+    // only moves the marks.
+    var list = curMd.querySelector("[data-md-list]"), nlist = nextMd.querySelector("[data-md-list]");
+    if (list && nlist) {
+      if (!(mdStrip(list) === mdStrip(nlist) && mdCopySelection(list, nlist))) {
+        var wraps = list.querySelectorAll(".table-wrap");
+        var wtops = [];
+        for (var wi = 0; wi < wraps.length; wi++) wtops.push(wraps[wi].scrollTop);
+        list = mdReplace(list, nlist);
+        var nwraps = list.querySelectorAll(".table-wrap");
+        for (var wj = 0; wj < nwraps.length && wj < wtops.length; wj++) nwraps[wj].scrollTop = wtops[wj];
+        var rows = list.querySelectorAll("tbody > tr, [data-md-item]");
+        motion.stagger(rows, { max: 20, total: 240 });
+      }
+    }
+    // Detail: slides in from the right when it opens, cross-fades when the
+    // item changes, slides out when it closes.
+    var det = curMd.querySelector("[data-md-detail]"), ndet = nextMd.querySelector("[data-md-detail]");
+    if (det && ndet) {
+      det.classList.remove("md-pending");
+      if (det.innerHTML !== ndet.innerHTML) {
+        var wasEmpty = mdIsEmpty(det), nowEmpty = mdIsEmpty(ndet);
+        var ghost = null;
+        if (!REDUCED && !wasEmpty) {
+          // The old content, frozen above the new while it leaves.
+          var r = det.getBoundingClientRect(), host = det.offsetParent || document.body, h = host.getBoundingClientRect();
+          ghost = det.cloneNode(true);
+          ghost.removeAttribute("id");
+          ghost.removeAttribute("data-md-detail");
+          ghost.setAttribute("aria-hidden", "true");
+          ghost.setAttribute("inert", "");
+          ghost.classList.add("md-ghost");
+          ghost.style.cssText += ";position:absolute;margin:0;left:" + (r.left - h.left + host.scrollLeft) + "px;top:" + (r.top - h.top + host.scrollTop) + "px;width:" + r.width + "px;height:" + r.height + "px;overflow:hidden;pointer-events:none;z-index:2;";
+          host.appendChild(ghost);
+        }
+        det = mdReplace(det, ndet);
+        if (ghost) {
+          var g = ghost;
+          motion.leave(g, { dx: nowEmpty ? 14 : 0, duration: nowEmpty ? MOTION.d2 : MOTION.d1 }).then(function () { g.remove(); });
+        }
+        if (wasEmpty && !nowEmpty) motion.enter(det, { dx: 14, duration: 200 });
+        else motion.fade(det, { duration: MOTION.d2 });
+        if (!nowEmpty) {
+          var head = det.querySelector("h2, h3, [data-md-heading]");
+          if (head) {
+            if (!head.hasAttribute("tabindex")) head.setAttribute("tabindex", "-1");
+            head.focus({ preventScroll: true });
+          }
+        }
+      }
+    }
+    var announcer = document.getElementById("nav-announcer");
+    if (announcer) announcer.textContent = document.title;
+    rememberPage();
+    document.dispatchEvent(new CustomEvent("hm:navigated", { detail: { main: main, md: true } }));
+  }
+
+  // Immediate feedback (< 100 ms): the clicked entry is selected at once;
+  // a response slower than 120 ms dims the detail behind a skeleton.
+  document.addEventListener("click", function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    var a = e.target.closest && e.target.closest("a[href]");
+    if (!a) return;
+    var md = a.closest("#main [data-md]");
+    if (!md || a.hasAttribute("data-md-full") || a.closest("[data-md-detail]")) return;
+    var region = a.closest("[data-md-rail], [data-md-list]");
+    if (!region) return;
+    if (region.hasAttribute("data-md-rail")) {
+      var was = mdSelected(region);
+      if (was && was !== a && was.getAttribute("aria-current")) {
+        was.removeAttribute("aria-current");
+        a.setAttribute("aria-current", "true");
+        motion.glide(was, a, "md-ink");
+      }
+    } else {
+      var row = a.closest("tr, [data-md-item]");
+      if (row) {
+        var olds = region.querySelectorAll('[aria-selected="true"]');
+        for (var i = 0; i < olds.length; i++) olds[i].removeAttribute("aria-selected");
+        row.setAttribute("aria-selected", "true");
+      }
+    }
+    var det = md.querySelector("[data-md-detail]");
+    if (det) {
+      if (mdPending) clearTimeout(mdPending.timer);
+      mdPending = {
+        timer: setTimeout(function () {
+          if (det.isConnected) det.classList.add("md-pending");
+        }, 120),
+      };
+    }
+  }, true);
+
   /* ---- swap handling ---------------------------------------------------- */
 
   var parser = new DOMParser();
+  var viewTransition = false;
+  // List → detail ("forward") and back: the content column enters from the
+  // right or the left instead of rising (REDESIGN.md §7, master-detail).
+  var navDir = null;
+  document.addEventListener("click", function (e) {
+    var a = e.target.closest && e.target.closest("a[href]");
+    if (!a || !a.closest("#main")) {
+      navDir = null;
+      return;
+    }
+    var row = a.closest("table.data-table > tbody > tr");
+    if (a.closest(".back-link, [data-drill=back]")) navDir = "back";
+    else if (row || a.closest("[data-drill]")) navDir = "forward";
+    else navDir = null;
+    // The row answers at once (well under 100 ms), before the page does.
+    if (row && !a.closest("[data-md]")) row.setAttribute("data-pressed", "");
+  }, true);
   var nextNav = null;
   var navigated = false;
 
@@ -384,12 +714,48 @@
       }
       return;
     }
-    if (next.querySelector("script[src]")) {
+    var scripts = next.querySelectorAll("script[src]");
+    var unsafe = false;
+    for (var si = 0; si < scripts.length; si++) {
+      if (!scripts[si].hasAttribute("data-swap-safe")) unsafe = true;
+    }
+    if (unsafe) {
       // Page scripts expect a fresh document: load it as one, and go there
       // directly next time.
       detail.shouldSwap = false;
       learn(new URL(url, location.href).pathname);
       go(url);
+      return;
+    }
+    if (scripts.length) {
+      // `data-swap-safe` scripts only delegate from `document` (and redo
+      // their per-page work on `hm:navigated`): load each once, never twice.
+      var stripped = false;
+      for (var sj = 0; sj < scripts.length; sj++) {
+        var src = scripts[sj].getAttribute("src");
+        if (document.querySelector('script[src="' + src + '"]')) {
+          scripts[sj].remove();
+          stripped = true;
+        }
+      }
+      if (stripped) detail.serverResponse = "<!doctype html>" + doc.documentElement.outerHTML;
+    }
+    // Master-detail pages: the same view under a new selection swaps only
+    // the regions that changed (rail, list, detail), with their own motion;
+    // the rest of #main, the scroll positions and the focus stay.
+    var curMd = document.querySelector("#main [data-md]");
+    var nextMd = next.querySelector("[data-md]");
+    if (curMd && nextMd && curMd.getAttribute("data-md") === nextMd.getAttribute("data-md") && !(detail.requestConfig && detail.requestConfig.elt && detail.requestConfig.elt.hasAttribute && detail.requestConfig.elt.hasAttribute("data-md-full"))) {
+      detail.swapOverride = "none";
+      detail.selectOverride = "#main";
+      detail.target = document.getElementById("main");
+      detail.shouldSwap = true;
+      detail.isError = false;
+      var title = doc.title;
+      setTimeout(function () {
+        mdSwap(curMd, nextMd, next);
+        if (title) document.title = title;
+      }, 0);
       return;
     }
     var key = doc.body ? doc.body.getAttribute("data-nav-key") : null;
@@ -401,7 +767,14 @@
     detail.isError = false;
     detail.target = document.getElementById("main");
     detail.selectOverride = "#main";
-    detail.swapOverride = "outerHTML show:window:top";
+    // The content column rises in (REDESIGN.md §7): a view transition
+    // around the swap where the browser has one (app.css animates the
+    // `hm-main` snapshot only — the sidebar and topbar hold still), else a
+    // CSS entrance on the new #main after the swap.
+    viewTransition = !REDUCED && typeof document.startViewTransition === "function";
+    if (navDir) document.documentElement.setAttribute("data-nav-dir", navDir);
+    else document.documentElement.removeAttribute("data-nav-dir");
+    detail.swapOverride = "outerHTML show:window:top" + (viewTransition ? " transition:true" : "");
     navigated = {
       title: doc.title,
       bodyClass: doc.body ? doc.body.getAttribute("class") || "" : "",
@@ -431,6 +804,23 @@
     var keep = document.body.classList.contains("nav-open") ? " nav-open" : "";
     document.body.setAttribute("class", (info.bodyClass + keep).trim());
     markActive();
+    var dir = navDir;
+    navDir = null;
+    setTimeout(function () {
+      if (!navDir) document.documentElement.removeAttribute("data-nav-dir");
+    }, 400);
+    if (main && !viewTransition && !REDUCED) {
+      main.classList.remove("page-enter");
+      void main.offsetWidth;
+      if (dir) main.setAttribute("data-enter", dir);
+      else main.removeAttribute("data-enter");
+      main.classList.add("page-enter");
+      main.addEventListener("animationend", function done(e) {
+        if (e.target !== main) return;
+        main.classList.remove("page-enter");
+        main.removeEventListener("animationend", done);
+      });
+    }
     initPages(main);
     var heading = main && main.querySelector("h1");
     if (heading) {
@@ -529,11 +919,224 @@
 
   window.addEventListener("pagehide", saveSidebarScroll);
 
+  /* ---- shared page components (console redesign §6, §7) ---------------- */
+
+  // A short confirmation that rises in at the bottom right and leaves.
+  function toast(message) {
+    var t = document.createElement("div");
+    t.className = "toast";
+    t.setAttribute("role", "status");
+    t.textContent = message;
+    document.body.appendChild(t);
+    setTimeout(function () {
+      t.classList.add("is-leaving");
+      setTimeout(function () {
+        t.remove();
+      }, 200);
+    }, 2000);
+  }
+  window.HM.toast = toast;
+
+  // The endpoint switcher keeps the page: each option asks the server for
+  // the same sub-page on its endpoint (`manager::switch`), from wherever the
+  // operator is now — the persistent sidebar's own hrefs cannot know that.
+  // The hrefs are set when the menu opens (htmx re-reads a boosted link's
+  // href when its attributes change and it is processed again).
+  document.addEventListener("toggle", function (e) {
+    var menu = e.target;
+    if (!menu.open || !menu.querySelector || !menu.querySelector("a[data-switch-href]")) return;
+    var from = encodeURIComponent(location.pathname + location.search);
+    var links = menu.querySelectorAll("a[data-switch-href]");
+    for (var i = 0; i < links.length; i++) {
+      links[i].setAttribute("href", links[i].getAttribute("data-switch-href") + "?from=" + from);
+    }
+    if (window.htmx) window.htmx.process(menu);
+  }, true);
+
+  // A server-side notice for the next page (`hm_toast` cookie, e.g. the
+  // switcher's "not on this endpoint" fallback): shown once.
+  function cookieToast() {
+    var m = document.cookie.match(/(?:^|;\s*)hm_toast=([^;]*)/);
+    if (!m) return;
+    document.cookie = "hm_toast=; Path=/ui; Max-Age=0; SameSite=Lax";
+    var text = "";
+    try {
+      text = decodeURIComponent(m[1].replace(/\+/g, " "));
+    } catch (err) {}
+    if (text) toast(text);
+  }
+  document.addEventListener("hm:navigated", cookieToast);
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", cookieToast);
+  else cookieToast();
+
+  // In-page tabs ([data-page-tabs]): one panel visible at a time; without
+  // JavaScript every panel shows. The active tab survives in the hash.
+  function initPageTabs(root) {
+    var lists = (root || document).querySelectorAll("[data-page-tabs]");
+    for (var i = 0; i < lists.length; i++) {
+      var list = lists[i];
+      if (list.__hmTabs) continue;
+      list.__hmTabs = true;
+      var tabs = list.querySelectorAll("[role=tab]");
+      var want = location.hash.slice(1);
+      var pick = null;
+      for (var t = 0; t < tabs.length; t++) {
+        if (want && tabs[t].getAttribute("aria-controls") === want) pick = tabs[t];
+      }
+      selectTab(list, pick || list.querySelector('[role=tab][aria-selected="true"]') || tabs[0], false);
+    }
+  }
+  function selectTab(list, tab, animate) {
+    var tabs = list.querySelectorAll("[role=tab]");
+    for (var k = 0; k < tabs.length; k++) {
+      var on = tabs[k] === tab;
+      tabs[k].setAttribute("aria-selected", on ? "true" : "false");
+      tabs[k].tabIndex = on ? 0 : -1;
+      // The ink under the chosen tab grows only when the operator picks it.
+      tabs[k].classList.toggle("ink-in", on && !!animate);
+      var panel = document.getElementById(tabs[k].getAttribute("aria-controls"));
+      if (!panel) continue;
+      panel.hidden = !on;
+      if (on && animate && !REDUCED) {
+        panel.classList.remove("page-enter");
+        void panel.offsetWidth;
+        panel.classList.add("page-enter");
+      }
+    }
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest && e.target.closest("[data-page-tabs] [role=tab]");
+    if (tab) {
+      selectTab(tab.closest("[data-page-tabs]"), tab, true);
+      try {
+        history.replaceState(history.state, "", "#" + tab.getAttribute("aria-controls"));
+      } catch (err) {}
+      return;
+    }
+    // Log viewer: wrap toggle and copy.
+    var wrap = e.target.closest && e.target.closest("[data-log-wrap]");
+    if (wrap) {
+      var log = document.getElementById(wrap.getAttribute("aria-controls"));
+      var wrapped = wrap.getAttribute("aria-pressed") !== "true";
+      wrap.setAttribute("aria-pressed", wrapped ? "true" : "false");
+      if (log) log.classList.toggle("log--nowrap", !wrapped);
+      return;
+    }
+    var copyLog = e.target.closest && e.target.closest("[data-log-copy]");
+    if (copyLog) {
+      var src = document.getElementById(copyLog.getAttribute("data-log-copy"));
+      if (src && navigator.clipboard) {
+        navigator.clipboard.writeText(src.textContent || "").then(function () {
+          toast(document.body.getAttribute("data-msg-copied") || "Copied");
+        }, function () {});
+      }
+      return;
+    }
+    // Type rails: types without data stay folded until asked for.
+    var empty = e.target.closest && e.target.closest("[data-rail-empty-toggle]");
+    if (empty) {
+      var rail = empty.closest(".filter-rail");
+      var on = empty.getAttribute("aria-pressed") !== "true";
+      empty.setAttribute("aria-pressed", on ? "true" : "false");
+      if (rail) rail.classList.toggle("show-empty", on);
+      return;
+    }
+    // Grouped versions: "+N older" folds the older rows of one system.
+    var tog = e.target.closest && e.target.closest("[data-versions-toggle]");
+    if (tog) {
+      var row = tog.closest("tr");
+      var open = tog.getAttribute("aria-expanded") !== "true";
+      // Browsers list one row per canonical; its other versions are
+      // fetched once, on the first expand, and inserted under it.
+      var src = tog.getAttribute("data-versions-src");
+      if (open && src && !tog.hasAttribute("data-loaded")) {
+        if (tog.getAttribute("aria-busy") === "true") return;
+        tog.setAttribute("aria-busy", "true");
+        fetch(src, { headers: { "HX-Request": "true" }, credentials: "same-origin" })
+          .then(function (r) { return r.text(); })
+          .then(function (html) {
+            var doc = new DOMParser().parseFromString(html, "text/html");
+            var rows = doc.querySelectorAll("tr[data-older]");
+            var at = row;
+            for (var i = 0; i < rows.length; i++) {
+              var tr = document.importNode(rows[i], true);
+              at.after(tr);
+              at = tr;
+            }
+            if (window.htmx) for (var j = row.nextElementSibling; j && j.hasAttribute("data-older"); j = j.nextElementSibling) window.htmx.process(j);
+            tog.setAttribute("data-loaded", "");
+            tog.removeAttribute("aria-busy");
+            tog.click();
+          })
+          .catch(function () { tog.removeAttribute("aria-busy"); });
+        return;
+      }
+      tog.setAttribute("aria-expanded", open ? "true" : "false");
+      var opened = [];
+      for (var r = row.nextElementSibling; r && r.hasAttribute("data-older"); r = r.nextElementSibling) {
+        r.classList.toggle("is-open", open);
+        if (open) opened.push(r);
+      }
+      motion.stagger(opened, { max: 20, total: 240 });
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    var tab = e.target.closest && e.target.closest("[data-page-tabs] [role=tab]");
+    if (!tab || (e.key !== "ArrowRight" && e.key !== "ArrowLeft")) return;
+    var list = tab.closest("[data-page-tabs]");
+    var tabs = Array.prototype.slice.call(list.querySelectorAll("[role=tab]"));
+    var i = tabs.indexOf(tab) + (e.key === "ArrowRight" ? 1 : -1);
+    var next = tabs[(i + tabs.length) % tabs.length];
+    selectTab(list, next, true);
+    next.focus();
+    e.preventDefault();
+  });
+  // Table rows fade up, staggered (<= 20 rows, <= 240 ms), when a filter
+  // or a pager swaps them in — never on first paint, where the content
+  // column's own rise is the only motion.
+  function staggerRows(root) {
+    if (REDUCED) return;
+    var bodies = (root || document).querySelectorAll("table.data-table > tbody");
+    for (var b = 0; b < bodies.length; b++) {
+      if (bodies[b].rows.length > 400) continue;
+      motion.stagger(bodies[b].rows, { max: 20, total: 240 });
+    }
+  }
+  document.addEventListener("hm:navigated", function (e) {
+    var main = e.detail && e.detail.main;
+    initPageTabs(main);
+  });
+  document.addEventListener("htmx:afterSwap", function (e) {
+    var t = e.detail && e.detail.target;
+    if (t && t.id !== "main" && t.querySelector) {
+      // An outerHTML swap leaves `target` detached: use its replacement.
+      var live = (t.id && document.getElementById(t.id)) || t;
+      initPageTabs(live);
+      staggerRows(live);
+    }
+  });
+
+  // A filter that matches only an older version keeps its group: that
+  // version is shown, marked, under the listed one.
+  function autoExpand(root) {
+    var t = (root || document).querySelectorAll("[data-versions-toggle][data-autoexpand]:not([data-loaded])");
+    for (var i = 0; i < t.length && i < 25; i++) t[i].click();
+  }
+  document.addEventListener("hm:navigated", function (e) {
+    autoExpand(e.detail && e.detail.main);
+  });
+  document.addEventListener("htmx:afterSettle", function (e) {
+    var t = e.detail && e.detail.target;
+    if (t && t.querySelector) autoExpand(document.getElementById("main"));
+  });
+
   function start() {
+    autoExpand(document.getElementById("main"));
     rememberPage();
     restoreSidebarScroll();
     markActive();
     initPages(document.getElementById("main"));
+    initPageTabs(document.getElementById("main"));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
   else start();

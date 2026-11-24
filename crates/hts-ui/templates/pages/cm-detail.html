@@ -67,9 +67,8 @@
 
         <div class="facets facets--bare">
           <span class="facet-label">{{ chrome.i18n.t("hts-detail-facts-label") }}</span>
-          {% if !summary.version.is_empty() %}
-          <span class="chip">{{ chrome.i18n.t("hts-detail-version-label") }} <span class="count">{{ summary.version }}</span></span>
-          {% endif %}
+          {%- let kind = crate::versions::Kind::ConceptMap %}
+          {% include "partials/hts-version-switch.html" %}
           {% if !summary.status.is_empty() %}
           <span class="chip">{{ chrome.i18n.t("hts-detail-status-label") }} <span class="count">{{ chrome.i18n.t(format!("hts-cm-status-{}", summary.status).as_str()) }}</span></span>
           {% endif %}

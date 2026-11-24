@@ -42,9 +42,6 @@
       {% call ui::field_text(i18n.t("mgr-field-jwks"), "auth_jwks_url", v.auth_jwks_url, self.err("auth.jwksUrl"), i18n.t("mgr-field-jwks-hint-optional"), "url", false, "", false, true) %}{% endcall %}
     </div>
   </fieldset>
-  {#- Outside the fieldset so it works while inheriting (UX-11): it then
-      checks the server's own settings. -#}
-  {% call ui::verify_panel("verify-auth", "/ui/e/" ~ head.name ~ "/security/verify", "auth_inherit auth_mode auth_issuer auth_jwks_url auth_audience auth_algorithms", "verify-intro-auth", "verify-run", true, false) %}{% endcall %}
   <fieldset class="inherit-target" id="auth-fields-more"{% if v.auth_inherit %} disabled{% endif %}>
     <legend class="visually-hidden">{{ i18n.t("mgr-sec-advanced") }}</legend>
     <div data-show-when="auth_mode=write-protect|full">

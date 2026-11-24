@@ -598,6 +598,20 @@ pub struct ResourceSearchQuery {
     /// Avoids reading the `resource_json` blob; returns a synthetic summary instead.
     #[serde(rename = "_summary")]
     pub summary: Option<String>,
+    /// `_hm-current`: group the versions of each canonical URL (see
+    /// `backends::grouped`). `None` lists every stored version.
+    #[serde(skip)]
+    pub group: Option<VersionGroup>,
+}
+
+/// `_hm-current=true|older`: which rows of each canonical's version group a
+/// grouped search returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionGroup {
+    /// The version answering version-less requests, one per canonical URL.
+    Current,
+    /// Every other version of the matched canonicals, in precedence order.
+    Older,
 }
 
 // ─── $closure ─────────────────────────────────────────────────────────────────

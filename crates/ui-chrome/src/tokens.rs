@@ -35,9 +35,9 @@ pub struct Theme {
     pub primary: &'static str,
     /// Text on primary buttons (`--color-on-primary`).
     pub on_primary: &'static str,
-    /// Accent (`--color-accent`).
+    /// Accent (`--accent`; the violet `--color-accent` is retired).
     pub accent: &'static str,
-    /// Info text (`--color-info`).
+    /// Info text (`--accent-text`; `--color-info` is retired).
     pub info: &'static str,
     /// Success / warning / danger (`--ok`, `--warn`, `--danger`).
     pub ok: &'static str,
@@ -51,59 +51,90 @@ pub struct Theme {
     pub warn_pill: (&'static str, &'static str),
     /// Danger pill.
     pub danger_pill: (&'static str, &'static str),
-    /// Info pill (`--color-info-soft`, `--color-info-text`).
-    pub info_pill: (&'static str, &'static str),
     /// Muted pill (`--muted-soft`, `--muted-text`).
     pub muted_pill: (&'static str, &'static str),
     /// Focus ring (`--color-focus-ring`).
     pub focus: &'static str,
+    /// Inset / hover surface (`--surface-2`, console redesign §4.1).
+    pub surface_2: &'static str,
+    /// Captions, table headers, meta (`--text-3`).
+    pub text_3: &'static str,
 }
 
 /// Light theme.
 pub const LIGHT: Theme = Theme {
     name: "light",
-    bg: "#f6f8fc",
-    frame: "#eef2f9",
+    bg: "#f4f6fa",
+    frame: "#ffffff",
     surface: "#ffffff",
     text: "#0e1726",
     muted: "#4a5568",
     primary: "#2f5be0",
     on_primary: "#ffffff",
-    accent: "#5a54e8",
-    info: "#0a7bb8",
+    accent: "#2f5be0",
+    info: "#2449b8",
     ok: "#17663f",
     warn: "#9a5b00",
     danger: "#c62828",
     ok_pill: ("#e3f3ea", "#17663f"),
     warn_pill: ("#fbf0dc", "#7f4b00"),
     danger_pill: ("#fbe7e7", "#a81f1f"),
-    info_pill: ("#e3f1f9", "#07618f"),
-    muted_pill: ("#e9edf4", "#4a5568"),
+    muted_pill: ("#f1f4f9", "#4a5568"),
     focus: "#1a8cff",
+    surface_2: "#f1f4f9",
+    text_3: "#5f6b7d",
 };
 
 /// Dark theme.
 pub const DARK: Theme = Theme {
     name: "dark",
-    bg: "#0e1726",
-    frame: "#0b1320",
-    surface: "#131c2e",
-    text: "#e8eef8",
-    muted: "#a7b3c6",
+    bg: "#0c1420",
+    frame: "#0a111c",
+    surface: "#111a28",
+    text: "#e6ecf5",
+    muted: "#a3b0c3",
     primary: "#5cb8ff",
-    on_primary: "#0e1726",
-    accent: "#a5a0ff",
-    info: "#49c6ff",
+    on_primary: "#0b1320",
+    accent: "#5cb8ff",
+    info: "#8fd0ff",
     ok: "#5fd39a",
     warn: "#f2b84b",
     danger: "#ff7a7a",
     ok_pill: ("#123026", "#74dca8"),
     warn_pill: ("#2f2612", "#f5c66a"),
     danger_pill: ("#3a1f27", "#ff9696"),
-    info_pill: ("#12293d", "#7dd6ff"),
-    muted_pill: ("#222d42", "#b4bfd0"),
+    muted_pill: ("#162133", "#b4bfd0"),
     focus: "#49c6ff",
+    surface_2: "#162133",
+    text_3: "#8592a7",
 };
+
+/// The console redesign's scale (REDESIGN.md §4): every value below must be
+/// declared in the stylesheet under the given custom property, so the
+/// layout auditor's design-scale rule and the CSS agree.
+pub const SCALE: &[(&str, &str)] = &[
+    ("--fs-xs", "12px"),
+    ("--fs-sm", "13px"),
+    ("--fs-md", "14px"),
+    ("--fs-lg", "16px"),
+    ("--fs-xl", "22px"),
+    ("--fs-2xl", "28px"),
+    ("--s1", "4px"),
+    ("--s2", "8px"),
+    ("--s3", "12px"),
+    ("--s4", "16px"),
+    ("--s5", "24px"),
+    ("--s6", "32px"),
+    ("--s7", "48px"),
+    ("--r-sm", "6px"),
+    ("--r-md", "10px"),
+    ("--r-full", "999px"),
+    ("--dur-1", "120ms"),
+    ("--dur-2", "180ms"),
+    ("--dur-3", "240ms"),
+    ("--dur-4", "420ms"),
+    ("--sidebar-w", "248px"),
+];
 
 /// Both themes.
 pub const THEMES: [Theme; 2] = [LIGHT, DARK];
@@ -141,6 +172,18 @@ pub fn text_pairs(t: &Theme) -> Vec<(&'static str, &'static str, &'static str)> 
         v.push(("accent", t.accent, bg));
         v.push(("danger", t.danger, bg));
     }
+    for (label, fg) in [
+        ("text", t.text),
+        ("muted", t.muted),
+        ("text-3", t.text_3),
+        ("primary", t.primary),
+        ("danger", t.danger),
+    ] {
+        v.push((label, fg, t.surface_2));
+    }
+    for bg in [t.surface, t.bg, t.frame] {
+        v.push(("text-3", t.text_3, bg));
+    }
     v.push(("info", t.info, t.surface));
     v.push(("ok", t.ok, t.surface));
     v.push(("warn", t.warn, t.surface));
@@ -149,7 +192,6 @@ pub fn text_pairs(t: &Theme) -> Vec<(&'static str, &'static str, &'static str)> 
         ("ok-pill", t.ok_pill),
         ("warn-pill", t.warn_pill),
         ("danger-pill", t.danger_pill),
-        ("info-pill", t.info_pill),
         ("muted-pill", t.muted_pill),
     ] {
         v.push((label, fg, bg));
@@ -205,6 +247,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_type_scale_has_six_steps_and_radii_three() {
+        let fs = SCALE.iter().filter(|(k, _)| k.starts_with("--fs-")).count();
+        let r = SCALE.iter().filter(|(k, _)| k.starts_with("--r-")).count();
+        assert_eq!((fs, r), (6, 3));
     }
 
     #[test]

@@ -195,7 +195,7 @@ async fn overview_lists_endpoints_with_badges_and_filters() {
         "env=test",
         r#"href="/ui/endpoints/new""#,
         "health-strip",
-        "status-pill--muted",
+        "dot--muted",
     ] {
         assert!(html.contains(needle), "overview lacks {needle}");
     }
@@ -478,9 +478,13 @@ async fn data_pages_are_scoped_to_their_endpoint() {
     // TenantHeader routing: the FHIR base stays the server's, the tenant
     // header selects the endpoint's data.
     assert!(html.contains(r#"<meta name="hfs-fhir-base" content="/fhir">"#));
-    // The sidebar carries the endpoint's sections with scoped links.
+    // The sidebar carries the endpoint's sections with scoped links (the
+    // Settings entry opens General; Security is one of its route tabs), and
+    // this page's own route tabs are its Data tools siblings.
     assert!(html.contains(r#"href="/ui/e/twcore/data/resources""#));
-    assert!(html.contains(r#"href="/ui/e/twcore/security""#));
+    assert!(html.contains(r#"href="/ui/e/twcore/config""#));
+    assert!(html.contains(r#"<nav class="route-tabs""#));
+    assert!(html.contains(r#"href="/ui/e/twcore/data/validate""#));
     assert!(html.contains("TW Core sandbox"));
     let (status, _) = get(&f.app, "/ui/e/twcore/data").await;
     assert_eq!(status, StatusCode::OK, "the endpoint dashboard");
@@ -614,11 +618,11 @@ fn design_tokens_in_the_stylesheet_match_the_asserted_ones() {
             theme.warn_pill.1,
             theme.danger_pill.0,
             theme.danger_pill.1,
-            theme.info_pill.0,
-            theme.info_pill.1,
             theme.muted_pill.0,
             theme.muted_pill.1,
             theme.focus,
+            theme.surface_2,
+            theme.text_3,
         ] {
             assert!(
                 css.contains(value),
@@ -628,6 +632,12 @@ fn design_tokens_in_the_stylesheet_match_the_asserted_ones() {
         }
     }
     assert!(css.contains(helios_ui_chrome::tokens::BRAND_GRADIENT));
+    for (name, value) in helios_ui_chrome::tokens::SCALE {
+        assert!(
+            css.contains(&format!("{name}: {value};")),
+            "scale token {name}: {value} missing from app.css"
+        );
+    }
 }
 
 /// Every `mgr-*` key a template or the manager code uses exists in the
@@ -690,9 +700,9 @@ fn manager_catalog_is_complete_in_en_and_zh_hant() {
     );
 }
 
-/// The endpoint switcher's avatar: first letters of words only, so a name
-/// with brackets ("Sandbox (demo)") never renders "S(", and a Chinese name
-/// gives its first character.
+/// The endpoint switcher (console redesign §5.2) is a chip with the
+/// endpoint's state dot and its full name — no initials avatar any more, so
+/// a name with brackets ("Sandbox (demo)") or in Chinese shows as written.
 #[tokio::test]
 async fn switcher_initials_skip_punctuation_and_handle_cjk() {
     let f = fixture().await;
@@ -705,8 +715,8 @@ async fn switcher_initials_skip_punctuation_and_handle_cjk() {
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (_, html) = get(&f.app, "/ui/e/twcore").await;
     assert!(
-        html.contains(r#"<span class="avatar avatar--brand">SD</span>"#),
-        "Sandbox (demo) → SD"
+        html.contains(r#"<span class="endpoint-switch__name">Sandbox (demo)</span>"#),
+        "the chip names the endpoint"
     );
     assert!(!html.contains(">S(<"), "no bracket as an initial");
 
@@ -719,7 +729,7 @@ async fn switcher_initials_skip_punctuation_and_handle_cjk() {
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (_, html) = get(&f.app, "/ui/e/twcore").await;
     assert!(
-        html.contains(r#"<span class="avatar avatar--brand">臺</span>"#),
-        "CJK name → its first character"
+        html.contains(r#"<span class="endpoint-switch__name">臺大 測試</span>"#),
+        "a CJK name as written"
     );
 }

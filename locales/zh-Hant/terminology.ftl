@@ -690,3 +690,31 @@ hts-term-stat-concepts-shown = 所有符合的代碼系統合計
 
 tx-denied-current-role = 您目前的角色是 { $role }。
 tx-searching = 搜尋中…
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+hts-nav-overview = 總覽
+hts-nav-group-browse = 瀏覽
+hts-nav-group-loaded = 已載入與匯入
+
+# Console redesign: grouped versions, row menu, Maintenance tab
+hts-term-tab-loaded = 已載入
+hts-term-tab-maint = 維護
+hts-term-older = 另 { $count } 個舊版本
+hts-term-older-version = 舊版本
+hts-term-row-actions = { $system } 的動作
+hts-job-log-wrap = 自動換行
+hts-job-log-copy = 複製
+
+## Version grouping (one row per canonical URL)
+hts-browser-open = 開啟
+hts-browser-delete-version = 刪除此版本…
+hts-browser-delete-confirm = 要刪除 { $url } 的版本 { $version } 嗎？
+hts-browser-older-failed = 無法載入較舊的版本。
+hts-cs-browser-total-grouped = { $total } 個代碼系統 · { $versions } 個版本
+hts-vs-browser-total-grouped = { $total } 個值集 · { $versions } 個版本
+hts-cm-browser-total-grouped = { $total } 個概念對應 · { $versions } 個版本
+hts-version-switch = 版本
+hts-version-switch-count = { $count } 個版本
+hts-version-switch-current = 目前
+hts-term-stat-versions = { $versions } 個版本
+hts-term-stat-other-versions = { $vs } / { $cm } 個版本

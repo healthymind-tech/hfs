@@ -99,7 +99,7 @@
     -#}
     <div class="field" role="group" aria-labelledby="translate-direction-label">
       <span class="field__label" id="translate-direction-label">{{ chrome.i18n.t("hts-cm-translate-direction-legend") }}</span>
-      <div class="facets facets--bare">
+      <div class="seg-radios">
         <label class="chip">
           <input type="radio" name="direction" value="forward"
                  {% if direction == TranslateDirection::Forward %} checked{% endif %}

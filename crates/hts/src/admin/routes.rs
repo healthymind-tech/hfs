@@ -267,6 +267,7 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
     let stats_ref = stats.as_deref().unwrap_or(&empty);
     let mut systems: Vec<(InventoryKey, Value)> = Vec::new();
     let mut total_concepts = 0u64;
+    let mut version_total = 0usize;
     for (url, mut versions) in by_url {
         versions.sort_by(|a, b| {
             crate::version_order::compare_versions(b.version.as_deref(), a.version.as_deref())
@@ -340,6 +341,7 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
             continue;
         }
         total_concepts += sys_concepts;
+        version_total += vjson.len();
         let title = versions
             .iter()
             .find_map(|r| r.title.clone().or_else(|| r.name.clone()));
@@ -377,6 +379,9 @@ async fn inventory(State(core): Core, Query(q): Query<InventoryQuery>) -> ApiRes
         "value_sets": vs,
         "concept_maps": cm,
         "code_system_count": matched,
+        // Stored versions across the matched systems ("N code systems ·
+        // M versions").
+        "code_system_version_count": version_total,
         "total_concepts": counts.as_ref().map(|_| total_concepts),
         "systems": systems,
     }))

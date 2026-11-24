@@ -1865,3 +1865,11 @@ sql-library-select-lede = 從清單中選擇一個項目，或建立新的項目
 sql-library-unavailable-title = 無法使用此選取項目
 sql-library-unavailable-lede = 無法確認可用的查詢與檢視。
 
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+nav-route-tabs = 本區頁面
+rail-show-empty = 顯示無資料類型
+activity-jobs = 工作
+activity-idle = 沒有進行中的工作
+activity-running = { $count } 個工作進行中
+activity-detail = 術語匯入進行中：{ $imports } · 同步：{ $syncs }

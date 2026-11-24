@@ -1,0 +1,29 @@
+{#- The endpoint switcher (console redesign §5.2): a compact chip in the
+    Endpoint block's heading — the endpoint's name and state dot; its menu
+    lists every endpoint, then "All endpoints". -#}
+          <details class="menu endpoint-switch">
+            <summary class="ep-chip" aria-label="{{ i18n.t("mgr-switch-endpoint") }}">
+              {% if let Some(ep) = status.nav_endpoint() %}
+              <span class="dot dot--{{ ep.tone }}" aria-hidden="true"></span>
+              <span class="endpoint-switch__name">{{ ep.display }}</span>
+              {% else %}
+              <span class="endpoint-switch__name">{{ i18n.t("mgr-all-endpoints") }}</span>
+              {% endif %}
+              <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+            </summary>
+            <div class="menu__panel">
+              <div class="menu__heading">{{ i18n.t("mgr-switch-endpoint") }}</div>
+              {% for ep in status.endpoint_options() %}
+              <a class="menu__option" href="{{ ep.href }}" data-switch-href="{{ ep.href }}/switch"{% if let Some(cur) = status.nav_endpoint() %}{% if cur.name == ep.name %} aria-current="true"{% endif %}{% endif %}>
+                <span class="dot dot--{{ ep.tone }}" aria-hidden="true"></span>
+                <span class="menu__option-text">{{ ep.display }}</span>
+                <small class="menu__option-meta">{{ ep.path }}</small>
+              </a>
+              {% endfor %}
+              <hr class="menu__sep">
+              <a class="menu__option" href="/ui"{% if status.current_endpoint().is_none() && active_page == "overview" %} aria-current="true"{% endif %}>
+                <span class="icon">{% include "icons/grid.svg" %}</span>
+                <span class="menu__option-text">{{ i18n.t("mgr-all-endpoints") }}</span>
+              </a>
+            </div>
+          </details>

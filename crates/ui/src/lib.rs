@@ -39,6 +39,7 @@
 //! resource type of the active FHIR version, offering the untouched ones at 0.
 
 mod account;
+mod activity;
 mod admin_login;
 mod auth_shell;
 mod bulk_export;
@@ -832,10 +833,24 @@ impl Status {
 
     /// Whether the nav entry `id` is the current page `active` — data pages
     /// opened from Resources (editor, history, queries, search) mark it too.
-    pub(crate) fn nav_current(&self, id: &str, active: &str) -> bool {
-        id == active
-            || (id == "resources" && matches!(active, "editor" | "history" | "queries" | "search"))
-            || (id == "ep-home" && active == "home")
+    pub(crate) fn nav_current(&self, link: &manager::nav::NavLink, active: &str) -> bool {
+        let active = match active {
+            "editor" | "history" | "queries" | "search" => "resources",
+            "home" => "ep-home",
+            a => a,
+        };
+        link.covers(active)
+    }
+
+    /// Whether the sidebar shows the current endpoint's block.
+    pub(crate) fn nav_has_endpoint_block(&self) -> bool {
+        self.nav_groups().iter().any(|g| g.block.is_endpoint())
+    }
+
+    /// The route tabs of the page `active` (console redesign §5.1): its
+    /// sibling pages, when the requester can open more than one.
+    pub(crate) fn route_tabs(&self, active: &str) -> &[manager::nav::NavLink] {
+        manager::nav::tabs(self.nav_groups(), active).unwrap_or(&[])
     }
 
     fn brand_links<'a>(&self, version: &'a str) -> helios_ui_chrome::BrandLinks<'a> {
@@ -947,6 +962,42 @@ impl Status {
     pub(crate) fn user_menu(&self, i18n: &I18n) -> Result<String, askama::Error> {
         let admin = self.user.as_ref().is_some_and(|u| u.admin);
         let admin_hint = i18n.t("admin-user-hint");
+        // Account, console settings and About (console redesign §5.1): in
+        // the account menu, not the sidebar.
+        let (account, console, about) = (
+            i18n.t("mgr-nav-account"),
+            i18n.t("mgr-nav-group-console"),
+            format!("{} · v{}", i18n.t("mgr-nav-about"), self.version),
+        );
+        let console_href = self
+            .nav_groups()
+            .iter()
+            .filter(|g| g.block.is_foot())
+            .flat_map(|g| &g.links)
+            .find(|l| l.id == "console-settings" || l.ids.contains("settings-"))
+            .map(|l| l.href.clone());
+        let mut links: Vec<helios_ui_chrome::MenuLink<'_>> = Vec::new();
+        if self.manager_on() {
+            if self.user_can_logout() && !admin {
+                links.push(helios_ui_chrome::MenuLink {
+                    href: "/ui/account",
+                    label: &account,
+                    icon: "user",
+                });
+            }
+            if let Some(href) = console_href.as_deref() {
+                links.push(helios_ui_chrome::MenuLink {
+                    href,
+                    label: &console,
+                    icon: "users",
+                });
+            }
+            links.push(helios_ui_chrome::MenuLink {
+                href: "/ui/about",
+                label: &about,
+                icon: "info",
+            });
+        }
         helios_ui_chrome::user_menu(
             i18n,
             helios_ui_chrome::UserIdentity {
@@ -964,6 +1015,7 @@ impl Status {
                 } else {
                     "/ui/logout"
                 },
+                links: &links,
             },
         )
     }
@@ -2422,6 +2474,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
         .merge(sync_pages::routes())
+        .merge(activity::routes())
         .merge(idp::routes())
         // Persists the sidebar's FHIR-version choice (#343) and redirects back.
         .route("/ui/version", axum::routing::post(set_version))
@@ -2457,6 +2510,7 @@ pub fn mount_with_conformance_source_and_runtime(
         // The manager console: overview at `/ui`, endpoint pages, About.
         Some(_) => router
             .merge(manager::pages::routes())
+            .merge(manager::switch::routes())
             .merge(manager::verify_pages::routes())
             .route("/ui/find", get(global_search::find)),
         None => router
@@ -11418,7 +11472,8 @@ mod tests {
             .expect("deferred theme.js");
         assert!(boot < script);
         assert!(html.contains("<svg"));
-        assert!(html.contains(r#"fill="currentColor""#));
+        // One outline icon family (console redesign §6): stroked, currentColor.
+        assert!(html.contains(r#"stroke="currentColor""#));
     }
 
     #[test]

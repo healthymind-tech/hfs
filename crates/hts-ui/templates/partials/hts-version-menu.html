@@ -1,0 +1,30 @@
+{#-
+  Row actions of one terminology resource version (the browsers' grouped
+  rows and their "+N older" rows): Open, and where the admin API has a verb
+  for it, Set as current / Delete version. Expects `kind`, `m_id`, `m_url`,
+  `m_version`, `m_current` and `m_count` in scope.
+-#}
+<details class="menu menu--actions row-menu">
+  <summary class="btn btn--ghost btn--icon btn--small" aria-label="{{ chrome.i18n.t_arg("hts-term-row-actions", "system", m_url.clone()) }} {{ m_version }}" title="{{ chrome.i18n.t("hts-term-col-actions") }}">⋯</summary>
+  <div class="menu__panel">
+    <a class="menu__option" href="{{ kind.detail_href(m_id, m_version) }}"><span class="menu__option-text">{{ chrome.i18n.t("hts-browser-open") }}</span></a>
+    {% if kind == crate::versions::Kind::CodeSystem %}
+    {% if !m_current && m_count.clone() > 1 %}
+    <form method="post" action="{{ crate::paths::manage() }}/current">
+      <input type="hidden" name="url" value="{{ m_url }}">
+      <input type="hidden" name="version" value="{{ m_version }}">
+      <input type="hidden" name="back" value="{{ crate::paths::ui() }}/code-systems?url={{ m_url|urlencode_strict }}">
+      <button class="menu__option" type="submit" name="action" value="pin"><span class="menu__option-text">{{ chrome.i18n.t("hts-term-set-current") }}</span></button>
+    </form>
+    {% endif %}
+    <a class="menu__option menu__option--danger" href="{{ crate::paths::manage() }}/delete?url={{ m_url|urlencode_strict }}&amp;version={{ m_version|urlencode_strict }}"><span class="menu__option-text">{{ chrome.i18n.t("hts-browser-delete-version") }}</span></a>
+    {% else if kind == crate::versions::Kind::ValueSet %}
+    <form method="post" action="{{ crate::paths::manage() }}/delete-resource" hx-confirm="{{ chrome.i18n.t_arg2("hts-browser-delete-confirm", "url", m_url.clone(), "version", m_version.clone()) }}" data-confirm-danger>
+      <input type="hidden" name="type" value="ValueSet">
+      <input type="hidden" name="url" value="{{ m_url }}">
+      <input type="hidden" name="version" value="{{ m_version }}">
+      <button class="menu__option menu__option--danger" type="submit"><span class="menu__option-text">{{ chrome.i18n.t("hts-browser-delete-version") }}</span></button>
+    </form>
+    {% endif %}
+  </div>
+</details>

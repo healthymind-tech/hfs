@@ -70,7 +70,7 @@
           hx-post="/ui/tenants"
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
-          hx-include="[name='q']"
+          hx-include="#main [name='q']"
           hx-sync="closest .table-card:queue all"
           hx-disabled-elt="find button[type=submit]"
         >
@@ -103,7 +103,7 @@
   <span
     hidden
     data-tenant-mutations
-    hx-include="[name='q']"
+    hx-include="#main [name='q']"
     hx-target="#tenant-rows"
     hx-swap="innerHTML"
     hx-sync="closest .table-card:queue all"

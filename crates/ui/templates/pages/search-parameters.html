@@ -7,7 +7,7 @@
 {% block content_class %} content--app{% endblock %}
 
 {% block content %}
-<section class="page-head page-head--row">
+<section class="page-head page-head--row" id="sp-head" data-md-sync>
   <div>
     <h1 class="page-head__title">{{ i18n.t("sp-heading") }}</h1>
     <p class="page-head__lede">{{ i18n.t("sp-lede") }}</p>
@@ -28,7 +28,7 @@
 <p class="notice notice--warn" id="sp-empty">{{ i18n.t("sp-empty") }}</p>
 {% endif %}
 
-<div class="filter-layout" hx-boost="true">
+<div class="filter-layout" hx-boost="true" data-md="search-parameters">
   <!--
     Resource Filter rail: a search box over resource types, an "All types"
     row, a server-rendered Recently-used group, and a live count next
@@ -48,7 +48,7 @@
     swaps `#sp-rail-list` and pulls the filtered `#sp-rail-recent` in with
     `hx-select-oob`, so the group narrows with the list (#1275).
   -->
-  <aside class="filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
+  <aside class="filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}" data-md-rail>
     <div class="filter-rail__heading">{{ i18n.t("sp-rail-types") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/search-parameters" role="search">
       {% for field in view.hidden_fields %}
@@ -81,7 +81,7 @@
     </div>
   </aside>
 
-  <div class="filter-center">
+  <div class="filter-center" data-md-list>
     <section class="card facets" aria-label="{{ i18n.t("sp-facet-type-label") }}">
       <span class="facet-label">{{ i18n.t("sp-facet-type") }}</span>
       {% for f in view.facets_type %}
@@ -153,7 +153,7 @@
     </section>
   </div>
 
-  <aside class="card detail" aria-label="{{ i18n.t("sp-detail-label") }}">
+  <aside class="card detail" aria-label="{{ i18n.t("sp-detail-label") }}" data-md-detail>
     {% if let Some(d) = view.detail %}
     <h2 class="detail__title">{{ d.code }}
       <span class="tag tag--{{ d.source }}">{{ i18n.t(d.source_key) }}</span>
@@ -220,13 +220,13 @@
     </div>
     {% endif %}
     {% else %}
-    <h2 class="detail__title">{{ i18n.t("sp-detail-empty") }}</h2>
+    <h2 class="detail__title" data-md-empty>{{ i18n.t("sp-detail-empty") }}</h2>
     <p class="detail__hint">{{ i18n.t("sp-detail-empty-hint") }}</p>
     {% endif %}
   </aside>
 </div>
 
-<script src="/ui/assets/resource-filter.js" defer></script>
-<script src="/ui/assets/row-navigation.js" defer></script>
-<script src="/ui/assets/conformance-crud.js" defer></script>
+<script src="/ui/assets/resource-filter.js" defer data-swap-safe></script>
+<script src="/ui/assets/row-navigation.js" defer data-swap-safe></script>
+<script src="/ui/assets/conformance-crud.js" defer data-swap-safe></script>
 {% endblock %}

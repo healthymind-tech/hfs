@@ -690,3 +690,31 @@ hts-term-stat-concepts-shown = en todos los sistemas de códigos coincidentes
 
 tx-denied-current-role = You are signed in with the { $role } role.
 tx-searching = Searching…
+
+# Console redesign: sidebar blocks and route tabs (REDESIGN.md §5)
+hts-nav-overview = Resumen
+hts-nav-group-browse = Explorar
+hts-nav-group-loaded = Cargadas e importaciones
+
+# Console redesign: grouped versions, row menu, Maintenance tab
+hts-term-tab-loaded = Cargadas
+hts-term-tab-maint = Mantenimiento
+hts-term-older = +{ $count } anteriores
+hts-term-older-version = versión anterior
+hts-term-row-actions = Acciones de { $system }
+hts-job-log-wrap = Ajustar
+hts-job-log-copy = Copiar
+
+## Version grouping (one row per canonical URL)
+hts-browser-open = Abrir
+hts-browser-delete-version = Eliminar versión…
+hts-browser-delete-confirm = ¿Eliminar la versión { $version } de { $url }?
+hts-browser-older-failed = No se pudieron cargar las versiones anteriores.
+hts-cs-browser-total-grouped = { $total } sistemas de códigos · { $versions } versiones
+hts-vs-browser-total-grouped = { $total } conjuntos de valores · { $versions } versiones
+hts-cm-browser-total-grouped = { $total } mapas de conceptos · { $versions } versiones
+hts-version-switch = Versión
+hts-version-switch-count = { $count } versiones
+hts-version-switch-current = actual
+hts-term-stat-versions = { $versions } versiones
+hts-term-stat-other-versions = { $vs } / { $cm } versiones

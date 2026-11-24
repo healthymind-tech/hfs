@@ -14,6 +14,7 @@
   and hide `name` behind a fallback, which broke column identity.
 -#}
 <div id="hts-cs-rows">
+  {%- let kind = crate::versions::Kind::CodeSystem %}
   {#-
     Inline degraded banner. Included here rather than reusing
     partials/hts-degraded.html to sidestep Askama's include-scope rule for
@@ -37,7 +38,7 @@
     {#- Match count up front (UIF defect 3): it used to appear only in the
         foot, below 25 rows. -#}
     {% if let Some(page) = view.page() %}{% if let Some(total) = page.total %}
-    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}" data-searching="{{ chrome.i18n.t("tx-searching") }}">{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}</span></div>
+    <div class="table-meta"><span class="toolbar__count" data-total="{{ total }}" data-searching="{{ chrome.i18n.t("tx-searching") }}">{% if let Some(versions) = page.versions_total %}{{ chrome.i18n.t_arg2("hts-cs-browser-total-grouped", "total", chrome.i18n.num(*total), "versions", chrome.i18n.num(*versions)) }}{% else %}{{ chrome.i18n.t_arg("hts-browser-total", "total", chrome.i18n.num(*total)) }}{% endif %}</span></div>
     {% endif %}{% endif %}
     <div class="table-wrap" tabindex="0">
       <table class="data-table data-table--stack" aria-describedby="hts-cs-browser-heading">
@@ -49,6 +50,7 @@
             <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-url") }}</th>
             <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-version") }}</th>
             <th scope="col">{{ chrome.i18n.t("hts-cs-browser-column-status") }}</th>
+            <th scope="col" class="col-actions"><span class="visually-hidden">{{ chrome.i18n.t("hts-term-col-actions") }}</span></th>
           </tr>
         </thead>
         <tbody aria-live="polite">
@@ -56,12 +58,15 @@
             {% if page.rows.is_empty() %}
               {% if !view.count_over_max %}
               <tr class="data-table__empty">
-                <td colspan="5">{{ chrome.i18n.t("hts-cs-browser-empty") }}</td>
+                <td colspan="6">{{ chrome.i18n.t("hts-cs-browser-empty") }}</td>
               </tr>
               {% endif %}
             {% else %}
               {% for row in page.rows %}
-              <tr>
+              {#- One row per canonical URL: the version a version-less
+                  request resolves to; "+N older" loads the others in
+                  place (`shell.js`, `versions::older_rows`). -#}
+              <tr data-system="{{ row.url }}">
                 <td class="col-name">
                   {#- CodeSystem ids carry a version pipe (`icd9cm|2015`),
                       so the path segment must be percent-encoded. -#}
@@ -70,16 +75,21 @@
                     {%- else %}{{ row.id }}
                     {%- endif %}
                   </a>
+                  {% if row.version_count.clone() > 1 %}<button type="button" class="versions-toggle" data-versions-toggle data-versions-src="{{ kind.older_href(row.url) }}{{ view.filters.match_query() }}"{% if view.filters.misses(row.name.as_str(), row.title.as_str(), row.status.as_str()) %} data-autoexpand{% endif %} aria-expanded="false">{{ chrome.i18n.t_arg("hts-term-older", "count", (row.version_count.clone() - 1).to_string()) }}</button>{% endif %}
                 </td>
                 <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-title") }}">{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
                 <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-url") }}">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url url--clip" title="{{ row.url }}">{{ row.url }}</span>{% endif %}</td>
-                <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-version") }}">{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
+                <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-version") }}">{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}{% if !row.date.is_empty() %} <span class="cell-sub">{{ row.date }}</span>{% endif %}</td>
                 <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-status") }}">
                   {% if row.status.is_empty() %}
                     &mdash;
                   {% else %}
                     <span class="tag tag--{{ row.status }}">{{ chrome.i18n.t(format!("hts-cs-status-{}", row.status).as_str()) }}</span>
                   {% endif %}
+                </td>
+                <td class="col-actions">
+                  {% let m_id = row.id.clone() %}{% let m_url = row.url.clone() %}{% let m_version = row.version.clone() %}{% let m_current = true %}{% let m_count = row.version_count %}
+                  {% include "partials/hts-version-menu.html" %}
                 </td>
               </tr>
               {% endfor %}

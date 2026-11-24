@@ -1,58 +1,53 @@
 {% import "partials/components.html" as ui %}
 {#
-  Manager console sidebar (design §10.1): the endpoint switcher, then the
-  sections built by `manager::nav::build` — Overview, the current endpoint's
-  Data / Configure / Operate groups, server Settings. Other packages add
+  Manager console sidebar (console redesign §5.1): blocks built by
+  `manager::nav::build` — the top block (Overview, Authorization servers,
+  Sync jobs), the current endpoint headed by a compact switcher chip, the
+  Terminology block, and Console settings in the foot. Sibling pages share
+  one entry (the page's own route tabs reach the rest). Other packages add
   entries with `manager::nav::register`, never by editing this file.
 #}
     <div class="sidebar-nav" id="sidebar-nav" data-nav-key="{{ status.nav_key() }}">
-    <details class="menu endpoint-switch">
-      <summary class="selector" aria-label="{{ i18n.t("mgr-switch-endpoint") }}">
-        {% if let Some(ep) = status.nav_endpoint() %}
-        <span class="avatar avatar--brand">{{ ep.initials }}</span>
-        <span class="selector__label">
-          <span class="endpoint-switch__name">{{ ep.display }}</span>
-          <span class="endpoint-switch__path">{{ ep.path }}</span>
-        </span>
-        {% else %}
-        <span class="avatar avatar--brand">{% include "icons/grid.svg" %}</span>
-        <span class="selector__label">
-          <span class="endpoint-switch__name">{{ i18n.t("mgr-all-endpoints") }}</span>
-          <span class="endpoint-switch__path">{{ i18n.t_arg("mgr-endpoint-count", "count", status.endpoint_options().len()) }}</span>
-        </span>
+    <nav class="nav" aria-label="{{ i18n.t("nav-main") }}">
+      {% for group in status.nav_groups() %}
+      {% if !group.block.is_foot() %}
+      <div class="nav__group" data-nav-section="{{ group.block.id() }}">
+        {% if group.block.is_endpoint() %}
+        <div class="nav__label">
+          <span>{{ i18n.t(group.label_key) }}</span>
+          {% include "partials/shell/endpoint-chip.html" %}
+        </div>
+        {% else if !group.label_key.is_empty() %}
+        <div class="nav__label"><span>{{ i18n.t(group.label_key) }}</span></div>
         {% endif %}
-        <span class="selector__chevrons">
-          <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
-          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-        </span>
-      </summary>
-      <div class="menu__panel">
-        <div class="menu__heading">{{ i18n.t("mgr-switch-endpoint") }}</div>
-        <a class="menu__option" href="/ui"{% if status.current_endpoint().is_none() && active_page == "overview" %} aria-current="true"{% endif %}>
-          <span class="avatar">{% include "icons/grid.svg" %}</span>
-          {{ i18n.t("mgr-all-endpoints") }}
-        </a>
-        {% for ep in status.endpoint_options() %}
-        <a class="menu__option" href="{{ ep.href }}"{% if let Some(cur) = status.nav_endpoint() %}{% if cur.name == ep.name %} aria-current="true"{% endif %}{% endif %}>
-          <span class="avatar">{{ ep.initials }}</span>
-          <span class="menu__option-text">{{ ep.display }} <small>{{ ep.path }}</small></span>
-          {% if !ep.serving %}<span class="tag tag--{{ ep.tone }}">{{ i18n.t(ep.status_key) }}</span>{% endif %}
+        {% for link in group.links %}
+        <a class="nav-item" href="{{ link.href }}" data-nav-id="{{ link.id }}" data-nav-ids="{{ link.ids }}" data-match="{{ link.match_prefix }}"{% if !link.boost %} data-full-load{% endif %}{% if status.nav_current(link, active_page) %} aria-current="page"{% endif %}>
+          <span class="icon">{% call ui::icon(link.icon) %}{% endcall %}</span>
+          <span class="nav-item__label">{{ i18n.t(link.label_key) }}</span>
         </a>
         {% endfor %}
       </div>
-    </details>
-
-    <hr class="divider">
-
-    <nav class="nav" aria-label="{{ i18n.t("nav-main") }}">
-      {% for group in status.nav_groups() %}
-      <div class="nav__section" data-nav-section="{{ group.section.id() }}">{{ i18n.t(group.label_key) }}</div>
+      {% endif %}
+      {% endfor %}
+      {% if !status.nav_has_endpoint_block() && !status.endpoint_options().is_empty() %}
+      <div class="nav__group" data-nav-section="data">
+        <div class="nav__label">
+          <span>{{ i18n.t("mgr-nav-section-endpoint") }}</span>
+          {% include "partials/shell/endpoint-chip.html" %}
+        </div>
+      </div>
+      {% endif %}
+    </nav>
+    {% for group in status.nav_groups() %}
+    {% if group.block.is_foot() %}
+    <div class="sidebar__foot" data-nav-section="{{ group.block.id() }}">
       {% for link in group.links %}
-      <a class="nav-item" href="{{ link.href }}" data-nav-id="{{ link.id }}" data-match="{{ link.match_prefix }}"{% if !link.boost %} data-full-load{% endif %}{% if status.nav_current(link.id, active_page) %} aria-current="page"{% endif %} title="{{ i18n.t(link.label_key) }}">
+      <a class="nav-item" href="{{ link.href }}" data-nav-id="{{ link.id }}" data-nav-ids="{{ link.ids }}" data-match="{{ link.match_prefix }}"{% if !link.boost %} data-full-load{% endif %}{% if status.nav_current(link, active_page) %} aria-current="page"{% endif %}>
         <span class="icon">{% call ui::icon(link.icon) %}{% endcall %}</span>
         <span class="nav-item__label">{{ i18n.t(link.label_key) }}</span>
       </a>
       {% endfor %}
-      {% endfor %}
-    </nav>
+    </div>
+    {% endif %}
+    {% endfor %}
     </div>
