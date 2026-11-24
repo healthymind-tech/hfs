@@ -15021,14 +15021,27 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     display: contents;
   }
 
+  /* The real radio lies over its segment (transparent, clickable), so
+     pointer, keyboard and automation all act on the input itself. */
   .config-form .radio-card input {
-    position: absolute;
-    width: 1px;
-    height: 1px;
+    position: relative;
+    z-index: 2;
+    grid-row: 1;
+    width: 100%;
+    height: 100%;
     margin: 0;
     opacity: 0;
-    pointer-events: none;
+    cursor: pointer;
   }
+
+  .config-form .radio-card:nth-child(1) > input,
+  .config-form .radio-card:nth-child(1) > .radio-card__title { grid-column: 1; }
+  .config-form .radio-card:nth-child(2) > input,
+  .config-form .radio-card:nth-child(2) > .radio-card__title { grid-column: 2; }
+  .config-form .radio-card:nth-child(3) > input,
+  .config-form .radio-card:nth-child(3) > .radio-card__title { grid-column: 3; }
+  .config-form .radio-card:nth-child(4) > input,
+  .config-form .radio-card:nth-child(4) > .radio-card__title { grid-column: 4; }
 
   .config-form .radio-card__title {
     grid-row: 1;
