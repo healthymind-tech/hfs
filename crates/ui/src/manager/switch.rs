@@ -83,7 +83,10 @@ pub(crate) fn reachable(nav: &[super::nav::NavGroup]) -> Vec<Reachable> {
 }
 
 fn under(path: &str, prefix: &str) -> bool {
-    path == prefix || path.strip_prefix(prefix).is_some_and(|r| r.starts_with('/'))
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|r| r.starts_with('/'))
 }
 
 /// Map `from` onto endpoint `target`. `pages` are the pages reachable on
@@ -194,7 +197,11 @@ async fn switch(
         ""
     };
     let mapped = map_route(from, &ep, &pages);
-    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, mapped.href.clone())]).into_response();
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, mapped.href.clone())],
+    )
+        .into_response();
     let headers = response.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&format!(
         "{}={ep}; Path=/ui; Max-Age=31536000; SameSite=Lax",
@@ -264,7 +271,9 @@ mod tests {
         // Some endpoint page an admin reaches and a viewer does not.
         let only_admin = admin
             .iter()
-            .find(|r| r.prefix.starts_with("/ui/e/b/") && !viewer.iter().any(|v| v.prefix == r.prefix))
+            .find(|r| {
+                r.prefix.starts_with("/ui/e/b/") && !viewer.iter().any(|v| v.prefix == r.prefix)
+            })
             .expect("an admin-only endpoint page");
         let from = only_admin.prefix.replacen("/ui/e/b", "/ui/e/a", 1);
         let m = map_route(&from, "b", &viewer);
@@ -276,7 +285,10 @@ mod tests {
     #[test]
     fn pages_outside_an_endpoint_stay_put() {
         let p = pages("b", ConsoleRole::Admin);
-        assert_eq!(map_route("/ui/terminology/code-systems?name=x", "b", &p).href, "/ui/terminology/code-systems?name=x");
+        assert_eq!(
+            map_route("/ui/terminology/code-systems?name=x", "b", &p).href,
+            "/ui/terminology/code-systems?name=x"
+        );
         assert_eq!(map_route("/ui", "b", &p).href, "/ui");
         assert_eq!(map_route("https://evil.example/x", "b", &p).href, "/ui/e/b");
     }
