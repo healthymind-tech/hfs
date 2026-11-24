@@ -20,6 +20,8 @@
 //! dependency so that every other crate can depend on it.
 
 pub mod console;
+#[cfg(feature = "http-guard")]
+pub mod http_guard;
 pub mod model;
 pub mod name;
 pub mod outbound;

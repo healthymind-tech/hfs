@@ -34,15 +34,25 @@ base64 = "0.22"
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"], optional = true }
 
+# The SSRF guard for reqwest clients (feature `http-guard`): a DNS resolver
+# that checks every resolved address and a redirect policy that checks every
+# hop against the outbound policy.
+reqwest = { version = "0.12", default-features = false, optional = true }
+
 [features]
 default = []
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+http-guard = ["dep:reqwest", "tokio/net"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 # PG integration tests (`postgres_integration_*`, feature `postgres`): the
 # real fork migrations create the tables.
 helios-persistence = { path = "../persistence", version = "0.2.9", default-features = false, features = ["R4", "postgres"] }
+
+[[test]]
+name = "http_guard"
+required-features = ["http-guard"]
 
 [[test]]
 name = "pg_console"
