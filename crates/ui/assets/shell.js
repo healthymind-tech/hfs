@@ -1310,7 +1310,39 @@
     if (t && t.querySelector) autoExpand(document.getElementById("main"));
   });
 
+  /* ---- Back/Forward to a page that needs a fresh document --------------
+     A page loaded as a full document (its own `<script src>` in #main) must
+     not come back from htmx's history cache: restoring the snapshot re-runs
+     every page script in this document (a second, dead code editor; every
+     document listener bound twice — a Delete sent twice). Its snapshot is
+     never saved (`hx-history="false"` on #main while it is shown, also
+     dropping a snapshot saved before this rule), and a cache miss reloads
+     the address instead of fetching it into the live page. */
+  if (window.htmx && window.htmx.config) window.htmx.config.refreshOnHistoryMiss = true;
+
+  function needsFreshDocument(main) {
+    if (!main) return false;
+    var scripts = main.querySelectorAll("script[src]");
+    for (var i = 0; i < scripts.length; i++) {
+      if (!scripts[i].hasAttribute("data-swap-safe")) return true;
+    }
+    return false;
+  }
+
+  function keepOutOfHistory(main) {
+    if (!needsFreshDocument(main)) return;
+    main.setAttribute("hx-history", "false");
+    try {
+      var key = "htmx-history-cache";
+      var here = location.pathname + location.search;
+      var cache = JSON.parse(localStorage.getItem(key) || "[]");
+      var kept = cache.filter(function (item) { return item && item.url !== here; });
+      if (kept.length !== cache.length) localStorage.setItem(key, JSON.stringify(kept));
+    } catch (e) {}
+  }
+
   function start() {
+    keepOutOfHistory(document.getElementById("main"));
     autoExpand(document.getElementById("main"));
     rememberPage();
     restoreSidebarScroll();
