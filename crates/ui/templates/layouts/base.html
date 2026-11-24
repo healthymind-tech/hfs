@@ -13,8 +13,11 @@
   <link rel="stylesheet" href="{{ status.assets() }}/search.css">
   <meta name="hm-build" content="{{ status.build_id() }}">
   <!-- htmx settings for in-place navigation: history snapshots of #main
-       only (the sidebar is never part of a snapshot), no inline styles. -->
-  <meta name="htmx-config" content='{"historyCacheSize":20,"includeIndicatorStyles":false,"allowEval":false,"scrollIntoViewOnBoost":false,"refreshOnHistoryMiss":false}'>
+       only (the sidebar is never part of a snapshot), no inline styles; a
+       page missing from the snapshot cache (a full-load page keeps itself
+       out of it, shell.js) is reloaded, never fetched into the live page,
+       which would run its scripts a second time. -->
+  <meta name="htmx-config" content='{"historyCacheSize":20,"includeIndicatorStyles":false,"allowEval":false,"scrollIntoViewOnBoost":false,"refreshOnHistoryMiss":true}'>
   <!-- The effective tenant for browser-issued FHIR calls (#344). -->
   <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
   <!-- Where the FHIR API lives, as seen from the browser: the path of

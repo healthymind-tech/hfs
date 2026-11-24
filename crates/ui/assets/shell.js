@@ -1346,8 +1346,8 @@
      document listener bound twice — a Delete sent twice). Its snapshot is
      never saved (`hx-history="false"` on #main while it is shown, also
      dropping a snapshot saved before this rule), and a cache miss reloads
-     the address instead of fetching it into the live page. */
-  if (window.htmx && window.htmx.config) window.htmx.config.refreshOnHistoryMiss = true;
+     the address instead of fetching it into the live page
+     (`refreshOnHistoryMiss` in the layout's htmx-config). */
 
   function needsFreshDocument(main) {
     if (!main) return false;
