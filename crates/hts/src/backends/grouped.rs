@@ -124,33 +124,86 @@ pub(crate) fn build(table: &str, dialect: Dialect, query: &ResourceSearchQuery) 
     } else {
         "updated_at"
     };
+    let filtered = query.url.is_some()
+        || query.version.is_some()
+        || query.status.is_some()
+        || query.name.is_some()
+        || query.title.is_some();
+    // Byte-order comparison of the lower-cased label: sorting ~30,000 group
+    // labels under a linguistic collation dominated the query on PostgreSQL.
+    let fast = match dialect {
+        Dialect::Postgres => " COLLATE \"C\"",
+        Dialect::Sqlite => "",
+    };
     let order = match (query.group, query.sort) {
         (Some(VersionGroup::Older), _) => "url, hm_rn".to_string(),
-        (_, Some(sort)) => super::explicit_sort_order_by(table, sort),
+        (_, Some(sort)) => {
+            let mut order = super::explicit_sort_order_by(table, sort);
+            for column in ["name", "title", "url", "version", "status"] {
+                order = order.replace(&format!("LOWER({column}) "), &format!("LOWER({column}){fast} "));
+            }
+            order
+        }
         (_, None) => format!(
             "(CASE WHEN COALESCE(title, name, '') = '' THEN 1 ELSE 0 END), \
-             LOWER(COALESCE(title, name, url)), url"
+             LOWER(COALESCE(title, name, url)){fast}, url"
         ),
     };
-    let keep = match query.group {
-        Some(VersionGroup::Older) => "hm_rn > 1",
-        _ => "hm_rn = 1",
+    let select = match query.group {
+        // `older`: the other versions of the matched canonicals. Used for one
+        // canonical at a time (the "+N older" rows), so a window over its
+        // few rows is cheap.
+        Some(VersionGroup::Older) => format!(
+            "WITH hm_ranked AS ( \
+               SELECT {table}.id, {table}.url, {table}.version, {table}.name, {table}.title, \
+                      {table}.status, {table}.fhir_id, {date} AS hm_date, \
+                      ROW_NUMBER() OVER (PARTITION BY {table}.url ORDER BY {prec}) AS hm_rn, \
+                      COUNT(*) OVER (PARTITION BY {table}.url) AS hm_n \
+               FROM {table} WHERE {table}.url IN (SELECT url FROM {table} WHERE {filter})) \
+             SELECT id, url, version, name, title, status, fhir_id, hm_n, hm_date \
+             FROM hm_ranked WHERE hm_rn > 1 ORDER BY {order} LIMIT {limit} OFFSET {offset}",
+            prec = precedence(table),
+            limit = pl(6),
+            offset = pl(7),
+        ),
+        // `true`: page the canonical groups first (one aggregate pass over
+        // the url index), then pick the precedence winner of only the page's
+        // groups — 25 small index lookups instead of ranking every row.
+        _ => format!(
+            "WITH hm_groups AS ( \
+               SELECT url, COUNT(*) AS hm_n, MAX(name) AS name, MAX(title) AS title, \
+                      MAX(version) AS version, MAX(status) AS status, MAX({updated}) AS {updated}, \
+                      MAX(id) AS id \
+               FROM {table} WHERE {scope} \
+               GROUP BY url), \
+             hm_page AS ( \
+               SELECT hm_groups.*, ROW_NUMBER() OVER (ORDER BY {order}) AS hm_pos \
+               FROM hm_groups ORDER BY {order} LIMIT {limit} OFFSET {offset}), \
+             hm_rep AS ( \
+               SELECT hm_page.hm_pos, hm_page.hm_n, \
+                      (SELECT {table}.id FROM {table} WHERE {table}.url = hm_page.url \
+                       ORDER BY {prec} LIMIT 1) AS hm_id \
+               FROM hm_page) \
+             SELECT t.id, t.url, t.version, t.name, t.title, t.status, t.fhir_id, hm_rep.hm_n, \
+                    {tdate} AS hm_date \
+             FROM hm_rep JOIN {table} t ON t.id = hm_rep.hm_id ORDER BY hm_rep.hm_pos",
+            prec = precedence(table),
+            limit = pl(6),
+            offset = pl(7),
+            // Unfiltered (the common case): one pass, no semi-join. Filtered:
+            // a group matches when any of its versions does, and still
+            // counts all of them.
+            scope = if filtered {
+                format!("url IN (SELECT url FROM {table} WHERE {filter})")
+            } else {
+                filter.clone()
+            },
+            tdate = match dialect {
+                Dialect::Postgres => "(t.resource_json->>'date')".to_string(),
+                Dialect::Sqlite => "json_extract(t.resource_json, '$.date')".to_string(),
+            },
+        ),
     };
-    let select = format!(
-        "WITH hm_matched AS (SELECT DISTINCT url FROM {table} WHERE {filter}), \
-         hm_ranked AS ( \
-           SELECT {table}.id, {table}.url, {table}.version, {table}.name, {table}.title, \
-                  {table}.status, {table}.fhir_id, {table}.{updated} AS {updated}, \
-                  {date} AS hm_date, \
-                  ROW_NUMBER() OVER (PARTITION BY {table}.url ORDER BY {prec}) AS hm_rn, \
-                  COUNT(*) OVER (PARTITION BY {table}.url) AS hm_n \
-           FROM {table} WHERE {table}.url IN (SELECT url FROM hm_matched)) \
-         SELECT id, url, version, name, title, status, fhir_id, hm_n, hm_date \
-         FROM hm_ranked WHERE {keep} ORDER BY {order} LIMIT {limit} OFFSET {offset}",
-        prec = precedence(table),
-        limit = pl(6),
-        offset = pl(7),
-    );
     let count = match query.group {
         Some(VersionGroup::Older) => format!(
             "SELECT COUNT(*) - COUNT(DISTINCT url) FROM {table} \
@@ -230,10 +283,10 @@ mod tests {
             ..Default::default()
         };
         let g = build("code_systems", Dialect::Postgres, &q);
-        assert!(g.select.contains("ROW_NUMBER() OVER (PARTITION BY code_systems.url ORDER BY"));
+        assert!(g.select.contains("GROUP BY url ORDER BY"));
         assert!(g.select.contains(&*super::super::cs_precedence_order_by("code_systems")));
-        assert!(g.select.contains("WHERE hm_rn = 1"));
-        assert!(g.select.ends_with("LIMIT $6 OFFSET $7"));
+        assert!(g.select.contains("LIMIT $6 OFFSET $7"));
+        assert!(g.select.ends_with("ORDER BY hm_rep.hm_pos"));
         assert!(g.count.starts_with("SELECT COUNT(DISTINCT url) FROM code_systems"));
         q.group = Some(VersionGroup::Older);
         let older = build("value_sets", Dialect::Sqlite, &q);
