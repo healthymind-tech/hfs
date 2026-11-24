@@ -14821,11 +14821,11 @@ details.card[open] > summary.card-head > .disclosure__chevron {
   }
 
   .config-form .radio-card:first-child .radio-card__title {
-    border-radius: 8px 0 0 8px;
+    border-radius: 6px 0 0 6px;
   }
 
   .config-form .radio-card:last-child .radio-card__title {
-    border-radius: 0 8px 8px 0;
+    border-radius: 0 6px 6px 0;
   }
 
   .config-form .radio-card__title {
@@ -15906,7 +15906,7 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     margin-left: 0;
     padding: 2px;
     border: 0;
-    border-radius: 8px;
+    border-radius: 6px;
     background: var(--surface-2);
     box-shadow: none;
     overflow-x: auto;
@@ -16079,11 +16079,11 @@ details.card[open] > summary.card-head > .disclosure__chevron {
       box-shadow var(--dur-2) var(--ease-out);
   }
 
-  .choice-grid > .choice-card:nth-child(1) > .choice-card__title { grid-column: 1; border-left-width: 2px; border-radius: 8px 0 0 8px; }
+  .choice-grid > .choice-card:nth-child(1) > .choice-card__title { grid-column: 1; border-left-width: 2px; border-radius: 6px 0 0 6px; }
   .choice-grid > .choice-card:nth-child(2) > .choice-card__title { grid-column: 2; }
   .choice-grid > .choice-card:nth-child(3) > .choice-card__title { grid-column: 3; }
   .choice-grid > .choice-card:nth-child(4) > .choice-card__title { grid-column: 4; }
-  .choice-grid > .choice-card:last-child > .choice-card__title { border-right-width: 2px; border-radius: 0 8px 8px 0; }
+  .choice-grid > .choice-card:last-child > .choice-card__title { border-right-width: 2px; border-radius: 0 6px 6px 0; }
 
   .choice-grid > .choice-card > .choice-card__title > input {
     position: absolute;
@@ -16145,8 +16145,8 @@ details.card[open] > summary.card-head > .disclosure__chevron {
   .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(4) > input,
   .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(4) > .radio-card__title { grid-column: 4; }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:first-child > .radio-card__title { border-left-width: 2px; border-radius: 8px 0 0 8px; }
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:last-child > .radio-card__title { border-right-width: 2px; border-radius: 0 8px 8px 0; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:first-child > .radio-card__title { border-left-width: 2px; border-radius: 6px 0 0 6px; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:last-child > .radio-card__title { border-right-width: 2px; border-radius: 0 6px 6px 0; }
 
   .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:has(> input:checked) > .radio-card__title {
     border-radius: 6px;
