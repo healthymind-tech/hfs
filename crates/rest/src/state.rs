@@ -709,12 +709,29 @@ impl<S: ResourceStorage> AppState<S> {
         if self.config.terminology_server.as_deref() == Some(url.as_str()) {
             return self.search_terminology.clone();
         }
+        // The endpoint's sealed credential for its own server, sent on the
+        // expansion calls (the cache key changes with it).
+        let token = crate::endpoint::with_current(|r| {
+            crate::terminology::endpoint_terminology_token(&r.endpoint)
+        })
+        .flatten();
+        let key = format!(
+            "{url}|{}",
+            crate::terminology::token_fingerprint(token.as_deref())
+        );
         let service = self
             .endpoint_search_terminology
-            .entry(url.clone())
+            .entry(key)
             .or_insert_with(|| {
-                Arc::new(crate::terminology::SearchTerminology::from_config(
+                // A console-entered URL: guarded, with the endpoint's token.
+                let (label, service) = crate::terminology::endpoint_service(
                     &url,
+                    token,
+                    crate::terminology::TxCaller::Search,
+                );
+                Arc::new(crate::terminology::SearchTerminology::from_service(
+                    &label,
+                    service,
                     &self.config.search_terminology,
                 ))
             })
