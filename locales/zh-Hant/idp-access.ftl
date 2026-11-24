@@ -114,6 +114,7 @@ idpa-mode-replace-hint = 清單會變成與貼上內容完全相同；不在其�
 idpa-preview = 預覽
 idpa-back = 返回
 idpa-apply = 套用
+idpa-apply-nothing = 沒有需要套用的變更
 idpa-apply-add = 新增 { $count } 筆
 idpa-apply-replace = 取代（+{ $added } −{ $removed }，共 { $total } 筆）
 idpa-too-many = 一次太多：每次貼上或每個檔案最多 { $max } 個參照。

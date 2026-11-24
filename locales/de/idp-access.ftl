@@ -114,6 +114,7 @@ idpa-mode-replace-hint = Die Liste wird genau das Eingefügte; alles andere wird
 idpa-preview = Vorschau
 idpa-back = Zurück
 idpa-apply = Anwenden
+idpa-apply-nothing = Keine Änderungen
 idpa-apply-add = { $count } hinzufügen
 idpa-apply-replace = Ersetzen (+{ $added } −{ $removed }, { $total } gesamt)
 idpa-too-many = Zu viel auf einmal: höchstens { $max } Referenzen pro Einfügen oder Datei.

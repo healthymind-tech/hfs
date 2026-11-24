@@ -114,6 +114,7 @@ idpa-mode-replace-hint = La lista pasa a ser exactamente lo pegado; lo demás se
 idpa-preview = Vista previa
 idpa-back = Atrás
 idpa-apply = Aplicar
+idpa-apply-nothing = Nada que aplicar
 idpa-apply-add = Añadir { $count }
 idpa-apply-replace = Reemplazar (+{ $added } −{ $removed }, { $total } en total)
 idpa-too-many = Demasiado de una vez: como máximo { $max } referencias por pegado o archivo.

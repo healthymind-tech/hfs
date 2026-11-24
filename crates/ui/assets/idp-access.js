@@ -697,7 +697,7 @@
     var added = +pv.getAttribute("data-added") + (inc && inc.checked ? missing : 0);
     var work = added + +pv.getAttribute("data-removed") + +pv.getAttribute("data-changed");
     a.disabled = work === 0;
-    a.textContent = pv.getAttribute("data-label").replace(/\d[\d,]*/, function (m) {
+    a.textContent = work === 0 ? this.msg("apply-nothing") : pv.getAttribute("data-label").replace(/\d[\d,]*/, function (m) {
       return pv.getAttribute("data-mode") === "add" ? added.toLocaleString() : m;
     });
   };

@@ -9,7 +9,7 @@
       data-key="{{ o.key }}" aria-selected="false"{% if o.granted.is_some() %} aria-disabled="true"{% endif %}>
     <span class="access-pick__box" aria-hidden="true"></span>
     <span class="access-pick__main">
-      <span class="access-pick__name">{% if o.name.is_empty() %}{{ o.reference }}{% else %}{{ o.name }}{% endif %}</span>
+      <span class="access-pick__name" title="{{ o.reference }}">{% if o.name.is_empty() %}{{ o.reference }}{% else %}{{ o.name }}{% endif %}</span>
       {% if !o.name.is_empty() || !o.detail.is_empty() %}<span class="access-pick__sub">{% if !o.name.is_empty() %}<code>{{ o.reference }}</code>{% endif %}{% if !o.name.is_empty() && !o.detail.is_empty() %} · {% endif %}{{ o.detail }}</span>{% endif %}
     </span>
     {% if let Some(k) = o.granted %}<span class="tag">{{ i18n.t("idpa-already") }} · {{ i18n.t(k) }}</span>{% endif %}

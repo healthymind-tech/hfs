@@ -115,6 +115,7 @@ idpa-mode-replace-hint = The list becomes exactly what you pasted; anything not 
 idpa-preview = Preview
 idpa-back = Back
 idpa-apply = Apply
+idpa-apply-nothing = No changes to apply
 idpa-apply-add = Add { $count }
 idpa-apply-replace = Replace (+{ $added } −{ $removed }, { $total } total)
 idpa-too-many = Too much at once: at most { $max } references per paste or file.
