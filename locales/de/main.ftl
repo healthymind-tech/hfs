@@ -1773,3 +1773,21 @@ activity-running = { $count ->
    *[other] { $count } Aufträge laufen
 }
 activity-detail = Laufende Terminologie-Importe: { $imports } · Synchronisationen: { $syncs }
+
+## List-and-editor workspace (hm/vd-layout): rail toggle, quick switcher, editor/form split.
+ws-rail-collapse = Liste einklappen
+ws-rail-expand = Liste anzeigen
+ws-switch-vd = View-Definition wechseln
+ws-switch-lib = Zu einem anderen Eintrag wechseln
+ws-switch-filter = Nach Name filtern
+ws-switch-none = Keine Treffer
+ws-switch-more = Vollständige Liste öffnen
+ws-pane-label = Editor-Layout
+ws-pane-json = JSON
+ws-pane-both = Beide
+ws-pane-form = Formular
+ws-split-label = Breite von Editor und Formular ändern
+sb-collapse = Seitenleiste einklappen
+sb-expand = Seitenleiste ausklappen
+sb-collapsed = Seitenleiste eingeklappt
+sb-expanded = Seitenleiste ausgeklappt

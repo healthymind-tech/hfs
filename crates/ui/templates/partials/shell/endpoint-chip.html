@@ -4,9 +4,12 @@
           <details class="menu endpoint-switch">
             <summary class="ep-chip" aria-label="{{ i18n.t("mgr-switch-endpoint") }}">
               {% if let Some(ep) = status.nav_endpoint() %}
+              {#- The collapsed sidebar shows the chip as this avatar alone. -#}
+              <span class="ep-chip__avatar" aria-hidden="true">{{ ep.initials }}</span>
               <span class="dot dot--{{ ep.tone }}" aria-hidden="true"></span>
               <span class="endpoint-switch__name">{{ ep.display }}</span>
               {% else %}
+              <span class="ep-chip__avatar" aria-hidden="true">{% include "icons/grid.svg" %}</span>
               <span class="endpoint-switch__name">{{ i18n.t("mgr-all-endpoints") }}</span>
               {% endif %}
               <span class="icon">{% include "icons/chevron-down.svg" %}</span>

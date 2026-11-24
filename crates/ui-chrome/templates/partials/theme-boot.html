@@ -9,7 +9,15 @@
   light | dark) and the effective `data-theme` (light | dark) on <html> --
   and `data-kbd="mac"` on Apple platforms, so shortcut hints (⌘K vs
   Ctrl K) are right from the first paint and never swapped afterwards.
+  It also stamps the list-and-editor workspace preferences
+  (`crates/ui/assets/workspace.js`) kept in localStorage: `data-ws-rail`
+  (collapsed | open), `data-ws-view` (json | form; absent = both) and the
+  `--ws-split` editor share (20-80), so a collapsed rail or a JSON-only
+  view never flashes in its default state first. And the console sidebar's
+  state, `data-sb` (collapsed | expanded) from localStorage `hfs-sidebar`,
+  else by width (collapsed below 1280px, marked `data-sb-auto`), so the
+  icon rail never flashes wide (`crates/ui/assets/sidebar-collapse.js`).
   Everything else -- cycling, persistence, migration, cross-tab and
   cross-console sync, animation -- lives in `crates/ui/assets/theme.js`.
-#}<script>(function(d,w){var e=d.documentElement,p=null;e.classList.add("js");try{var m=d.cookie.match(/(?:^|;\s*){{ cookie }}=(system|light|dark)(?:;|$)/);p=m&&m[1];if(!p){var l=w.localStorage.getItem("{{ legacy_key }}");if(l==="light"||l==="dark")p=l}}catch(x){}p=p||"system";var k=p==="dark"||(p==="system"&&!!w.matchMedia&&w.matchMedia("(prefers-color-scheme: dark)").matches);if(/Mac|iPhone|iPad/.test(w.navigator.platform||w.navigator.userAgent||""))e.setAttribute("data-kbd","mac");e.setAttribute("data-theme-pref",p);e.setAttribute("data-theme",k?"dark":"light")})(document,window);</script>
+#}<script>(function(d,w){var e=d.documentElement,p=null;e.classList.add("js");try{var m=d.cookie.match(/(?:^|;\s*){{ cookie }}=(system|light|dark)(?:;|$)/);p=m&&m[1];if(!p){var l=w.localStorage.getItem("{{ legacy_key }}");if(l==="light"||l==="dark")p=l}}catch(x){}p=p||"system";var k=p==="dark"||(p==="system"&&!!w.matchMedia&&w.matchMedia("(prefers-color-scheme: dark)").matches);if(/Mac|iPhone|iPad/.test(w.navigator.platform||w.navigator.userAgent||""))e.setAttribute("data-kbd","mac");try{var s=w.localStorage,r=s.getItem("hfs-ws-rail"),v=s.getItem("hfs-ws-view"),q=+s.getItem("hfs-ws-split");if(r==="collapsed"||r==="open")e.setAttribute("data-ws-rail",r);if(v==="json"||v==="form")e.setAttribute("data-ws-view",v);if(q>=20&&q<=80)e.style.setProperty("--ws-split",q);var b=s.getItem("hfs-sidebar")}catch(x){}if(b!=="collapsed"&&b!=="expanded"){b=w.innerWidth<1280?"collapsed":"expanded";e.setAttribute("data-sb-auto","")}e.setAttribute("data-sb",b);e.setAttribute("data-theme-pref",p);e.setAttribute("data-theme",k?"dark":"light")})(document,window);</script>
 {#- -#}

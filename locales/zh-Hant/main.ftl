@@ -1873,3 +1873,21 @@ activity-jobs = 工作
 activity-idle = 沒有進行中的工作
 activity-running = { $count } 個工作進行中
 activity-detail = 術語匯入進行中：{ $imports } · 同步：{ $syncs }
+
+## List-and-editor workspace (hm/vd-layout): rail toggle, quick switcher, editor/form split.
+ws-rail-collapse = 收合清單
+ws-rail-expand = 顯示清單
+ws-switch-vd = 切換 ViewDefinition
+ws-switch-lib = 切換到其他項目
+ws-switch-filter = 依名稱篩選
+ws-switch-none = 沒有符合的項目
+ws-switch-more = 開啟完整清單
+ws-pane-label = 編輯器版面
+ws-pane-json = JSON
+ws-pane-both = 並排
+ws-pane-form = 表單
+ws-split-label = 調整編輯器與表單的寬度
+sb-collapse = 收合側邊欄
+sb-expand = 展開側邊欄
+sb-collapsed = 側邊欄已收合
+sb-expanded = 側邊欄已展開

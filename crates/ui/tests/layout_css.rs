@@ -83,3 +83,66 @@ fn fieldsets_draw_no_browser_frame() {
     }
     assert!(rule(".idp-provider").contains("margin: 4px 0 20px"));
 }
+
+#[test]
+fn workspace_rail_is_narrower_and_collapses() {
+    // hm/vd-layout: the 280px rail left most of its column empty on View
+    // Definitions; it is 232px and collapses to a 44px strip.
+    let two = rule(".filter-layout--two");
+    assert!(two.contains("--rail-w: 232px"), "{two}");
+    assert!(two.contains("grid-template-columns: var(--rail-w) minmax(0, 1fr)"));
+    assert!(CSS.contains("--rail-w: 44px;"));
+    // The editor/form split and the view modes.
+    assert!(CSS.contains("flex: var(--ws-split, 50) 1 0;"));
+    assert!(CSS.contains("flex: calc(100 - var(--ws-split, 50)) 1 0;"));
+    assert!(CSS.contains(r#"html[data-ws-view="json"] .editor__grid--stretch[data-ws-pair] > .editor-form"#));
+    assert!(CSS.contains(
+        ".editor__grid--stretch[data-ws-pair=\"fill\"] {\n    height: var(--ws-fill, 70vh);"
+    ));
+}
+
+#[test]
+fn collapsed_sidebar_is_a_64px_rail_that_never_moves_on_hover() {
+    let at = CSS
+        .find("Collapsible console sidebar (hm/vd-layout)")
+        .expect("sidebar collapse block");
+    let at = CSS[..at].rfind("/*").expect("the block's header comment");
+    let block = &CSS[at..];
+    assert!(block.contains(r#":root[data-sb="collapsed"] {"#));
+    assert!(block.contains("--sidebar-w: 64px;"));
+    // Hover only ever changes colours: no width/padding/transform under :hover.
+    for (i, _) in block.match_indices(":hover") {
+        // Skip mentions inside comments.
+        let before = &block[..i];
+        if before.rfind("/*") > before.rfind("*/") {
+            continue;
+        }
+        let open = i + block[i..].find('{').unwrap();
+        let close = open + block[open..].find('}').unwrap();
+        let body = &block[open + 1..close];
+        for prop in ["width", "padding", "margin", "transform", "gap", "display"] {
+            assert!(
+                !body.lines().any(|l| l.trim_start().starts_with(&format!("{prop}:"))),
+                "a :hover rule in the sidebar block sets {prop}: {body}"
+            );
+        }
+    }
+    // The animation runs only while `.sb-anim` is set (a click or Ctrl+B),
+    // never on load or resize.
+    assert!(block.contains(":root.sb-anim body {"));
+}
+
+#[test]
+fn first_paint_boot_stamps_the_layout_preferences() {
+    let boot = include_str!("../../ui-chrome/templates/partials/theme-boot.html");
+    for needle in [
+        r#"getItem("hfs-sidebar")"#,
+        r#"e.setAttribute("data-sb",b)"#,
+        r#"w.innerWidth<1280?"collapsed":"expanded""#,
+        r#"getItem("hfs-ws-rail")"#,
+        r#"getItem("hfs-ws-view")"#,
+        r#""--ws-split""#,
+    ] {
+        assert!(boot.contains(needle), "theme-boot.html lacks {needle}");
+    }
+}

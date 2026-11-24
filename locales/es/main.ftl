@@ -1769,3 +1769,21 @@ activity-running = { $count ->
    *[other] { $count } trabajos en curso
 }
 activity-detail = Importaciones de terminología en curso: { $imports } · Sincronizaciones: { $syncs }
+
+## List-and-editor workspace (hm/vd-layout): rail toggle, quick switcher, editor/form split.
+ws-rail-collapse = Contraer la lista
+ws-rail-expand = Mostrar la lista
+ws-switch-vd = Cambiar de definición de vista
+ws-switch-lib = Cambiar a otro elemento
+ws-switch-filter = Filtrar por nombre
+ws-switch-none = Sin coincidencias
+ws-switch-more = Abrir la lista completa
+ws-pane-label = Diseño del editor
+ws-pane-json = JSON
+ws-pane-both = Ambos
+ws-pane-form = Formulario
+ws-split-label = Cambiar el ancho del editor y del formulario
+sb-collapse = Contraer la barra lateral
+sb-expand = Expandir la barra lateral
+sb-collapsed = Barra lateral contraída
+sb-expanded = Barra lateral expandida
