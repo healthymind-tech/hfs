@@ -116,7 +116,8 @@
 .access__bulk[hidden] { display: none; }
 .access__bulk-count { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
 .access__bulk-spacer { flex: 1 1 auto; }
-.access__table { border-top: 1px solid var(--border); min-height: 120px; transition: opacity var(--dur-2) var(--ease-std); }
+/* The table scrolls inside its own box: its width never widens the page. */
+.access__table { contain: inline-size; min-width: 0; border-top: 1px solid var(--border); min-height: 120px; transition: opacity var(--dur-2) var(--ease-std); }
 .access__table.is-loading { opacity: 0.55; }
 .access__note { display: flex; gap: 6px; align-items: center; margin: 10px 24px 0; font-size: var(--fs-xs); color: var(--text-3); }
 .access__note svg { width: 14px; height: 14px; flex: none; }
@@ -138,7 +139,7 @@
 .access-t__name { min-width: 160px; }
 .access-t__cell { display: block; min-width: 0; }
 .access-t__primary { display: block; font-weight: 500; color: var(--text); }
-.access-t__name .cell-sub { display: block; font-size: var(--fs-xs); color: var(--text-3); margin-top: 1px; }
+.access-t__name .cell-sub { display: block; margin: 1px 0 0; white-space: normal; overflow-wrap: anywhere; font-size: var(--fs-xs); color: var(--text-3); }
 .access-t__none { color: var(--text-3); }
 .access-t__ep { white-space: nowrap; font-family: ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, monospace; font-size: 12.5px; color: var(--text-2); }
 .access-t__kind { color: var(--text-2); font-size: var(--fs-sm); }
@@ -231,7 +232,7 @@
 .access-pv__t thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
 .access-pv__line { color: var(--text-3); font-variant-numeric: tabular-nums; width: 3.5em; }
 .access-pv__ref code { font-size: 12px; overflow-wrap: anywhere; }
-.access-pv__t .cell-sub { display: block; font-size: var(--fs-xs); color: var(--text-3); overflow-wrap: anywhere; }
+.access-pv__t .cell-sub { display: block; margin-left: 0; white-space: normal; font-size: var(--fs-xs); color: var(--text-3); overflow-wrap: anywhere; }
 @media (max-width: 640px) {
   .access-dialog { width: 100vw; max-width: 100vw; max-height: 100dvh; height: 100dvh; border-radius: 0; margin: 0; }
   .access-dialog__head, .access-dialog__body, .access-dialog__foot { padding-left: 16px; padding-right: 16px; }
