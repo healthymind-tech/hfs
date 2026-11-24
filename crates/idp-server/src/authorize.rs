@@ -23,7 +23,7 @@ use helios_idp::interaction::{
 };
 use helios_idp::launch::LaunchContext;
 use helios_idp::runtime::RealmRuntime;
-use helios_idp::scope::{self, Scope, ScopeContext};
+use helios_idp::scope;
 use helios_idp::token::{HandleKind, handle_hash, mint_handle};
 use helios_idp::{OAuthError, OAuthErrorCode, pkce};
 
@@ -85,24 +85,8 @@ pub(crate) fn respond(resp: &AuthorizationResponse) -> Response {
 /// Drops scopes the realm does not offer (the server may grant less than
 /// requested; SMART "scope … may differ").
 fn realm_allows(realm: &RealmRuntime, tok: &str) -> bool {
-    let f = &realm.spec.features;
-    match scope::parse_scope(tok) {
-        Scope::Resource(r) => {
-            (!r.v1 || f.permission_v1)
-                && match r.context {
-                    ScopeContext::Patient => f.permission_patient,
-                    ScopeContext::User => f.permission_user,
-                    // system/ scopes only through client_credentials.
-                    ScopeContext::System => false,
-                }
-        }
-        Scope::Launch => f.launch_ehr,
-        Scope::LaunchContext { .. } => f.launch_standalone || f.launch_ehr,
-        Scope::OpenId | Scope::FhirUser | Scope::Profile | Scope::Email => f.openid_connect,
-        Scope::OfflineAccess => f.offline_access,
-        Scope::OnlineAccess => f.online_access,
-        Scope::Other(_) => true,
-    }
+    // system/ scopes only through client_credentials.
+    helios_idp::scope_catalog::realm_offers(&realm.spec.features, tok, false)
 }
 
 fn parse_prompt(v: Option<&str>) -> Result<Vec<Prompt>, OAuthError> {

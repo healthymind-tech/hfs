@@ -6,6 +6,27 @@
 {% include "partials/idp/flash.html" %}
 {% if let Some(secret) = new_secret %}{% let cid = client_id.clone() %}{% include "partials/idp/secret-once.html" %}{% endif %}
 {% include "partials/idp/errors.html" %}
+<section class="card scope-chips" aria-labelledby="scope-chips-title">
+  <header class="scope-chips__head">
+    <h2 class="scope-chips__title" id="scope-chips-title">{{ i18n.t("idps-effective") }}</h2>
+    <p class="scope-chips__desc">{{ i18n.t("idps-effective-desc") }} <a href="#smart-how" data-smart-how>{{ i18n.t("idps-how-link") }}</a></p>
+  </header>
+  {% if chips.is_empty() %}
+  <p class="scope-chips__empty">{{ i18n.t("idps-effective-none") }}</p>
+  {% else %}
+  <div class="scope-chips__groups">
+    {% for g in chips %}
+    <div class="scope-chips__group">
+      <h3 class="scope-chips__gtitle">{{ g.title }}</h3>
+      <p class="scope-chips__ghint">{{ g.hint }}</p>
+      <ul class="scope-chips__list">
+        {% for ch in g.chips %}<li class="scope-chip{% if ch.off %} scope-chip--off{% endif %}" title="{{ ch.scope }}{% if ch.off %} — {{ i18n.t("idps-not-offered") }}{% endif %}"><span class="scope-chip__label">{{ ch.label }}</span><code class="scope-chip__code">{{ ch.scope }}</code>{% if ch.off %}<span class="visually-hidden"> ({{ i18n.t("idps-not-offered") }})</span>{% endif %}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
 <form method="post" action="/ui/idp/{{ head.name }}/clients/{{ client_id }}" novalidate data-idp-track>
   <input type="hidden" name="revision" value="{{ revision }}">
   {% call ui::form_section("client", client_id.clone(), i18n.t(kind_key)) %}
@@ -23,11 +44,7 @@
       {% call ui::field_text(i18n.t("idpc-client-jwks-uri"), "jwks_uri", self.v("jwks_uri"), self.err("jwks_uri"), i18n.t("idpc-client-jwks-uri-hint"), "url", false, "", false, true) %}{% endcall %}
       {% call ui::field_area(i18n.t("idpc-client-jwks"), "jwks", self.v("jwks"), self.err("jwks"), i18n.t("idpc-client-jwks-hint"), 4) %}{% endcall %}
     {% endif %}
-    <fieldset class="checks">
-      <legend class="mfield__label">{{ i18n.t("idpc-client-scopes") }}</legend>
-      <div class="idp-scope-grid">{% for s in scope_presets %}<div class="mcheck"><input type="checkbox" class="mcheck__input" id="f-scope-{{ loop.index }}" name="scope" value="{{ s.value }}"{% if s.checked %} checked{% endif %}><label class="mcheck__label" for="f-scope-{{ loop.index }}">{{ i18n.t(s.label_key) }} <code>{{ s.value }}</code></label></div>{% endfor %}</div>
-      {% call ui::field_text(i18n.t("idpc-client-scopes-custom"), "scopes_custom", self.v("scopes_custom"), self.err("scopes"), i18n.t("idpc-client-scopes-custom-hint"), "text", false, "", false, true) %}{% endcall %}
-    </fieldset>
+    {% include "partials/idp/scope-builder.html" %}
     {% call ui::checkbox(i18n.t("idpc-client-trusted"), "trusted", self.v("trusted") == "on", i18n.t("idpc-client-trusted-hint")) %}{% endcall %}
     {% call ui::checkbox(i18n.t("idpc-client-disabled"), "disabled", self.v("disabled") == "on", i18n.t("idpc-client-disabled-hint")) %}{% endcall %}
   {% endcall %}

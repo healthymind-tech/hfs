@@ -810,7 +810,7 @@ mod tests {
 
         // Catalogs every locale carries (the console's other catalogs are
         // en + zh-Hant only and fall back to English elsewhere).
-        for file in ["main.ftl", "idp-access.ftl"] {
+        for file in ["main.ftl", "idp-access.ftl", "idp-scopes.ftl"] {
             let en = keys_of("en", file);
             assert!(!en.is_empty());
             for locale in ["es", "de", "zh-Hant"] {

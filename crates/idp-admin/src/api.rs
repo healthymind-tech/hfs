@@ -105,6 +105,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/admin/idp/realms/{realm}/grants/{grant}"),
     ("POST", "/admin/idp/realms/{realm}/launches"),
     ("GET", "/admin/idp/realms/{realm}/endpoints/{endpoint}"),
+    ("GET", "/admin/idp/scopes/catalog"),
+    ("POST", "/admin/idp/realms/{realm}/scopes/$analyze"),
     ("PUT", "/admin/idp/realms/{realm}/endpoints/{endpoint}"),
     ("DELETE", "/admin/idp/realms/{realm}/endpoints/{endpoint}"),
 ];
@@ -168,6 +170,8 @@ pub fn router(auth: Option<Authorize>) -> Router {
             axum::routing::delete(revoke_grant),
         )
         .route(&format!("{r}/launches"), post(create_launch))
+        .route("/admin/idp/scopes/catalog", get(scope_catalog))
+        .route(&format!("{r}/scopes/$analyze"), post(analyze_scopes))
         .route(
             &format!("{r}/endpoints/{{endpoint}}"),
             get(bind_diff).put(bind).delete(unbind),
@@ -261,6 +265,70 @@ fn client_from_body(mut v: Value) -> Result<ClientSpec, Response> {
         v["auth"]["secret_hash"] = json!(keep);
     }
     serde_json::from_value(v).map_err(|e| err(&OpError::invalid("body", e.to_string())))
+}
+
+// ------------------------------------------------------------ scopes
+
+#[derive(Deserialize, Default)]
+struct CatalogQuery {
+    /// Realm name: list the types of its endpoints (bound, else chosen in
+    /// the wizard, else all); absent: every endpoint of the server.
+    realm: Option<String>,
+}
+
+async fn scope_catalog(Query(q): Query<CatalogQuery>) -> ApiResult {
+    let c = console()?;
+    ok(op(c
+        .scope_catalog(q.realm.as_deref().filter(|r| !r.is_empty()))
+        .await)?)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyzeBody {
+    scopes: Vec<String>,
+    /// Take the client's shape (auth, grants, launch types, acceptV1) from
+    /// this registered client…
+    #[serde(default)]
+    client_id: Option<String>,
+    /// …or from this description of a client not saved yet.
+    #[serde(default)]
+    shape: Option<helios_idp::scope_catalog::ClientShape>,
+}
+
+/// Findings as the API returns them: each with its English message.
+fn analysis_json(a: &helios_idp::scope_catalog::Analysis) -> Value {
+    json!({
+        "invalid": a.invalid.iter().map(|(s, e)| json!({
+            "scope": s, "code": e.code(), "message": e.message(),
+        })).collect::<Vec<_>>(),
+        "redundant": a.redundant,
+        "findings": a.findings.iter().map(|f| {
+            let mut v = serde_json::to_value(f).unwrap_or(Value::Null);
+            v["message"] = json!(f.message());
+            v
+        }).collect::<Vec<_>>(),
+    })
+}
+
+async fn analyze_scopes(Path(realm): Path<String>, Json(body): Json<AnalyzeBody>) -> ApiResult {
+    let c = console()?;
+    let shape = match (&body.client_id, body.shape) {
+        (Some(id), _) => {
+            let rec = op(c.realm(&realm).await)?;
+            let cl = find_client(&c, &rec.id, id).await?;
+            helios_idp::scope_catalog::ClientShape::of(&cl.spec)
+        }
+        (None, Some(s)) => s,
+        (None, None) => {
+            return Err(err(&OpError::invalid(
+                "clientId",
+                "give clientId (a registered app) or shape",
+            )));
+        }
+    };
+    let a = op(c.analyze_scopes(&realm, &body.scopes, &shape).await)?;
+    ok(analysis_json(&a))
 }
 
 // ------------------------------------------------------------ realms

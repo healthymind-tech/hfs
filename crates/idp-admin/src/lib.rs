@@ -9,4 +9,5 @@ pub mod access;
 pub mod api;
 pub mod binding;
 pub mod diagnostic;
+pub mod scopes;
 pub mod service;

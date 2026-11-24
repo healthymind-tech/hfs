@@ -141,7 +141,7 @@
       },
       "ClientSpec": {
         "type": "object",
-        "description": "helios_idp::client::ClientSpec (camelCase): clientId, name, auth{method:none|client_secret|private_key_jwt,…}, grantTypes, redirectUris, launchTypes[ehr|standalone|backend], scopes{allowed[],acceptV1}, trusted, disabled",
+        "description": "helios_idp::client::ClientSpec (camelCase): clientId, name, auth{method:none|client_secret|private_key_jwt,…}, grantTypes, redirectUris, launchTypes[ehr|standalone|backend], scopes{allowed[],acceptV1}, trusted, disabled. Every scopes.allowed entry must be a valid OAuth scope token; SMART-looking ones (patient/…, user/…, system/…, launch/…) must follow the SMART v1/v2 grammar, granular `?name=value` filters included (400 with field `scopes` otherwise).",
         "required": [
           "clientId",
           "name",
@@ -483,6 +483,274 @@
           },
           "dryRun": {
             "type": "boolean"
+          }
+        }
+      },
+      "ScopeCatalog": {
+        "type": "object",
+        "description": "What the console's SMART scope builder lists. Endpoints are this server's own: each serves every resource type of its FHIR release (the types its CapabilityStatement lists).",
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "bound",
+              "chosen",
+              "all",
+              "server"
+            ],
+            "description": "Whose types: the endpoints bound to the realm, the endpoints chosen in the wizard, every endpoint (none bound or chosen), or every endpoint (no realm given)."
+          },
+          "endpoints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "baseUrl": {
+                  "type": "string"
+                },
+                "fhirVersion": {
+                  "type": "string",
+                  "examples": [
+                    "R4"
+                  ]
+                },
+                "authMode": {
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "write-protect",
+                    "full",
+                    "inherit"
+                  ]
+                },
+                "bound": {
+                  "type": "boolean"
+                },
+                "resourceTypes": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "groups": {
+            "type": "array",
+            "description": "Union of the endpoints' resource types, grouped. `*` (every type) is always available and not listed.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "enum": [
+                    "clinical",
+                    "medications",
+                    "diagnostics",
+                    "administrative",
+                    "documents",
+                    "financial",
+                    "workflow",
+                    "conformance",
+                    "other"
+                  ]
+                },
+                "types": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "presets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "enum": [
+                    "patient-read",
+                    "clinician-read",
+                    "clinician-write",
+                    "ehr-launch",
+                    "backend-export",
+                    "identity"
+                  ]
+                },
+                "scopes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "backend": {
+                  "type": "boolean",
+                  "description": "Backend Services (client_credentials only)."
+                }
+              }
+            }
+          },
+          "nonResource": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "examples": [
+              [
+                "openid",
+                "fhirUser",
+                "profile",
+                "launch",
+                "launch/patient",
+                "launch/encounter",
+                "offline_access",
+                "online_access"
+              ]
+            ]
+          },
+          "contexts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "patient",
+                "user",
+                "system"
+              ]
+            }
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "c",
+                "r",
+                "u",
+                "d",
+                "s"
+              ]
+            }
+          }
+        }
+      },
+      "ClientShape": {
+        "type": "object",
+        "description": "The parts of an app that decide which scopes can work.",
+        "properties": {
+          "public": {
+            "type": "boolean"
+          },
+          "authorizationCode": {
+            "type": "boolean"
+          },
+          "clientCredentials": {
+            "type": "boolean"
+          },
+          "standalone": {
+            "type": "boolean"
+          },
+          "ehr": {
+            "type": "boolean"
+          },
+          "acceptV1": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ScopeAnalysis": {
+        "type": "object",
+        "properties": {
+          "invalid": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "scope": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "enum": [
+                    "characters",
+                    "resource-shape",
+                    "resource-type",
+                    "permissions",
+                    "v1-query",
+                    "query",
+                    "launch",
+                    "case"
+                  ]
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "redundant": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "scope": {
+                  "type": "string"
+                },
+                "covered_by": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "enum": [
+                    "empty",
+                    "system-public",
+                    "system-no-cc",
+                    "user-scopes-backend",
+                    "standalone-no-launch-patient",
+                    "ehr-no-launch",
+                    "patient-no-context",
+                    "fhiruser-no-openid",
+                    "online-offline",
+                    "v1-syntax",
+                    "realm-off",
+                    "write-protect-reads",
+                    "no-resource",
+                    "launch-not-ehr"
+                  ]
+                },
+                "level": {
+                  "type": "string",
+                  "enum": [
+                    "warn",
+                    "info"
+                  ]
+                },
+                "scopes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "detail": {
+                  "type": "string",
+                  "description": "Realm feature (realm-off) or endpoint names (write-protect-reads)."
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3517,6 +3785,160 @@
             }
           },
           "409": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/idp/scopes/catalog": {
+      "get": {
+        "summary": "SMART scope catalog: resource types per endpoint (grouped), presets, identity and launch scopes",
+        "parameters": [
+          {
+            "name": "realm",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Realm name: list the types of its bound endpoints (else those chosen in the wizard, else every endpoint)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScopeCatalog"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/idp/realms/{realm}/scopes/$analyze": {
+      "post": {
+        "summary": "Check a list of allowed scopes for an app: syntax, scopes another one already covers, and combinations that cannot work in this realm",
+        "description": "Nothing is saved. Give `clientId` to use a registered app's auth method, grants and launch types, or `shape` for an app not saved yet.",
+        "parameters": [
+          {
+            "name": "realm",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Realm name (the last path segment of its issuer)"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "scopes"
+                ],
+                "properties": {
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "clientId": {
+                    "type": "string"
+                  },
+                  "shape": {
+                    "$ref": "#/components/schemas/ClientShape"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScopeAnalysis"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
             "description": "Error",
             "content": {
               "application/json": {

@@ -49,6 +49,8 @@ impl Perms {
     pub const D: u8 = 8;
     pub const S: u8 = 16;
     pub const ALL: Perms = Perms(31);
+    /// `r` alone.
+    pub const READ: Perms = Perms(Self::R);
 
     /// v2 letters in canonical order; `None` if out of order, repeated,
     /// empty or containing other letters.

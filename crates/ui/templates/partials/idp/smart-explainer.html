@@ -1,0 +1,30 @@
+{#- "How SMART access works" (scope builder of an app, Resource access of a
+    user). Opens itself when a link to #smart-how is followed (idp-scopes.js).
+    The includer sets `how_link` (href, may be empty) and `how_link_key`. -#}
+<details class="disclosure smart-how" id="smart-how" data-smart-how-box>
+  <summary class="disclosure__summary">{% call ui::icon("info") %}{% endcall %}<span>{{ i18n.t("idps-how-title") }}</span></summary>
+  <div class="disclosure__body smart-how__body">
+    <div class="smart-how__flow" role="img" aria-label="{{ i18n.t("idps-how-flow-label") }}">
+      <span class="smart-how__box"><strong>{{ i18n.t("idps-how-flow-requested") }}</strong><small>{{ i18n.t("idps-how-flow-requested-sub") }}</small></span>
+      <span class="smart-how__op" aria-hidden="true">∩</span>
+      <span class="smart-how__box smart-how__box--here"><strong>{{ i18n.t("idps-how-flow-allowed") }}</strong><small>{{ i18n.t("idps-how-flow-allowed-sub") }}</small></span>
+      <span class="smart-how__op" aria-hidden="true">∩</span>
+      <span class="smart-how__box"><strong>{{ i18n.t("idps-how-flow-consent") }}</strong><small>{{ i18n.t("idps-how-flow-consent-sub") }}</small></span>
+      <span class="smart-how__op" aria-hidden="true">→</span>
+      <span class="smart-how__box smart-how__box--token"><strong>{{ i18n.t("idps-how-flow-token") }}</strong><small>{{ i18n.t("idps-how-flow-token-sub") }}</small></span>
+    </div>
+    <dl class="smart-how__pair">
+      <div><dt>{{ i18n.t("idps-how-scopes-t") }}</dt><dd>{{ i18n.t("idps-how-scopes-d") }}</dd></div>
+      <div><dt>{{ i18n.t("idps-how-access-t") }}</dt><dd>{{ i18n.t("idps-how-access-d") }}</dd></div>
+    </dl>
+    <ul class="smart-how__list">
+      <li>{{ i18n.t("idps-how-grant") }}</li>
+      <li>{{ i18n.t("idps-how-patient") }}</li>
+      <li>{{ i18n.t("idps-how-user") }}</li>
+      <li>{{ i18n.t("idps-how-system") }}</li>
+      <li>{{ i18n.t("idps-how-perms") }}</li>
+    </ul>
+    <p class="smart-how__example"><strong>{{ i18n.t("idps-how-example-t") }}</strong> {{ i18n.t("idps-how-example") }}</p>
+    {% if !how_link.is_empty() %}<p class="smart-how__links"><a href="{{ how_link }}">{{ i18n.t(how_link_key) }}</a></p>{% endif %}
+  </div>
+</details>

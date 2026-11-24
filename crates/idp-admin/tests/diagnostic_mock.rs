@@ -616,6 +616,7 @@ fn config(base: &str, backend: SigningKey) -> RunConfig {
         base_url: format!("{base}/fhir/ep1"),
         auth_mode: "full".into(),
         provider: EndpointProvider::Internal { realm: "r".into() },
+        fhir_version: "R4".into(),
     }];
     cfg.revocation_wait = std::time::Duration::from_millis(500);
     cfg

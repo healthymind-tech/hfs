@@ -66,10 +66,24 @@ async fn install() -> Arc<dyn EndpointStore> {
         jwks_via: None,
         realms: Arc::new(move || rt2.realms().iter().map(|r| r.spec.clone()).collect()),
     };
-    service::install(Arc::new(IdpConsole::new(
-        IdpAdmin::new(rt),
-        Some(Arc::new(binder)),
-    )));
+    service::install(Arc::new(
+        IdpConsole::new(IdpAdmin::new(rt), Some(Arc::new(binder))).with_type_provider(Some(
+            Arc::new(|release: &str| {
+                assert_eq!(release, "R4");
+                [
+                    "Patient",
+                    "Observation",
+                    "Condition",
+                    "Claim",
+                    "ValueSet",
+                    "Basic",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+            }),
+        )),
+    ));
     eps
 }
 
@@ -329,6 +343,116 @@ async fn admin_api_end_to_end() {
     .await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     assert!(v["launch"].as_str().unwrap().starts_with("hmlh_"));
+
+    // Scope catalog: the bound endpoint's types, grouped; presets.
+    let (s, v, _) = call("GET", "/admin/idp/scopes/catalog?realm=clinic", None, &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["source"], "bound");
+    assert_eq!(v["endpoints"][0]["name"], "clinic");
+    assert_eq!(v["endpoints"][0]["bound"], true);
+    assert_eq!(v["endpoints"][0]["authMode"], "write-protect");
+    assert_eq!(v["endpoints"][0]["resourceTypes"], 6);
+    assert_eq!(
+        v["groups"],
+        json!([
+            {"id": "clinical", "types": ["Condition", "Observation"]},
+            {"id": "administrative", "types": ["Patient"]},
+            {"id": "financial", "types": ["Claim"]},
+            {"id": "conformance", "types": ["ValueSet"]},
+            {"id": "other", "types": ["Basic"]},
+        ])
+    );
+    let presets: Vec<&str> = v["presets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        presets,
+        [
+            "patient-read",
+            "clinician-read",
+            "clinician-write",
+            "ehr-launch",
+            "backend-export",
+            "identity"
+        ]
+    );
+    assert_eq!(v["nonResource"].as_array().unwrap().len(), 8);
+    let (s, v, _) = call("GET", "/admin/idp/scopes/catalog", None, &[]).await;
+    assert_eq!((s, v["source"].as_str()), (StatusCode::OK, Some("server")));
+    let (s, _, _) = call("GET", "/admin/idp/scopes/catalog?realm=nope", None, &[]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Analysis of a registered app (standalone, confidential, no client_credentials).
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/scopes/$analyze",
+        Some(json!({"clientId": "portal", "scopes": ["openid", "patient/*.rs", "patient/Observation.rs", "system/*.rs", "patient/observation.rs"]})),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["invalid"][0]["scope"], "patient/observation.rs");
+    assert_eq!(v["invalid"][0]["code"], "resource-type");
+    assert_eq!(v["redundant"][0]["scope"], "patient/Observation.rs");
+    assert_eq!(v["redundant"][0]["covered_by"], "patient/*.rs");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "system-no-cc",
+            "standalone-no-launch-patient",
+            "write-protect-reads"
+        ],
+        "{v}"
+    );
+    assert!(
+        v["findings"][2]["message"]
+            .as_str()
+            .unwrap()
+            .contains("clinic")
+    );
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/scopes/$analyze",
+        Some(json!({"shape": {"public": true, "authorizationCode": true, "standalone": true}, "scopes": ["system/*.rs"]})),
+        &[],
+    )
+    .await;
+    assert_eq!(v["findings"][0]["code"], "system-public", "{s} {v}");
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/scopes/$analyze",
+        Some(json!({"scopes": []})),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (s, v["field"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("clientId"))
+    );
+    // Invalid scopes are refused on save.
+    let mut bad_scope = client.clone();
+    bad_scope["clientId"] = json!("x3");
+    bad_scope["scopes"] = json!({"allowed": ["openid", "Patient/*.rs"]});
+    let (s, v, _) = call(
+        "POST",
+        "/admin/idp/realms/clinic/clients",
+        Some(bad_scope),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (s, v["field"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("scopes")),
+        "{v}"
+    );
 
     // Diagnostic (preflight only; the disabled client is pinpointed).
     let (s, v, _) = call(

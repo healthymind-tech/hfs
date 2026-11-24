@@ -52,6 +52,7 @@ pub mod realm;
 pub mod runtime;
 pub mod schema;
 pub mod scope;
+pub mod scope_catalog;
 pub mod store;
 pub mod token;
 pub mod user;
