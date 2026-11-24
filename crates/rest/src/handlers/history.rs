@@ -495,7 +495,7 @@ fn build_history_bundle<S>(
     entries: &[HistoryEntry],
     state: &AppState<S>,
     tenant: &TenantExtractor,
-    total: u64,
+    total: Option<u64>,
     links: Vec<Value>,
 ) -> Value
 where
@@ -506,13 +506,21 @@ where
         .map(|entry| history_entry_to_json(entry, state, tenant))
         .collect();
 
-    json!({
-        "resourceType": "Bundle",
-        "type": "history",
-        "total": total,
-        "link": links,
-        "entry": bundle_entries,
-    })
+    match total {
+        Some(total) => json!({
+            "resourceType": "Bundle",
+            "type": "history",
+            "total": total,
+            "link": links,
+            "entry": bundle_entries,
+        }),
+        None => json!({
+            "resourceType": "Bundle",
+            "type": "history",
+            "link": links,
+            "entry": bundle_entries,
+        }),
+    }
 }
 
 /// Serializes a history Bundle in the negotiated response format.
@@ -700,7 +708,13 @@ where
         }
     };
 
-    let total = page_info.total.unwrap_or(items.len() as u64);
+    // `Bundle.total` is the number of versions in the whole history, not on
+    // this page: the page's length is that number only when the history fits
+    // on one page; otherwise it is left out (unknown) rather than claiming
+    // the page size (`_count=2` answered `total: 2` for a long history).
+    let total = page_info.total.or_else(|| {
+        (!page_info.has_next && !page_info.has_previous).then_some(items.len() as u64)
+    });
     let links = history_links(
         state,
         tenant,
