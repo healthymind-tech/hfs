@@ -10789,12 +10789,18 @@ async fn sql_workspace_pages_render_the_collapsible_rail_switcher_and_view_switc
     );
     let html = body_text(
         view_definitions_app(source)
-            .oneshot(Request::get("/ui/sql/view-definitions?vd=v1").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap(),
     )
     .await;
-    assert!(html.contains(r#"class="filter-layout filter-layout--two" hx-history="false" data-ws data-rail-few"#));
+    assert!(html.contains(
+        r#"class="filter-layout filter-layout--two" hx-history="false" data-ws data-rail-few"#
+    ));
     assert!(html.contains(r#"<aside class="filter-rail" id="ws-rail""#));
     assert!(html.contains(r#"data-rail-toggle aria-controls="ws-rail""#));
     assert!(html.contains(r#"data-ws-switch-for="ws-rail""#));
@@ -10806,25 +10812,37 @@ async fn sql_workspace_pages_render_the_collapsible_rail_switcher_and_view_switc
         .nth(1)
         .and_then(|s| s.split("</h2>").next())
         .unwrap();
-    assert!(!title.contains("ws-switch"), "the switcher sits beside the title");
+    assert!(
+        !title.contains("ws-switch"),
+        "the switcher sits beside the title"
+    );
 
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
     let libs: Vec<_> = (0..5)
-        .map(|i| serde_json::json!({"resourceType": "Library", "id": format!("q{i}"),
+        .map(|i| {
+            serde_json::json!({"resourceType": "Library", "id": format!("q{i}"),
             "name": format!("query_{i}"), "status": "active",
-            "type": {"coding": [{"system": system, "code": "sql-query"}]}}))
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}})
+        })
         .collect();
     let source = helios_ui::StaticConformanceSource::empty()
         .with("Library", helios_fhir::FhirVersion::R4, libs)
         .with_sql_run(Ok(vec![]));
     let html = body_text(
         library_app(source)
-            .oneshot(Request::get("/ui/sql/queries?lib=q1").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=q1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap(),
     )
     .await;
-    assert!(html.contains(r#"hx-history="false" data-ws>"#), "five items: not auto-collapsed");
+    assert!(
+        html.contains(r#"hx-history="false" data-ws>"#),
+        "five items: not auto-collapsed"
+    );
     assert!(html.contains(r#"data-ws-view-for="lib-details-grid""#));
     assert!(html.contains(r#"id="lib-details-grid" data-ws-pair"#));
     assert!(html.contains(r#"data-ws-switch-for="ws-rail""#));

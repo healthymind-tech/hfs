@@ -748,12 +748,24 @@ async fn the_manager_sidebar_carries_its_collapse_toggle_in_both_languages() {
         assert_eq!(status, StatusCode::OK);
         let aside = &html[html.find(r#"<aside class="sidebar""#).unwrap()..];
         let aside = &aside[..aside.find("</aside>").unwrap()];
-        assert!(aside.contains("data-sb-toggle"), "[{lang}] toggle inside the sidebar");
+        assert!(
+            aside.contains("data-sb-toggle"),
+            "[{lang}] toggle inside the sidebar"
+        );
         assert!(aside.contains(r#"aria-controls="sidebar""#));
         assert!(aside.contains(r#"aria-keyshortcuts="Control+B Meta+B""#));
-        assert!(aside.contains(&format!(r#"data-label-collapse="{collapse}""#)), "[{lang}]");
-        assert!(aside.contains(&format!(r#"data-label-expand="{expand}""#)), "[{lang}]");
-        assert!(aside.contains(r#"class="ep-chip__avatar""#), "[{lang}] endpoint avatar");
+        assert!(
+            aside.contains(&format!(r#"data-label-collapse="{collapse}""#)),
+            "[{lang}]"
+        );
+        assert!(
+            aside.contains(&format!(r#"data-label-expand="{expand}""#)),
+            "[{lang}]"
+        );
+        assert!(
+            aside.contains(r#"class="ep-chip__avatar""#),
+            "[{lang}] endpoint avatar"
+        );
         assert!(html.contains("/sidebar-collapse.js"), "[{lang}] script");
     }
 }

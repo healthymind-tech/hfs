@@ -95,7 +95,9 @@ fn workspace_rail_is_narrower_and_collapses() {
     // The editor/form split and the view modes.
     assert!(CSS.contains("flex: var(--ws-split, 50) 1 0;"));
     assert!(CSS.contains("flex: calc(100 - var(--ws-split, 50)) 1 0;"));
-    assert!(CSS.contains(r#"html[data-ws-view="json"] .editor__grid--stretch[data-ws-pair] > .editor-form"#));
+    assert!(CSS.contains(
+        r#"html[data-ws-view="json"] .editor__grid--stretch[data-ws-pair] > .editor-form"#
+    ));
     assert!(CSS.contains(
         ".editor__grid--stretch[data-ws-pair=\"fill\"] {\n    height: var(--ws-fill, 70vh);"
     ));
@@ -122,7 +124,9 @@ fn collapsed_sidebar_is_a_64px_rail_that_never_moves_on_hover() {
         let body = &block[open + 1..close];
         for prop in ["width", "padding", "margin", "transform", "gap", "display"] {
             assert!(
-                !body.lines().any(|l| l.trim_start().starts_with(&format!("{prop}:"))),
+                !body
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{prop}:"))),
                 "a :hover rule in the sidebar block sets {prop}: {body}"
             );
         }
