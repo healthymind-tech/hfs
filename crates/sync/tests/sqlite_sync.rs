@@ -711,3 +711,24 @@ async fn continuous_run_follows_an_edited_target() {
     f.svc.runtime().shutdown();
 }
 
+/// Changing an interval job's period reschedules it from now.
+#[tokio::test]
+async fn interval_change_reschedules_the_next_run() {
+    let f = fixture(config(&[])).await;
+    let mut body = local_job("daily", "a", "b");
+    body["trigger"] = json!({"type": "interval", "everySecs": 86400});
+    let job = f.create_job(body).await;
+    f.svc.runtime().schedule_once().await.unwrap();
+    let before = f.svc.job(&job).await.unwrap().next_run_at.expect("scheduled");
+    assert!(before > chrono::Utc::now() + chrono::Duration::hours(23));
+
+    let j = f.svc.job(&job).await.unwrap();
+    let mut spec = serde_json::to_value(&j.spec).unwrap();
+    spec["trigger"] = json!({"type": "interval", "everySecs": 60});
+    f.svc.update(&job, None, spec, "t").await.unwrap();
+    let after = f.svc.job(&job).await.unwrap().next_run_at.expect("rescheduled");
+    assert!(
+        after <= chrono::Utc::now() + chrono::Duration::seconds(61),
+        "next run still a day away: {after}"
+    );
+}
