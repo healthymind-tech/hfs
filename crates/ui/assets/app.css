@@ -15117,10 +15117,16 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     align-items: start;
   }
 
+  /* Never taller than the room above the floating save bar: a long Verify
+     report scrolls inside the card, so its first failing step can always be
+     brought into view. */
   .config-aside {
     position: sticky;
     top: calc(var(--topbar-h) + var(--s5));
     min-width: 0;
+    max-height: calc(100dvh - var(--topbar-h) - 120px);
+    overflow-y: auto;
+    scrollbar-width: thin;
   }
 
   .config-aside__fields {
@@ -15163,6 +15169,8 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     .config-aside {
       position: static;
       order: -1;
+      max-height: none;
+      overflow: visible;
     }
   }
 
