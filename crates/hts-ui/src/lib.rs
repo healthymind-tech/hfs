@@ -67,6 +67,7 @@ mod raw_fold;
 mod raw_json_fragment;
 mod upstream;
 mod value_sets;
+mod versions;
 
 use axum::{
     Router,
@@ -194,6 +195,7 @@ pub fn embedded_router(state: Arc<HtsUiState>, admin: Option<Router>) -> Router 
         .merge(code_systems::routes())
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
+        .merge(versions::routes())
         .merge(concepts::routes())
         .merge(explore::routes())
         .merge(import::routes())
@@ -363,6 +365,7 @@ pub fn router_with_admin(
         .merge(code_systems::routes())
         .merge(value_sets::routes())
         .merge(concept_maps::routes())
+        .merge(versions::routes())
         .merge(concepts::routes())
         .merge(explore::routes())
         .merge(import::routes())

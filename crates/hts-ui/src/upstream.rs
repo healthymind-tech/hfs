@@ -559,6 +559,7 @@ impl OutcomeView {
 /// substring behavior operators already expect.
 fn build_upstream_browser_query<const N: usize>(
     filters: [(&str, &Option<String>); N],
+    grouped: bool,
     sort: &str,
     count: u32,
     offset: u32,
@@ -574,6 +575,11 @@ fn build_upstream_browser_query<const N: usize>(
             _ => field,
         };
         query.push((upstream_field.to_owned(), value.clone()));
+    }
+    // One row per canonical URL (the version a version-less request
+    // resolves to); a version filter asks for that version's own rows.
+    if grouped {
+        query.push(("_hm-current".to_owned(), "true".to_owned()));
     }
     query.push(("_sort".to_owned(), sort.to_owned()));
     query.push(("_count".to_owned(), count.to_string()));
@@ -608,7 +614,7 @@ pub fn browser_sort_label_key(sort: &str) -> &'static str {
 }
 
 /// Percent-encode one query-string component.
-fn urlencoding_component(raw: &str) -> String {
+pub(crate) fn urlencoding_component(raw: &str) -> String {
     form_urlencoded::byte_serialize(raw.as_bytes()).collect()
 }
 
@@ -668,6 +674,7 @@ impl CsBrowserFilters {
                 ("title", &self.title),
                 ("status", &self.status),
             ],
+            self.version.as_deref().is_none_or(str::is_empty),
             self.effective_sort(),
             self.effective_count(),
             self.offset,
@@ -759,6 +766,11 @@ pub struct CsBrowserRow {
     pub name: String,
     pub title: String,
     pub status: String,
+    /// Stored versions of this canonical URL (`_hm-current` searches; 1
+    /// otherwise).
+    pub version_count: u64,
+    /// `date` of the listed version, when it carries one.
+    pub date: String,
 }
 
 impl CsBrowserRow {
@@ -777,6 +789,65 @@ impl CsBrowserRow {
             name: s("name"),
             title: s("title"),
             status: s("status"),
+            version_count: version_count_of(resource),
+            date: s("date"),
+        }
+    }
+}
+
+/// The `hm-version-count` meta extension HTS puts on a `_hm-current`
+/// search entry: how many versions of that canonical URL are stored. 1 when
+/// absent (an ungrouped search lists each version on its own row).
+pub(crate) fn version_count_of(resource: &Value) -> u64 {
+    resource
+        .pointer("/meta/extension")
+        .and_then(|e| e.as_array())
+        .and_then(|e| {
+            e.iter().find(|x| {
+                x.get("url")
+                    .and_then(|u| u.as_str())
+                    .is_some_and(|u| u.ends_with("/hm-version-count"))
+            })
+        })
+        .and_then(|x| x.get("valueInteger"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+}
+
+/// One stored version of a canonical, for the "+N older" rows and the
+/// detail pages' version switcher.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VersionChoice {
+    /// Logical id (version suffix trimmed), the detail route's segment.
+    pub id: String,
+    pub url: String,
+    pub version: String,
+    pub name: String,
+    pub title: String,
+    pub status: String,
+    pub date: String,
+    /// The version a version-less request resolves to.
+    pub current: bool,
+}
+
+impl VersionChoice {
+    fn from_resource(resource: &Value, current: bool) -> Self {
+        let s = |k: &str| {
+            resource
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Self {
+            id: base_id(&s("id")).to_owned(),
+            url: s("url"),
+            version: s("version"),
+            name: s("name"),
+            title: s("title"),
+            status: s("status"),
+            date: s("date"),
+            current,
         }
     }
 }
@@ -837,6 +908,9 @@ pub struct CsBrowserPage {
     /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
     pub total: Option<u64>,
     pub paging: SearchPaging,
+    /// Stored versions across the matched canonicals (grouped searches
+    /// only): the list header reads "N code systems · M versions".
+    pub versions_total: Option<u64>,
 }
 
 impl CsBrowserPage {
@@ -1156,13 +1230,15 @@ impl UpstreamClient {
         let query = filters.upstream_query();
 
         let url = format!("{}/CodeSystem", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .query(&query)
-            .header("Accept", "application/fhir+json")
-            .send_via(self, "cs-search", &url)
-            .await?;
+        let (response, older) = tokio::join!(
+            self.client
+                .get(&url)
+                .query(&query)
+                .header("Accept", "application/fhir+json")
+                .send_via(self, "cs-search", &url),
+            self.older_version_count("CodeSystem", &query),
+        );
+        let response = response?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "cs-search",
@@ -1189,11 +1265,13 @@ impl UpstreamClient {
                     .collect()
             })
             .unwrap_or_default();
+        let total = body.get("total").and_then(|v| v.as_u64());
         Ok(CsBrowserPage {
             rows,
             filters: filters.clone(),
-            total: body.get("total").and_then(|v| v.as_u64()),
+            total,
             paging: SearchPaging::from_bundle(&body),
+            versions_total: total.zip(older).map(|(t, o)| t + o),
         })
     }
 
@@ -1338,12 +1416,17 @@ impl UpstreamClient {
         op: &'static str,
         id: &str,
         canonical_url: &str,
+        version: Option<&str>,
     ) -> Result<Value, UpstreamError> {
         let full_endpoint = format!("{}/{}", self.base_url, resource_type);
+        let mut query = vec![("url", canonical_url)];
+        if let Some(v) = version.filter(|v| !v.is_empty()) {
+            query.push(("version", v));
+        }
         let response = self
             .client
             .get(&full_endpoint)
-            .query(&[("url", canonical_url)])
+            .query(&query)
             .header("Accept", "application/fhir+json")
             .send_via(self, op, &full_endpoint)
             .await?;
@@ -1389,6 +1472,120 @@ impl UpstreamClient {
             })
     }
 
+    /// `_hm-current=older&_summary=count` over the same filters: how many
+    /// stored versions the matched canonicals have beyond the one listed.
+    /// `None` when the search is not grouped or HTS cannot say (an older
+    /// release answers 400 to `_hm-current`).
+    async fn older_version_count(
+        &self,
+        resource_type: &'static str,
+        query: &[(String, String)],
+    ) -> Option<u64> {
+        if !query.iter().any(|(k, v)| k == "_hm-current" && v == "true") {
+            return None;
+        }
+        let mut count: Vec<(String, String)> = query
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        count.push(("_hm-current".into(), "older".into()));
+        count.push(("_summary".into(), "count".into()));
+        let url = format!("{}/{}", self.base_url, resource_type);
+        let response = self
+            .client
+            .get(&url)
+            .query(&count)
+            .header("Accept", "application/fhir+json")
+            .send_via(self, "version-count", &url)
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        body.get("total").and_then(|v| v.as_u64())
+    }
+
+    /// How many canonical URLs of `resource_type` are stored (one per URL,
+    /// whatever its version count): `_hm-current=true&_summary=count`.
+    /// `None` when HTS cannot group (an older release answers 400).
+    pub async fn canonical_count(&self, resource_type: &'static str) -> Option<u64> {
+        self.count_of(resource_type, true).await
+    }
+
+    /// `_summary=count` of `resource_type`: canonical URLs when `grouped`,
+    /// stored versions otherwise.
+    pub async fn count_of(&self, resource_type: &'static str, grouped: bool) -> Option<u64> {
+        let url = format!("{}/{}", self.base_url, resource_type);
+        let query: &[(&str, &str)] = if grouped {
+            &[("_hm-current", "true"), ("_summary", "count")]
+        } else {
+            &[("_summary", "count")]
+        };
+        let response = self
+            .client
+            .get(&url)
+            .query(query)
+            .header("Accept", "application/fhir+json")
+            .send_via(self, "canonical-count", &url)
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().await.ok()?;
+        body.get("total").and_then(|v| v.as_u64())
+    }
+
+    /// Every stored version of one canonical, the resolver's choice first
+    /// (HTS orders a `url` search by its version precedence). Feeds the
+    /// "+N older" rows (`skip_current`) and the detail version switcher.
+    pub async fn versions_of(
+        &self,
+        resource_type: &'static str,
+        canonical_url: &str,
+        skip_current: bool,
+    ) -> Result<Vec<VersionChoice>, UpstreamError> {
+        let url = format!("{}/{}", self.base_url, resource_type);
+        let mut query = vec![
+            ("url", canonical_url.to_owned()),
+            ("_summary", "true".to_owned()),
+            ("_count", "200".to_owned()),
+        ];
+        if skip_current {
+            query.push(("_hm-current", "older".to_owned()));
+        }
+        let response = self
+            .client
+            .get(&url)
+            .query(&query)
+            .header("Accept", "application/fhir+json")
+            .send_via(self, "versions", &url)
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
+            op: "versions",
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
+        if !status.is_success() {
+            return Err(status_to_error("versions", &url, status.as_u16(), &body));
+        }
+        Ok(body
+            .get("entry")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e.get("resource"))
+                    .enumerate()
+                    .map(|(i, r)| VersionChoice::from_resource(r, i == 0 && !skip_current))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// CS detail page source.
     ///
     /// Implementation note (Alt E — Phase 3b): HTS stores each imported
@@ -1412,11 +1609,21 @@ impl UpstreamClient {
     /// so the detail handler can render an explanatory OperationOutcome
     /// partial (design doc §7.3) rather than propagating a page 404.
     pub async fn read_code_system(&self, id: &str) -> Result<CodeSystemSummary, UpstreamError> {
+        self.read_code_system_at(id, None).await
+    }
+
+    /// [`Self::read_code_system`] for one stored version (`None`: the version a
+    /// version-less request resolves to) — the detail page's switcher.
+    pub async fn read_code_system_at(
+        &self,
+        id: &str,
+        version: Option<&str>,
+    ) -> Result<CodeSystemSummary, UpstreamError> {
         let canonical_url = self
             .resolve_canonical_url("CodeSystem", "cs-read", id)
             .await?;
         let parsed = self
-            .fetch_by_url("CodeSystem", "cs-read", id, &canonical_url)
+            .fetch_by_url("CodeSystem", "cs-read", id, &canonical_url, version)
             .await?;
         let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
         Ok(CodeSystemSummary::from_resource(&parsed, pretty))
@@ -1887,6 +2094,7 @@ impl VsBrowserFilters {
                 ("title", &self.title),
                 ("status", &self.status),
             ],
+            self.version.as_deref().is_none_or(str::is_empty),
             self.effective_sort(),
             self.effective_count(),
             self.offset,
@@ -1965,6 +2173,11 @@ pub struct VsBrowserRow {
     pub name: String,
     pub title: String,
     pub status: String,
+    /// Stored versions of this canonical URL (`_hm-current` searches; 1
+    /// otherwise).
+    pub version_count: u64,
+    /// `date` of the listed version, when it carries one.
+    pub date: String,
 }
 
 impl VsBrowserRow {
@@ -1983,6 +2196,8 @@ impl VsBrowserRow {
             name: s("name"),
             title: s("title"),
             status: s("status"),
+            version_count: version_count_of(resource),
+            date: s("date"),
         }
     }
 }
@@ -1998,6 +2213,9 @@ pub struct VsBrowserPage {
     /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
     pub total: Option<u64>,
     pub paging: SearchPaging,
+    /// Stored versions across the matched canonicals (grouped searches
+    /// only): the list header reads "N code systems · M versions".
+    pub versions_total: Option<u64>,
 }
 
 impl VsBrowserPage {
@@ -2310,13 +2528,15 @@ impl UpstreamClient {
         let query = filters.upstream_query();
 
         let url = format!("{}/ValueSet", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .query(&query)
-            .header("Accept", "application/fhir+json")
-            .send_via(self, "vs-search", &url)
-            .await?;
+        let (response, older) = tokio::join!(
+            self.client
+                .get(&url)
+                .query(&query)
+                .header("Accept", "application/fhir+json")
+                .send_via(self, "vs-search", &url),
+            self.older_version_count("ValueSet", &query),
+        );
+        let response = response?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "vs-search",
@@ -2343,11 +2563,13 @@ impl UpstreamClient {
                     .collect()
             })
             .unwrap_or_default();
+        let total = body.get("total").and_then(|v| v.as_u64());
         Ok(VsBrowserPage {
             rows,
             filters: filters.clone(),
-            total: body.get("total").and_then(|v| v.as_u64()),
+            total,
             paging: SearchPaging::from_bundle(&body),
+            versions_total: total.zip(older).map(|(t, o)| t + o),
         })
     }
 
@@ -2358,11 +2580,21 @@ impl UpstreamClient {
     /// explanatory OperationOutcome partial inside the page shell (design
     /// doc §7.4 states matrix, §7.4.1 invariant #5).
     pub async fn read_value_set(&self, id: &str) -> Result<ValueSetSummary, UpstreamError> {
+        self.read_value_set_at(id, None).await
+    }
+
+    /// [`Self::read_value_set`] for one stored version (`None`: the version a
+    /// version-less request resolves to) — the detail page's switcher.
+    pub async fn read_value_set_at(
+        &self,
+        id: &str,
+        version: Option<&str>,
+    ) -> Result<ValueSetSummary, UpstreamError> {
         let canonical_url = self
             .resolve_canonical_url("ValueSet", "vs-read", id)
             .await?;
         let parsed = self
-            .fetch_by_url("ValueSet", "vs-read", id, &canonical_url)
+            .fetch_by_url("ValueSet", "vs-read", id, &canonical_url, version)
             .await?;
         let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
         Ok(ValueSetSummary::from_resource(&parsed, pretty))
@@ -2921,6 +3153,7 @@ impl CmBrowserFilters {
                 ("target-uri", &self.target),
                 ("status", &self.status),
             ],
+            true,
             self.effective_sort(),
             self.effective_count(),
             self.offset,
@@ -3008,6 +3241,11 @@ pub struct CmBrowserRow {
     pub name: String,
     pub title: String,
     pub status: String,
+    /// Stored versions of this canonical URL (`_hm-current` searches; 1
+    /// otherwise).
+    pub version_count: u64,
+    /// `date` of the listed version, when it carries one.
+    pub date: String,
     pub source_uri: String,
     pub target_uri: String,
 }
@@ -3050,6 +3288,8 @@ impl CmBrowserRow {
             name: s("name"),
             title: s("title"),
             status: s("status"),
+            version_count: version_count_of(resource),
+            date: s("date"),
             source_uri,
             target_uri,
         }
@@ -3066,6 +3306,9 @@ pub struct CmBrowserPage {
     /// "25 of 21,334" and offer page links. `None` when HTS omitted it.
     pub total: Option<u64>,
     pub paging: SearchPaging,
+    /// Stored versions across the matched canonicals (grouped searches
+    /// only): the list header reads "N code systems · M versions".
+    pub versions_total: Option<u64>,
 }
 
 impl CmBrowserPage {
@@ -3328,13 +3571,15 @@ impl UpstreamClient {
         let query = filters.upstream_query();
 
         let url = format!("{}/ConceptMap", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .query(&query)
-            .header("Accept", "application/fhir+json")
-            .send_via(self, "cm-search", &url)
-            .await?;
+        let (response, older) = tokio::join!(
+            self.client
+                .get(&url)
+                .query(&query)
+                .header("Accept", "application/fhir+json")
+                .send_via(self, "cm-search", &url),
+            self.older_version_count("ConceptMap", &query),
+        );
+        let response = response?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| UpstreamError::Decode {
             op: "cm-search",
@@ -3361,11 +3606,13 @@ impl UpstreamClient {
                     .collect()
             })
             .unwrap_or_default();
+        let total = body.get("total").and_then(|v| v.as_u64());
         Ok(CmBrowserPage {
             rows,
             filters: filters.clone(),
-            total: body.get("total").and_then(|v| v.as_u64()),
+            total,
             paging: SearchPaging::from_bundle(&body),
+            versions_total: total.zip(older).map(|(t, o)| t + o),
         })
     }
 
@@ -3376,11 +3623,21 @@ impl UpstreamClient {
     /// explanatory OperationOutcome partial inside the page shell (§7.5
     /// states matrix, mirroring §7.3.1 / §7.4.1 invariant #5).
     pub async fn read_concept_map(&self, id: &str) -> Result<ConceptMapSummary, UpstreamError> {
+        self.read_concept_map_at(id, None).await
+    }
+
+    /// [`Self::read_concept_map`] for one stored version (`None`: the version a
+    /// version-less request resolves to) — the detail page's switcher.
+    pub async fn read_concept_map_at(
+        &self,
+        id: &str,
+        version: Option<&str>,
+    ) -> Result<ConceptMapSummary, UpstreamError> {
         let canonical_url = self
             .resolve_canonical_url("ConceptMap", "cm-read", id)
             .await?;
         let parsed = self
-            .fetch_by_url("ConceptMap", "cm-read", id, &canonical_url)
+            .fetch_by_url("ConceptMap", "cm-read", id, &canonical_url, version)
             .await?;
         let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
         Ok(ConceptMapSummary::from_resource(&parsed, pretty))
@@ -4863,6 +5120,7 @@ mod tests {
             vec![
                 ("name:contains".into(), "ExampleLimbsVS".into()),
                 ("title:contains".into(), "Limbs Value".into()),
+                ("_hm-current".into(), "true".into()),
                 ("_sort".into(), "name".into()),
                 ("_count".into(), "25".into()),
                 ("_offset".into(), "0".into()),
@@ -4893,6 +5151,7 @@ mod tests {
                 ("source-uri".into(), "http://example.org/cs/source".into()),
                 ("target-uri".into(), "http://example.org/cs/target".into()),
                 ("status".into(), "active".into()),
+                ("_hm-current".into(), "true".into()),
                 ("_sort".into(), "title".into()),
                 ("_count".into(), "100".into()),
                 ("_offset".into(), "50".into()),
@@ -4923,6 +5182,7 @@ mod tests {
                 ..CsBrowserFilters::default()
             },
             paging: SearchPaging::default(),
+            versions_total: None,
         };
         assert_eq!(page.next_offset(), None);
 
@@ -4935,6 +5195,7 @@ mod tests {
                 ..CsBrowserFilters::default()
             },
             paging: SearchPaging::default(),
+            versions_total: None,
         };
         assert_eq!(page.next_offset(), Some(75));
     }
@@ -5014,6 +5275,7 @@ mod tests {
                 ..CsBrowserFilters::default()
             },
             paging: SearchPaging::default(),
+            versions_total: None,
         };
         assert_eq!(page.showing_count(), 25);
 
@@ -5027,6 +5289,7 @@ mod tests {
                 ..CsBrowserFilters::default()
             },
             paging: SearchPaging::default(),
+            versions_total: None,
         };
         assert_eq!(page.showing_count(), 34);
     }
@@ -6221,6 +6484,7 @@ mod paging_tests {
             rows: Vec::new(),
             total: Some(21_334),
             paging: Default::default(),
+            versions_total: None,
             filters: VsBrowserFilters {
                 count: 25,
                 offset: 50,

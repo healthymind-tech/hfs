@@ -50,7 +50,7 @@
     <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-systems") }}</span>
       <span class="stat__value" data-stat="systems">{{ systems }}</span>
-      <span class="stat__sub">{% if show_all %}{{ chrome.i18n.t("hts-term-stat-systems-all") }}{% else if counts_pending %}{{ chrome.i18n.t("hts-term-stat-systems-counting") }}{% else %}{{ chrome.i18n.t("hts-term-stat-systems-populated") }}{% endif %}</span>
+      <span class="stat__sub">{% if let Some(v) = system_versions %}{{ chrome.i18n.t_arg("hts-term-stat-versions", "versions", v.clone()) }} · {% endif %}{% if show_all %}{{ chrome.i18n.t("hts-term-stat-systems-all") }}{% else if counts_pending %}{{ chrome.i18n.t("hts-term-stat-systems-counting") }}{% else %}{{ chrome.i18n.t("hts-term-stat-systems-populated") }}{% endif %}</span>
     </article>
     <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-concepts") }}</span>
@@ -61,8 +61,13 @@
     </article>
     <article class="stat">
       <span class="stat__label">{{ chrome.i18n.t("hts-term-stat-other") }}</span>
+      {% if let (Some(vsu), Some(cmu)) = (value_set_urls, concept_map_urls) %}
+      <span class="stat__value">{{ vsu }} / {{ cmu }}</span>
+      <span class="stat__sub">{{ chrome.i18n.t_arg2("hts-term-stat-other-versions", "vs", value_sets.clone(), "cm", concept_maps.clone()) }}</span>
+      {% else %}
       <span class="stat__value">{{ value_sets }} / {{ concept_maps }}</span>
       <span class="stat__sub">{{ chrome.i18n.t("hts-term-stat-other-sub") }}</span>
+      {% endif %}
     </article>
   </section>
 

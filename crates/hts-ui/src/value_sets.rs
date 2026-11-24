@@ -344,6 +344,7 @@ async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRows
                 filters: VsBrowserFilters::default(),
                 total: None,
                 paging: Default::default(),
+                versions_total: None,
             }),
             count_over_max: true,
         };
@@ -364,6 +365,9 @@ struct DetailPageTemplate<'a> {
     chrome: Chrome<'a>,
     id: String,
     detail: Result<ValueSetSummary, UpstreamError>,
+    /// Every stored version of this canonical, for the switcher (empty
+    /// after a workbench POST: the switcher then shows the plain chip).
+    versions: Vec<crate::upstream::VersionChoice>,
     tab: VsTab,
     /// Populated only when this render is an Expand result. Keeps the
     /// `tab` field independent of the workbench state, matching Slice B.
@@ -451,6 +455,7 @@ async fn detail_page(Path(id): Path<String>) -> Response {
 async fn expand_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
+    Query(vq): Query<crate::versions::VersionQuery>,
     HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
@@ -460,7 +465,11 @@ async fn expand_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state.upstream.read_value_set(&id).await.ok();
+    let summary = state
+        .upstream
+        .read_value_set_at(&id, vq.get())
+        .await
+        .ok();
     render_detail_with_tab(&state, chrome, id, VsTab::Expand, summary).await
 }
 
@@ -475,10 +484,19 @@ async fn render_detail_with_tab<'a>(
         Some(s) => Ok(s),
         None => state.upstream.read_value_set(&id).await,
     };
+    let versions = match &detail {
+        Ok(d) if !d.url.is_empty() => state
+            .upstream
+            .versions_of("ValueSet", &d.url, false)
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     render(
         DetailPageTemplate {
             chrome,
             id,
+            versions,
             detail,
             tab,
             workbench: None,
@@ -699,10 +717,12 @@ async fn respond_workbench<'a>(
         );
     }
     let detail = state.upstream.read_value_set(&id).await;
+    let versions = Vec::new();
     render(
         DetailPageTemplate {
             chrome,
             id,
+            versions,
             detail,
             tab: VsTab::Expand,
             workbench: Some(view),

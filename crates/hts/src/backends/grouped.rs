@@ -53,6 +53,16 @@ fn precedence(table: &str) -> std::borrow::Cow<'static, str> {
     }
 }
 
+/// A ConceptMap's source / target scope column (the maps browser lists
+/// both); a typed NULL for the other tables.
+fn scope_column(table: &str, alias: &str, column: &str) -> String {
+    if table == "concept_maps" {
+        format!("{alias}{column}")
+    } else {
+        "CAST(NULL AS TEXT)".to_string()
+    }
+}
+
 /// A `LIKE` pattern for a FHIR string filter (case-insensitive; `%`, `_` and
 /// `\` in the value are escaped, `ESCAPE '\'`).
 pub(crate) fn like_pattern(value: &str, mode: FhirStringSearchMode) -> String {
@@ -156,15 +166,17 @@ pub(crate) fn build(table: &str, dialect: Dialect, query: &ResourceSearchQuery) 
         Some(VersionGroup::Older) => format!(
             "WITH hm_ranked AS ( \
                SELECT {table}.id, {table}.url, {table}.version, {table}.name, {table}.title, \
-                      {table}.status, {table}.fhir_id, {date} AS hm_date, \
+                      {table}.status, {table}.fhir_id, {date} AS hm_date, {src} AS hm_src, {tgt} AS hm_tgt, \
                       ROW_NUMBER() OVER (PARTITION BY {table}.url ORDER BY {prec}) AS hm_rn, \
                       COUNT(*) OVER (PARTITION BY {table}.url) AS hm_n \
                FROM {table} WHERE {table}.url IN (SELECT url FROM {table} WHERE {filter})) \
-             SELECT id, url, version, name, title, status, fhir_id, hm_n, hm_date \
+             SELECT id, url, version, name, title, status, fhir_id, hm_n, hm_date, hm_src, hm_tgt \
              FROM hm_ranked WHERE hm_rn > 1 ORDER BY {order} LIMIT {limit} OFFSET {offset}",
             prec = precedence(table),
             limit = pl(6),
             offset = pl(7),
+            src = scope_column(table, "", "source_uri"),
+            tgt = scope_column(table, "", "target_uri"),
         ),
         // `true`: page the canonical groups first (one aggregate pass over
         // the url index), then pick the precedence winner of only the page's
@@ -185,11 +197,13 @@ pub(crate) fn build(table: &str, dialect: Dialect, query: &ResourceSearchQuery) 
                        ORDER BY {prec} LIMIT 1) AS hm_id \
                FROM hm_page) \
              SELECT t.id, t.url, t.version, t.name, t.title, t.status, t.fhir_id, hm_rep.hm_n, \
-                    {tdate} AS hm_date \
+                    {tdate} AS hm_date, {src} AS hm_src, {tgt} AS hm_tgt \
              FROM hm_rep JOIN {table} t ON t.id = hm_rep.hm_id ORDER BY hm_rep.hm_pos",
             prec = precedence(table),
             limit = pl(6),
             offset = pl(7),
+            src = scope_column(table, "t.", "source_uri"),
+            tgt = scope_column(table, "t.", "target_uri"),
             // Unfiltered (the common case): one pass, no semi-join. Filtered:
             // a group matches when any of its versions does, and still
             // counts all of them.
@@ -239,6 +253,7 @@ pub(crate) fn resource(
     fhir_id: Option<&str>,
     versions: i64,
     date: Option<&str>,
+    scope: [Option<&str>; 2],
 ) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "resourceType": resource_type,
@@ -262,6 +277,11 @@ pub(crate) fn resource(
     if let Some(d) = date.filter(|d| !d.is_empty()) {
         obj["date"] = d.into();
     }
+    for (key, value) in ["sourceUri", "targetUri"].into_iter().zip(scope) {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            obj[key] = v.into();
+        }
+    }
     obj
 }
 
@@ -283,7 +303,7 @@ mod tests {
             ..Default::default()
         };
         let g = build("code_systems", Dialect::Postgres, &q);
-        assert!(g.select.contains("GROUP BY url ORDER BY"));
+        assert!(g.select.contains("GROUP BY url), hm_page AS"));
         assert!(g.select.contains(&*super::super::cs_precedence_order_by("code_systems")));
         assert!(g.select.contains("LIMIT $6 OFFSET $7"));
         assert!(g.select.ends_with("ORDER BY hm_rep.hm_pos"));
@@ -297,8 +317,12 @@ mod tests {
 
     #[test]
     fn grouped_entries_carry_the_version_count_and_date() {
-        let r = resource("ValueSet", "us-core-race|7.0.0", "http://x/vs", Some("7.0.0"), None, Some("Race"), "active", Some("us-core-race"), 4, Some("2024-01-01"));
+        let r = resource("ValueSet", "us-core-race|7.0.0", "http://x/vs", Some("7.0.0"), None, Some("Race"), "active", Some("us-core-race"), 4, Some("2024-01-01"), [None, None]);
         assert_eq!(r["id"], "us-core-race");
+        assert!(r.get("sourceUri").is_none());
+        let m = resource("ConceptMap", "m", "http://x/cm", None, None, None, "active", None, 2, None, [Some("http://x/a"), Some("")]);
+        assert_eq!(m["sourceUri"], "http://x/a");
+        assert!(m.get("targetUri").is_none());
         assert_eq!(r["meta"]["extension"][0]["valueInteger"], 4);
         assert_eq!(r["date"], "2024-01-01");
     }

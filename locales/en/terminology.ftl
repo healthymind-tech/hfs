@@ -705,3 +705,17 @@ hts-term-older-version = older version
 hts-term-row-actions = Actions for { $system }
 hts-job-log-wrap = Wrap
 hts-job-log-copy = Copy
+
+## Version grouping (one row per canonical URL)
+hts-browser-open = Open
+hts-browser-delete-version = Delete version…
+hts-browser-delete-confirm = Delete version { $version } of { $url }?
+hts-browser-older-failed = Could not load the older versions.
+hts-cs-browser-total-grouped = { $total } code systems · { $versions } versions
+hts-vs-browser-total-grouped = { $total } value sets · { $versions } versions
+hts-cm-browser-total-grouped = { $total } concept maps · { $versions } versions
+hts-version-switch = Version
+hts-version-switch-count = { $count } versions
+hts-version-switch-current = current
+hts-term-stat-versions = { $versions } versions
+hts-term-stat-other-versions = { $vs } / { $cm } versions

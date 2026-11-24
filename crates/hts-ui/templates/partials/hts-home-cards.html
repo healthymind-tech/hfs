@@ -115,6 +115,9 @@
       {#- Bundled-data footprint, folded in from its own tile. `None` when no
           HTS_BOOTSTRAP_DIR was configured — then the provenance hint stands
           alone rather than claiming a misleading zero. -#}
+      {%- if let Some(v) = cards.cs_versions -%}
+          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-term-stat-versions", "versions", chrome.i18n.num(*v)) }}</span>
+      {%- endif -%}
       {%- match cards.bundled_data_mib() -%}
         {%- when Some(mib) -%}
           <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-loaded-systems-sub", "mib", *mib) }}</span>

@@ -1,0 +1,24 @@
+{#-
+  "+N older": the other stored versions of one canonical, inserted under its
+  grouped row by `shell.js` (`[data-versions-toggle][data-versions-src]`).
+  Same six columns as the browser tables; `data-older` folds them away
+  with the toggle.
+-#}
+<table><tbody>
+{% if failed %}
+<tr data-older class="data-table__empty"><td colspan="6">{{ chrome.i18n.t("hts-browser-older-failed") }}</td></tr>
+{% endif %}
+{% for v in rows %}
+<tr data-older data-version="{{ v.version }}">
+  <td class="col-name"><a class="col-name__older" href="{{ kind.detail_href(v.id, v.version) }}" title="{{ v.url }}">{{ chrome.i18n.t("hts-term-older-version") }}</a></td>
+  <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-title") }}">{% if v.title.is_empty() %}&mdash;{% else %}{{ v.title }}{% endif %}</td>
+  <td class="col-older-url" aria-hidden="true"></td>
+  <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-version") }}">{% if v.version.is_empty() %}&mdash;{% else %}<code>{{ v.version }}</code>{% endif %}{% if !v.date.is_empty() %} <span class="cell-sub">{{ v.date }}</span>{% endif %}</td>
+  <td data-label="{{ chrome.i18n.t("hts-cs-browser-column-status") }}">{% if v.status.is_empty() %}&mdash;{% else %}<span class="tag tag--{{ v.status }}">{{ chrome.i18n.t(format!("hts-cs-status-{}", v.status).as_str()) }}</span>{% endif %}</td>
+  <td class="col-actions">
+    {% let m_id = v.id.clone() %}{% let m_url = v.url.clone() %}{% let m_version = v.version.clone() %}{% let m_current = v.current %}{% let m_count = 2 %}
+    {% include "partials/hts-version-menu.html" %}
+  </td>
+</tr>
+{% endfor %}
+</tbody></table>

@@ -687,6 +687,31 @@
     if (tog) {
       var row = tog.closest("tr");
       var open = tog.getAttribute("aria-expanded") !== "true";
+      // Browsers list one row per canonical; its other versions are
+      // fetched once, on the first expand, and inserted under it.
+      var src = tog.getAttribute("data-versions-src");
+      if (open && src && !tog.hasAttribute("data-loaded")) {
+        if (tog.getAttribute("aria-busy") === "true") return;
+        tog.setAttribute("aria-busy", "true");
+        fetch(src, { headers: { "HX-Request": "true" }, credentials: "same-origin" })
+          .then(function (r) { return r.text(); })
+          .then(function (html) {
+            var doc = new DOMParser().parseFromString(html, "text/html");
+            var rows = doc.querySelectorAll("tr[data-older]");
+            var at = row;
+            for (var i = 0; i < rows.length; i++) {
+              var tr = document.importNode(rows[i], true);
+              at.after(tr);
+              at = tr;
+            }
+            if (window.htmx) for (var j = row.nextElementSibling; j && j.hasAttribute("data-older"); j = j.nextElementSibling) window.htmx.process(j);
+            tog.setAttribute("data-loaded", "");
+            tog.removeAttribute("aria-busy");
+            tog.click();
+          })
+          .catch(function () { tog.removeAttribute("aria-busy"); });
+        return;
+      }
       tog.setAttribute("aria-expanded", open ? "true" : "false");
       var n = 0;
       for (var r = row.nextElementSibling; r && r.hasAttribute("data-older"); r = r.nextElementSibling) {

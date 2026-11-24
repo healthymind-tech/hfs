@@ -87,6 +87,7 @@ fn search_grouped(
                     row.get::<_, Option<String>>(6)?.as_deref(),
                     row.get::<_, i64>(7)?,
                     row.get::<_, Option<String>>(8)?.as_deref(),
+                    [row.get::<_, Option<String>>(9)?.as_deref(), row.get::<_, Option<String>>(10)?.as_deref()],
                 ))
             },
         )

@@ -414,6 +414,12 @@ pub struct HomeCards {
     /// was configured (the docker image or a bare `hts run` from a source
     /// tree). Renders as an em-dash in that arm.
     pub bundled_data_bytes: Option<u64>,
+    /// Code systems by canonical URL and by stored version
+    /// (`_hm-current=true` / plain `_summary=count`), for "N code systems ·
+    /// M versions". `None` when HTS cannot say; the tile then falls back to
+    /// `TerminologyCapabilities.codeSystem[]`.
+    pub cs_canonicals: Option<u64>,
+    pub cs_versions: Option<u64>,
     /// Process-wide count of HTTP requests, from `http_requests_total` on
     /// `/metrics`. `None` when the fetch or parse fails — fail-open per
     /// design §7 degraded contract.
@@ -444,10 +450,12 @@ impl HomeCards {
         series: SeriesFilter,
         i18n: &I18n,
     ) -> Self {
-        let (health, capabilities, metrics_result) = tokio::join!(
+        let (health, capabilities, metrics_result, cs_canonicals, cs_versions) = tokio::join!(
             state.upstream.health(),
             state.upstream.terminology_capabilities(),
             state.upstream.metrics_text(),
+            state.upstream.count_of("CodeSystem", true),
+            state.upstream.count_of("CodeSystem", false),
         );
 
         // Fail-open: any failure in the metrics leg leaves both tiles as
@@ -480,6 +488,8 @@ impl HomeCards {
             health,
             capabilities,
             bundled_data_bytes: state.bundled_data_bytes,
+            cs_canonicals,
+            cs_versions,
             requests_total,
             avg_latency_ms,
             window,
@@ -509,6 +519,9 @@ impl HomeCards {
     /// Returns `None` when the capabilities fetch failed — the tile then
     /// renders an em-dash instead of a zero, which would be a lie.
     pub fn loaded_system_count(&self) -> Option<usize> {
+        if let Some(n) = self.cs_canonicals {
+            return Some(n as usize);
+        }
         self.capabilities
             .as_ref()
             .ok()

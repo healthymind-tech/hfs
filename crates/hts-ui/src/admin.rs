@@ -309,6 +309,8 @@ struct Inventory {
     concept_maps: u64,
     #[serde(default)]
     code_system_count: u64,
+    /// Older HTS releases lack it: then the card shows the systems alone.
+    code_system_version_count: Option<u64>,
     total_concepts: Option<u64>,
     #[serde(default)]
     systems: Vec<InvSystem>,
@@ -366,6 +368,11 @@ struct InventoryPage<'a> {
     db_size: Option<String>,
     db_reclaimable: Option<String>,
     systems: String,
+    /// Stored versions of those systems, when HTS reports it.
+    system_versions: Option<String>,
+    /// Canonical ValueSets / ConceptMaps (one per URL), when HTS can group.
+    value_set_urls: Option<String>,
+    concept_map_urls: Option<String>,
     concepts: Option<String>,
     value_sets: String,
     concept_maps: String,
@@ -393,7 +400,12 @@ async fn inventory_page(
     let show_all = q.all.is_some();
     let limit = q.limit.unwrap_or(50).clamp(1, 5000);
     let (path, back) = inventory_urls(&query, sort, show_all, limit);
-    let result = admin_get(&state, &path, SLOW).await.and_then(|v| {
+    let (result, vs_urls, cm_urls) = tokio::join!(
+        admin_get(&state, &path, SLOW),
+        state.upstream.canonical_count("ValueSet"),
+        state.upstream.canonical_count("ConceptMap"),
+    );
+    let result = result.and_then(|v| {
         serde_json::from_value::<Inventory>(v).map_err(|e| Unavailable::Error(e.to_string()))
     });
     let mut page = InventoryPage {
@@ -409,6 +421,9 @@ async fn inventory_page(
         db_size: None,
         db_reclaimable: None,
         systems: String::new(),
+        system_versions: None,
+        value_set_urls: vs_urls.map(|n| i18n.num(n)),
+        concept_map_urls: cm_urls.map(|n| i18n.num(n)),
         concepts: None,
         value_sets: String::new(),
         concept_maps: String::new(),
@@ -429,6 +444,7 @@ async fn inventory_page(
                 page.db_reclaimable = Some(bytes_label(&i18n, db.reclaimable_bytes));
             }
             page.systems = i18n.num(inv.code_system_count);
+            page.system_versions = inv.code_system_version_count.map(|n| i18n.num(n));
             page.concepts = inv.total_concepts.map(|n| i18n.num(n));
             page.value_sets = i18n.num(inv.value_sets);
             page.concept_maps = i18n.num(inv.concept_maps);

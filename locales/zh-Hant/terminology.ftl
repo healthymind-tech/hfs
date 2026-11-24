@@ -704,3 +704,17 @@ hts-term-older-version = 舊版本
 hts-term-row-actions = { $system } 的動作
 hts-job-log-wrap = 自動換行
 hts-job-log-copy = 複製
+
+## Version grouping (one row per canonical URL)
+hts-browser-open = 開啟
+hts-browser-delete-version = 刪除此版本…
+hts-browser-delete-confirm = 要刪除 { $url } 的版本 { $version } 嗎？
+hts-browser-older-failed = 無法載入較舊的版本。
+hts-cs-browser-total-grouped = { $total } 個代碼系統 · { $versions } 個版本
+hts-vs-browser-total-grouped = { $total } 個值集 · { $versions } 個版本
+hts-cm-browser-total-grouped = { $total } 個概念對應 · { $versions } 個版本
+hts-version-switch = 版本
+hts-version-switch-count = { $count } 個版本
+hts-version-switch-current = 目前
+hts-term-stat-versions = { $versions } 個版本
+hts-term-stat-other-versions = { $vs } / { $cm } 個版本

@@ -376,6 +376,7 @@ async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRows
                 filters: CsBrowserFilters::default(),
                 total: None,
                 paging: Default::default(),
+                versions_total: None,
             }),
             count_over_max: true,
         };
@@ -396,6 +397,9 @@ struct DetailPageTemplate<'a> {
     chrome: Chrome<'a>,
     id: String,
     detail: Result<CodeSystemSummary, UpstreamError>,
+    /// Every stored version of this canonical, for the switcher (empty
+    /// after a workbench POST: the switcher then shows the plain chip).
+    versions: Vec<crate::upstream::VersionChoice>,
     tab: CsTab,
     /// Populated only when this render is a workbench result. Kept
     /// separate from `tab` so the template can distinguish "tab pre-loaded
@@ -477,6 +481,7 @@ async fn detail_page(Path(id): Path<String>) -> Response {
 async fn lookup_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
+    Query(vq): Query<crate::versions::VersionQuery>,
     HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
@@ -486,13 +491,18 @@ async fn lookup_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state.upstream.read_code_system(&id).await.ok();
+    let summary = state
+        .upstream
+        .read_code_system_at(&id, vq.get())
+        .await
+        .ok();
     render_detail_with_tab(&state, chrome, id, CsTab::Lookup, summary).await
 }
 
 async fn validate_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
+    Query(vq): Query<crate::versions::VersionQuery>,
     HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
@@ -502,13 +512,18 @@ async fn validate_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state.upstream.read_code_system(&id).await.ok();
+    let summary = state
+        .upstream
+        .read_code_system_at(&id, vq.get())
+        .await
+        .ok();
     render_detail_with_tab(&state, chrome, id, CsTab::Validate, summary).await
 }
 
 async fn subsumes_input(
     State(state): State<Arc<HtsUiState>>,
     Path(id): Path<String>,
+    Query(vq): Query<crate::versions::VersionQuery>,
     HxRequest(_is_htmx): HxRequest,
     locale: RequestLocale,
 ) -> Response {
@@ -518,7 +533,11 @@ async fn subsumes_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state.upstream.read_code_system(&id).await.ok();
+    let summary = state
+        .upstream
+        .read_code_system_at(&id, vq.get())
+        .await
+        .ok();
     render_detail_with_tab(&state, chrome, id, CsTab::Subsumes, summary).await
 }
 
@@ -533,10 +552,19 @@ async fn render_detail_with_tab<'a>(
         Some(s) => Ok(s),
         None => state.upstream.read_code_system(&id).await,
     };
+    let versions = match &detail {
+        Ok(d) if !d.url.is_empty() => state
+            .upstream
+            .versions_of("CodeSystem", &d.url, false)
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     render(
         DetailPageTemplate {
             chrome,
             id,
+            versions,
             detail,
             tab,
             workbench: None,
@@ -911,10 +939,12 @@ async fn respond_workbench<'a>(
         return render(WorkbenchResultTemplate { chrome, view }.render());
     }
     let detail = state.upstream.read_code_system(&id).await;
+    let versions = Vec::new();
     render(
         DetailPageTemplate {
             chrome,
             id,
+            versions,
             detail,
             tab,
             workbench: Some(view),

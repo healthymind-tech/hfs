@@ -16180,3 +16180,44 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     }
   }
 }
+
+/* ── Redesign: version-grouped terminology browsers ──────────────────
+   One row per canonical URL; "+N older" inserts the other versions under
+   it (`shell.js`). The grouped row's date and the older rows read as
+   secondary text; the older rows repeat no URL. */
+@layer pages {
+  .data-table .cell-sub {
+    display: inline-block;
+    margin-left: var(--s1);
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+    white-space: nowrap;
+  }
+
+  .data-table td.col-actions,
+  .data-table th.col-actions {
+    width: 1%;
+    white-space: nowrap;
+    text-align: right;
+  }
+
+  .versions-toggle[aria-busy="true"] {
+    opacity: .6;
+    cursor: progress;
+  }
+
+  .versions-toggle[aria-expanded="true"] {
+    color: var(--text-2);
+  }
+
+  a.col-name__older {
+    display: inline-block;
+    color: var(--text-2);
+  }
+
+  @media (max-width: 720px) {
+    .data-table--stack td.col-older-url {
+      display: none;
+    }
+  }
+}

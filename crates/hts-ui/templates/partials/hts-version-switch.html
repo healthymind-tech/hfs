@@ -1,0 +1,26 @@
+{#-
+  Detail pages' version switcher: every stored version of this canonical,
+  the one a version-less request resolves to marked "current". Each entry
+  is a plain link to the same detail tab at `?version=`. Expects `kind`,
+  `id`, `versions` and `summary` in scope; one version renders the plain
+  chip.
+-#}
+{% if versions.len() > 1 %}
+<details class="menu version-switch">
+  <summary class="chip" aria-label="{{ chrome.i18n.t("hts-version-switch") }}: {{ summary.version }} ({{ chrome.i18n.t_arg("hts-version-switch-count", "count", versions.len().to_string()) }})">
+    {{ chrome.i18n.t("hts-detail-version-label") }} <span class="count">{{ summary.version }}</span>
+    <span class="version-switch__n">{{ chrome.i18n.t_arg("hts-version-switch-count", "count", versions.len().to_string()) }}</span>
+    <span class="version-switch__chev" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+  <div class="menu__panel" role="list">
+    {% for v in versions %}
+    <a role="listitem" class="menu__option" href="{{ kind.detail_href(id, v.version) }}"{% if v.version == summary.version %} aria-current="true"{% endif %}>
+      <span class="menu__option-text"><code>{{ v.version }}</code>{% if v.current %} <span class="status status--ok">{{ chrome.i18n.t("hts-version-switch-current") }}</span>{% endif %}</span>
+      <span class="menu__option-meta">{% if !v.status.is_empty() %}{{ v.status }}{% endif %}{% if !v.date.is_empty() %} · {{ v.date }}{% endif %}</span>
+    </a>
+    {% endfor %}
+  </div>
+</details>
+{% else if !summary.version.is_empty() %}
+<span class="chip">{{ chrome.i18n.t("hts-detail-version-label") }} <span class="count">{{ summary.version }}</span></span>
+{% endif %}
