@@ -16374,3 +16374,48 @@ html[data-nav-dir]::view-transition-old(hm-main) {
     box-shadow: inset 2px 0 0 var(--accent);
   }
 }
+
+/* Version switcher on narrow screens: the chip wraps instead of running out
+   of its pane; the version count is dropped first. The "+N older" toggle
+   ellipsizes inside a narrow name cell. The endpoint path prefix keeps a
+   hairline off the input's border. */
+@layer pages {
+  details.version-switch {
+    max-width: 100%;
+  }
+
+  details.version-switch > summary.chip {
+    max-width: 100%;
+    height: auto;
+    min-height: 28px;
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  details.version-switch > summary .count {
+    overflow-wrap: anywhere;
+  }
+
+  details.version-switch > .menu__panel {
+    max-width: min(360px, calc(100vw - 32px));
+  }
+
+  @media (max-width: 720px) {
+    .version-switch__n {
+      display: none;
+    }
+  }
+
+  .data-table td.col-name > .versions-toggle {
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .input-prefix > .input-prefix__text {
+    margin-inline-end: 2px;
+  }
+}
