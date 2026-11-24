@@ -43,7 +43,7 @@
       (select, pushState, one queued settings write). Boosted, the persistent
       shell would also reload the page — a second, server-side settings write
       racing the client's into a 412. -#}
-  <aside class="filter-rail" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}" hx-boost="false"
+  <aside class="filter-rail" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}" hx-boost="false" data-md-rail
          data-selected-type="{{ selected_type }}"
          data-create-eligible="{% if create_disabled %}false{% else %}true{% endif %}"
          data-create-target="{% if create_disabled %}{% else %}{{ selected_type }}{% endif %}"

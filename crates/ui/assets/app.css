@@ -16327,3 +16327,33 @@ html[data-nav-dir]::view-transition-old(hm-main) {
     background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   }
 }
+
+/* ── Redesign: dialogs enter (motion audit) ──────────────────────────
+   The Resources editor (the page's detail) and the shared confirm dialog
+   rise 8px and fade in over 180 ms; the scrim fades. */
+@layer pages {
+  .modal:not([hidden]) > .modal__box,
+  .confirm-dialog[open] {
+    animation: hm-dialog-in var(--dur-2) var(--ease-out) both;
+  }
+
+  .modal:not([hidden]) > .modal__backdrop {
+    animation: hm-fade-in var(--dur-2) var(--ease-std) both;
+  }
+
+  @keyframes hm-dialog-in {
+    from { opacity: 0; transform: translateY(8px) scale(.99); }
+  }
+
+  @keyframes hm-fade-in {
+    from { opacity: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .modal:not([hidden]) > .modal__box,
+    .confirm-dialog[open],
+    .modal:not([hidden]) > .modal__backdrop {
+      animation: none;
+    }
+  }
+}

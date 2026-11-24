@@ -1779,6 +1779,7 @@
     ["type-rail-list", "type-rail-recent"].forEach(function (id) {
       var host = document.getElementById(id);
       if (!host) return;
+    var before = host.querySelector('a.filter-rail__item[aria-current="true"]');
       host.querySelectorAll("a.filter-rail__item").forEach(function (item) {
         if (item.dataset.type === type) {
           item.setAttribute("aria-current", "true");
@@ -1786,6 +1787,9 @@
           item.removeAttribute("aria-current");
         }
       });
+      // Master-detail motion: the highlight glides to the new type.
+      var after = host.querySelector('a.filter-rail__item[aria-current="true"]');
+      if (before && after && window.HM && window.HM.motion) window.HM.motion.glide(before, after, "md-ink");
     });
   }
 
@@ -3050,6 +3054,8 @@
     results.error.hidden = true;
   }
 
+  var resultsShown = false;
+
   function renderResults(path, body, context) {
     var card = results.card;
     if (!card) return false;
@@ -3059,6 +3065,10 @@
     card.hidden = false;
     results.head.replaceChildren(prepared.head);
     results.body.replaceChildren(prepared.rows);
+    // A new list re-renders with a short stagger (<= 20 rows, <= 240 ms);
+    // not the first one, which arrives with the page.
+    if (resultsShown && window.HM && window.HM.motion) window.HM.motion.stagger(results.body.rows || [], { max: 20, total: 240 });
+    resultsShown = true;
     results.meta.textContent = prepared.meta;
     results.note.textContent = prepared.note;
     var renderedRevision = builderRevision;
