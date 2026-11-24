@@ -15853,3 +15853,23 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     color: var(--text-2);
   }
 }
+
+/* Loaded terminologies: row actions stay on one line (Explore + ⋯), so a
+   row is one line of text tall; numbers right-aligned. */
+@layer pages {
+  #hts-term-table td.col-actions,
+  #hts-term-table th.col-actions {
+    width: 1%;
+    white-space: nowrap;
+  }
+
+  #hts-term-table .row-actions {
+    flex-wrap: nowrap;
+  }
+
+  @media (min-width: 768px) {
+    #hts-term-table .col-num {
+      text-align: right;
+    }
+  }
+}
