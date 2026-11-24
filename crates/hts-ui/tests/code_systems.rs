@@ -1097,6 +1097,7 @@ async fn grouped_rows_offer_older_versions_and_count_both() {
         .and_then(|r| r.split('"').next())
         .unwrap_or_default()
         .replace("&amp;", "&")
+        .replace("&#38;", "&")
         .replace("&#x2f;", "/");
     assert!(
         src.ends_with("/code-systems/versions?url=http%3A%2F%2Fx%2Fcs%2Falpha&status=draft"),
