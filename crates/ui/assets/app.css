@@ -16041,7 +16041,7 @@ details.card[open] > summary.card-head > .disclosure__chevron {
      simple radio cards become the same segmented control, the chosen
      option's hint on one line below. */
   .choice-grid,
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) {
     display: grid;
     grid-template-columns: repeat(var(--seg-n, 3), max-content) 1fr;
     align-items: center;
@@ -16050,16 +16050,16 @@ details.card[open] > summary.card-head > .disclosure__chevron {
   }
 
   .choice-grid:has(> .choice-card:nth-child(2):last-child),
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))):has(> .radio-card:nth-child(2):last-child) { --seg-n: 2; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))):has(> .radio-card:nth-child(2):last-child) { --seg-n: 2; }
   .choice-grid:has(> .choice-card:nth-child(4)),
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))):has(> .radio-card:nth-child(4)) { --seg-n: 4; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))):has(> .radio-card:nth-child(4)) { --seg-n: 4; }
 
   .choice-grid > .choice-card {
     display: contents;
   }
 
   .choice-grid > .choice-card > .choice-card__title,
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > .radio-card__title {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card > .radio-card__title {
     position: relative;
     grid-row: 1;
     display: inline-flex;
@@ -16121,11 +16121,11 @@ details.card[open] > summary.card-head > .disclosure__chevron {
 
   /* The simple radio-card grids outside the endpoint settings form (the
      new-endpoint wizard) take the settings form's segmented look. */
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card {
     display: contents;
   }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > input {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card > input {
     position: relative;
     z-index: 2;
     grid-row: 1;
@@ -16136,31 +16136,31 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     cursor: pointer;
   }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(1) > input,
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(1) > .radio-card__title { grid-column: 1; }
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(2) > input,
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(2) > .radio-card__title { grid-column: 2; }
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(3) > input,
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(3) > .radio-card__title { grid-column: 3; }
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(4) > input,
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:nth-child(4) > .radio-card__title { grid-column: 4; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(1) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(1) > .radio-card__title { grid-column: 1; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(2) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(2) > .radio-card__title { grid-column: 2; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(3) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(3) > .radio-card__title { grid-column: 3; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(4) > input,
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:nth-child(4) > .radio-card__title { grid-column: 4; }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:first-child > .radio-card__title { border-left-width: 2px; border-radius: 6px 0 0 6px; }
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:last-child > .radio-card__title { border-right-width: 2px; border-radius: 0 6px 6px 0; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:first-child > .radio-card__title { border-left-width: 2px; border-radius: 6px 0 0 6px; }
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:last-child > .radio-card__title { border-right-width: 2px; border-radius: 0 6px 6px 0; }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:has(> input:checked) > .radio-card__title {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:has(> input:checked) > .radio-card__title {
     border-radius: 6px;
     background: var(--surface);
     box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 0 0 1px var(--border);
     color: var(--text);
   }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:has(> input:focus-visible) > .radio-card__title {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:has(> input:focus-visible) > .radio-card__title {
     outline: 2px solid var(--color-focus-ring);
     outline-offset: 1px;
   }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > .radio-card__desc {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card > .radio-card__desc {
     grid-row: 2;
     grid-column: 1 / -1;
     margin-top: 8px;
@@ -16168,18 +16168,18 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     color: var(--text-2);
   }
 
-  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card:not(:has(> input:checked)) > .radio-card__desc {
+  .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card:not(:has(> input:checked)) > .radio-card__desc {
     display: none;
   }
 
   @media (max-width: 560px) {
     .choice-grid,
-    .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) {
+    .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) {
       grid-template-columns: repeat(var(--seg-n, 3), minmax(0, 1fr));
     }
 
     .choice-grid > .choice-card > .choice-card__title,
-    .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title):not(.radio-card__desc))) > .radio-card > .radio-card__title {
+    .radio-cards__grid:not(:has(> .radio-card > :not(input):not(.radio-card__title))):not(:has(> .radio-card:nth-child(5))) > .radio-card > .radio-card__title {
       padding: 0 8px;
       white-space: normal;
       text-align: center;
@@ -16429,5 +16429,49 @@ html[data-nav-dir]::view-transition-old(hm-main) {
 
   #batch-upload > .batch-pane {
     padding: 0 var(--s5) var(--s5);
+  }
+}
+
+/* Terminology browsers below 1280px: the listed version's day goes under
+   the version, canonical URLs clip shorter and a map's scope URIs wrap, so
+   the six columns fit the content column instead of scrolling the page. */
+@layer pages {
+  @media (max-width: 1280px) {
+    :is(#hts-cs-rows, #hts-vs-rows, #hts-cm-rows) .data-table .cell-sub {
+      display: block;
+      margin-left: 0;
+    }
+
+    :is(#hts-cs-rows, #hts-vs-rows, #hts-cm-rows) .url--clip {
+      max-width: 22ch;
+    }
+
+    #hts-cm-rows .cm-mapping code.url {
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+  }
+}
+
+/* (Unlayered, like the base `.url` rule it overrides.) A concept map's
+   scope URIs wrap inside the mapping column below 1280px. */
+@media (max-width: 1280px) {
+  #hts-cm-rows .cm-mapping__line .url {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+  }
+
+  #hts-cm-rows .cm-mapping {
+    max-width: 26ch;
+  }
+
+  :is(#hts-cs-rows, #hts-vs-rows, #hts-cm-rows) .data-table .col-name {
+    max-width: 160px;
+  }
+
+  :is(#hts-cs-rows, #hts-vs-rows, #hts-cm-rows) .data-table td:nth-child(2) {
+    max-width: 22ch;
+    overflow-wrap: anywhere;
   }
 }
