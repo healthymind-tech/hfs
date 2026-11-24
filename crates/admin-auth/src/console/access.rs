@@ -141,7 +141,9 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
     }
     if let Some(rest) = path.strip_prefix("/ui/e/") {
         let mut parts = rest.split('/');
-        let endpoint = parts.next().unwrap_or_default().to_string();
+        // The handlers see the decoded name (axum `Path`): `/ui/e/l%61b`
+        // is endpoint `lab` and needs the role on `lab`.
+        let endpoint = percent_decode(parts.next().unwrap_or_default());
         if !endpoint.is_empty() {
             let section = parts.next().unwrap_or_default();
             let role = if read {
@@ -161,6 +163,29 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
         return Some(Requirement::Role(ConsoleRole::Admin));
     }
     Some(Requirement::Role(ConsoleRole::Editor))
+}
+
+/// `%XX`-decodes a path segment (invalid escapes are kept as they are).
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The console role an admin API request needs (design §7.2 and §8):
@@ -314,6 +339,15 @@ mod tests {
             Some(Requirement::EndpointRole("lab".into(), Admin))
         );
         assert_eq!(req(Method::GET, "/ui/e/"), Some(Requirement::Role(Viewer)));
+        // A percent-encoded name is the endpoint the handler will act on.
+        assert_eq!(
+            req(Method::POST, "/ui/e/l%61b/security"),
+            Some(Requirement::EndpointRole("lab".into(), Admin))
+        );
+        assert_eq!(
+            req(Method::GET, "/ui/e/l%6/x"),
+            Some(Requirement::EndpointRole("l%6".into(), Viewer))
+        );
     }
 
     /// A data page reached as `/ui/e/{ep}/data/X` is checked against the
