@@ -16419,3 +16419,15 @@ html[data-nav-dir]::view-transition-old(hm-main) {
     margin-inline-end: 2px;
   }
 }
+
+/* Batch upload card: the mode switch and the drop zone sit inside the card's
+   padding instead of on its border. */
+@layer pages {
+  #batch-upload > .batch-modes {
+    margin: var(--s4) var(--s5) var(--s3);
+  }
+
+  #batch-upload > .batch-pane {
+    padding: 0 var(--s5) var(--s5);
+  }
+}
