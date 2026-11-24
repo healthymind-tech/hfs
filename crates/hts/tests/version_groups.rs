@@ -49,7 +49,13 @@ fn entries(body: &Value) -> Vec<&Value> {
 fn version_count(resource: &Value) -> i64 {
     resource["meta"]["extension"]
         .as_array()
-        .and_then(|e| e.iter().find(|x| x["url"].as_str().is_some_and(|u| u.ends_with("hm-version-count"))))
+        .and_then(|e| {
+            e.iter().find(|x| {
+                x["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("hm-version-count"))
+            })
+        })
         .and_then(|x| x["valueInteger"].as_i64())
         .unwrap_or(-1)
 }
@@ -68,13 +74,20 @@ async fn one_entry_per_canonical_with_the_resolvers_choice() {
     let all = get(&app, "/CodeSystem?url=http://hts.test/vg/cs/a&_count=50").await;
     assert_eq!(all["total"], 3, "three stored versions: {all}");
 
-    let grouped = get(&app, "/CodeSystem?_hm-current=true&title:contains=a&_count=50").await;
+    let grouped = get(
+        &app,
+        "/CodeSystem?_hm-current=true&title:contains=a&_count=50",
+    )
+    .await;
     let rows = entries(&grouped);
     let urls: Vec<&str> = rows.iter().map(|r| r["url"].as_str().unwrap()).collect();
     let mut unique = urls.clone();
     unique.dedup();
     assert_eq!(urls, unique, "no duplicate canonical on a page: {grouped}");
-    let a = rows.iter().find(|r| r["url"] == "http://hts.test/vg/cs/a").expect("group a");
+    let a = rows
+        .iter()
+        .find(|r| r["url"] == "http://hts.test/vg/cs/a")
+        .expect("group a");
     // 3.0 is newest but content=not-present: the precedence order picks the
     // populated 2.0, exactly as a version-less $lookup would.
     assert_eq!(a["version"], "2.0", "{a}");
@@ -86,7 +99,11 @@ async fn one_entry_per_canonical_with_the_resolvers_choice() {
     assert_eq!(entries(&read)[0]["version"], "2.0");
 
     // ValueSet: semantic version order (1.10.0 > 1.9.0 > 1.0.0).
-    let vs = get(&app, "/ValueSet?_hm-current=true&url=http://hts.test/vg/vs/v").await;
+    let vs = get(
+        &app,
+        "/ValueSet?_hm-current=true&url=http://hts.test/vg/vs/v",
+    )
+    .await;
     assert_eq!(vs["total"], 1);
     assert_eq!(entries(&vs)[0]["version"], "1.10.0");
     assert_eq!(version_count(entries(&vs)[0]), 3);
@@ -97,15 +114,27 @@ async fn counts_and_pages_operate_on_groups() {
     let app = TestApp::new().await;
     app.import_bundle_ok(BUNDLE).await;
 
-    let first = get(&app, "/CodeSystem?_hm-current=true&name:contains=a&_count=1&_sort=name").await;
+    let first = get(
+        &app,
+        "/CodeSystem?_hm-current=true&name:contains=a&_count=1&_sort=name",
+    )
+    .await;
     // Alpha and Beta both contain "a": two groups, four stored versions.
     assert_eq!(first["total"], 2, "{first}");
     assert_eq!(entries(&first).len(), 1);
     assert_eq!(entries(&first)[0]["name"], "Alpha");
-    let second = get(&app, "/CodeSystem?_hm-current=true&name:contains=a&_count=1&_offset=1&_sort=name").await;
+    let second = get(
+        &app,
+        "/CodeSystem?_hm-current=true&name:contains=a&_count=1&_offset=1&_sort=name",
+    )
+    .await;
     assert_eq!(entries(&second)[0]["name"], "Beta");
 
-    let count = get(&app, "/CodeSystem?_hm-current=true&name:contains=a&_summary=count").await;
+    let count = get(
+        &app,
+        "/CodeSystem?_hm-current=true&name:contains=a&_summary=count",
+    )
+    .await;
     assert_eq!(count["total"], 2);
 }
 
@@ -120,10 +149,20 @@ async fn a_match_on_an_older_version_keeps_the_group_and_older_lists_the_rest() 
     assert_eq!(legacy["total"], 1);
     assert_eq!(entries(&legacy)[0]["version"], "2.0");
 
-    let older = get(&app, "/CodeSystem?_hm-current=older&url=http://hts.test/vg/cs/a").await;
+    let older = get(
+        &app,
+        "/CodeSystem?_hm-current=older&url=http://hts.test/vg/cs/a",
+    )
+    .await;
     assert_eq!(older["total"], 2, "{older}");
-    let versions: Vec<&str> = entries(&older).iter().map(|r| r["version"].as_str().unwrap()).collect();
-    assert!(versions.contains(&"1.0") && versions.contains(&"3.0") && !versions.contains(&"2.0"), "{versions:?}");
+    let versions: Vec<&str> = entries(&older)
+        .iter()
+        .map(|r| r["version"].as_str().unwrap())
+        .collect();
+    assert!(
+        versions.contains(&"1.0") && versions.contains(&"3.0") && !versions.contains(&"2.0"),
+        "{versions:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

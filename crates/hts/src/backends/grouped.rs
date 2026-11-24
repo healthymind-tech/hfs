@@ -150,7 +150,10 @@ pub(crate) fn build(table: &str, dialect: Dialect, query: &ResourceSearchQuery) 
         (_, Some(sort)) => {
             let mut order = super::explicit_sort_order_by(table, sort);
             for column in ["name", "title", "url", "version", "status"] {
-                order = order.replace(&format!("LOWER({column}) "), &format!("LOWER({column}){fast} "));
+                order = order.replace(
+                    &format!("LOWER({column}) "),
+                    &format!("LOWER({column}){fast} "),
+                );
             }
             order
         }
@@ -291,7 +294,10 @@ mod tests {
 
     #[test]
     fn like_patterns_escape_wildcards_and_follow_the_mode() {
-        assert_eq!(like_pattern("US_Core", FhirStringSearchMode::Contains), "%us\\_core%");
+        assert_eq!(
+            like_pattern("US_Core", FhirStringSearchMode::Contains),
+            "%us\\_core%"
+        );
         assert_eq!(like_pattern("Lo", FhirStringSearchMode::Prefix), "lo%");
         assert_eq!(like_pattern("50%", FhirStringSearchMode::Exact), "50\\%");
     }
@@ -304,23 +310,57 @@ mod tests {
         };
         let g = build("code_systems", Dialect::Postgres, &q);
         assert!(g.select.contains("GROUP BY url), hm_page AS"));
-        assert!(g.select.contains(&*super::super::cs_precedence_order_by("code_systems")));
+        assert!(
+            g.select
+                .contains(&*super::super::cs_precedence_order_by("code_systems"))
+        );
         assert!(g.select.contains("LIMIT $6 OFFSET $7"));
         assert!(g.select.ends_with("ORDER BY hm_rep.hm_pos"));
-        assert!(g.count.starts_with("SELECT COUNT(DISTINCT url) FROM code_systems"));
+        assert!(
+            g.count
+                .starts_with("SELECT COUNT(DISTINCT url) FROM code_systems")
+        );
         q.group = Some(VersionGroup::Older);
         let older = build("value_sets", Dialect::Sqlite, &q);
         assert!(older.select.contains("WHERE hm_rn > 1 ORDER BY url, hm_rn"));
-        assert!(older.select.contains("json_extract(value_sets.resource_json, '$.date')"));
+        assert!(
+            older
+                .select
+                .contains("json_extract(value_sets.resource_json, '$.date')")
+        );
         assert!(older.select.ends_with("LIMIT ?6 OFFSET ?7"));
     }
 
     #[test]
     fn grouped_entries_carry_the_version_count_and_date() {
-        let r = resource("ValueSet", "us-core-race|7.0.0", "http://x/vs", Some("7.0.0"), None, Some("Race"), "active", Some("us-core-race"), 4, Some("2024-01-01"), [None, None]);
+        let r = resource(
+            "ValueSet",
+            "us-core-race|7.0.0",
+            "http://x/vs",
+            Some("7.0.0"),
+            None,
+            Some("Race"),
+            "active",
+            Some("us-core-race"),
+            4,
+            Some("2024-01-01"),
+            [None, None],
+        );
         assert_eq!(r["id"], "us-core-race");
         assert!(r.get("sourceUri").is_none());
-        let m = resource("ConceptMap", "m", "http://x/cm", None, None, None, "active", None, 2, None, [Some("http://x/a"), Some("")]);
+        let m = resource(
+            "ConceptMap",
+            "m",
+            "http://x/cm",
+            None,
+            None,
+            None,
+            "active",
+            None,
+            2,
+            None,
+            [Some("http://x/a"), Some("")],
+        );
         assert_eq!(m["sourceUri"], "http://x/a");
         assert!(m.get("targetUri").is_none());
         assert_eq!(r["meta"]["extension"][0]["valueInteger"], 4);

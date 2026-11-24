@@ -491,11 +491,7 @@ async fn lookup_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state
-        .upstream
-        .read_code_system_at(&id, vq.get())
-        .await
-        .ok();
+    let summary = state.upstream.read_code_system_at(&id, vq.get()).await.ok();
     render_detail_with_tab(&state, chrome, id, CsTab::Lookup, summary).await
 }
 
@@ -512,11 +508,7 @@ async fn validate_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state
-        .upstream
-        .read_code_system_at(&id, vq.get())
-        .await
-        .ok();
+    let summary = state.upstream.read_code_system_at(&id, vq.get()).await.ok();
     render_detail_with_tab(&state, chrome, id, CsTab::Validate, summary).await
 }
 
@@ -533,11 +525,7 @@ async fn subsumes_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state
-        .upstream
-        .read_code_system_at(&id, vq.get())
-        .await
-        .ok();
+    let summary = state.upstream.read_code_system_at(&id, vq.get()).await.ok();
     render_detail_with_tab(&state, chrome, id, CsTab::Subsumes, summary).await
 }
 

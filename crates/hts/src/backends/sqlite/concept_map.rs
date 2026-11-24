@@ -125,7 +125,9 @@ impl ConceptMapOperations for SqliteTerminologyBackend {
         mut query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError> {
         if query.group.is_some() {
-            return self.search_grouped("concept_maps", "ConceptMap", query).await;
+            return self
+                .search_grouped("concept_maps", "ConceptMap", query)
+                .await;
         }
         let string_search = crate::string_search::ResourceStringSearch::new(&query);
         if string_search.is_empty() {

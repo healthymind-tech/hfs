@@ -65,7 +65,8 @@ fn search_grouped(
     resource_type: &str,
     query: &ResourceSearchQuery,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
-    let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Sqlite, query);
+    let g =
+        crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Sqlite, query);
     let limit = i64::from(query.count.unwrap_or(20));
     let offset = i64::from(query.offset.unwrap_or(0));
     let [a, b, c, d, e] = &g.params;
@@ -73,24 +74,24 @@ fn search_grouped(
         .prepare_cached(&g.select)
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
-        .query_map(
-            rusqlite::params![a, b, c, d, e, limit, offset],
-            |row| {
-                Ok(crate::backends::grouped::resource(
-                    resource_type,
-                    &row.get::<_, String>(0)?,
-                    &row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?.as_deref(),
-                    row.get::<_, Option<String>>(3)?.as_deref(),
-                    row.get::<_, Option<String>>(4)?.as_deref(),
-                    &row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?.as_deref(),
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<String>>(8)?.as_deref(),
-                    [row.get::<_, Option<String>>(9)?.as_deref(), row.get::<_, Option<String>>(10)?.as_deref()],
-                ))
-            },
-        )
+        .query_map(rusqlite::params![a, b, c, d, e, limit, offset], |row| {
+            Ok(crate::backends::grouped::resource(
+                resource_type,
+                &row.get::<_, String>(0)?,
+                &row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.as_deref(),
+                row.get::<_, Option<String>>(3)?.as_deref(),
+                row.get::<_, Option<String>>(4)?.as_deref(),
+                &row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?.as_deref(),
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?.as_deref(),
+                [
+                    row.get::<_, Option<String>>(9)?.as_deref(),
+                    row.get::<_, Option<String>>(10)?.as_deref(),
+                ],
+            ))
+        })
         .map_err(|error| HtsError::StorageError(error.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
@@ -281,11 +282,17 @@ fn count_resources(
     query: &ResourceSearchQuery,
 ) -> Result<u64, HtsError> {
     if query.group.is_some() {
-        let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Sqlite, query);
+        let g = crate::backends::grouped::build(
+            table,
+            crate::backends::grouped::Dialect::Sqlite,
+            query,
+        );
         let [a, b, c, d, e] = &g.params;
         let count: i64 = conn
             .prepare_cached(&g.count)
-            .and_then(|mut statement| statement.query_row(rusqlite::params![a, b, c, d, e], |row| row.get(0)))
+            .and_then(|mut statement| {
+                statement.query_row(rusqlite::params![a, b, c, d, e], |row| row.get(0))
+            })
             .map_err(|error| HtsError::StorageError(error.to_string()))?;
         return Ok(count.max(0) as u64);
     }

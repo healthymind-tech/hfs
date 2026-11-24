@@ -199,7 +199,10 @@ mod tests {
     fn hrefs_encode_ids_versions_and_canonicals() {
         assert_eq!(
             Kind::CodeSystem.detail_href("icd9cm", "2015|x"),
-            format!("{}/code-systems/icd9cm/lookup?version=2015%7Cx", crate::paths::ui())
+            format!(
+                "{}/code-systems/icd9cm/lookup?version=2015%7Cx",
+                crate::paths::ui()
+            )
         );
         assert_eq!(
             Kind::ValueSet.detail_href("v", ""),

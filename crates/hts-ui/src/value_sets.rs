@@ -465,11 +465,7 @@ async fn expand_input(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let summary = state
-        .upstream
-        .read_value_set_at(&id, vq.get())
-        .await
-        .ok();
+    let summary = state.upstream.read_value_set_at(&id, vq.get()).await.ok();
     render_detail_with_tab(&state, chrome, id, VsTab::Expand, summary).await
 }
 

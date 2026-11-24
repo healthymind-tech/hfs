@@ -201,7 +201,11 @@ where
     C: GenericClient + Sync,
 {
     if query.group.is_some() {
-        let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Postgres, query);
+        let g = crate::backends::grouped::build(
+            table,
+            crate::backends::grouped::Dialect::Postgres,
+            query,
+        );
         let [a, b, c, d, e] = &g.params;
         let count: i64 = client
             .query_one(&g.count, &[a, b, c, d, e])
@@ -380,7 +384,8 @@ async fn search_grouped(
     resource_type: &str,
     query: &ResourceSearchQuery,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
-    let g = crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Postgres, query);
+    let g =
+        crate::backends::grouped::build(table, crate::backends::grouped::Dialect::Postgres, query);
     let limit = i64::from(query.count.unwrap_or(20));
     let offset = i64::from(query.offset.unwrap_or(0));
     let [a, b, c, d, e] = &g.params;
@@ -402,7 +407,10 @@ async fn search_grouped(
                 row.get::<_, Option<String>>(6).as_deref(),
                 row.get::<_, i64>(7),
                 row.get::<_, Option<String>>(8).as_deref(),
-                [row.get::<_, Option<String>>(9).as_deref(), row.get::<_, Option<String>>(10).as_deref()],
+                [
+                    row.get::<_, Option<String>>(9).as_deref(),
+                    row.get::<_, Option<String>>(10).as_deref(),
+                ],
             )
         })
         .collect())
