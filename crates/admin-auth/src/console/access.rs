@@ -5,6 +5,8 @@
 //! | sign-in flow, assets, about | public |
 //! | `/ui/account/**` | any signed-in user (not an anonymous visitor) |
 //! | server administration: `/ui/settings/**`, `/ui/endpoints/**`, IG Packages, Tenants, Bulk Import/Export, SQL Export; writes under `/ui/sync/**` | global admin |
+//! | authorization servers `/ui/idp/**` (realms, clients, users, keys, sessions) | global admin |
+//! | a user's resource access `/ui/idp/{realm}/users/{user}/access[/…]` | viewer to read, editor to change |
 //! | `/ui/e/{ep}/{config,security,validation,terminology,sync}` writes | admin on `ep` |
 //! | `/ui/e/{ep}/**` other writes (data, bulk) | editor on `ep` |
 //! | `/ui/e/{ep}/**` reads | viewer on `ep` |
@@ -94,6 +96,22 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
         return Some(Requirement::Role(ConsoleRole::Admin));
     }
     let read = is_read_only(method);
+    if under(path, "/ui/idp") {
+        // The built-in authorization server's console: realms, clients
+        // (secrets), users (passwords), keys and sessions are server
+        // administration. A user's resource-access editor follows the same
+        // roles as its admin API (`admin_api_requirement`).
+        let role = if is_idp_user_access(path) {
+            if read {
+                ConsoleRole::Viewer
+            } else {
+                ConsoleRole::Editor
+            }
+        } else {
+            ConsoleRole::Admin
+        };
+        return Some(Requirement::Role(role));
+    }
     if let Some(rest) = path.strip_prefix("/ui/e/") {
         let mut parts = rest.split('/');
         let endpoint = parts.next().unwrap_or_default().to_string();
@@ -154,6 +172,15 @@ pub fn admin_api_requirement(method: &Method, path: &str) -> (ConsoleRole, Optio
         return (ConsoleRole::Admin, endpoint);
     }
     (ConsoleRole::Admin, None)
+}
+
+/// `/ui/idp/{realm}/users/{user}/access[/…]` (the resource-access editor).
+fn is_idp_user_access(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/ui/idp/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    matches!(parts.as_slice(), [realm, "users", user, "access", ..] if !realm.is_empty() && !user.is_empty() && *realm != "new")
 }
 
 /// `/admin/idp/realms/{realm}/users/{user}/links` (exactly).
@@ -260,6 +287,42 @@ mod tests {
             Some(Requirement::EndpointRole("lab".into(), Admin))
         );
         assert_eq!(req(Method::GET, "/ui/e/"), Some(Requirement::Role(Viewer)));
+    }
+
+    /// The built-in authorization server's console is server administration
+    /// (it resets client secrets and sets user passwords); only a user's
+    /// resource-access editor is open to viewers (read) and editors (write).
+    #[test]
+    fn idp_console_needs_admin() {
+        for (m, p) in [
+            (Method::GET, "/ui/idp"),
+            (Method::GET, "/ui/idp/demo"),
+            (Method::GET, "/ui/idp/demo/users/u1"),
+            (Method::GET, "/ui/idp/demo/clients/app"),
+            (Method::GET, "/ui/idp/demo/test/report.json"),
+            (Method::POST, "/ui/idp/new"),
+            (Method::POST, "/ui/idp/demo/clients/app/reset-secret"),
+            (Method::POST, "/ui/idp/demo/users/u1/password"),
+            (Method::POST, "/ui/idp/demo/keys/rotate"),
+            (Method::POST, "/ui/idp/demo/settings/unbind"),
+            (Method::GET, "/ui/idp/new/users/x/access"),
+        ] {
+            assert_eq!(req(m.clone(), p), Some(Requirement::Role(Admin)), "{m} {p}");
+        }
+        for p in [
+            "/ui/idp/demo/users/u1/access",
+            "/ui/idp/demo/users/u1/access/export",
+            "/ui/idp/demo/users/u1/access/search",
+        ] {
+            assert_eq!(req(Method::GET, p), Some(Requirement::Role(Viewer)), "{p}");
+        }
+        for p in [
+            "/ui/idp/demo/users/u1/access/preview",
+            "/ui/idp/demo/users/u1/access/apply",
+            "/ui/idp/demo/users/u1/access/patch",
+        ] {
+            assert_eq!(req(Method::POST, p), Some(Requirement::Role(Editor)), "{p}");
+        }
     }
 
     #[test]
