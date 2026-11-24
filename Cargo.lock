@@ -4022,6 +4022,7 @@ dependencies = [
  "dashmap",
  "futures",
  "helios-auth",
+ "helios-endpoints",
  "helios-fhir",
  "helios-persistence",
  "lettre",

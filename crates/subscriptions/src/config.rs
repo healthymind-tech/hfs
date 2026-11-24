@@ -103,6 +103,14 @@ pub struct SubscriptionConfig {
     /// reference only, never the resource body). The history is in memory, like
     /// the event counter, and is empty after a restart. `0` disables it.
     pub event_history_size: usize,
+
+    /// Where rest-hook (and message) notifications may be delivered: the
+    /// endpoint comes from a client-written Subscription, so the server
+    /// refuses internal addresses unless allow-listed — on the URL, after DNS
+    /// resolution and on every redirect. `None` delivers anywhere (library
+    /// default; the server sets `HFS_OUTBOUND_ALLOW`'s policy unless
+    /// `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`).
+    pub outbound_policy: Option<helios_endpoints::OutboundPolicy>,
 }
 
 /// FHIR Messaging channel configuration.
@@ -145,6 +153,7 @@ impl Default for SubscriptionConfig {
             status_write_timeout: Duration::from_secs(5),
             status_write_concurrency: 4,
             event_history_size: 100,
+            outbound_policy: None,
         }
     }
 }

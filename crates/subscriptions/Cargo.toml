@@ -27,6 +27,8 @@ helios-persistence = { path = "../persistence", version = "0.2.9", default-featu
 
 # Outbound auth (OutboundAuthProvider trait + static-bearer impl)
 helios-auth = { path = "../auth", version = "0.2.9" }
+# The outbound SSRF guard for rest-hook and message endpoints.
+helios-endpoints = { path = "../endpoints", version = "0.2.9", features = ["http-guard"] }
 
 # Serialization
 serde.workspace = true
