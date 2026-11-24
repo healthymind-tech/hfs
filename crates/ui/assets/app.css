@@ -15815,3 +15815,14 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     }
   }
 }
+
+/* Stacked tables and the raw-response disclosure under them (concept
+   identity: designations, properties, raw) keep the card rhythm instead of
+   touching. */
+@layer pages {
+  .table-wrap + .table-wrap,
+  .table-wrap + details,
+  .table-wrap + .table-wrap + details {
+    margin-top: var(--s4);
+  }
+}
