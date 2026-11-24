@@ -15268,7 +15268,7 @@ details.card[open] > summary.card-head > .disclosure__chevron {
   }
 
   .endpoint-card__name {
-    font-family: var(--font-mono);
+    font-family: inherit;
     font-size: var(--fs-xs);
     color: var(--text-3);
   }
