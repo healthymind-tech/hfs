@@ -34,6 +34,11 @@ const KEEP: &[&str] = &[
     "format", "mode", "_count",
 ];
 
+/// Data pages the sidebar does not list but opens from Resources (the
+/// editor, a resource's history, saved queries, search): they exist where
+/// Resources does, and their list is Resources.
+const RESOURCE_PAGES: &[&str] = &["data/editor", "data/history", "data/queries", "data/search"];
+
 /// Where switching to `target` from `from` lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Mapped {
@@ -110,6 +115,11 @@ pub(crate) fn map_route(from: &str, target: &str, pages: &[Reachable]) -> Mapped
         };
     };
     let sub = rest.split_once('/').map_or("", |(_, s)| s);
+    // Resources' own sub-pages are reachable where Resources is.
+    let owner = RESOURCE_PAGES
+        .iter()
+        .any(|p| sub == *p || sub.starts_with(&format!("{p}/")))
+        .then(|| format!("{home}/data/resources"));
     let mapped = if sub.is_empty() {
         home.clone()
     } else {
@@ -133,10 +143,32 @@ pub(crate) fn map_route(from: &str, target: &str, pages: &[Reachable]) -> Mapped
             format!("{p}?{q}")
         }
     };
-    // The deepest page the target reaches that covers the mapped path.
+    if let Some(list) = owner {
+        let reachable = pages.iter().any(|r| r.prefix == list);
+        return match (reachable, dropped_ids) {
+            (true, false) => Mapped {
+                href: with_query(&mapped),
+                fell_back: false,
+            },
+            (true, true) => Mapped {
+                href: with_query(&list),
+                fell_back: false,
+            },
+            (false, _) => Mapped {
+                href: home,
+                fell_back: true,
+            },
+        };
+    }
+    // The deepest page the target reaches that covers the mapped path (the
+    // endpoint home covers only itself).
     let best = pages
         .iter()
-        .filter(|r| r.prefix.starts_with(&home) && under(&mapped, &r.prefix))
+        .filter(|r| {
+            r.prefix.starts_with(&home)
+                && under(&mapped, &r.prefix)
+                && (r.prefix != home || mapped == home)
+        })
         .max_by_key(|r| r.prefix.len());
     match best {
         // The page itself (a list, a settings section): keep the
@@ -249,9 +281,11 @@ mod tests {
     fn ids_of_the_old_endpoint_are_dropped_for_the_list_page() {
         let p = pages("b", ConsoleRole::Admin);
         let m = map_route("/ui/e/a/data/editor?type=Patient&id=123", "b", &p);
-        assert!(!m.href.contains("id=123"), "{m:?}");
-        assert!(m.href.starts_with("/ui/e/b/data/"), "{m:?}");
+        assert_eq!(m.href, "/ui/e/b/data/resources?type=Patient");
         assert!(!m.fell_back);
+        // Without an id the same sub-page opens.
+        let m = map_route("/ui/e/a/data/queries", "b", &p);
+        assert_eq!(m.href, "/ui/e/b/data/queries");
         let m = map_route("/ui/e/a/data/history?type=Patient&id=9&vid=2", "b", &p);
         assert!(!m.href.contains("id="), "{m:?}");
     }
@@ -266,20 +300,22 @@ mod tests {
 
     #[test]
     fn a_page_the_role_cannot_open_falls_back() {
-        let admin = pages("b", ConsoleRole::Admin);
-        let viewer = pages("b", ConsoleRole::Viewer);
-        // Some endpoint page an admin reaches and a viewer does not.
-        let only_admin = admin
-            .iter()
-            .find(|r| {
-                r.prefix.starts_with("/ui/e/b/") && !viewer.iter().any(|v| v.prefix == r.prefix)
-            })
-            .expect("an admin-only endpoint page");
-        let from = only_admin.prefix.replacen("/ui/e/b", "/ui/e/a", 1);
-        let m = map_route(&from, "b", &viewer);
+        // What a viewer reaches on `b`: the sidebar without the admin-only
+        // pages (modelled here: everything but Security).
+        let viewer: Vec<Reachable> = pages("b", ConsoleRole::Admin)
+            .into_iter()
+            .filter(|r| !r.prefix.ends_with("/security"))
+            .collect();
+        let m = map_route("/ui/e/a/security", "b", &viewer);
         assert!(m.fell_back, "{m:?}");
-        assert!(m.href.starts_with("/ui/e/b"), "{m:?}");
-        assert_ne!(m.href, only_admin.prefix);
+        assert_eq!(m.href, "/ui/e/b");
+        // Resources' sub-pages follow Resources.
+        let no_data: Vec<Reachable> = viewer
+            .into_iter()
+            .filter(|r| !r.prefix.contains("/data/"))
+            .collect();
+        let m = map_route("/ui/e/a/data/editor?type=Patient", "b", &no_data);
+        assert!(m.fell_back, "{m:?}");
     }
 
     #[test]
