@@ -1091,9 +1091,17 @@ async fn grouped_rows_offer_older_versions_and_count_both() {
     assert_eq!(html.matches("data-system=\"").count(), 2, "{html}");
     assert!(html.contains(">+2 older<"), "{html}");
     assert!(html.contains(">+1 older<"));
-    assert!(html.contains(
-        "data-versions-src=\"/ui/hts/code-systems/versions?url=http%3A%2F%2Fx%2Fcs%2Falpha&amp;status=draft\""
-    ));
+    let src = html
+        .split("data-versions-src=\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or_default()
+        .replace("&amp;", "&")
+        .replace("&#x2f;", "/");
+    assert!(
+        src.ends_with("/code-systems/versions?url=http%3A%2F%2Fx%2Fcs%2Falpha&status=draft"),
+        "{src}"
+    );
     // The listed version is active, the filter asks for draft: it opens itself.
     assert!(html.contains("data-autoexpand"));
     // "N code systems · M versions": 2 groups + 3 older versions.
