@@ -258,6 +258,7 @@ pub(crate) struct AccessCard {
     pub total: usize,
     pub q: TableQuery,
     pub max_import: i64,
+    pub default_ep: String,
 }
 
 impl AccessCard {
@@ -269,6 +270,11 @@ impl AccessCard {
     }
     pub fn is_ep(&self, e: &str) -> bool {
         self.q.ep == e
+    }
+    /// The endpoint the add picker and Paste start on: the filtered one,
+    /// else the one most of the list is on.
+    pub fn is_default_ep(&self, e: &str) -> bool {
+        self.default_ep == e
     }
 }
 
@@ -794,7 +800,9 @@ pub(crate) async fn card(
     let list = ops::entries(c, rec, user).await.unwrap_or_default();
     let mut types: BTreeMap<String, usize> = BTreeMap::new();
     let mut kinds: BTreeMap<AccessKind, usize> = BTreeMap::new();
+    let mut per_ep: BTreeMap<&str, usize> = BTreeMap::new();
     for e in &list {
+        *per_ep.entry(e.endpoint.as_str()).or_default() += 1;
         *types.entry(e.resource_type().to_string()).or_default() += 1;
         *kinds.entry(e.kind).or_default() += 1;
     }
@@ -804,6 +812,17 @@ pub(crate) async fn card(
             "<p class=\"notice notice--danger\">{}</p>",
             askama_escape(&e.message)
         ),
+    };
+    let default_ep = if rec.spec.endpoints.contains(&q.ep) {
+        q.ep.clone()
+    } else {
+        per_ep
+            .iter()
+            .filter(|(e, _)| rec.spec.endpoints.iter().any(|x| x == *e))
+            .max_by_key(|(_, n)| **n)
+            .map(|(e, _)| e.to_string())
+            .or_else(|| rec.spec.endpoints.first().cloned())
+            .unwrap_or_default()
     };
     AccessCard {
         base: base(rec.spec.name.as_str(), user),
@@ -822,6 +841,7 @@ pub(crate) async fn card(
         total: list.len(),
         q,
         max_import: access::MAX_IMPORT as i64,
+        default_ep,
     }
 }
 

@@ -94,7 +94,7 @@
    table — plus the add picker and the paste dialog (native <dialog>).
    Tokens only; motion through HM.motion (off under reduced motion).
    --------------------------------------------------------------------------- */
-.access { padding: 0; overflow: visible; }
+.access { padding: 0; overflow: visible; margin-bottom: 16px; }
 .access__head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 16px; padding: 20px 24px 12px; }
 .access__heading { min-width: 0; flex: 1 1 280px; }
 .access__title { margin: 0; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -136,6 +136,7 @@
 .access-t__ref .tag { margin-right: 4px; }
 .access-t__id { display: inline-block; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; font-size: 12.5px; }
 .access-t__name { min-width: 160px; }
+.access-t__cell { display: block; min-width: 0; }
 .access-t__primary { display: block; font-weight: 500; color: var(--text); }
 .access-t__name .cell-sub { display: block; font-size: var(--fs-xs); color: var(--text-3); margin-top: 1px; }
 .access-t__none { color: var(--text-3); }
@@ -155,8 +156,8 @@
   .access__search { flex-basis: 100%; max-width: none; }
   .access__select { flex: 1 1 40%; max-width: none; }
   .access__bulk { margin: 0 16px 10px; }
-  .access__actions { width: 100%; }
-  .access__actions > * { flex: 1 1 auto; }
+  .access__actions { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+  .access__actions > [data-access-open="add"] { grid-column: 1 / -1; order: -1; }
   .access__actions .btn, .access__copy > summary { justify-content: center; width: 100%; }
   .access-t th:first-child, .access-t td:first-child { padding-left: 0; }
   .access-t tbody tr { position: relative; padding-left: 44px; }
@@ -177,12 +178,14 @@
 .access-dialog__form { display: flex; flex-direction: column; width: 100%; max-height: inherit; min-height: 0; }
 .access-dialog__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px 12px; border-bottom: 1px solid var(--border); }
 .access-dialog__title { margin: 0; font-size: var(--fs-lg); font-weight: 600; }
-.access-dialog__body { padding: 16px 20px; overflow: auto; min-height: 0; flex: 1 1 auto; display: grid; gap: 14px; align-content: start; }
+.access-dialog__body > * { min-width: 0; }
+.access-dialog__body .field { min-width: 0; }
+.access-dialog__body { padding: 16px 20px; overflow-x: hidden; overflow-y: auto; min-height: 0; flex: 1 1 auto; display: grid; gap: 14px; align-content: start; }
 .access-dialog__foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border); background: var(--surface); }
 .access-dialog__status { margin-right: auto; font-size: var(--fs-sm); color: var(--text-2); min-width: 0; overflow-wrap: anywhere; }
 .access-pick__opts, .access-paste__opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap: 12px 16px; align-items: start; }
 .access-pick__field { margin: 0; }
-.access-pick__types { max-width: 100%; }
+.access-pick__types { max-width: 100%; width: max-content; }
 .access-pick__search { max-width: none; }
 .access-pick__results { min-height: 220px; max-height: 340px; overflow: auto; border: 1px solid var(--border); border-radius: var(--r-sm); transition: opacity var(--dur-2) var(--ease-std); }
 .access-pick__results.is-loading { opacity: 0.6; }
@@ -235,7 +238,8 @@
   .access-dialog__foot .btn { flex: 1 1 auto; justify-content: center; }
   .access-dialog__status { flex-basis: 100%; }
   .access-pick__results { max-height: none; flex: 1 1 auto; }
-  .access-pv__t th:nth-child(3), .access-pv__t td:nth-child(3) { display: none; }
+  .access-pv__t th:nth-child(3), .access-pv__t td:nth-child(3),
+  .access-pv__t th:nth-child(4), .access-pv__t td:nth-child(4) { display: none; }
 }
 
 /* Toast with an action (Undo). */

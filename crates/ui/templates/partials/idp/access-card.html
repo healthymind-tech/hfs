@@ -104,7 +104,7 @@
         <div class="access-pick__opts">
           {% if access.endpoints.len() > 1 %}
           <label class="field access-pick__field"><span class="field__label">{{ i18n.t("idpa-col-endpoint") }}</span>
-            <select class="mfield__input" name="ep" data-access-pick-ep>{% for e in access.endpoints %}<option value="{{ e }}">{{ e }}</option>{% endfor %}</select></label>
+            <select class="mfield__input" name="ep" data-access-pick-ep>{% for e in access.endpoints %}<option value="{{ e }}"{% if access.is_default_ep(e) %} selected{% endif %}>{{ e }}</option>{% endfor %}</select></label>
           {% else %}
           {% for e in access.endpoints %}<input type="hidden" name="ep" value="{{ e }}" data-access-pick-ep>{% endfor %}
           {% endif %}
@@ -163,7 +163,7 @@
           <div class="access-paste__opts">
             {% if access.endpoints.len() > 1 %}
             <label class="field access-pick__field"><span class="field__label">{{ i18n.t("idpa-default-endpoint") }}</span>
-              <select class="mfield__input" name="ep">{% for e in access.endpoints %}<option value="{{ e }}">{{ e }}</option>{% endfor %}</select>
+              <select class="mfield__input" name="ep">{% for e in access.endpoints %}<option value="{{ e }}"{% if access.is_default_ep(e) %} selected{% endif %}>{{ e }}</option>{% endfor %}</select>
               <span class="field__hint">{{ i18n.t("idpa-default-endpoint-hint") }}</span></label>
             {% else %}
             {% for e in access.endpoints %}<input type="hidden" name="ep" value="{{ e }}">{% endfor %}
