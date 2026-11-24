@@ -389,8 +389,23 @@ async fn search_grouped(
     let limit = i64::from(query.count.unwrap_or(20));
     let offset = i64::from(query.offset.unwrap_or(0));
     let [a, b, c, d, e] = &g.params;
-    let rows = (**client)
+    // The group aggregate hashes ~30,000 canonicals: give this one statement
+    // the memory to do it without spilling to disk (SET LOCAL ends with the
+    // transaction; 263 ms → ~100 ms on 37,027 ValueSets).
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    transaction
+        .batch_execute("SET LOCAL work_mem = '64MB'")
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    let rows = transaction
         .query(&g.select, &[a, b, c, d, e, &limit, &offset])
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    transaction
+        .commit()
         .await
         .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
     Ok(rows

@@ -177,8 +177,10 @@ pub(crate) fn build(table: &str, dialect: Dialect, query: &ResourceSearchQuery) 
             tgt = scope_column(table, "", "target_uri"),
         ),
         // `true`: page the canonical groups first (one aggregate pass over
-        // the url index), then pick the precedence winner of only the page's
-        // groups — 25 small index lookups instead of ranking every row.
+        // the url index, a top-N sort of the page — the position is numbered
+        // after the LIMIT, so no full sort for a window), then pick the
+        // precedence winner of only the page's groups — 25 small index
+        // lookups instead of ranking every row.
         _ => format!(
             "WITH hm_groups AS ( \
                SELECT url, COUNT(*) AS hm_n, MAX(name) AS name, MAX(title) AS title, \
@@ -187,8 +189,9 @@ pub(crate) fn build(table: &str, dialect: Dialect, query: &ResourceSearchQuery) 
                FROM {table} WHERE {scope} \
                GROUP BY url), \
              hm_page AS ( \
-               SELECT hm_groups.*, ROW_NUMBER() OVER (ORDER BY {order}) AS hm_pos \
-               FROM hm_groups ORDER BY {order} LIMIT {limit} OFFSET {offset}), \
+               SELECT hm_top.*, ROW_NUMBER() OVER () AS hm_pos \
+               FROM (SELECT hm_groups.* FROM hm_groups ORDER BY {order} \
+                     LIMIT {limit} OFFSET {offset}) hm_top), \
              hm_rep AS ( \
                SELECT hm_page.hm_pos, hm_page.hm_n, \
                       (SELECT {table}.id FROM {table} WHERE {table}.url = hm_page.url \
