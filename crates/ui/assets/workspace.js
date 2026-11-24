@@ -550,7 +550,7 @@
       initSwitcher(layout);
       // The title truncates and narrow work areas show Duplicate/Delete as
       // icons: their full text becomes the tooltip.
-      var titled = layout.querySelectorAll(".ws-title > .page-head__title, .ws-head > .page-head__actions > .btn");
+      var titled = layout.querySelectorAll(".ws-title__name, .ws-head > .page-head__actions > .btn");
       for (var t = 0; t < titled.length; t++) {
         if (!titled[t].getAttribute("title")) titled[t].setAttribute("title", titled[t].textContent.replace(/\s+/g, " ").trim());
       }

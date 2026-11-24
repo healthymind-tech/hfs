@@ -144,7 +144,7 @@
       <div class="ws-title">
       <h2 class="page-head__title page-head__title--kind">
         <span class="icon" aria-hidden="true">{% include "icons/grid.svg" %}</span>
-        {% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}
+        <span class="ws-title__name">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</span>
       </h2>
       {% call ws::switcher("ws-rail", i18n.t("ws-switch-vd")) %}{% endcall %}
       </div>

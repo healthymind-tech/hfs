@@ -147,7 +147,7 @@
       <div class="ws-title">
       <h2 class="page-head__title page-head__title--kind">
         <span class="icon" aria-hidden="true">{{ icon_svg|safe }}</span>
-        {% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}
+        <span class="ws-title__name">{% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}</span>
         <span class="tag tag--type">{{ i18n.t(chip_key) }}</span>
         <span class="tag tag--{{ sel.status_class }}">{{ sel.status }}</span>
       </h2>
