@@ -407,6 +407,7 @@
   }
 
   function enhanceAll(scope) {
+    if (!scope || !scope.querySelectorAll) return;
     if (scope.matches && scope.matches(ROOT_SELECTOR)) enhance(scope);
     scope.querySelectorAll(ROOT_SELECTOR).forEach(enhance);
   }

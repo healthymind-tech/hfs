@@ -461,7 +461,8 @@
   }
 
   function destroyFixed(scope) {
-    if (!scope) return;
+    // htmx also cleans up text nodes (a history restore): nothing to destroy.
+    if (!scope || !scope.querySelectorAll) return;
     var natives = scope.matches && scope.matches("select") ? [scope]
       : Array.prototype.slice.call(scope.querySelectorAll("select[data-combobox-native]"));
     natives.forEach(function (native) {
