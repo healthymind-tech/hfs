@@ -536,3 +536,9 @@ mgr-nav-group-conformance = Conformance
 mgr-nav-group-activity = Activity
 mgr-nav-group-settings = Settings
 mgr-nav-group-console = Console settings
+
+# Endpoint switcher: the same page on the other endpoint.
+mgr-switch-fallback = That page isn't available on this endpoint — showing the nearest one that is.
+
+# Endpoint switcher: the same page on the other endpoint.
+mgr-switch-fallback = That page isn't available on this endpoint — showing the nearest one that is.

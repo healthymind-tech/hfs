@@ -27,6 +27,7 @@ pub(crate) mod forms;
 pub mod nav;
 pub(crate) mod pages;
 pub(crate) mod scope;
+pub(crate) mod switch;
 /// Verify panels: the checklist view of a verification report.
 pub(crate) mod verify;
 /// Verify panels: their routes.

@@ -16221,3 +16221,102 @@ details.card[open] > summary.card-head > .disclosure__chevron {
     }
   }
 }
+
+/* ── Redesign: master-detail regions (shell.js `mdSwap`) ─────────────
+   The selection highlight glides between rail items (a stand-in `.md-ink`
+   under the entries while the target's own fill steps aside); a detail
+   slower than 120 ms dims behind a skeleton; the leaving detail is a frozen
+   `.md-ghost` above the new one. Transform and opacity only. */
+@layer pages {
+  [data-md-rail] .filter-rail__list,
+  [data-md-rail] {
+    position: relative;
+  }
+
+  [data-md-rail] .filter-rail__item {
+    position: relative;
+    z-index: 1;
+  }
+
+  .md-ink {
+    z-index: 0;
+  }
+
+  .is-gliding {
+    background-color: transparent !important;
+  }
+
+  [data-md-detail] {
+    position: relative;
+  }
+
+  [data-md-detail].md-pending > * {
+    opacity: .45;
+    transition: opacity var(--dur-1) var(--ease-std);
+  }
+
+  [data-md-detail].md-pending::after {
+    content: "";
+    position: absolute;
+    inset: var(--s5) var(--s5) auto;
+    height: 64px;
+    border-radius: var(--r-sm);
+    background:
+      linear-gradient(var(--surface-2), var(--surface-2)) 0 0 / 55% 14px no-repeat,
+      linear-gradient(var(--surface-2), var(--surface-2)) 0 26px / 85% 10px no-repeat,
+      linear-gradient(var(--surface-2), var(--surface-2)) 0 46px / 70% 10px no-repeat;
+    animation: hm-skeleton-pulse 1.2s var(--ease-std) infinite alternate;
+    pointer-events: none;
+  }
+
+  @keyframes hm-skeleton-pulse {
+    from { opacity: .55; }
+    to { opacity: 1; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [data-md-detail].md-pending::after {
+      animation: none;
+    }
+  }
+}
+
+/* ── Redesign: list → detail and back (shell.js `navDir`) ─────────────
+   A row opened from a list slides the content column in from the right
+   (14px, 200ms, emphasized); a back link brings the list in from the left.
+   The pressed row answers at once, before the response. */
+html[data-nav-dir="forward"]::view-transition-new(hm-main) {
+  animation: hm-drill-in 200ms var(--ease-out) both;
+}
+html[data-nav-dir="back"]::view-transition-new(hm-main) {
+  animation: hm-drill-back 200ms var(--ease-out) both;
+}
+html[data-nav-dir]::view-transition-old(hm-main) {
+  animation: hm-drill-out var(--dur-1) var(--ease-in) both;
+}
+@keyframes hm-drill-in {
+  from { opacity: 0; transform: translateX(14px); }
+}
+@keyframes hm-drill-back {
+  from { opacity: 0; transform: translateX(-14px); }
+}
+@keyframes hm-drill-out {
+  to { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html[data-nav-dir]::view-transition-old(hm-main),
+  html[data-nav-dir]::view-transition-new(hm-main) {
+    animation: none;
+  }
+}
+@layer pages {
+  .content.page-enter[data-enter="forward"] {
+    animation-name: hm-drill-in;
+  }
+  .content.page-enter[data-enter="back"] {
+    animation-name: hm-drill-back;
+  }
+  .data-table > tbody > tr[data-pressed] > td {
+    background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  }
+}

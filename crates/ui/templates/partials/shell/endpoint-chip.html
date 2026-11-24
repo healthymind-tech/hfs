@@ -14,7 +14,7 @@
             <div class="menu__panel">
               <div class="menu__heading">{{ i18n.t("mgr-switch-endpoint") }}</div>
               {% for ep in status.endpoint_options() %}
-              <a class="menu__option" href="{{ ep.href }}"{% if let Some(cur) = status.nav_endpoint() %}{% if cur.name == ep.name %} aria-current="true"{% endif %}{% endif %}>
+              <a class="menu__option" href="{{ ep.href }}" data-switch-href="{{ ep.href }}/switch"{% if let Some(cur) = status.nav_endpoint() %}{% if cur.name == ep.name %} aria-current="true"{% endif %}{% endif %}>
                 <span class="dot dot--{{ ep.tone }}" aria-hidden="true"></span>
                 <span class="menu__option-text">{{ ep.display }}</span>
                 <small class="menu__option-meta">{{ ep.path }}</small>

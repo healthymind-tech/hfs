@@ -46,8 +46,17 @@
 
   /* `title` remains useful when JavaScript is unavailable. Once this richer
      tooltip is active, remove it to avoid two competing hover bubbles. */
-  document.querySelectorAll(ITEM_SELECTOR).forEach(function (item) {
-    item.removeAttribute("title");
+  function dropTitles() {
+    document.querySelectorAll(ITEM_SELECTOR).forEach(function (item) {
+      item.removeAttribute("title");
+    });
+  }
+  dropTitles();
+  // Loaded once and kept across in-place navigation (`data-swap-safe`):
+  // a swapped-in page brings new items, and the old tooltip target is gone.
+  document.addEventListener("hm:navigated", function () {
+    hide(activeItem);
+    dropTitles();
   });
 
   function hide(item) {
@@ -262,7 +271,7 @@
    the selection. Recent clones live outside the scrolling list. */
 (function () {
   "use strict";
-  window.addEventListener("load", function () {
+  function reveal() {
     document.querySelectorAll(".filter-rail__list").forEach(function (list) {
       var current = list.querySelector('[aria-current="true"]');
       if (!current) return;
@@ -271,5 +280,11 @@
       var target = list.scrollTop + offset - (list.clientHeight - current.offsetHeight) / 2;
       if (target > 0) list.scrollTop = target;
     });
+  }
+  window.addEventListener("load", reveal);
+  // A page swapped in place (not a master-detail selection, which keeps the
+  // rail where the operator left it).
+  document.addEventListener("hm:navigated", function (e) {
+    if (!(e.detail && e.detail.md)) reveal();
   });
 })();

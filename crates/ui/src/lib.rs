@@ -2510,6 +2510,7 @@ pub fn mount_with_conformance_source_and_runtime(
         // The manager console: overview at `/ui`, endpoint pages, About.
         Some(_) => router
             .merge(manager::pages::routes())
+            .merge(manager::switch::routes())
             .merge(manager::verify_pages::routes())
             .route("/ui/find", get(global_search::find)),
         None => router

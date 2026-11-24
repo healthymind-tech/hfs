@@ -240,6 +240,97 @@
 
   var REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+  /* ---- motion: the one helper every console animation goes through ------
+     Durations and easings are the app.css tokens (120 / 180 / 240 ms;
+     standard and emphasized). Transform and opacity only, through the Web
+     Animations API; nothing runs under prefers-reduced-motion (each call
+     resolves at once, the element in its end state). */
+  var MOTION = {
+    d1: 120,
+    d2: 180,
+    d3: 240,
+    std: "cubic-bezier(0.4, 0, 0.2, 1)",
+    emph: "cubic-bezier(0.2, 0.7, 0.2, 1)",
+  };
+  function animate(el, frames, opts) {
+    if (!el || REDUCED || typeof el.animate !== "function") return Promise.resolve();
+    var a = el.animate(frames, {
+      duration: (opts && opts.duration) || MOTION.d2,
+      easing: (opts && opts.easing) || MOTION.std,
+      delay: (opts && opts.delay) || 0,
+      fill: "backwards",
+    });
+    return a.finished.catch(function () {});
+  }
+  var motion = {
+    tokens: MOTION,
+    reduced: REDUCED,
+    animate: animate,
+    // In from `dx`/`dy` px with a fade (emphasized easing).
+    enter: function (el, o) {
+      o = o || {};
+      return animate(el, [
+        { opacity: 0, transform: "translate(" + (o.dx || 0) + "px," + (o.dy || 0) + "px)" },
+        { opacity: 1, transform: "none" },
+      ], { duration: o.duration || MOTION.d2, easing: MOTION.emph, delay: o.delay });
+    },
+    // Out to `dx`/`dy` px with a fade (standard easing), the end state kept.
+    leave: function (el, o) {
+      o = o || {};
+      if (!el || REDUCED || typeof el.animate !== "function") return Promise.resolve();
+      return el.animate([
+        { opacity: 1, transform: "none" },
+        { opacity: 0, transform: "translate(" + (o.dx || 0) + "px," + (o.dy || 0) + "px)" },
+      ], { duration: o.duration || MOTION.d1, easing: MOTION.std, fill: "forwards" }).finished.catch(function () {});
+    },
+    fade: function (el, o) {
+      o = o || {};
+      return animate(el, [{ opacity: 0 }, { opacity: 1 }], { duration: o.duration || MOTION.d2, delay: o.delay });
+    },
+    // Rows fade up one after another: at most `max` rows (20), the whole
+    // run within `total` ms (240).
+    stagger: function (rows, o) {
+      o = o || {};
+      var max = Math.min(rows.length, o.max || 20);
+      var total = o.total || MOTION.d3;
+      var dur = MOTION.d1;
+      var step = max > 1 ? Math.max(0, Math.floor((total - dur) / (max - 1))) : 0;
+      for (var i = 0; i < max; i++) {
+        animate(rows[i], [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }], {
+          duration: dur,
+          easing: MOTION.emph,
+          delay: i * step,
+        });
+      }
+    },
+    // Slide a stand-in of `from`'s box to `to`'s (a selection highlight
+    // moving between rail items).
+    glide: function (from, to, cls) {
+      if (!from || !to || from === to || REDUCED) return;
+      var host = to.offsetParent;
+      if (!host) return;
+      var a = from.getBoundingClientRect(), b = to.getBoundingClientRect(), h = host.getBoundingClientRect();
+      var ink = document.createElement("div");
+      ink.className = cls || "md-ink";
+      ink.setAttribute("aria-hidden", "true");
+      ink.style.cssText = "position:absolute;pointer-events:none;left:" + (b.left - h.left + host.scrollLeft) + "px;top:" + (b.top - h.top + host.scrollTop) + "px;width:" + b.width + "px;height:" + b.height + "px;";
+      var cs = getComputedStyle(to);
+      ink.style.background = cs.backgroundColor;
+      ink.style.borderRadius = cs.borderRadius;
+      ink.style.zIndex = "0";
+      host.appendChild(ink);
+      to.classList.add("is-gliding");
+      animate(ink, [
+        { transform: "translate(" + (a.left - b.left) + "px," + (a.top - b.top) + "px)", opacity: 1 },
+        { transform: "none", opacity: 1 },
+      ], { duration: MOTION.d2, easing: MOTION.emph }).then(function () {
+        to.classList.remove("is-gliding");
+        ink.remove();
+      });
+    },
+  };
+  window.HM.motion = motion;
+
   // One element under the entries of the sidebar's <nav>, moved to the
   // current entry: it slides (240 ms) on in-place navigation instead of the
   // highlight jumping. Entries outside the <nav> (the sidebar foot) and
@@ -293,10 +384,199 @@
     } catch (e) {}
   }
 
+  /* ---- master-detail: swap the regions, not the page -------------------- */
+
+  var mdPending = null;
+
+  function mdStrip(el) {
+    // A region's markup without its selection marks: equal means only the
+    // selection moved.
+    var c = el.cloneNode(true);
+    var marked = c.querySelectorAll("[aria-current],[aria-selected]");
+    for (var i = 0; i < marked.length; i++) {
+      marked[i].removeAttribute("aria-current");
+      marked[i].removeAttribute("aria-selected");
+    }
+    if (c.removeAttribute) {
+      c.removeAttribute("aria-current");
+      c.removeAttribute("aria-selected");
+    }
+    return c.innerHTML.replace(/\s+/g, " ");
+  }
+
+  function mdSelected(root) {
+    return root.querySelector('[aria-current="true"], [aria-current="page"], [aria-selected="true"]');
+  }
+
+  function mdCopySelection(cur, nxt) {
+    // Move the selection marks in place, element for element.
+    var a = cur.querySelectorAll("*"), b = nxt.querySelectorAll("*");
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      ["aria-current", "aria-selected"].forEach(function (attr) {
+        var v = b[i].getAttribute(attr);
+        if (v === null) a[i].removeAttribute(attr);
+        else if (a[i].getAttribute(attr) !== v) a[i].setAttribute(attr, v);
+      });
+    }
+    return true;
+  }
+
+  function mdIsEmpty(region) {
+    return !region || region.hasAttribute("data-md-empty") || !!region.querySelector("[data-md-empty]");
+  }
+
+  function mdReplace(cur, nxt) {
+    var fresh = document.importNode(nxt, true);
+    cur.replaceWith(fresh);
+    if (window.htmx) window.htmx.process(fresh);
+    initPages(fresh);
+    return fresh;
+  }
+
+  function mdSwap(curMd, nextMd, nextMain) {
+    if (!curMd.isConnected) return;
+    var done = mdPending;
+    mdPending = null;
+    if (done) clearTimeout(done.timer);
+    var main = document.getElementById("main");
+    // Regions outside the master-detail container that follow the
+    // selection (a page head's counts, a version switch).
+    var syncs = nextMain.querySelectorAll("[data-md-sync]");
+    for (var k = 0; k < syncs.length; k++) {
+      var id = syncs[k].id;
+      var here = id && document.getElementById(id);
+      if (here) mdReplace(here, syncs[k]);
+    }
+    // Rail: only the selection moved → move the marks and glide the
+    // highlight; otherwise replace it, keeping its scroll position.
+    var rail = curMd.querySelector("[data-md-rail]"), nrail = nextMd.querySelector("[data-md-rail]");
+    if (rail && nrail) {
+      var before = mdSelected(rail);
+      if (mdStrip(rail) === mdStrip(nrail) && mdCopySelection(rail, nrail)) {
+        motion.glide(before, mdSelected(rail), "md-ink");
+      } else {
+        var lists = rail.querySelectorAll("[data-md-scroll], .filter-rail__list");
+        var tops = [];
+        for (var li = 0; li < lists.length; li++) tops.push(lists[li].scrollTop);
+        rail = mdReplace(rail, nrail);
+        var nlists = rail.querySelectorAll("[data-md-scroll], .filter-rail__list");
+        for (var lj = 0; lj < nlists.length && lj < tops.length; lj++) nlists[lj].scrollTop = tops[lj];
+      }
+    }
+    // List: a new list re-renders with a short stagger; a moved selection
+    // only moves the marks.
+    var list = curMd.querySelector("[data-md-list]"), nlist = nextMd.querySelector("[data-md-list]");
+    if (list && nlist) {
+      if (!(mdStrip(list) === mdStrip(nlist) && mdCopySelection(list, nlist))) {
+        var wraps = list.querySelectorAll(".table-wrap");
+        var wtops = [];
+        for (var wi = 0; wi < wraps.length; wi++) wtops.push(wraps[wi].scrollTop);
+        list = mdReplace(list, nlist);
+        var nwraps = list.querySelectorAll(".table-wrap");
+        for (var wj = 0; wj < nwraps.length && wj < wtops.length; wj++) nwraps[wj].scrollTop = wtops[wj];
+        var rows = list.querySelectorAll("tbody > tr, [data-md-item]");
+        motion.stagger(rows, { max: 20, total: 240 });
+      }
+    }
+    // Detail: slides in from the right when it opens, cross-fades when the
+    // item changes, slides out when it closes.
+    var det = curMd.querySelector("[data-md-detail]"), ndet = nextMd.querySelector("[data-md-detail]");
+    if (det && ndet) {
+      det.classList.remove("md-pending");
+      if (det.innerHTML !== ndet.innerHTML) {
+        var wasEmpty = mdIsEmpty(det), nowEmpty = mdIsEmpty(ndet);
+        var ghost = null;
+        if (!REDUCED && !wasEmpty) {
+          // The old content, frozen above the new while it leaves.
+          var r = det.getBoundingClientRect(), host = det.offsetParent || document.body, h = host.getBoundingClientRect();
+          ghost = det.cloneNode(true);
+          ghost.removeAttribute("id");
+          ghost.removeAttribute("data-md-detail");
+          ghost.setAttribute("aria-hidden", "true");
+          ghost.setAttribute("inert", "");
+          ghost.classList.add("md-ghost");
+          ghost.style.cssText += ";position:absolute;margin:0;left:" + (r.left - h.left + host.scrollLeft) + "px;top:" + (r.top - h.top + host.scrollTop) + "px;width:" + r.width + "px;height:" + r.height + "px;overflow:hidden;pointer-events:none;z-index:2;";
+          host.appendChild(ghost);
+        }
+        det = mdReplace(det, ndet);
+        if (ghost) {
+          var g = ghost;
+          motion.leave(g, { dx: nowEmpty ? 14 : 0, duration: nowEmpty ? MOTION.d2 : MOTION.d1 }).then(function () { g.remove(); });
+        }
+        if (wasEmpty && !nowEmpty) motion.enter(det, { dx: 14, duration: 200 });
+        else motion.fade(det, { duration: MOTION.d2 });
+        if (!nowEmpty) {
+          var head = det.querySelector("h2, h3, [data-md-heading]");
+          if (head) {
+            if (!head.hasAttribute("tabindex")) head.setAttribute("tabindex", "-1");
+            head.focus({ preventScroll: true });
+          }
+        }
+      }
+    }
+    var announcer = document.getElementById("nav-announcer");
+    if (announcer) announcer.textContent = document.title;
+    rememberPage();
+    document.dispatchEvent(new CustomEvent("hm:navigated", { detail: { main: main, md: true } }));
+  }
+
+  // Immediate feedback (< 100 ms): the clicked entry is selected at once;
+  // a response slower than 120 ms dims the detail behind a skeleton.
+  document.addEventListener("click", function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    var a = e.target.closest && e.target.closest("a[href]");
+    if (!a) return;
+    var md = a.closest("#main [data-md]");
+    if (!md || a.hasAttribute("data-md-full") || a.closest("[data-md-detail]")) return;
+    var region = a.closest("[data-md-rail], [data-md-list]");
+    if (!region) return;
+    if (region.hasAttribute("data-md-rail")) {
+      var was = mdSelected(region);
+      if (was && was !== a && was.getAttribute("aria-current")) {
+        was.removeAttribute("aria-current");
+        a.setAttribute("aria-current", "true");
+        motion.glide(was, a, "md-ink");
+      }
+    } else {
+      var row = a.closest("tr, [data-md-item]");
+      if (row) {
+        var olds = region.querySelectorAll('[aria-selected="true"]');
+        for (var i = 0; i < olds.length; i++) olds[i].removeAttribute("aria-selected");
+        row.setAttribute("aria-selected", "true");
+      }
+    }
+    var det = md.querySelector("[data-md-detail]");
+    if (det) {
+      if (mdPending) clearTimeout(mdPending.timer);
+      mdPending = {
+        timer: setTimeout(function () {
+          if (det.isConnected) det.classList.add("md-pending");
+        }, 120),
+      };
+    }
+  }, true);
+
   /* ---- swap handling ---------------------------------------------------- */
 
   var parser = new DOMParser();
   var viewTransition = false;
+  // List → detail ("forward") and back: the content column enters from the
+  // right or the left instead of rising (REDESIGN.md §7, master-detail).
+  var navDir = null;
+  document.addEventListener("click", function (e) {
+    var a = e.target.closest && e.target.closest("a[href]");
+    if (!a || !a.closest("#main")) {
+      navDir = null;
+      return;
+    }
+    var row = a.closest("table.data-table > tbody > tr");
+    if (a.closest(".back-link, [data-drill=back]")) navDir = "back";
+    else if (row || a.closest("[data-drill]")) navDir = "forward";
+    else navDir = null;
+    // The row answers at once (well under 100 ms), before the page does.
+    if (row && !a.closest("[data-md]")) row.setAttribute("data-pressed", "");
+  }, true);
   var nextNav = null;
   var navigated = false;
 
@@ -434,12 +714,48 @@
       }
       return;
     }
-    if (next.querySelector("script[src]")) {
+    var scripts = next.querySelectorAll("script[src]");
+    var unsafe = false;
+    for (var si = 0; si < scripts.length; si++) {
+      if (!scripts[si].hasAttribute("data-swap-safe")) unsafe = true;
+    }
+    if (unsafe) {
       // Page scripts expect a fresh document: load it as one, and go there
       // directly next time.
       detail.shouldSwap = false;
       learn(new URL(url, location.href).pathname);
       go(url);
+      return;
+    }
+    if (scripts.length) {
+      // `data-swap-safe` scripts only delegate from `document` (and redo
+      // their per-page work on `hm:navigated`): load each once, never twice.
+      var stripped = false;
+      for (var sj = 0; sj < scripts.length; sj++) {
+        var src = scripts[sj].getAttribute("src");
+        if (document.querySelector('script[src="' + src + '"]')) {
+          scripts[sj].remove();
+          stripped = true;
+        }
+      }
+      if (stripped) detail.serverResponse = "<!doctype html>" + doc.documentElement.outerHTML;
+    }
+    // Master-detail pages: the same view under a new selection swaps only
+    // the regions that changed (rail, list, detail), with their own motion;
+    // the rest of #main, the scroll positions and the focus stay.
+    var curMd = document.querySelector("#main [data-md]");
+    var nextMd = next.querySelector("[data-md]");
+    if (curMd && nextMd && curMd.getAttribute("data-md") === nextMd.getAttribute("data-md") && !(detail.requestConfig && detail.requestConfig.elt && detail.requestConfig.elt.hasAttribute && detail.requestConfig.elt.hasAttribute("data-md-full"))) {
+      detail.swapOverride = "none";
+      detail.selectOverride = "#main";
+      detail.target = document.getElementById("main");
+      detail.shouldSwap = true;
+      detail.isError = false;
+      var title = doc.title;
+      setTimeout(function () {
+        mdSwap(curMd, nextMd, next);
+        if (title) document.title = title;
+      }, 0);
       return;
     }
     var key = doc.body ? doc.body.getAttribute("data-nav-key") : null;
@@ -456,6 +772,8 @@
     // `hm-main` snapshot only — the sidebar and topbar hold still), else a
     // CSS entrance on the new #main after the swap.
     viewTransition = !REDUCED && typeof document.startViewTransition === "function";
+    if (navDir) document.documentElement.setAttribute("data-nav-dir", navDir);
+    else document.documentElement.removeAttribute("data-nav-dir");
     detail.swapOverride = "outerHTML show:window:top" + (viewTransition ? " transition:true" : "");
     navigated = {
       title: doc.title,
@@ -486,9 +804,16 @@
     var keep = document.body.classList.contains("nav-open") ? " nav-open" : "";
     document.body.setAttribute("class", (info.bodyClass + keep).trim());
     markActive();
+    var dir = navDir;
+    navDir = null;
+    setTimeout(function () {
+      if (!navDir) document.documentElement.removeAttribute("data-nav-dir");
+    }, 400);
     if (main && !viewTransition && !REDUCED) {
       main.classList.remove("page-enter");
       void main.offsetWidth;
+      if (dir) main.setAttribute("data-enter", dir);
+      else main.removeAttribute("data-enter");
       main.classList.add("page-enter");
       main.addEventListener("animationend", function done(e) {
         if (e.target !== main) return;
@@ -611,6 +936,38 @@
     }, 2000);
   }
   window.HM.toast = toast;
+
+  // The endpoint switcher keeps the page: each option asks the server for
+  // the same sub-page on its endpoint (`manager::switch`), from wherever the
+  // operator is now — the persistent sidebar's own hrefs cannot know that.
+  // The hrefs are set when the menu opens (htmx re-reads a boosted link's
+  // href when its attributes change and it is processed again).
+  document.addEventListener("toggle", function (e) {
+    var menu = e.target;
+    if (!menu.open || !menu.querySelector || !menu.querySelector("a[data-switch-href]")) return;
+    var from = encodeURIComponent(location.pathname + location.search);
+    var links = menu.querySelectorAll("a[data-switch-href]");
+    for (var i = 0; i < links.length; i++) {
+      links[i].setAttribute("href", links[i].getAttribute("data-switch-href") + "?from=" + from);
+    }
+    if (window.htmx) window.htmx.process(menu);
+  }, true);
+
+  // A server-side notice for the next page (`hm_toast` cookie, e.g. the
+  // switcher's "not on this endpoint" fallback): shown once.
+  function cookieToast() {
+    var m = document.cookie.match(/(?:^|;\s*)hm_toast=([^;]*)/);
+    if (!m) return;
+    document.cookie = "hm_toast=; Path=/ui; Max-Age=0; SameSite=Lax";
+    var text = "";
+    try {
+      text = decodeURIComponent(m[1].replace(/\+/g, " "));
+    } catch (err) {}
+    if (text) toast(text);
+  }
+  document.addEventListener("hm:navigated", cookieToast);
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", cookieToast);
+  else cookieToast();
 
   // In-page tabs ([data-page-tabs]): one panel visible at a time; without
   // JavaScript every panel shows. The active tab survives in the hash.
