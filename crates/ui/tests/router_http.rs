@@ -1867,7 +1867,7 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert!(html.contains(
         r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#
     ));
-    assert!(html.contains(r#"<script src="/ui/assets/row-navigation.js" defer></script>"#));
+    assert!(html.contains(r#"<script src="/ui/assets/row-navigation.js" defer data-swap-safe></script>"#));
     // The Resource Filter rail and the facet rows are server-rendered.
     assert!(html.contains(r#"id="sp-rail-list""#));
     assert!(html.contains("base=Patient"));

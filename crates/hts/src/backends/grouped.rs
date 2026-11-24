@@ -40,11 +40,6 @@ pub(crate) struct GroupedSql {
     pub params: [Option<String>; 5],
 }
 
-/// Columns of a [`GroupedSql::select`] row, in order.
-pub(crate) const SELECT_COLUMNS: [&str; 9] = [
-    "id", "url", "version", "name", "title", "status", "fhir_id", "hm_n", "hm_date",
-];
-
 fn precedence(table: &str) -> std::borrow::Cow<'static, str> {
     match table {
         "code_systems" => super::cs_precedence_order_by("code_systems"),
