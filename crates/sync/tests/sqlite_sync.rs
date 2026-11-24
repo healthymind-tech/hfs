@@ -671,3 +671,43 @@ async fn write_waker_wakes_continuous_jobs_of_the_written_tenant() {
     );
     assert!(!waker.retired());
 }
+
+/// Editing a running continuous job takes effect: its run ends and the next
+/// one moves data with the new definition (before, the run kept writing to
+/// the old target until the job was disabled and enabled again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuous_run_follows_an_edited_target() {
+    let f = fixture(config(&[("HFS_SYNC_ENABLED", "true")])).await;
+    let mut body = local_job("retarget", "a", "b");
+    body["initialLoad"] = json!("none");
+    body["trigger"] = json!({"type": "continuous", "pollSecs": 1});
+    let job = f.create_job(body).await;
+    let _ = f.svc.run_now(&job, "t").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let j = f.svc.job(&job).await.unwrap();
+    let mut spec = serde_json::to_value(&j.spec).unwrap();
+    spec["target"] = serde_json::to_value(local_job("x", "a", "c")["target"].clone()).unwrap();
+    f.svc.update(&job, None, spec, "t").await.unwrap();
+    f.svc.runtime().wake_tenant("a");
+
+    f.put("a", "Patient", "moved", json!({"n": 1})).await;
+    let t0 = Instant::now();
+    loop {
+        f.svc.runtime().wake_tenant("a");
+        if f.get("c", "Patient", "moved").await.is_some() {
+            break;
+        }
+        if t0.elapsed() > Duration::from_secs(15) {
+            let runs = f.svc.runs(&job, 3).await.unwrap();
+            panic!("the edited target never received the change: {runs:#?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        f.get("b", "Patient", "moved").await.is_none(),
+        "the old target still received a change after the edit"
+    );
+    f.svc.runtime().shutdown();
+}
+

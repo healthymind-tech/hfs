@@ -744,6 +744,23 @@ pub async fn execute(
     }
 }
 
+/// Whether two definitions move the same data the same way: everything but
+/// the name, description, trigger (its poll period is re-read each round)
+/// and the enabled flag.
+fn same_data_path(
+    a: &helios_endpoints::sync::SyncJobSpec,
+    b: &helios_endpoints::sync::SyncJobSpec,
+) -> bool {
+    let (mut a, mut b) = (a.clone(), b.clone());
+    for s in [&mut a, &mut b] {
+        s.name.clear();
+        s.description = None;
+        s.enabled = true;
+    }
+    a.trigger = b.trigger.clone();
+    a == b
+}
+
 async fn drive(st: &mut RunState<'_>, run: &SyncRun) -> Result<(), EngineError> {
     let peers = build_peers(st.env, st.job)?;
     st.log(
@@ -784,6 +801,19 @@ async fn drive(st: &mut RunState<'_>, run: &SyncRun) -> Result<(), EngineError> 
         }
         // The job may have been disabled, changed or deleted meanwhile.
         match st.env.store.job(&job.id).await? {
+            Some(j) if j.spec.enabled && !same_data_path(&st.job.spec, &j.spec) => {
+                // The peers, types, filters and conflict policy of this run
+                // were fixed when it started: an edited definition ends it,
+                // and the scheduler starts the next run with the new one
+                // (before, edits took effect only after a disable/enable or
+                // a restart).
+                st.log(
+                    LogLevel::Info,
+                    "job definition changed; continuous run restarts with it",
+                )
+                .await;
+                return Ok(());
+            }
             Some(j) if j.spec.enabled => job = j,
             Some(_) => {
                 st.log(LogLevel::Info, "job disabled; continuous run ends")
