@@ -130,7 +130,7 @@ helios-hts-ui = { path = "../hts-ui", version = "0.2.9", default-features = fals
 # The FHIR server manager contracts (package P0): endpoint model, routing
 # snapshot/registry, store traits, console roles and sync job model. The
 # manager console (src/manager) reads endpoints only through these types.
-helios-endpoints = { path = "../endpoints", version = "0.2.9" }
+helios-endpoints = { path = "../endpoints", version = "0.2.9", features = ["http-guard"] }
 # The server's terminology service (editor `$expand` picker, health probe;
 # docs/design/unified-server.md U2) plus the terminology route namespace and
 # role table (design §3.2, §7.2).

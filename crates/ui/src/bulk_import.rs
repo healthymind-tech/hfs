@@ -1068,6 +1068,10 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
     if client_id.is_empty() || token_url.is_empty() {
         return Err("missing client_id or token URL".to_string());
     }
+    // The token URL is typed by an operator: the outbound policy applies
+    // (`HFS_OUTBOUND_ALLOW`), here and after DNS resolution / redirects.
+    helios_endpoints::http_guard::check(&outbound_policy(), token_url)
+        .map_err(|e| format!("token URL refused: {e}"))?;
     let pem = std::env::var("HFS_BULK_SUBMIT_PRIVATE_KEY")
         .map_err(|_| "HFS_BULK_SUBMIT_PRIVATE_KEY is not configured on this server".to_string())?;
     let alg = std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or_else(|_| "ES384".to_string());
@@ -1086,7 +1090,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
-    let response = http_client()
+    let response = guarded_http_client()
         .post(token_url)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -1260,6 +1264,22 @@ const STATUS_POLL_FAILURE_BACKOFF_SECS: u64 = 30;
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn outbound_policy() -> helios_endpoints::OutboundPolicy {
+    helios_endpoints::OutboundPolicy::from_env()
+}
+
+/// The client for operator-typed URLs (a recipient's token endpoint): under
+/// the outbound policy. Kick-offs and polls go to this server itself and use
+/// [`http_client`].
+fn guarded_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        helios_endpoints::http_guard::guard(reqwest::Client::builder(), &outbound_policy())
+            .build()
+            .expect("bulk-import HTTP client")
+    })
 }
 
 /// Stamps the selected tenant onto a self-call. The recipient is this HFS
@@ -2079,6 +2099,21 @@ pub async fn test_auth(
 
 #[cfg(test)]
 mod tests {
+
+    /// The test-auth token URL is operator-typed: an internal address is not
+    /// requested unless allow-listed (`HFS_OUTBOUND_ALLOW`).
+    #[tokio::test]
+    async fn the_token_url_is_refused_when_internal() {
+        for url in [
+            "http://169.254.169.254/token",
+            "http://127.0.0.1:9/token",
+            "file:///etc/passwd",
+        ] {
+            let err = backend_services_token("client", url).await.unwrap_err();
+            assert!(err.contains("refused"), "{url}: {err}");
+        }
+    }
+
     use super::*;
 
     /// #1436: a submission without a client of its own authenticates its
