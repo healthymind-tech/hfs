@@ -150,6 +150,19 @@ pub fn role_values(tokens: &OidcTokens, role_claim: &str) -> Vec<String> {
     v
 }
 
+/// Fingerprint of what decides a role (claim path, mapping, default role):
+/// a session mapped under another fingerprint is re-mapped.
+pub fn mapping_fingerprint(settings: &OidcClientSettings) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!(
+        "{}|{:?}|{:?}",
+        settings.role_claim, settings.role_mapping, settings.default_role
+    )
+    .hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// The role these tokens map to under `settings` (`None` = no access).
 pub fn map_role(tokens: &OidcTokens, settings: &OidcClientSettings) -> Option<ConsoleRole> {
     settings.role_mapping.resolve(
