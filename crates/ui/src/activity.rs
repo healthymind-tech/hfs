@@ -39,9 +39,9 @@ async fn chip(locale: RequestLocale) -> Response {
         Some(s) => s.list().await.map_or(0, |jobs| {
             jobs.iter()
                 .filter(|j| {
-                    j.last_run
-                        .as_ref()
-                        .is_some_and(|r| matches!(r.state, SyncRunState::Running | SyncRunState::Queued))
+                    j.last_run.as_ref().is_some_and(|r| {
+                        matches!(r.state, SyncRunState::Running | SyncRunState::Queued)
+                    })
                 })
                 .count() as u32
         }),
