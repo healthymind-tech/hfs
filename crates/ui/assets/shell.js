@@ -740,6 +740,7 @@
   /* ---- swap handling ---------------------------------------------------- */
 
   var parser = new DOMParser();
+  var HEAD_METAS = ["hfs-tenant", "hfs-fhir-base", "hfs-user-settings"];
   var viewTransition = false;
   // List → detail ("forward") and back: the content column enters from the
   // right or the left instead of rising (REDESIGN.md §7, master-detail).
@@ -955,7 +956,17 @@
     if (navDir) document.documentElement.setAttribute("data-nav-dir", navDir);
     else document.documentElement.removeAttribute("data-nav-dir");
     detail.swapOverride = "outerHTML show:window:top" + (viewTransition ? " transition:true" : "");
+    // Per-endpoint values page scripts read from <head> (the FHIR base,
+    // the tenant, the settings document): an in-place switch to another
+    // endpoint must carry them over, or a Delete or a theme change would go
+    // to the endpoint the document was first loaded on.
+    var heads = {};
+    HEAD_METAS.forEach(function (name) {
+      var m = doc.querySelector('meta[name="' + name + '"]');
+      if (m) heads[name] = m.getAttribute("content");
+    });
     navigated = {
+      heads: heads,
       title: doc.title,
       bodyClass: doc.body ? doc.body.getAttribute("class") || "" : "",
       method: String((detail.requestConfig || {}).verb || "get"),
@@ -976,6 +987,10 @@
       nextNav = null;
     }
     if (info.title) document.title = info.title;
+    Object.keys(info.heads || {}).forEach(function (name) {
+      var m = document.head.querySelector('meta[name="' + name + '"]');
+      if (m && m.getAttribute("content") !== info.heads[name]) m.setAttribute("content", info.heads[name]);
+    });
     // Menus opened to navigate (endpoint switcher, account) close, as they
     // would on a fresh page.
     var menus = document.querySelectorAll("#sidebar details.menu[open], .topbar details[open]");

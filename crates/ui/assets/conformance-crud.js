@@ -13,16 +13,19 @@
   if (document.hfsConformanceCrudInstalled) return;
   document.hfsConformanceCrudInstalled = true;
 
-  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
-  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it.
+     Read at call time: an in-place switch to another endpoint updates the
+     tag (shell.js), and this script stays installed across swaps. */
+  function meta(name) {
+    return (document.querySelector('meta[name="' + name + '"]') || {}).content || "";
+  }
   /* The FHIR API's path prefix, stamped by the server from HFS_BASE_URL
      (`<meta name="hfs-fhir-base">`): "" at the origin root, "/fhir" behind a
      reverse proxy that mounts the server under a prefix. Root-relative FHIR
      paths are built on it; absolute URLs (a Bundle's paging links) and paths
      already carrying the prefix pass through untouched. */
-  var FHIR_BASE = ((document.querySelector('meta[name="hfs-fhir-base"]') || {}).content || "")
-    .replace(/\/+$/, "");
   function fhirUrl(path) {
+    var FHIR_BASE = meta("hfs-fhir-base").replace(/\/+$/, "");
     if (!FHIR_BASE || !/^\/(?!\/)/.test(path)) return path;
     if (path === FHIR_BASE || path.indexOf(FHIR_BASE + "/") === 0 || path.indexOf(FHIR_BASE + "?") === 0) {
       return path;
@@ -68,6 +71,7 @@
 
   function remove(btn) {
     var headers = { Accept: "application/fhir+json" };
+    var TENANT = meta("hfs-tenant");
     if (TENANT) headers["X-Tenant-ID"] = TENANT;
     /* The shared busy state (#679); the guard is per-button, so unrelated
        rows stay independently deletable. */

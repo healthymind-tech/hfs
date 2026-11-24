@@ -60,8 +60,12 @@
   // Where the settings document lives is the server's call: HFS stamps
   // `<meta name="hfs-user-settings">` with the endpoint under its own API
   // prefix; a layout without the tag (HTS) means "no such endpoint".
-  var settingsMeta = document.querySelector('meta[name="hfs-user-settings"]');
-  var SETTINGS = settingsMeta ? settingsMeta.content : null;
+  // Read at call time: an in-place switch to another endpoint updates the
+  // tag (shell.js).
+  function settingsUrl() {
+    var settingsMeta = document.querySelector('meta[name="hfs-user-settings"]');
+    return settingsMeta ? settingsMeta.content : null;
+  }
 
   function valid(pref) {
     return ORDER.indexOf(pref) >= 0 ? pref : null;
@@ -151,6 +155,7 @@
   }
 
   function patchServer(pref) {
+    var SETTINGS = settingsUrl();
     if (!window.fetch || !SETTINGS) return;
     fetch(SETTINGS, {
       method: "PATCH",
@@ -268,8 +273,8 @@
   }
 
   // Roaming seed (HFS): only when this browser has no choice of its own.
-  if (!initial && window.fetch && SETTINGS) {
-    fetch(SETTINGS, { headers: { Accept: "application/json" }, credentials: "same-origin" })
+  if (!initial && window.fetch && settingsUrl()) {
+    fetch(settingsUrl(), { headers: { Accept: "application/json" }, credentials: "same-origin" })
       .then(function (response) {
         return response.ok ? response.json() : null;
       })
