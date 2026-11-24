@@ -790,7 +790,7 @@ impl CsBrowserRow {
             title: s("title"),
             status: s("status"),
             version_count: version_count_of(resource),
-            date: s("date"),
+            date: day(&s("date")),
         }
     }
 }
@@ -812,6 +812,12 @@ pub(crate) fn version_count_of(resource: &Value) -> u64 {
         .and_then(|x| x.get("valueInteger"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1)
+}
+
+/// The calendar day of a FHIR `date` / `dateTime` (`2021-11-09T10:00:00+10:00`
+/// → `2021-11-09`): the lists show when, not the second.
+pub(crate) fn day(date: &str) -> String {
+    date.split('T').next().unwrap_or(date).to_string()
 }
 
 /// One stored version of a canonical, for the "+N older" rows and the
@@ -846,7 +852,7 @@ impl VersionChoice {
             name: s("name"),
             title: s("title"),
             status: s("status"),
-            date: s("date"),
+            date: day(&s("date")),
             current,
         }
     }
@@ -2200,7 +2206,7 @@ impl VsBrowserRow {
             title: s("title"),
             status: s("status"),
             version_count: version_count_of(resource),
-            date: s("date"),
+            date: day(&s("date")),
         }
     }
 }
@@ -3292,7 +3298,7 @@ impl CmBrowserRow {
             title: s("title"),
             status: s("status"),
             version_count: version_count_of(resource),
-            date: s("date"),
+            date: day(&s("date")),
             source_uri,
             target_uri,
         }
