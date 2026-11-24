@@ -1257,7 +1257,12 @@
         if (tog.getAttribute("aria-busy") === "true") return;
         tog.setAttribute("aria-busy", "true");
         fetch(src, { headers: { "HX-Request": "true" }, credentials: "same-origin" })
-          .then(function (r) { return r.text(); })
+          .then(function (r) {
+            // An error (a signed-out session) is not "no older versions":
+            // leave the toggle unloaded so the next click asks again.
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.text();
+          })
           .then(function (html) {
             var doc = new DOMParser().parseFromString(html, "text/html");
             var rows = doc.querySelectorAll("tr[data-older]");
