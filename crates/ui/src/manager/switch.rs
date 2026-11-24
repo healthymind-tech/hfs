@@ -275,7 +275,11 @@ mod tests {
 
     #[test]
     fn the_nav_cookie_takes_only_an_endpoint_name() {
-        assert!(nav_cookie("sandbox").unwrap().starts_with("hm_ep=sandbox; Path=/ui"));
+        assert!(
+            nav_cookie("sandbox")
+                .unwrap()
+                .starts_with("hm_ep=sandbox; Path=/ui")
+        );
         assert!(nav_cookie("x; Max-Age=0").is_none());
         assert!(nav_cookie("").is_none());
     }
