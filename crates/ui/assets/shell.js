@@ -1058,7 +1058,9 @@
   // which innerHTML does not carry: written into attributes first, so Back
   // shows the filter the list was filtered by.
   var pageState = {};
+  var shownUrl = location.href;
   function rememberPage() {
+    shownUrl = location.href;
     var main = document.getElementById("main");
     pageState[location.href] = {
       bodyClass: document.body.getAttribute("class") || "",
@@ -1073,6 +1075,13 @@
       for (var i = 0; i < fields.length; i++) {
         var el = fields[i];
         if (el.type === "password" || el.type === "file") continue;
+        // Only filters (GET forms, loose fields) keep what was typed: an
+        // edit in a settings form (POST) is a draft that was either saved
+        // or discarded when the page was left — restoring it as the page's
+        // value would show a discarded edit as if it were saved, with no
+        // unsaved marker.
+        var owner = el.form;
+        if (owner && String(owner.getAttribute("method") || "get").toLowerCase() === "post") continue;
         if (el.tagName === "SELECT") {
           for (var o = 0; o < el.options.length; o++) {
             if (el.options[o].selected) el.options[o].setAttribute("selected", "");
@@ -1356,7 +1365,40 @@
     } catch (e) {}
   }
 
+  /* Back/Forward with an unsaved draft asks first, like a link does: htmx
+     restores history in `window.onpopstate`, after the browser has already
+     moved; the page being left is put back on top until the operator
+     answers, then the move is replayed. */
+  function guardHistory() {
+    var restore = window.onpopstate;
+    if (typeof restore !== "function" || restore.__hmGuard) return;
+    var guarded = function (event) {
+      var U = window.HfsUnsaved;
+      var main = document.getElementById("main");
+      if (U && U.isDirty && U.isDirty(main) && shownUrl !== location.href) {
+        var target = location.href;
+        try {
+          history.pushState(history.state, "", shownUrl);
+        } catch (e) {
+          return restore.call(this, event);
+        }
+        U.confirmDiscard(main).then(function (leave) {
+          if (leave && location.href !== target) history.back();
+        });
+        return;
+      }
+      return restore.call(this, event);
+    };
+    guarded.__hmGuard = true;
+    window.onpopstate = guarded;
+  }
+
+  // htmx installs its handler when the document is ready (after this
+  // deferred script ran): wrap it once it exists.
+  document.addEventListener("htmx:load", guardHistory);
+
   function start() {
+    guardHistory();
     keepOutOfHistory(document.getElementById("main"));
     autoExpand(document.getElementById("main"));
     rememberPage();
