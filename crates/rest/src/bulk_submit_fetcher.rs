@@ -50,6 +50,9 @@ use serde_json::Value;
 use tokio::io::AsyncBufRead;
 use tokio_util::io::StreamReader;
 
+use helios_endpoints::OutboundPolicy;
+use helios_endpoints::http_guard;
+
 use crate::jwe::{self, DecryptionKeys, PrivateKey};
 
 /// The default `fileEncryptionKey.coding` code (submit spec: "If omitted,
@@ -110,14 +113,27 @@ pub struct HttpSubmitInputFetcher {
     /// addresses HFS asymmetrically — `RSA-OAEP*` / `ECDH-ES*`.
     decryption_keys: Vec<PrivateKey>,
     retry: RetryPolicy,
+    /// Where the server may fetch from (`HFS_OUTBOUND_ALLOW`): manifest and
+    /// file URLs come from the submitting client, so internal addresses are
+    /// refused unless allow-listed — on the first URL, after DNS resolution
+    /// and on every redirect hop.
+    policy: OutboundPolicy,
+    read_timeout: Duration,
 }
 
-/// Builds the decoding and the non-decoding client with the same timeouts.
-fn build_clients(read_timeout: Duration) -> (reqwest::Client, reqwest::Client) {
+/// Builds the decoding and the non-decoding client with the same timeouts,
+/// both under the outbound `policy`.
+fn build_clients(
+    read_timeout: Duration,
+    policy: &OutboundPolicy,
+) -> (reqwest::Client, reqwest::Client) {
     let base = || {
-        reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(read_timeout)
+        http_guard::guard(
+            reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(read_timeout),
+            policy,
+        )
     };
     // `Client::new()` panics the same way when the TLS backend cannot start.
     let client = base()
@@ -132,8 +148,12 @@ fn build_clients(read_timeout: Duration) -> (reqwest::Client, reqwest::Client) {
 
 impl HttpSubmitInputFetcher {
     /// Creates a fetcher with the given optional outbound token provider and scope.
+    ///
+    /// Fetches are guarded by the policy of `HFS_OUTBOUND_ALLOW`
+    /// ([`OutboundPolicy::from_env`]); see [`Self::with_outbound_policy`].
     pub fn new(token_provider: Option<Arc<dyn FileTokenProvider>>, outbound_scope: String) -> Self {
-        let (client, stream_client) = build_clients(DEFAULT_FETCH_READ_TIMEOUT);
+        let policy = OutboundPolicy::from_env();
+        let (client, stream_client) = build_clients(DEFAULT_FETCH_READ_TIMEOUT, &policy);
         Self {
             client,
             stream_client,
@@ -141,16 +161,28 @@ impl HttpSubmitInputFetcher {
             outbound_scope,
             decryption_keys: Vec::new(),
             retry: RetryPolicy::default(),
+            policy,
+            read_timeout: DEFAULT_FETCH_READ_TIMEOUT,
         }
+    }
+
+    /// Replaces the outbound policy (the clients are rebuilt under it).
+    pub fn with_outbound_policy(mut self, policy: OutboundPolicy) -> Self {
+        let (client, stream_client) = build_clients(self.read_timeout, &policy);
+        self.client = client;
+        self.stream_client = stream_client;
+        self.policy = policy;
+        self
     }
 
     /// Sets the idle time allowed between two reads of a response
     /// (`HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`); the default is
     /// [`DEFAULT_FETCH_READ_TIMEOUT`].
     pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
-        let (client, stream_client) = build_clients(read_timeout);
+        let (client, stream_client) = build_clients(read_timeout, &self.policy);
         self.client = client;
         self.stream_client = stream_client;
+        self.read_timeout = read_timeout;
         self
     }
 
@@ -182,6 +214,7 @@ impl HttpSubmitInputFetcher {
         oauth_metadata_urls: &[String],
     ) -> FileRequest {
         FileRequest {
+            policy: self.policy.clone(),
             client: client.clone(),
             token_provider: self.token_provider.clone(),
             outbound_scope: self.outbound_scope.clone(),
@@ -412,6 +445,7 @@ const ACCEPT_IDENTITY: &str = "identity";
 /// An owned description of one input-file GET, re-issuable for resumes.
 #[derive(Clone)]
 struct FileRequest {
+    policy: OutboundPolicy,
     client: reqwest::Client,
     token_provider: Option<Arc<dyn FileTokenProvider>>,
     outbound_scope: String,
@@ -433,6 +467,8 @@ impl FileRequest {
         extra_headers: &[(header::HeaderName, String)],
     ) -> StorageResult<reqwest::RequestBuilder> {
         let shown = &self.shown_url;
+        http_guard::check(&self.policy, &self.url)
+            .map_err(|e| HttpSubmitInputFetcher::err(format!("{shown} is not fetched: {e}")))?;
         let mut rb = self
             .client
             .get(&self.url)
@@ -1016,6 +1052,9 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         // Identity encoding on purpose: a gzip Content-Length would be the
         // compressed size, and the ingestion counts decompressed bytes. The
         // non-decoding client sends no `Accept-Encoding` of its own.
+        if http_guard::check(&self.policy, url).is_err() {
+            return Ok(None);
+        }
         let mut rb = self.stream_client.head(url);
         if requires_access_token {
             let Some(provider) = &self.token_provider else {
@@ -1061,7 +1100,60 @@ mod tests {
         base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     fn fetcher() -> HttpSubmitInputFetcher {
+        // The test servers listen on loopback.
         HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+            .with_outbound_policy(OutboundPolicy::parse("127.0.0.1,localhost"))
+    }
+
+    /// Manifest and file URLs come from the submitting client: an internal
+    /// address is refused unless allow-listed — by IP literal, by a name that
+    /// resolves to one, and behind a redirect.
+    #[tokio::test]
+    async fn test_internal_addresses_are_not_fetched() {
+        let strict = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+            .with_outbound_policy(OutboundPolicy::strict());
+        for url in [
+            "http://127.0.0.1:1/manifest.json",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost:1/manifest.json",
+            "http://[::1]:1/manifest.json",
+        ] {
+            let err = strict
+                .fetch_manifest(url, &[], &[], None)
+                .await
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("internal")
+                    || text.contains("not fetched")
+                    || text.contains("refused")
+                    || text.contains("is internal"),
+                "{url}: {text}"
+            );
+        }
+        // Behind a redirect from an allow-listed host.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 302 Found\r\nlocation: http://169.254.169.254/latest/meta-data/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let only_localhost = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+            .with_outbound_policy(OutboundPolicy::parse("localhost"));
+        let err = only_localhost
+            .fetch_manifest(&format!("http://localhost:{port}/m.json"), &[], &[], None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("169.254.169.254") || err.to_string().contains("internal"),
+            "{err}"
+        );
     }
 
     /// Builds a `dir` + A256GCM compact JWE over `plaintext`.

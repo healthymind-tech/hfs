@@ -278,7 +278,11 @@ async fn the_served_key_verifies_the_assertion_the_provider_sends() {
     tokio::spawn(async move { axum::serve(hfs, hfs_app).await.unwrap() });
 
     let provider = JwtClientCredentialsTokenProvider::new("hfs-client", TEST_ES384_PEM, "ES384")
-        .expect("valid ES384 key");
+        .expect("valid ES384 key")
+        .with_outbound_policy(helios_endpoints::OutboundPolicy::parse(
+            "127.0.0.1,localhost",
+        ))
+        .unwrap();
     let token = provider
         .token(
             &[format!("{idp_base}/.well-known/smart-configuration")],

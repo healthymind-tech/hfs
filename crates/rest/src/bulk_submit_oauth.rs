@@ -15,14 +15,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use helios_endpoints::OutboundPolicy;
+use helios_endpoints::http_guard;
 use helios_persistence::core::FileTokenProvider;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+fn guarded_client(policy: &OutboundPolicy) -> reqwest::Client {
+    http_guard::guard(reqwest::Client::builder(), policy)
+        .build()
+        .expect("bulk-submit OAuth HTTP client configuration is valid")
+}
+
 /// Acquires read-scoped bearer tokens via SMART Backend Services `client_credentials`.
 pub struct JwtClientCredentialsTokenProvider {
     client: reqwest::Client,
+    /// The `oauthMetadataUrl` comes from the submitting client, and the token
+    /// endpoint from the document it points to: both are fetched under the
+    /// outbound policy (`HFS_OUTBOUND_ALLOW`).
+    policy: OutboundPolicy,
     client_id: String,
     signing_alg: Algorithm,
     encoding_key: EncodingKey,
@@ -49,8 +61,10 @@ impl JwtClientCredentialsTokenProvider {
         };
         let kid = derive_public_jwk(private_key_pem, signing_alg)
             .and_then(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(String::from));
+        let policy = OutboundPolicy::from_env();
         Some(Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: guarded_client(&policy),
+            policy,
             client_id: client_id.to_string(),
             signing_alg: alg,
             encoding_key: key,
@@ -59,8 +73,20 @@ impl JwtClientCredentialsTokenProvider {
         }))
     }
 
+    /// The same provider under another outbound policy.
+    pub fn with_outbound_policy(self: Arc<Self>, policy: OutboundPolicy) -> Option<Arc<Self>> {
+        let mut me = Arc::try_unwrap(self).ok()?;
+        me.client = guarded_client(&policy);
+        me.policy = policy;
+        Some(Arc::new(me))
+    }
+
     /// Resolves the token endpoint from a SMART/OAuth metadata URL.
     async fn discover_token_endpoint(&self, oauth_metadata_url: &str) -> Option<String> {
+        if let Err(e) = http_guard::check(&self.policy, oauth_metadata_url) {
+            tracing::warn!(error = %e, "bulk-submit: oauthMetadataUrl refused by the outbound policy");
+            return None;
+        }
         let resp = self.client.get(oauth_metadata_url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -89,6 +115,10 @@ impl JwtClientCredentialsTokenProvider {
     }
 
     async fn request_token(&self, token_endpoint: &str, scope: &str) -> Option<(String, Instant)> {
+        if let Err(e) = http_guard::check(&self.policy, token_endpoint) {
+            tracing::warn!(error = %e, "bulk-submit: token endpoint refused by the outbound policy");
+            return None;
+        }
         let assertion = self.client_assertion(token_endpoint)?;
         let params = [
             ("grant_type", "client_credentials"),

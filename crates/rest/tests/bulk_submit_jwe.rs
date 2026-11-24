@@ -90,7 +90,10 @@ async fn read_all(fetcher: &HttpSubmitInputFetcher, url: &str, key: Option<&Valu
 }
 
 fn fetcher() -> HttpSubmitInputFetcher {
-    HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+    // The provider under test listens on loopback.
+    HttpSubmitInputFetcher::new(None, "system/*.rs".to_string()).with_outbound_policy(
+        helios_endpoints::OutboundPolicy::parse("127.0.0.1,localhost"),
+    )
 }
 
 #[tokio::test]
