@@ -51,3 +51,11 @@ test("existsFromStatus is true only for 200", () => {
     assert.equal(saveTarget.existsFromStatus(status), false, String(status));
   }
 });
+
+test("ifMatch carries the loaded version, nothing without one", () => {
+  assert.equal(saveTarget.ifMatch({ meta: { versionId: "7" } }), 'W/"7"');
+  assert.equal(saveTarget.ifMatch({ meta: {} }), "");
+  assert.equal(saveTarget.ifMatch({}), "");
+  assert.equal(saveTarget.ifMatch(null), "");
+  assert.equal(saveTarget.ifMatch({ meta: { versionId: 'x"y' } }), "");
+});

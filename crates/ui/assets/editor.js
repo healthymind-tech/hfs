@@ -448,9 +448,16 @@
         )) return;
         if (!root.isConnected || editRevision !== revision) return;
       }
+      var saveHeaders = { "Content-Type": "application/fhir+json" };
+      // An update of the resource this page loaded carries the version it was
+      // loaded at: a concurrent save elsewhere answers 412, not a silent
+      // overwrite.
+      var precondition = target.method === "PUT" && confirmed && confirmed.id === target.id
+        ? window.HfsSaveTarget.ifMatch(parsed) : "";
+      if (precondition) saveHeaders["If-Match"] = precondition;
       var response = await fetch(fhirUrl(target.url), {
         method: target.method,
-        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+        headers: fhirHeaders(saveHeaders),
         body: doc,
       });
       var payload = await response.json();
