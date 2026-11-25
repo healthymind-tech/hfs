@@ -1238,10 +1238,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 );
             }
 
-            let limit = i64::from(query.count.unwrap_or(20));
-            let offset = i64::from(query.offset.unwrap_or(0));
             let want_summary = query.summary.as_deref() == Some("true");
-            let order_by = crate::backends::search_order_by("code_systems", &query);
 
             // Summary path: avoid reading resource_json blob; the covering index
             // idx_code_systems_meta serves this query without touching the main table.
@@ -1252,41 +1249,22 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     && query.title.is_none()
                     && query.status.is_none()
             {
+                let (sql_meta, params_meta) =
+                    super::exact_search("code_systems", super::SEARCH_META_COLUMNS, &query);
                 let mut stmt = conn
-                    .prepare_cached(&format!(
-                        "SELECT id, url, version, name, title, status
-                         FROM code_systems
-                         WHERE (?1 IS NULL OR url = ?1)
-                           AND (?2 IS NULL OR version = ?2)
-                           AND (?3 IS NULL OR name = ?3)
-                           AND (?4 IS NULL OR title = ?4)
-                           AND (?5 IS NULL OR status = ?5)
-                         ORDER BY {order_by}
-                         LIMIT ?6 OFFSET ?7",
-                    ))
+                    .prepare_cached(&sql_meta)
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = stmt
-                    .query_map(
-                        rusqlite::params![
-                            query.url,
-                            query.version,
-                            query.name,
-                            query.title,
-                            query.status,
-                            limit,
-                            offset
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, Option<String>>(3)?,
-                                row.get::<_, Option<String>>(4)?,
-                                row.get::<_, String>(5)?,
-                            ))
-                        },
-                    )
+                    .query_map(rusqlite::params_from_iter(params_meta), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
                     .map_err(|e| HtsError::StorageError(e.to_string()))?;
                 let rows = rows
                     .collect::<Result<Vec<_>, _>>()
@@ -1309,44 +1287,24 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 return Ok(results);
             }
 
+            let (sql_full, params_full) =
+                super::exact_search("code_systems", super::SEARCH_FULL_COLUMNS, &query);
             let mut stmt = conn
-                .prepare_cached(&format!(
-                    "SELECT id, url, version, name, title, status, resource_json, fhir_id
-                     FROM code_systems
-                     WHERE (?1 IS NULL OR url = ?1)
-                       AND (?2 IS NULL OR version = ?2)
-                       AND (?3 IS NULL OR name = ?3)
-                       AND (?4 IS NULL OR title = ?4)
-                       AND (?5 IS NULL OR status = ?5)
-                     ORDER BY {order_by}
-                     LIMIT ?6 OFFSET ?7",
-                ))
+                .prepare_cached(&sql_full)
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
             let rows = stmt
-                .query_map(
-                    rusqlite::params![
-                        query.url,
-                        query.version,
-                        query.name,
-                        query.title,
-                        query.status,
-                        limit,
-                        offset
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                        ))
-                    },
-                )
+                .query_map(rusqlite::params_from_iter(params_full), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
             let mut results = Vec::new();

@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use tokio_postgres::NoTls;
 use tracing::info;
 
+use crate::backends::ExactFilter;
 use crate::error::HtsError;
 use crate::import::bundle_parser::{
     self, ParsedCodeSystem, ParsedConcept, ParsedConceptMap, ParsedValueSet,
@@ -215,11 +216,9 @@ where
         return Ok(count.max(0) as u64);
     }
     let search = ResourceStringSearch::new(query);
-    let filter = "WHERE ($1::text IS NULL OR url = $1)
-           AND ($2::text IS NULL OR version = $2)
-           AND ($3::text IS NULL OR status = $3)";
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
-        [&query.url, &query.version, &query.status];
+    let exact = ExactFilter::url_version_status('$', query);
+    let filter = format!("WHERE {}", exact.sql);
+    let params = exact_params(&exact);
 
     if search.is_empty() {
         let count: i64 = client
@@ -245,6 +244,15 @@ where
         .map(search_row)
         .filter(|row| search.matches_row(row))
         .count() as u64)
+}
+
+/// The values of `filter` as statement parameters, in placeholder order.
+fn exact_params(filter: &ExactFilter) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+    filter
+        .values
+        .iter()
+        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect()
 }
 
 /// Map a row of [`crate::string_search::metadata_select_list`].
@@ -322,32 +330,24 @@ async fn search_table(
                 && query.status.is_none());
     let order_by = crate::backends::search_order_by(table, &query);
     let has_fhir_id = fhir_ids::TABLES.contains(&table);
+    let exact = ExactFilter::all_columns('$', &query);
     let sql = format!(
         "SELECT id, url, version, name, title, status, {fhir_id}{json}
          FROM {table}
-         WHERE ($1::text IS NULL OR url = $1)
-           AND ($2::text IS NULL OR version = $2)
-           AND ($3::text IS NULL OR name = $3)
-           AND ($4::text IS NULL OR title = $4)
-           AND ($5::text IS NULL OR status = $5)
+         WHERE {filter}
          ORDER BY {order_by}
-         LIMIT $6 OFFSET $7",
+         LIMIT {limit_at} OFFSET {offset_at}",
         json = if metadata_only { "" } else { ", resource_json" },
-        fhir_id = if has_fhir_id { "fhir_id" } else { "NULL::text" }
+        fhir_id = if has_fhir_id { "fhir_id" } else { "NULL::text" },
+        filter = exact.sql,
+        limit_at = exact.placeholder_after(1),
+        offset_at = exact.placeholder_after(2),
     );
+    let mut params = exact_params(&exact);
+    params.push(&limit);
+    params.push(&offset);
     let rows = (**client)
-        .cq(
-            &sql,
-            &[
-                &query.url,
-                &query.version,
-                &query.name,
-                &query.title,
-                &query.status,
-                &limit,
-                &offset,
-            ],
-        )
+        .cq(&sql, &params)
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     let mut results = Vec::with_capacity(rows.len());
@@ -489,18 +489,18 @@ where
     C: GenericClient + Sync,
 {
     // Read large JSON bodies only after string filtering and pagination.
+    let exact = ExactFilter::url_version_status('$', &query);
     let metadata_sql = format!(
         "SELECT {columns}
          FROM {table}
-         WHERE ($1::text IS NULL OR url = $1)
-           AND ($2::text IS NULL OR version = $2)
-           AND ($3::text IS NULL OR status = $3)
+         WHERE {filter}
          ORDER BY {order_by}",
         columns = crate::string_search::metadata_select_list(table, &search, true),
+        filter = exact.sql,
         order_by = crate::backends::search_order_by(table, &query)
     );
     let rows = client
-        .query(&metadata_sql, &[&query.url, &query.version, &query.status])
+        .query(&metadata_sql, &exact_params(&exact))
         .await
         .map_err(|error| HtsError::StorageError(error_chain(&error)))?
         .iter()
