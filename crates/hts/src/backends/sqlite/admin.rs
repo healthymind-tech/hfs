@@ -663,6 +663,10 @@ impl TerminologyAdmin for SqliteTerminologyBackend {
                 })
                 .map_err(storage)?;
             super::fhir_ids::reassign(&tx, "code_systems", &declared)?;
+            // The persisted expansions over the url were computed with the
+            // previous default version.
+            crate::import::fhir_bundle::invalidate_expansion_cache_for_system(&tx, &url)?;
+            crate::import::fhir_bundle::invalidate_implicit_expansions(&tx, &url)?;
             tx.commit().map_err(storage)
         })
         .await?;
