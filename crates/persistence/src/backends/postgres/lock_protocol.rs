@@ -299,8 +299,8 @@ pub(super) fn resource_key(tenant_id: &str, resource_type: &str, id: &str) -> St
     ])
 }
 
-/// Advisory-lock namespace of the fork's session-level conditional
-/// create / upsert lock (`ConditionLock` in `storage.rs`, hm/p3-cluster).
+/// Advisory-lock namespace of the fork's conditional create / upsert lock
+/// for single (non-Bundle) interactions ([`acquire_conditional_write_locks`]).
 /// The same `HFSC` namespace as upstream's Bundle [`CRITERIA_LOCK_NAMESPACE`];
 /// the keys are derived differently (`b"conditional"` vs `b"criteria"`
 /// components), so the two only meet on a hash collision (false contention).
@@ -584,6 +584,76 @@ pub(super) async fn acquire_exclusive_write_gate(
         "failed to acquire exclusive write gate lock",
     )
     .await
+}
+
+/// How long a single conditional create / update waits for another one on the
+/// same criteria before it gives up with a retryable 503.
+const CONDITION_LOCK_WAIT_MS: u64 = 30_000;
+
+/// The statements of [`acquire_conditional_write_locks`].
+fn conditional_write_locks_sql(gate: i32, exclusive_gate: bool, condition: i32) -> String {
+    let gate_fn = if exclusive_gate {
+        "pg_advisory_xact_lock"
+    } else {
+        "pg_advisory_xact_lock_shared"
+    };
+    format!(
+        "SELECT set_config('hfs.saved_statement_timeout', current_setting('statement_timeout'), true);\n\
+         SET LOCAL statement_timeout = {LOCK_WAIT_TIMEOUT_MS};\n\
+         SELECT {gate_fn}({TENANT_GATE_NAMESPACE}, {gate});\n\
+         SET LOCAL lock_timeout = {CONDITION_LOCK_WAIT_MS};\n\
+         SELECT pg_advisory_xact_lock({CONDITION_LOCK_NAMESPACE}, {condition});\n\
+         SET LOCAL lock_timeout = DEFAULT;\n\
+         SELECT set_config('statement_timeout', current_setting('hfs.saved_statement_timeout'), true);"
+    )
+}
+
+/// Locks a single conditional create / update (`If-None-Exist`, `PUT
+/// [type]?criteria`): the tenant gate, then the lock of its criteria,
+/// exclusive, both held to the end of the caller's transaction — one
+/// simple-query message on the connection that then searches and writes.
+///
+/// The criteria lock makes search-then-write atomic among writers naming the
+/// same criteria, on this instance or any other: the second one's search runs
+/// after the first one's commit (the caller's transaction is `READ
+/// COMMITTED`, so that search is a new snapshot). It replaces a *session*
+/// lock taken with `pg_try_advisory_lock` on a second pooled connection that
+/// the request held until it finished: with as many conditional writes in
+/// flight as the pool has connections, every holder waited for a connection
+/// to write with and none was left (503 after the pool's wait timeout).
+///
+/// The gate is exclusive for a `SearchParameter` (whose write takes it
+/// exclusive anyway; asking for it shared first and exclusive later would
+/// deadlock two such writers) and shared otherwise. The write then takes its
+/// resource key after the criteria lock. That order cannot deadlock: a writer
+/// that holds a resource key never waits for a criteria lock of this
+/// derivation (a Bundle's criteria keys are derived differently, see
+/// [`CONDITION_LOCK_NAMESPACE`]).
+///
+/// A wait longer than [`CONDITION_LOCK_WAIT_MS`] fails with `55P03`, which the
+/// caller reports as [`BackendError::Unavailable`].
+pub(super) async fn acquire_conditional_write_locks(
+    client: &impl GenericClient,
+    tenant_id: &str,
+    exclusive_gate: bool,
+    condition: i32,
+) -> StorageResult<()> {
+    let gate = gate_key(tenant_id)?;
+    client
+        .batch_execute(&conditional_write_locks_sql(gate, exclusive_gate, condition))
+        .await
+        .map_err(|e| {
+            if e.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "postgres".to_string(),
+                    message: "timed out waiting for a concurrent conditional write on the same \
+                              criteria"
+                        .to_string(),
+                })
+            } else {
+                lock_error("failed to acquire conditional write locks", e)
+            }
+        })
 }
 
 /// Maps a failed criteria lock statement for [`transient_bundle_error`]: a
