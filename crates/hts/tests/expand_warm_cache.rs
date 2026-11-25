@@ -646,3 +646,46 @@ async fn a_cached_response_equals_a_fresh_computation() {
         );
     }
 }
+
+/// The `ValueSet.search` calls of `calls` that read one row by url: the
+/// lookup of the value set a request names.
+fn requested_value_set_lookups(calls: &[String]) -> Vec<&String> {
+    calls
+        .iter()
+        .filter(|c| c.starts_with("ValueSet.search ") && c.ends_with(" count=1"))
+        .collect()
+}
+
+/// A paged request, so the expansion itself does not read the ValueSet to
+/// decide on nesting: what is left is the lookup ahead of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_expand_reads_the_requested_value_set_once() {
+    let app = App::new().await;
+    let request = Req::Get(format!("url={VS_URL}&offset=1&count=2"));
+    app.send(&request).await;
+    let calls = app.calls.since(0);
+    assert_eq!(
+        requested_value_set_lookups(&calls).len(),
+        1,
+        "one lookup of the stored ValueSet: {calls:#?}"
+    );
+}
+
+/// An implicit ValueSet URL names no stored resource: nothing is looked up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_expand_of_an_implicit_value_set_reads_no_stored_value_set() {
+    let app = App::new().await;
+    for query in [
+        format!("url={IMPLICIT_VS}&offset=1&count=2"),
+        format!("url={IMPLICIT_VS}&filter=glucose&count=20"),
+    ] {
+        let from = app.calls.len();
+        app.send(&Req::Get(query.clone())).await;
+        let calls = app.calls.since(from);
+        assert_eq!(
+            requested_value_set_lookups(&calls),
+            Vec::<&String>::new(),
+            "{query}: {calls:#?}"
+        );
+    }
+}
