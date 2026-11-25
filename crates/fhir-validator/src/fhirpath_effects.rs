@@ -38,7 +38,8 @@
 //! resource unless bound, so they are bound whenever they differ from it.
 
 use crate::effects::{
-    CodedValue, ConstraintEvaluator, ConstraintOutcome, DeferredConstraint, MemberOfAnswers,
+    CodedValue, ConstraintEvaluator, ConstraintOutcome, ConstraintSession, DeferredConstraint,
+    MemberOfAnswers,
 };
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath::parser::{Expression, Invocation, Term};
@@ -47,7 +48,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Evaluates invariants with helios-fhirpath. Cheap to construct; hold one
 /// per service for the lifetime of the process to benefit from the AST
@@ -63,6 +65,8 @@ pub struct FhirPathConstraintEvaluator {
     /// validator's `evaluateToBoolean` does (default: empty passes, the
     /// FHIRPath boolean coercion).
     empty_fails: bool,
+    /// Typed parses done so far (see [`Self::typed_parses`]).
+    parses: AtomicUsize,
 }
 
 impl FhirPathConstraintEvaluator {
@@ -79,6 +83,13 @@ impl FhirPathConstraintEvaluator {
     /// Number of distinct expressions parsed so far (cache size).
     pub fn cached_expressions(&self) -> usize {
         self.asts.read().expect("ast cache lock").len()
+    }
+
+    /// Number of resources parsed into the typed model so far: one per
+    /// resource whose invariants reached the FHIRPath engine, none for a
+    /// resource without such invariants.
+    pub fn typed_parses(&self) -> usize {
+        self.parses.load(Ordering::Relaxed)
     }
 
     /// The parsed AST for `expression`, parsed at most once per process.
@@ -114,6 +125,85 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         members: &Arc<MemberOfAnswers>,
     ) -> Vec<ConstraintOutcome> {
         self.evaluate(resource, version, constraints, Some(members))
+    }
+
+    fn session<'a>(
+        &'a self,
+        resource: &'a Value,
+        version: FhirVersion,
+    ) -> Box<dyn ConstraintSession + 'a> {
+        Box::new(TypedSession::new(self, resource, version))
+    }
+}
+
+/// One resource's evaluations: the typed parse (and its conversion into the
+/// evaluator's value model) is done once, on the first evaluation that has
+/// constraints, and shared by the later ones. Before, the walk's
+/// slice-candidate checks and each pass over the deferred constraints
+/// deserialized the resource again.
+struct TypedSession<'a> {
+    evaluator: &'a FhirPathConstraintEvaluator,
+    resource: &'a Value,
+    version: FhirVersion,
+    /// The context every evaluation starts from (no memo, no `memberOf()`
+    /// answers), or why the resource does not parse.
+    base: OnceLock<Result<EvaluationContext, String>>,
+    /// The resource's JSON as the `conformsTo()` resolver holds it.
+    raw: OnceLock<Arc<Value>>,
+}
+
+impl<'a> TypedSession<'a> {
+    fn new(
+        evaluator: &'a FhirPathConstraintEvaluator,
+        resource: &'a Value,
+        version: FhirVersion,
+    ) -> Self {
+        Self {
+            evaluator,
+            resource,
+            version,
+            base: OnceLock::new(),
+            raw: OnceLock::new(),
+        }
+    }
+}
+
+impl ConstraintSession for TypedSession<'_> {
+    fn evaluate(
+        &self,
+        constraints: &[DeferredConstraint<'_>],
+        members: Option<&Arc<MemberOfAnswers>>,
+    ) -> Vec<ConstraintOutcome> {
+        if constraints.is_empty() {
+            return Vec::new();
+        }
+        let base = self.base.get_or_init(|| {
+            self.evaluator.parses.fetch_add(1, Ordering::Relaxed);
+            parse_typed(self.resource, self.version)
+                .map(|typed| EvaluationContext::new(vec![typed]))
+        });
+        let base = match base {
+            Ok(base) => base,
+            Err(e) => {
+                // Structural errors are already on the report when the
+                // typed parse fails; constraints simply cannot run.
+                let detail = format!("resource does not parse into the typed model: {e}");
+                return constraints
+                    .iter()
+                    .map(|_| ConstraintOutcome::NotEvaluable(detail.clone()))
+                    .collect();
+            }
+        };
+        // A clone shares the parsed resource and its converted root (`Arc`s);
+        // the terminology cache and call budget stay per evaluation.
+        let mut context = base.clone();
+        context.set_terminology_session(Arc::default());
+        if let Some(m) = members {
+            let raw = self.raw.get_or_init(|| Arc::new(self.resource.clone()));
+            context.member_of = Some(Arc::new(Members(Arc::clone(m), Arc::clone(raw))));
+        }
+        self.evaluator
+            .evaluate_in(self.resource, context, constraints)
     }
 }
 
@@ -226,25 +316,17 @@ impl FhirPathConstraintEvaluator {
         constraints: &[DeferredConstraint<'_>],
         members: Option<&Arc<MemberOfAnswers>>,
     ) -> Vec<ConstraintOutcome> {
-        if constraints.is_empty() {
-            return Vec::new();
-        }
-        let typed = match parse_typed(resource, version) {
-            Ok(t) => t,
-            Err(e) => {
-                // Structural errors are already on the report when the
-                // typed parse fails; constraints simply cannot run.
-                let detail = format!("resource does not parse into the typed model: {e}");
-                return constraints
-                    .iter()
-                    .map(|_| ConstraintOutcome::NotEvaluable(detail.clone()))
-                    .collect();
-            }
-        };
-        let mut context = EvaluationContext::new(vec![typed]);
-        if let Some(m) = members {
-            context.member_of = Some(Arc::new(Members(Arc::clone(m), Arc::new(resource.clone()))));
-        }
+        TypedSession::new(self, resource, version).evaluate(constraints, members)
+    }
+
+    /// Evaluate `constraints` against `context` (one resource's, see
+    /// [`TypedSession`]); the root memo lives for this call only.
+    fn evaluate_in(
+        &self,
+        resource: &Value,
+        mut context: EvaluationContext,
+        constraints: &[DeferredConstraint<'_>],
+    ) -> Vec<ConstraintOutcome> {
         // Sound: every AST evaluated here is held by `self.asts` for the
         // life of the evaluator, which outlives this context.
         context.enable_root_memo();
@@ -607,6 +689,84 @@ fn parse_typed(resource: &Value, version: FhirVersion) -> Result<FhirResource, S
         other => Err(format!(
             "FHIR version {other:?} not enabled in helios-fhir-validator"
         )),
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::FhirPathConstraintEvaluator;
+    use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint};
+    use helios_fhir::FhirVersion;
+    use serde_json::json;
+
+    fn constraint<'a>(path: &'a str, expression: &'a str) -> DeferredConstraint<'a> {
+        DeferredConstraint {
+            path,
+            id: "t-1",
+            expression,
+            own_resource: false,
+        }
+    }
+
+    /// Every evaluation of one session shares one typed parse; a session
+    /// that evaluates nothing parses nothing.
+    #[test]
+    fn a_session_parses_the_resource_once_and_only_when_needed() {
+        let evaluator = FhirPathConstraintEvaluator::new();
+        let patient = json!({
+            "resourceType": "Patient",
+            "contact": [{ "name": { "family": "Chalmers" } }, { "gender": "female" }]
+        });
+
+        let idle = evaluator.session(&patient, FhirVersion::R4);
+        assert!(idle.evaluate(&[], None).is_empty());
+        drop(idle);
+        assert_eq!(evaluator.typed_parses(), 0, "nothing to evaluate: no parse");
+
+        let session = evaluator.session(&patient, FhirVersion::R4);
+        let first = session.evaluate(&[constraint("Patient", "contact.exists()")], None);
+        let second = session.evaluate(
+            &[
+                constraint("Patient.contact.0", "name.exists() or telecom.exists()"),
+                constraint("Patient.contact.1", "name.exists() or telecom.exists()"),
+            ],
+            None,
+        );
+        assert_eq!(first, vec![ConstraintOutcome::Passed]);
+        assert_eq!(
+            second,
+            vec![ConstraintOutcome::Passed, ConstraintOutcome::Failed]
+        );
+        assert_eq!(evaluator.typed_parses(), 1, "one parse per session");
+
+        // The per-call entry points give the same answers, one parse each.
+        let again = evaluator.evaluate_all(
+            &patient,
+            FhirVersion::R4,
+            &[constraint(
+                "Patient.contact.1",
+                "name.exists() or telecom.exists()",
+            )],
+        );
+        assert_eq!(again, vec![ConstraintOutcome::Failed]);
+        assert_eq!(evaluator.typed_parses(), 2);
+    }
+
+    /// A resource the typed model rejects: every constraint is not
+    /// evaluable, and the failed parse is not retried within the session.
+    #[test]
+    fn a_failed_parse_is_remembered_for_the_session() {
+        let evaluator = FhirPathConstraintEvaluator::new();
+        let broken = json!({ "resourceType": "Patient", "active": "not-a-boolean" });
+        let session = evaluator.session(&broken, FhirVersion::R4);
+        for _ in 0..2 {
+            let out = session.evaluate(&[constraint("Patient", "active.exists()")], None);
+            assert!(matches!(
+                out.as_slice(),
+                [ConstraintOutcome::NotEvaluable(_)]
+            ));
+        }
+        assert_eq!(evaluator.typed_parses(), 1);
     }
 }
 
