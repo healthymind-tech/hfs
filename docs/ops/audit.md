@@ -113,6 +113,17 @@ Recording costs the request a queue push, not a database write.
   database at the next start and renamed `*.replayed-<timestamp>`.
 - Events are written in batches, one database transaction per batch
   (SQLite/PostgreSQL), by `HFS_AUDIT_WRITERS` concurrent writers.
+- Sizing: the queue drains at `HFS_AUDIT_WRITERS` × `HFS_AUDIT_BATCH_SIZE`
+  events per round of writes. When it cannot keep up, requests wait for room
+  (`audit_queue_full_waits_total`, `audit_queue_blocked_seconds`) — the audit
+  trail is never sampled. With `HFS_AUDIT_STORE=resource` (events stored as
+  FHIR resources, the pre-table layout) a batch transaction takes one
+  transaction-level advisory lock per event, so keep
+  `HFS_AUDIT_WRITERS × HFS_AUDIT_BATCH_SIZE` (default 8 × 256 = 2,048) well
+  below PostgreSQL's lock table, `max_locks_per_transaction × max_connections`
+  (64 × 100 = 6,400 with stock settings; set `max_locks_per_transaction=256`
+  or more on a server that also takes large transaction Bundles). The table
+  store takes no advisory locks.
 - Lost only on a hard kill (`SIGKILL`, OOM, power loss) while events are
   queued: at most the queue's content.
 
@@ -209,6 +220,7 @@ Both servers export the audit write path on `/metrics` (Prometheus, labelled
 | `audit_events_written_total` | counter | events handed to the store — `rate(...[5m])` is events/s |
 | `audit_queue_depth` | gauge | accepted but not yet written (queued + in flight) |
 | `audit_queue_full_waits_total` | counter | requests that waited for room (backpressure) |
+| `audit_queue_blocked_seconds` | histogram | how long a request waited for room in the full queue; `rate(audit_queue_blocked_seconds_sum[5m])` is request-seconds lost to audit backpressure per second |
 | `audit_batch_write_duration_seconds` | histogram | wall time of one batch write |
 | `audit_events_spilled_total{reason}` | counter | written to the fallback file instead (`shutdown`, `write_failure`) |
 | `audit_events_replayed_total` | counter | fallback events stored at start-up |
@@ -219,7 +231,10 @@ Both servers export the audit write path on `/metrics` (Prometheus, labelled
 Suggested alerts: `audit_events_dropped_total` increases (any loss);
 `audit_events_spilled_total{reason="write_failure"}` increases (the database
 refuses audit writes); `audit_queue_depth > 5000` for 5 minutes (the writer
-does not keep up); `histogram_quantile(0.95, rate(audit_batch_write_duration_seconds_bucket[5m])) > 1`.
+does not keep up); `rate(audit_queue_full_waits_total[5m]) > 0` for 5 minutes
+(requests are being slowed down by the audit writers: raise
+`HFS_AUDIT_WRITERS` / `HFS_AUDIT_BATCH_SIZE` or look at the database);
+`histogram_quantile(0.95, rate(audit_batch_write_duration_seconds_bucket[5m])) > 1`.
 
 ## Configuration reference
 
@@ -233,8 +248,8 @@ does not keep up); `histogram_quantile(0.95, rate(audit_batch_write_duration_sec
 | `HFS_AUDIT_EXCLUDE_PATHS` | — | extra exclusions, comma separated: `/path`, `/prefix/*`, `GET /path` |
 | `HFS_AUDIT_TRUST_FORWARDED_FOR` | `false` | client address from the first `X-Forwarded-For` hop (only behind a proxy that sets it) |
 | `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | events queued before requests wait |
-| `HFS_AUDIT_BATCH_SIZE` | `64` | events per writer batch |
-| `HFS_AUDIT_WRITERS` | `4` | concurrent writer tasks (database connections in use) |
+| `HFS_AUDIT_BATCH_SIZE` | `256` | events per writer batch (one database round trip and one commit) |
+| `HFS_AUDIT_WRITERS` | `8` | concurrent writer tasks (database connections in use) |
 | `HFS_AUDIT_SHUTDOWN_TIMEOUT` | `5` | seconds to drain the queue on shutdown before spilling the rest to the fallback file |
 | `HFS_AUDIT_FALLBACK_FILE` | `<data dir>/audit-fallback.ndjson` | spill file while the database is down |
 | `HFS_AUDIT_READS` | `true` (HTS: `false`) | record read-only requests (`GET`, `_search`, read-only operations) |
@@ -255,7 +270,8 @@ HFS_AUDIT_TRUST_FORWARDED_FOR=true          # HFS sits behind the reverse proxy
 HFS_AUDIT_RETENTION_DAYS=2190               # 6 years; set to your legal requirement
 HFS_AUDIT_RETENTION_ARCHIVE_DIR=/var/lib/hfs/audit-archive   # on a backed-up volume
 HFS_AUDIT_FALLBACK_FILE=/var/lib/hfs/audit-fallback.ndjson   # persistent volume
-HFS_AUDIT_WRITERS=4
+HFS_AUDIT_WRITERS=8
+HFS_AUDIT_BATCH_SIZE=256
 ```
 
 - Mount the archive and fallback paths on a persistent, backed-up volume.

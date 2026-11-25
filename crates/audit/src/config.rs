@@ -7,6 +7,17 @@ use std::fmt;
 
 use crate::exclusion::ExclusionRule;
 
+/// Default `*_AUDIT_BATCH_SIZE`: events one writer stores per round trip.
+/// 256 keeps a batch well under a second on a loaded database while paying
+/// the commit (WAL flush) once per 256 events.
+pub const DEFAULT_BATCH_SIZE: usize = 256;
+
+/// Default `*_AUDIT_WRITERS`. The 2026-11 benchmark showed 4 writers × 64
+/// events capping a 16-client bulk load at the audit drain rate (requests
+/// wait when the queue is full); 8 writers keep up with that load and use at
+/// most 8 connections of the audit pool.
+pub const DEFAULT_WRITERS: usize = 8;
+
 /// Which audit backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditBackend {
@@ -214,8 +225,8 @@ impl AuditConfig {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             queue_capacity: env_parse(&k("QUEUE_CAPACITY"), 10_000usize).max(1),
-            batch_size: env_parse(&k("BATCH_SIZE"), 64usize).max(1),
-            writers: env_parse(&k("WRITERS"), 4usize).max(1),
+            batch_size: env_parse(&k("BATCH_SIZE"), DEFAULT_BATCH_SIZE).max(1),
+            writers: env_parse(&k("WRITERS"), DEFAULT_WRITERS).max(1),
             shutdown_timeout_secs: env_parse(&k("SHUTDOWN_TIMEOUT"), 5u64),
             fallback_file: env::var(k("FALLBACK_FILE"))
                 .ok()
@@ -322,8 +333,8 @@ impl Default for AuditConfig {
             trust_forwarded_for: false,
             tenant: None,
             queue_capacity: 10_000,
-            batch_size: 64,
-            writers: 4,
+            batch_size: DEFAULT_BATCH_SIZE,
+            writers: DEFAULT_WRITERS,
             shutdown_timeout_secs: 5,
             fallback_file: None,
             auth_events: false,
@@ -496,7 +507,7 @@ mod tests {
         assert!(!defaults.trust_forwarded_for);
         assert!(!defaults.auth_events);
         assert_eq!(defaults.tenant, None);
-        assert_eq!(defaults.writers, 4);
+        assert_eq!(defaults.writers, DEFAULT_WRITERS);
         unsafe {
             env::set_var("HFS_AUDIT_TENANT", "audit");
             env::set_var("HFS_AUDIT_TRUST_FORWARDED_FOR", "true");
