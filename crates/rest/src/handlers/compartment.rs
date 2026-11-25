@@ -79,6 +79,25 @@ where
         .await;
     }
 
+    // `Patient/{id}/AuditEvent` with the dedicated audit store: the store's
+    // `patient` search (which also merges the events written before it).
+    if compartment_type == "Patient" && target_type == crate::handlers::audit_events::AUDIT_EVENT {
+        let mut audit_pairs = pairs.clone();
+        audit_pairs.push(("patient".to_string(), format!("Patient/{compartment_id}")));
+        if let Some(bundle) = crate::handlers::audit_events::search_bundle(
+            &state,
+            &tenant,
+            &crate::patient_compartment::PatientCompartment::unconfined(),
+            &target_type,
+            &audit_pairs,
+            strict,
+        )
+        .await?
+        {
+            return Ok((StatusCode::OK, Json(bundle)).into_response());
+        }
+    }
+
     // Get the reference parameters for this compartment/target combination
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let ref_params =
@@ -259,6 +278,11 @@ where
                 requested_types
                     .as_ref()
                     .is_none_or(|types| types.iter().any(|t| t == target_type))
+            })
+            // The audit trail is not part of the chart: `AuditEvent` is
+            // searched only when `_type` names it (or the deployment opted in).
+            .filter(|target_type| {
+                crate::handlers::audit_events::walk_includes(target_type, requested_types.as_deref())
             })
             .collect();
 

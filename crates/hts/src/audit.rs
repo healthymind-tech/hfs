@@ -171,7 +171,28 @@ async fn open_dedicated(url: &str, audit: &AuditConfig) -> anyhow::Result<Stores
                 .init_schema()
                 .await
                 .map_err(|e| anyhow::anyhow!("HTS_AUDIT_DATABASE_URL schema: {e}"))?;
-            return Ok(tx_store(Arc::new(backend), audit));
+            let backend = Arc::new(backend);
+            if audit.store == helios_audit::AuditStore::Table {
+                // The dedicated audit tables (the same ones HFS writes to and
+                // serves `AuditEvent` from). HFS owns their maintenance when
+                // the database is shared; running it here as well is safe
+                // (advisory locks) and covers an HTS-only audit database.
+                let store = Arc::new(helios_persistence::audit_store::TableAuditStore::new(
+                    Arc::clone(&backend),
+                    audit.tenant.clone(),
+                    "default".to_string(),
+                ));
+                if let Err(e) = store.table().ensure_partitions(chrono::Utc::now(), 2).await {
+                    tracing::warn!(error = %e, "Could not create audit partitions");
+                }
+                tracing::info!("HTS audit events go to the dedicated audit tables (HTS_AUDIT_STORE=table)");
+                return Ok((
+                    store.clone(),
+                    store,
+                    Some(backend as Arc<dyn RetentionStorage>),
+                ));
+            }
+            return Ok(tx_store(backend, audit));
         }
         #[cfg(not(feature = "postgres"))]
         anyhow::bail!("HTS_AUDIT_DATABASE_URL is PostgreSQL but HTS was built without `postgres`");

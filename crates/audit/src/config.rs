@@ -47,8 +47,34 @@ impl fmt::Display for AuditBackend {
 /// `Debug` is hand-written (#2149): `database_url` prints only as
 /// `[redacted]` when set. This crate has no driver to parse it with, and a
 /// connection string can carry a password in several syntaxes.
+/// Where the database backend keeps audit events (`*_AUDIT_STORE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditStore {
+    /// The dedicated append-only audit tables (PostgreSQL). Backends without
+    /// them store events as resources whatever this says.
+    #[default]
+    Table,
+    /// `AuditEvent` resources in the general resource tables (the layout
+    /// before the audit tables existed).
+    Resource,
+}
+
+impl fmt::Display for AuditStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Table => "table",
+            Self::Resource => "resource",
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct AuditConfig {
+    /// `*_AUDIT_STORE`: `table` (default) or `resource`.
+    pub store: AuditStore,
+    /// `*_AUDIT_BACKFILL`: move the `AuditEvent` resources written before the
+    /// audit tables existed into them, in the background. Off unless set.
+    pub backfill: bool,
     /// Active backend.
     pub backend: AuditBackend,
     /// File path for the file sink (required when `backend = File`).
@@ -202,6 +228,16 @@ impl AuditConfig {
             .unwrap_or_default();
 
         Self {
+            store: match env::var(k("STORE"))
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "resource" | "resources" => AuditStore::Resource,
+                _ => AuditStore::Table,
+            },
+            backfill: env_bool(&k("BACKFILL")),
             backend,
             file_path: env::var(k("FILE_PATH")).ok(),
             database_url: env::var(k("DATABASE_URL")).ok(),
@@ -262,6 +298,8 @@ impl fmt::Debug for AuditConfig {
         // Destructured without `..` so a new field fails to compile until it
         // is classified as secret or not.
         let Self {
+            store,
+            backfill,
             backend,
             file_path,
             database_url,
@@ -287,6 +325,8 @@ impl fmt::Debug for AuditConfig {
             reads,
         } = self;
         f.debug_struct("AuditConfig")
+            .field("store", store)
+            .field("backfill", backfill)
             .field("backend", backend)
             .field("file_path", file_path)
             .field("database_url", &database_url.as_ref().map(|_| "[redacted]"))
@@ -317,6 +357,8 @@ impl fmt::Debug for AuditConfig {
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
+            store: AuditStore::Table,
+            backfill: false,
             backend: AuditBackend::None,
             file_path: None,
             database_url: None,

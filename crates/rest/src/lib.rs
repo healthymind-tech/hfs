@@ -724,6 +724,9 @@ where
     if let Some(runtime) = &endpoints {
         state = state.with_endpoints(runtime.clone());
     }
+    if let Some(reader) = audit_state.as_ref().and_then(|audit| audit.reader.clone()) {
+        state = state.with_audit_reader(reader);
+    }
 
     // Stored StructureDefinitions are replayed into the profile registries
     // (the registries are in-memory; without this every restart forgot

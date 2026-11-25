@@ -173,6 +173,11 @@ pub struct AppState<S> {
     /// `None` when no terminology server is configured.
     search_terminology: Option<Arc<crate::terminology::SearchTerminology>>,
 
+    /// The dedicated audit store (`HFS_AUDIT_STORE=table`), from which
+    /// `AuditEvent` read and search are served; `None` when audit events are
+    /// ordinary resources.
+    audit_events: Option<Arc<crate::handlers::audit_events::AuditEventAdapter>>,
+
     /// FHIR server manager runtime (registry + store); `None` without the
     /// manager (`HFS_MANAGER=off`).
     endpoints: Option<crate::endpoint::EndpointRuntime>,
@@ -213,6 +218,7 @@ impl<S> Clone for AppState<S> {
             validation: Arc::clone(&self.validation),
             write_observability: self.write_observability.clone(),
             search_terminology: self.search_terminology.clone(),
+            audit_events: self.audit_events.clone(),
             endpoints: self.endpoints.clone(),
             endpoint_search_terminology: Arc::clone(&self.endpoint_search_terminology),
         }
@@ -268,6 +274,7 @@ impl<S: ResourceStorage> AppState<S> {
             validation,
             write_observability: WriteObservability::new(),
             search_terminology,
+            audit_events: None,
             endpoints: None,
             endpoint_search_terminology: Default::default(),
         }
@@ -333,6 +340,7 @@ impl<S: ResourceStorage> AppState<S> {
             validation,
             write_observability: WriteObservability::new(),
             search_terminology,
+            audit_events: None,
             endpoints: None,
             endpoint_search_terminology: Default::default(),
         }
@@ -779,6 +787,22 @@ impl<S: ResourceStorage> AppState<S> {
     pub fn has_terminology(&self) -> bool {
         self.config.terminology_server.is_some()
             || crate::terminology::server_terminology().is_some()
+    }
+
+    /// Serves `AuditEvent` read and search from the dedicated audit store.
+    pub fn with_audit_reader(
+        mut self,
+        reader: Arc<dyn helios_audit::store::AuditEventReader>,
+    ) -> Self {
+        self.audit_events = Some(Arc::new(
+            crate::handlers::audit_events::AuditEventAdapter::new(reader),
+        ));
+        self
+    }
+
+    /// The dedicated audit store, when `AuditEvent` is served from it.
+    pub fn audit_events(&self) -> Option<&Arc<crate::handlers::audit_events::AuditEventAdapter>> {
+        self.audit_events.as_ref()
     }
 
     /// Returns the audit sink for handler-level audit emission, if configured.

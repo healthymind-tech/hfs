@@ -176,6 +176,164 @@ pub fn spawn(
     }))
 }
 
+/// Retention over the dedicated audit tables: archives (when configured) and
+/// then **drops** every monthly partition that lies entirely before
+/// `now - days`, and row-deletes expired events of the default partition.
+///
+/// Whole months only: an event is kept for at least the retention period and
+/// for at most one month longer. Only one instance runs it at a time (an
+/// advisory lock); the others return an empty report.
+#[cfg(feature = "postgres")]
+pub async fn run_table_once(
+    table: &crate::backends::postgres::audit_table::PgAuditTable,
+    config: &RetentionConfig,
+    now: DateTime<Utc>,
+) -> Result<RetentionReport, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(days) = config.days else {
+        return Ok(RetentionReport::default());
+    };
+    let Some(lock) = table.maintenance_lock().await? else {
+        info!("Audit retention is running on another instance; skipping this run");
+        return Ok(RetentionReport::default());
+    };
+    let result = run_table_locked(table, config, days, now).await;
+    lock.release().await;
+    result
+}
+
+#[cfg(feature = "postgres")]
+async fn run_table_locked(
+    table: &crate::backends::postgres::audit_table::PgAuditTable,
+    config: &RetentionConfig,
+    days: u32,
+    now: DateTime<Utc>,
+) -> Result<RetentionReport, Box<dyn std::error::Error + Send + Sync>> {
+    let cutoff = now - chrono::Duration::days(i64::from(days));
+    let mut archive: Option<Archive> = None;
+    let mut report = RetentionReport::default();
+    let line = |r: &crate::core::retention::ExpiredResource| {
+        serde_json::json!({
+            "tenant": r.tenant_id,
+            "lastUpdated": r.last_updated.to_rfc3339(),
+            "resource": r.content,
+        })
+        .to_string()
+    };
+
+    for partition in table.partitions().await? {
+        if partition.end() > cutoff {
+            continue;
+        }
+        if let Some(dir) = &config.archive_dir {
+            let mut after = None;
+            loop {
+                let page = table
+                    .partition_page(&partition.name, after.as_ref(), None, config.batch)
+                    .await?;
+                let Some(last) = page.last() else {
+                    break;
+                };
+                after = Some((last.tenant_id.clone(), last.last_updated, last.id.clone()));
+                if archive.is_none() {
+                    archive = Some(Archive::create(Path::new(dir), now)?);
+                }
+                let lines: Vec<String> = page.iter().map(line).collect();
+                let a = archive.as_mut().expect("created above");
+                tokio::task::block_in_place(|| a.append(&lines))?;
+            }
+        }
+        // Everything of the partition is in the archive and on disk.
+        let dropped = table.drop_partition(&partition).await?;
+        info!(partition = %partition.name, events = dropped, "Dropped expired audit partition");
+        report.purged += dropped;
+    }
+
+    // Events filed in the default partition (their month had no partition).
+    loop {
+        let page = table
+            .partition_page("audit_event_default", None, Some(cutoff), config.batch)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        if let Some(dir) = &config.archive_dir {
+            if archive.is_none() {
+                archive = Some(Archive::create(Path::new(dir), now)?);
+            }
+            let lines: Vec<String> = page.iter().map(line).collect();
+            let a = archive.as_mut().expect("created above");
+            tokio::task::block_in_place(|| a.append(&lines))?;
+        }
+        let keys: Vec<(String, DateTime<Utc>, String)> = page
+            .into_iter()
+            .map(|r| (r.tenant_id, r.last_updated, r.id))
+            .collect();
+        let removed = table.delete_default_rows(&keys).await?;
+        report.purged += removed;
+        if removed == 0 {
+            break;
+        }
+    }
+
+    if let Some(a) = archive {
+        report.archive = Some(tokio::task::block_in_place(|| a.finish())?);
+    }
+    Ok(report)
+}
+
+/// Starts the maintenance of the dedicated audit tables: creates the monthly
+/// partitions ahead of time (now and every five minutes) and, when retention
+/// is configured, runs [`run_table_once`] at the retention interval (first a
+/// few minutes after start).
+#[cfg(feature = "postgres")]
+pub fn spawn_table(
+    table: crate::backends::postgres::audit_table::PgAuditTable,
+    config: RetentionConfig,
+    sink: Arc<dyn AuditSink>,
+    source_observer: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let retention_every = Duration::from_secs(config.interval_hours.max(1) * 3600);
+        let mut next_retention = started + Duration::from_secs(60);
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            if let Err(e) = table.ensure_partitions(Utc::now(), 2).await {
+                // Not fatal: events of a month without a partition go to the
+                // default partition and are moved when the partition appears.
+                warn!(error = %e, "Could not create audit partitions ahead of time");
+            }
+            if config.days.is_none() || tokio::time::Instant::now() < next_retention {
+                continue;
+            }
+            next_retention = tokio::time::Instant::now() + retention_every;
+            match run_table_once(&table, &config, Utc::now()).await {
+                Ok(report) => {
+                    helios_observability::audit_metrics::record_retention_run(report.purged, true);
+                    if report.purged > 0 {
+                        info!(purged = report.purged, archive = ?report.archive, "Audit retention run dropped expired audit partitions");
+                        record(&*sink, &source_observer, &config, &report, "0", None).await;
+                    }
+                }
+                Err(e) => {
+                    helios_observability::audit_metrics::record_retention_run(0, false);
+                    error!(error = %e, "Audit table retention run failed");
+                    record(
+                        &*sink,
+                        &source_observer,
+                        &config,
+                        &RetentionReport::default(),
+                        "8",
+                        Some(e.to_string()),
+                    )
+                    .await;
+                }
+            }
+        }
+    })
+}
+
 async fn record(
     sink: &dyn AuditSink,
     source_observer: &str,

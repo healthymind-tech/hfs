@@ -260,7 +260,9 @@ impl AuditEventBuilder {
         let type_code = self.event_type_code.as_deref().unwrap_or("rest");
 
         AuditEvent {
-            id: Some(fhir_string(uuid::Uuid::new_v4().to_string())),
+            // UUIDv7: time-ordered, so the table store can find an event by id
+            // in the one monthly partition it was written to.
+            id: Some(fhir_string(uuid::Uuid::now_v7().to_string())),
             // A profile is claimed only when the event conforms (fork, BALP);
             // the tenant tag is upstream's #1515.
             meta: {
@@ -590,7 +592,7 @@ mod tests {
     fn test_uuid_generated() {
         let event = AuditEventBuilder::new("Device/hfs").build();
         let id = event.id.as_ref().and_then(|s| s.value.as_deref()).unwrap();
-        // UUID v4 format: 8-4-4-4-12
+        // UUID format: 8-4-4-4-12
         assert_eq!(id.len(), 36);
         assert_eq!(&id[8..9], "-");
     }

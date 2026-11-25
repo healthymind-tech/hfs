@@ -2389,6 +2389,10 @@ impl ResourceStorage for PostgresBackend {
                 .await
                 .or_query_error("purge delete")?;
         }
+        // The tenant's audit trail in the dedicated audit tables (hm-0030).
+        super::audit_table::purge_tenant_in_txn(&tx, id)
+            .await
+            .or_query_error("purge audit events")?;
         // Per-user settings are keyed by user, not tenant, so they are not swept
         // by the deletes above — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313). Same transaction, so an

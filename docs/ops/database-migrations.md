@@ -55,6 +55,8 @@ Fork migrations in this build:
 | `hm-0010-endpoint-sync` | `hfs_sync_jobs`, `hfs_sync_runs`, `hfs_sync_log`, `hfs_sync_conflicts`, `hfs_sync_item_state` | fork (design §4.3) |
 | `hm-0011-terminology-schema` | schema `terminology` + `hfs_terminology_state` (one row: `store`, `moved_from`, `moved_at`, `source_fingerprint`, `note`, `updated_at`) | unified server ([design](../design/unified-server.md) §5.4). **Not** in `FORK_MIGRATIONS`: applied by `PostgresBackend::apply_unified_migrations` only when terminology is embedded; checks `has_database_privilege(…, 'CREATE')` first |
 | `hm-0012-console-terminology-bindings` | `hfs_console_scope_bindings(subject, scope ∈ {terminology}, role)` + console epoch trigger | unified server (design §7.2), same rule as hm-0011. A sibling table, not a column on `hfs_console_role_bindings` (whose key is `(subject, endpoint_id)` with an FK to `hfs_endpoints`) |
+| `hm-0030-audit-event-table` | `audit_event`, `audit_event_ref` (monthly partitions + default), immutability trigger `hfs_audit_event_immutable`, `hfs_audit_ensure_partition(date)`, `hm_audit_backfill_state` ([audit.md](audit.md#the-audit-tables-hfs_audit_storetable)). Additive: the previous build is unaffected | fork (hm/perf-audit-table). The audit line owns `hm-0030`…`hm-0039` |
+| `hm-0031-audit-backfill` | **not applied at start-up**: recorded when the operator-started backfill (`HFS_AUDIT_BACKFILL=true`) has moved every legacy `AuditEvent` resource into the audit tables | fork (hm/perf-audit-table) |
 
 hm/p3-cluster first numbered 0002–0005 as ladder v48–v51; they were moved onto
 this track when it was merged with hm/p3-pgops (upstream has its own v48+). No
