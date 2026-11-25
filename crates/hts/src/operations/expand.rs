@@ -2135,11 +2135,37 @@ async fn snomed_expression_expand<B: TerminologyBackend>(
     )))
 }
 
+/// The stored response for `params`, from the handler cache their key
+/// belongs to (see [`build_expand_cache_key`] and
+/// [`build_inline_compose_cache_key`]); `None` when there is none or the
+/// request is not cached.
+fn cached_expand_response<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Bytes> {
+    if let Some(key) = build_expand_cache_key(params) {
+        return expand_handler_cache_get(&state.expand_handler_cache, &key);
+    }
+    let key = build_inline_compose_cache_key(params)?;
+    expand_handler_cache_get(&state.inline_compose_handler_cache, &key)
+}
+
 async fn process_expand_cached<B: TerminologyBackend>(
     state: &AppState<B>,
     mut params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
     normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
+    // A response already stored for these parameters is returned before
+    // anything below asks the backend: the lookups that follow (the requested
+    // ValueSet, the stored SNOMED CT versions) would otherwise run on every
+    // request. The value sets they answer for never enter the handler caches
+    // (each returns before the `put`s below), and an entry is only ever
+    // stored under the parameters as they are after
+    // `normalize_snomed_versions`, so a hit here is the answer the full path
+    // gives. `clear_expand_cache` drops the entries on every content change.
+    if let Some(cached) = cached_expand_response(state, &params) {
+        return Ok(cached);
+    }
     if let Some(result) = Box::pin(snomed_expression_expand(state, &params)).await {
         return result;
     }
