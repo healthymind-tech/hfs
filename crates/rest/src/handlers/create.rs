@@ -126,8 +126,8 @@ where
     // Empty-element cleanup (#2554) and write-path validation
     // (HFS_VALIDATION_MODE: off | log | enforce).
     state
-        .validation()
-        .prepare_write(
+        .validation_shared()
+        .prepare_write_offloaded(
             tenant.tenant_id(),
             fhir_version,
             &resource_type,

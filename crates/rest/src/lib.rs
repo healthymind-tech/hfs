@@ -175,6 +175,8 @@ pub mod tenant;
 pub mod terminology;
 pub mod validation;
 pub mod validation_cache;
+pub mod validation_log;
+mod validation_pool;
 
 /// Test-only support helpers shared across the crate's unit tests.
 #[cfg(test)]

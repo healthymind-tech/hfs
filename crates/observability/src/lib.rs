@@ -32,6 +32,9 @@
 //!   PostgreSQL connection pools (ceiling, open, idle, waiting callers),
 //!   sampled at scrape time from sources the server registers (#1907). Only
 //!   a fixed `pool` label.
+//! - [`validation_metrics`] — counters for the write-path validation issues
+//!   that are logged rather than rejected, and for the log lines the rate
+//!   limit did not write. Labels: `resource_type`, `severity`; no tenant.
 //! - [`build_info`] — the constant `build_info{version, revision}` gauge.
 //! - [`shutdown`] — the SIGINT/SIGTERM future every server drains on.
 //! - [`redact`] — strips credentials from URLs before they reach logs or
@@ -82,3 +85,4 @@ pub mod shutdown;
 pub mod subscriptions;
 pub mod telemetry;
 pub mod uptime;
+pub mod validation_metrics;
