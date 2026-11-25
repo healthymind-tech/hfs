@@ -14075,7 +14075,6 @@ mod postgres_integration {
     /// seek when PostgreSQL plans the complete count query with or without bind
     /// values available.
     #[tokio::test]
-    #[ignore = "the search_index-only count it inspects is disabled (COUNT_FROM_INDEX_ALONE, orphan rows #2074)"]
     async fn postgres_reference_bare_id_count_plan_uses_target_index_for_custom_and_generic_plans()
     {
         use helios_persistence::core::SearchProvider;
@@ -14138,6 +14137,15 @@ mod postgres_integration {
             .await
             .unwrap();
         drop(client);
+
+        // The index-only count needs the type verified free of orphan rows.
+        assert_eq!(
+            backend
+                .verify_search_index_liveness(tenant_id, "Observation")
+                .await
+                .unwrap(),
+            0
+        );
 
         let mut query = observation_reference_query("subject", &[target_id]);
         query.total = Some(TotalMode::Accurate);
