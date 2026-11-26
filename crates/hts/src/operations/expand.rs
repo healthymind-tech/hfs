@@ -1788,9 +1788,12 @@ fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Byte
 /// `$expand` of a value set over media types only (see
 /// [`crate::mimetypes`]); `None` for any other value set. The core
 /// `mimetypes` value set keeps its own handling.
-async fn media_type_expand<B: TerminologyBackend>(
+///
+/// `vs` is the value set the request names (see [`RequestedValueSet`]).
+fn media_type_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: &[Value],
+    vs: &Value,
 ) -> Result<Option<Bytes>, HtsError> {
     use crate::mimetypes;
     if find_str_param(params, "url")
@@ -1799,13 +1802,10 @@ async fn media_type_expand<B: TerminologyBackend>(
     {
         return Ok(None);
     }
-    let Some(vs) = super::validate_code::requested_value_set(state, params).await else {
-        return Ok(None);
-    };
-    if !mimetypes::is_media_type_value_set(&vs) {
+    if !mimetypes::is_media_type_value_set(vs) {
         return Ok(None);
     }
-    let (codes, unclosed) = mimetypes::expand(&vs).map_err(|()| {
+    let (codes, unclosed) = mimetypes::expand(vs).map_err(|()| {
         HtsError::coded(
             "not-supported",
             "not-supported",
@@ -1881,15 +1881,14 @@ async fn media_type_expand<B: TerminologyBackend>(
 /// `$expand` of a value set over the UCUM grammar (see [`crate::ucum`]):
 /// based on the common UCUM units, filtered by the value set, and marked
 /// unclosed; `None` for any other value set.
+///
+/// `vs` is the value set the request names (see [`RequestedValueSet`]).
 async fn ucum_expand<B: TerminologyBackend>(
     state: &AppState<B>,
-    params: &[Value],
+    vs: &Value,
 ) -> Result<Option<Bytes>, HtsError> {
     use crate::ucum_validate::UCUM_URL;
-    let Some(vs) = super::validate_code::requested_value_set(state, params).await else {
-        return Ok(None);
-    };
-    if !crate::ucum::is_ucum_grammar_value_set(&vs) {
+    if !crate::ucum::is_ucum_grammar_value_set(vs) {
         return Ok(None);
     }
     let version = crate::ucum::stored_version(state.backend()).await;
@@ -1897,14 +1896,14 @@ async fn ucum_expand<B: TerminologyBackend>(
     let mut codes: Vec<String> = common
         .into_iter()
         .map(|(c, _)| c)
-        .filter(|c| crate::ucum::takes_whole_grammar(&vs) || crate::ucum::in_value_set(&vs, c))
+        .filter(|c| crate::ucum::takes_whole_grammar(vs) || crate::ucum::in_value_set(vs, c))
         .collect();
     codes.sort();
     codes.dedup();
     let mut parameter =
         vec![json!({"name": "used-codesystem", "valueUri": format!("{UCUM_URL}|{version}")})];
     // The whole grammar is the common units value set, with its status.
-    if crate::ucum::takes_whole_grammar(&vs) {
+    if crate::ucum::takes_whole_grammar(vs) {
         if let Some(cvs) = common_vs.as_ref() {
             let canonical = match cvs.get("version").and_then(|v| v.as_str()) {
                 Some(v) => format!("{}|{v}", crate::ucum::UCUM_COMMON),
@@ -1933,7 +1932,7 @@ async fn ucum_expand<B: TerminologyBackend>(
         "parameter": parameter,
         "contains": codes.iter().map(|c| json!({"system": UCUM_URL, "code": c, "display": c})).collect::<Vec<_>>(),
     });
-    if !crate::ucum::takes_whole_grammar(&vs) {
+    if !crate::ucum::takes_whole_grammar(vs) {
         expansion["total"] = json!(codes.len());
     }
     let mut out = json!({"resourceType": "ValueSet"});
@@ -2019,11 +2018,13 @@ fn adopt_limit_param(params: &mut Vec<Value>) {
 /// same concepts either way), and the listed expressions that are valid are
 /// added to the expansion after. The `valueset-unclosed` marking follows the
 /// original definition.
+///
+/// `vs` is the value set the request names (see [`RequestedValueSet`]).
 async fn snomed_expression_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: &[Value],
+    vs: &Value,
 ) -> Option<Result<Bytes, HtsError>> {
-    let vs = super::validate_code::requested_value_set(state, params).await?;
     let includes = vs.get("compose")?.get("include")?.as_array()?;
     let is_expr = |c: &str| !c.bytes().all(|b| b.is_ascii_digit());
     let affected = includes.iter().any(|inc| {
@@ -2117,7 +2118,7 @@ async fn snomed_expression_expand<B: TerminologyBackend>(
         if let Some(t) = exp.get("total").and_then(Value::as_u64) {
             exp["total"] = json!(t + added);
         }
-        match snomed_unclosed(Some(&vs), None) {
+        match snomed_unclosed(Some(vs), None) {
             Some(ext) => exp["extension"] = Value::Array(ext),
             None => {
                 if let Some(o) = exp.as_object_mut() {
@@ -2135,12 +2136,70 @@ async fn snomed_expression_expand<B: TerminologyBackend>(
     )))
 }
 
+/// The value set an `$expand` request names (see
+/// [`super::validate_code::requested_value_set`]), resolved once per request.
+enum RequestedValueSet {
+    /// Named by `url`: the stored or request-supplied (`tx-resource`) value
+    /// set, if there is one. Nothing later in the request changes which.
+    ByUrl(Option<Value>),
+    /// The inline `valueSet` parameter, read where it is used:
+    /// `normalize_snomed_versions` may rewrite it in between.
+    Inline,
+}
+
+impl RequestedValueSet {
+    async fn of<B: TerminologyBackend>(state: &AppState<B>, params: &[Value]) -> Self {
+        if find_str_param(params, "url").is_some() {
+            Self::ByUrl(super::validate_code::requested_value_set(state, params).await)
+        } else {
+            Self::Inline
+        }
+    }
+
+    fn get(&self, params: &[Value]) -> Option<std::borrow::Cow<'_, Value>> {
+        match self {
+            Self::ByUrl(vs) => vs.as_ref().map(std::borrow::Cow::Borrowed),
+            Self::Inline => find_resource_param(params, "valueSet").map(std::borrow::Cow::Owned),
+        }
+    }
+}
+
+/// The stored response for `params`, from the handler cache their key
+/// belongs to (see [`build_expand_cache_key`] and
+/// [`build_inline_compose_cache_key`]); `None` when there is none or the
+/// request is not cached.
+fn cached_expand_response<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: &[Value],
+) -> Option<Bytes> {
+    if let Some(key) = build_expand_cache_key(params) {
+        return expand_handler_cache_get(&state.expand_handler_cache, &key);
+    }
+    let key = build_inline_compose_cache_key(params)?;
+    expand_handler_cache_get(&state.inline_compose_handler_cache, &key)
+}
+
 async fn process_expand_cached<B: TerminologyBackend>(
     state: &AppState<B>,
     mut params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
     normalize_canonical_params(&mut params, "url", Some("valueSetVersion"))?;
-    if let Some(result) = Box::pin(snomed_expression_expand(state, &params)).await {
+    // A response already stored for these parameters is returned before
+    // anything below asks the backend: the lookups that follow (the requested
+    // ValueSet, the stored SNOMED CT versions) would otherwise run on every
+    // request. The value sets they answer for never enter the handler caches
+    // (each returns before the `put`s below), and an entry is only ever
+    // stored under the parameters as they are after
+    // `normalize_snomed_versions`, so a hit here is the answer the full path
+    // gives. `clear_expand_cache` drops the entries on every content change.
+    if let Some(cached) = cached_expand_response(state, &params) {
+        return Ok(cached);
+    }
+    // The value set the request names, read once for the three checks below.
+    let requested = RequestedValueSet::of(state, &params).await;
+    if let Some(vs) = requested.get(&params)
+        && let Some(result) = Box::pin(snomed_expression_expand(state, &params, &vs)).await
+    {
         return result;
     }
     // SNOMED CT edition URIs in `*-system-version` pins and an inline
@@ -2151,11 +2210,13 @@ async fn process_expand_cached<B: TerminologyBackend>(
         &mut params,
     )
     .await;
-    if let Some(bytes) = media_type_expand(state, &params).await? {
-        return Ok(bytes);
-    }
-    if let Some(bytes) = ucum_expand(state, &params).await? {
-        return Ok(bytes);
+    if let Some(vs) = requested.get(&params) {
+        if let Some(bytes) = media_type_expand(state, &params, &vs)? {
+            return Ok(bytes);
+        }
+        if let Some(bytes) = ucum_expand(state, &vs).await? {
+            return Ok(bytes);
+        }
     }
     if let Some(key) = build_expand_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {

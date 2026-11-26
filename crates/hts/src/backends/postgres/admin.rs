@@ -487,6 +487,16 @@ impl TerminologyAdmin for PostgresTerminologyBackend {
             .map(|r| r.get(0))
             .collect();
         super::fhir_ids::reassign(&*tx, "code_systems", &declared).await?;
+        // The persisted expansions over the url were computed with the
+        // previous default version.
+        super::invalidate_expansion_cache_for_system(&tx, url).await?;
+        tx.execute(
+            "DELETE FROM value_set_expansions WHERE value_set_id IN \
+             (SELECT value_set_id FROM value_set_dependencies WHERE dep_url = $1)",
+            &[&url],
+        )
+        .await
+        .map_err(pg)?;
         tx.commit().await.map_err(pg)?;
         self.invalidate_caches();
         self.bump_terminology_epoch().await;

@@ -433,7 +433,8 @@ fn build_validate_response_inner(
 
 /// The ValueSet a `$validate-code` / `$expand` request names: the stored
 /// one (`url` + `valueSetVersion`), a request-supplied one with that url, or
-/// the inline `valueSet`.
+/// the inline `valueSet`. `None` for an implicit ValueSet URL, which names
+/// no resource.
 pub(crate) async fn requested_value_set<B: TerminologyBackend>(
     state: &AppState<B>,
     params: &[Value],
@@ -453,6 +454,12 @@ pub(crate) async fn requested_value_set<B: TerminologyBackend>(
         })
     {
         return Some(vs);
+    }
+    // An implicit ValueSet URL (`<cs>?fhir_vs…`, `http://loinc.org/vs/LP…`)
+    // describes its members by rule: the backends answer it without reading
+    // `value_sets`, so no stored row stands for it.
+    if crate::implicit_vs::is_implicit_vs_url(&url) {
+        return None;
     }
     ValueSetOperations::search(
         state.backend(),
