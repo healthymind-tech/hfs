@@ -2759,7 +2759,6 @@ impl PostgresBackend {
         Ok(())
     }
 
-
     /// Indexes a mutation on its already guarded transaction connection.
     ///
     /// The caller holds the advisory write lock and an open transaction on
@@ -5310,7 +5309,8 @@ impl BundleProvider for PostgresBackend {
         // A Bundle with criteria-addressed entries runs under the shared gate
         // first and, if a target or its criteria is busy or moved under it,
         // once more under the exclusive gate (`LockPlan::conditional_targets`).
-        let optimistic = matches!(&lock_mode, BundleLockMode::Shared(plan) if plan.conditional_targets);
+        let optimistic =
+            matches!(&lock_mode, BundleLockMode::Shared(plan) if plan.conditional_targets);
         if !optimistic {
             return self
                 .run_transaction_bundle(tenant, entries, fhir_version, validator, lock_mode)
@@ -8432,7 +8432,8 @@ impl SearchableContent {
     /// both are within [`FTS_MAX_INPUT_BYTES`], the size the truncating retry
     /// cuts oversized input down to.
     fn fits_tsvector_limit(&self) -> bool {
-        self.narrative.len() <= FTS_MAX_INPUT_BYTES && self.full_content.len() <= FTS_MAX_INPUT_BYTES
+        self.narrative.len() <= FTS_MAX_INPUT_BYTES
+            && self.full_content.len() <= FTS_MAX_INPUT_BYTES
     }
 
     fn is_empty(&self) -> bool {
@@ -10268,6 +10269,7 @@ impl PostgresBackend {
     /// the caller under the same locks; the statement still names the version,
     /// so a tombstone that is no longer there (a writer that does not take the
     /// key) reports `NotFound`, which `create_or_update` retries.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_deleted_in_tx<C>(
         &self,
         client: &C,

@@ -170,7 +170,9 @@ impl PostgresBackend {
     /// How many counts (`_summary=count`, `_total=accurate`) this backend has
     /// answered from `search_index` alone, without joining `resources`.
     pub fn index_only_count_total(&self) -> u64 {
-        self.index_liveness.index_only_counts.load(Ordering::Relaxed)
+        self.index_liveness
+            .index_only_counts
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn note_index_only_count(&self) {
@@ -278,8 +280,10 @@ impl PostgresBackend {
                  (docs/ops/index-strategy.md, \"Orphan index rows\")"
             );
         }
-        self.index_liveness
-            .store((tenant.to_string(), resource_type.to_string()), orphans == 0);
+        self.index_liveness.store(
+            (tenant.to_string(), resource_type.to_string()),
+            orphans == 0,
+        );
         Ok(orphans as u64)
     }
 }

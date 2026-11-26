@@ -253,7 +253,14 @@ async fn index_count_equals_joined_count_after_every_kind_of_write() {
     assert_counts(&backend, &t2, "AAA", 7, "other tenant").await;
     backend.delete(&t2, "Observation", "a0").await.unwrap();
     assert_counts(&backend, &t2, "AAA", 6, "other tenant delete").await;
-    assert_counts(&backend, &t1, "AAA", 27, "first tenant after the other's delete").await;
+    assert_counts(
+        &backend,
+        &t1,
+        "AAA",
+        27,
+        "first tenant after the other's delete",
+    )
+    .await;
 
     // Purging a whole type empties it.
     backend.purge_all(&t2, "Observation").await.unwrap();

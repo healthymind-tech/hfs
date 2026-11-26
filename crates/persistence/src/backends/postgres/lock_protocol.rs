@@ -640,7 +640,11 @@ pub(super) async fn acquire_conditional_write_locks(
 ) -> StorageResult<()> {
     let gate = gate_key(tenant_id)?;
     client
-        .batch_execute(&conditional_write_locks_sql(gate, exclusive_gate, condition))
+        .batch_execute(&conditional_write_locks_sql(
+            gate,
+            exclusive_gate,
+            condition,
+        ))
         .await
         .map_err(|e| {
             if e.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) {
