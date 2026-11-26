@@ -2444,7 +2444,7 @@ async fn init_audit(
                 Ok(n) => info!(events = n, "Replayed audit events from the fallback file"),
                 Err(e) => warn!(error = %e, "Could not replay the audit fallback file"),
             }
-            info!(tenant = ?config.tenant, "Audit logging to the database (AuditEvent resources)");
+            info!(tenant = ?config.tenant, store = %config.store, "Audit logging to the database");
             Arc::new(db)
         }
         #[cfg(feature = "cloudwatch")]
