@@ -229,7 +229,7 @@ async fn interactions_land_in_the_audit_tables_and_are_served_from_them() {
     assert!(all.get("total").is_none(), "no total unless asked");
     // Newest first, each a complete BALP event with server meta.
     assert_eq!(events[0]["outcome"], "4");
-    assert_eq!(subtype(events[6]), "update");
+    assert_eq!(subtype(events[6]), "create", "a PUT to a new id creates");
     for e in &events {
         assert_eq!(e["resourceType"], "AuditEvent");
         assert_eq!(e["meta"]["versionId"], "1");
@@ -260,7 +260,8 @@ async fn interactions_land_in_the_audit_tables_and_are_served_from_them() {
     assert_eq!(count(&f.bundle("/AuditEvent?entity=Observation/o1&action=R").await), 1);
     assert_eq!(count(&f.bundle("/AuditEvent?outcome=4").await), 1);
     assert_eq!(count(&f.bundle("/AuditEvent?outcome:not=0").await), 1);
-    assert_eq!(count(&f.bundle("/AuditEvent?subtype=search-type").await), 2);
+    // The Observation search, and every AuditEvent search made so far.
+    assert_eq!(count(&f.bundle("/AuditEvent?subtype=search-type&_count=100").await), 8);
     assert_eq!(count(&f.bundle("/AuditEvent?type=rest&date=ge2020&_count=100").await), 15);
     assert_eq!(count(&f.bundle("/AuditEvent?date=lt2020").await), 0);
     let by_id = f
@@ -333,7 +334,7 @@ async fn search_pages_through_the_whole_trail_in_both_orders() {
 async fn unsupported_parameters_are_reported_or_refused() {
     let f = fixture_or_skip!("params", true);
     f.seed_clinical().await;
-    let lenient = f.bundle("/AuditEvent?entity-name=x&_content=y&action=U&_count=50").await;
+    let lenient = f.bundle("/AuditEvent?entity-name=x&_content=y&action=C&_count=50").await;
     assert_eq!(entries(&lenient).len(), 4, "the supported criterion still applies");
     let outcome = lenient["entry"]
         .as_array()
@@ -344,7 +345,7 @@ async fn unsupported_parameters_are_reported_or_refused() {
     let text = outcome["resource"].to_string();
     assert!(text.contains("entity-name") && text.contains("_content"), "{text}");
     let self_link = lenient["link"][0]["url"].as_str().unwrap();
-    assert!(self_link.contains("action=U") && !self_link.contains("entity-name"), "{self_link}");
+    assert!(self_link.contains("action=C") && !self_link.contains("entity-name"), "{self_link}");
 
     let strict = f
         .server
@@ -474,11 +475,14 @@ async fn events_written_before_the_tables_stay_visible_in_one_trail() {
                 .map(|e| e["id"].as_str().unwrap().to_string()),
         );
         url = next_link(&page);
-        assert!(seen.len() <= 11, "paging repeats events: {seen:?}");
+        assert!(seen.len() <= 12, "paging repeats events: {seen:?}");
     }
-    assert_eq!(seen.len(), 11);
-    assert!(!seen[0].starts_with("old-") && !seen[1].starts_with("old-"), "new events first: {seen:?}");
-    assert_eq!(&seen[2..], ["old-8", "old-7", "old-6", "old-5", "old-4", "old-3", "old-2", "old-1", "old-0"]);
+    // The two writes about the patient and the count search above (a search
+    // by patient is itself an event about that patient); the page requests
+    // themselves are newer than the first page and so never appear.
+    assert_eq!(seen.len(), 12);
+    assert!(seen[..3].iter().all(|id| !id.starts_with("old-")), "new events first: {seen:?}");
+    assert_eq!(&seen[3..], ["old-8", "old-7", "old-6", "old-5", "old-4", "old-3", "old-2", "old-1", "old-0"]);
 
     let asc = f.bundle("/AuditEvent?patient=Patient/p1&_sort=date&_count=3").await;
     let ids: Vec<&str> = entries(&asc).iter().map(|e| e["id"].as_str().unwrap()).collect();
