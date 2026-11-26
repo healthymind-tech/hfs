@@ -547,5 +547,5 @@ requests after 20 warm-ups, median / p95 of the HTTP request:
 | `_total=accurate&_count=50` | 121 / 143 ms | 36 / 43 ms | 62 / 66 ms |
 
 The migration applied to the loaded database in under a second and the
-Observation type (about 3.4 M index rows) was verified in the background
+Observation type was verified in the background
 before the measured requests.
