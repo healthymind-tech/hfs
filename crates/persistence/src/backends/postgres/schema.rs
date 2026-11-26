@@ -75,8 +75,16 @@ pub const FORK_MIGRATIONS: &[&str] = &[
     FORK_CONSOLE_AUTH,
     FORK_ENDPOINT_SYNC,
     FORK_IDP_CORE,
+    FORK_SEARCH_INDEX_LIVENESS,
     FORK_AUDIT_EVENT_TABLE,
 ];
+
+/// `search_index` rows follow their resource out of the database (row
+/// triggers on `resources`), and `hfs_search_index_liveness` records which
+/// `(tenant, resource type)` pairs were checked to hold no orphan index rows —
+/// what lets `_summary=count` / `_total=accurate` count a lone search filter
+/// from the index alone. The performance line owns `hm-0040`…`hm-0049`.
+pub const FORK_SEARCH_INDEX_LIVENESS: &str = "hm-0040-search-index-liveness";
 
 /// FHIR server manager: endpoint registry `hfs_endpoints`, its change
 /// history and the cluster-wide configuration epochs
@@ -439,6 +447,7 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
             FORK_CONSOLE_AUTH => fork_console_auth(client).await?,
             FORK_ENDPOINT_SYNC => fork_endpoint_sync(client).await?,
             FORK_IDP_CORE => fork_idp_core(client).await?,
+            FORK_SEARCH_INDEX_LIVENESS => fork_search_index_liveness(client).await?,
             FORK_AUDIT_EVENT_TABLE => super::audit_table::fork_audit_event_table(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
@@ -5174,6 +5183,73 @@ async fn fork_search_parameter_epochs(client: &deadpool_postgres::Client) -> Sto
             ))
         })?;
     Ok(())
+}
+
+/// SQL of fork migration `hm-0040-search-index-liveness`. Idempotent.
+///
+/// The triggers make "a deleted resource has no `search_index` rows" a
+/// property of the database instead of a convention of each delete path:
+///
+/// * `AFTER DELETE` — purge, retention, tenant purge, maintenance SQL;
+/// * `AFTER UPDATE OF is_deleted` when it turns true — the soft delete. `OF`
+///   keeps the trigger off every other update (the condition is not even
+///   evaluated unless the statement assigns `is_deleted`).
+///
+/// They cost nothing on create and update. A delete pays one probe of
+/// `idx_search_resource` per row, which finds nothing when the server's own
+/// delete path already removed the rows (measured: see
+/// `docs/ops/index-strategy.md`). `TRUNCATE resources` has no rows to follow,
+/// so it clears the verification markers and every type is checked again.
+///
+/// Rollback: drop the three triggers, the function and the table; the server
+/// then finds no marker and keeps the `resources`-joined count.
+pub const FORK_SEARCH_INDEX_LIVENESS_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS hfs_search_index_liveness (
+        tenant_id TEXT NOT NULL,
+        resource_type TEXT NOT NULL,
+        verified_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        orphan_resources BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (tenant_id, resource_type)
+    );
+    CREATE OR REPLACE FUNCTION hfs_search_index_follow_resource() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'TRUNCATE' THEN
+            DELETE FROM hfs_search_index_liveness;
+            RETURN NULL;
+        END IF;
+        DELETE FROM search_index
+        WHERE tenant_id = OLD.tenant_id
+          AND resource_type = OLD.resource_type
+          AND resource_id = OLD.id;
+        RETURN NULL;
+    END
+    $$;
+    DROP TRIGGER IF EXISTS trg_search_index_follow_delete ON resources;
+    CREATE TRIGGER trg_search_index_follow_delete
+        AFTER DELETE ON resources FOR EACH ROW
+        EXECUTE FUNCTION hfs_search_index_follow_resource();
+    DROP TRIGGER IF EXISTS trg_search_index_follow_soft_delete ON resources;
+    CREATE TRIGGER trg_search_index_follow_soft_delete
+        AFTER UPDATE OF is_deleted ON resources FOR EACH ROW
+        WHEN (NEW.is_deleted AND NOT OLD.is_deleted)
+        EXECUTE FUNCTION hfs_search_index_follow_resource();
+    DROP TRIGGER IF EXISTS trg_search_index_follow_truncate ON resources;
+    CREATE TRIGGER trg_search_index_follow_truncate
+        AFTER TRUNCATE ON resources FOR EACH STATEMENT
+        EXECUTE FUNCTION hfs_search_index_follow_resource();";
+
+/// Fork migration `hm-0040-search-index-liveness`; see
+/// [`FORK_SEARCH_INDEX_LIVENESS_SQL`] and `index_liveness.rs`.
+async fn fork_search_index_liveness(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(FORK_SEARCH_INDEX_LIVENESS_SQL)
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Fork migration {FORK_SEARCH_INDEX_LIVENESS} failed: {e}"
+            ))
+        })
 }
 
 /// Fork migration `hm-0006-search-index-statistics`: keep the extended

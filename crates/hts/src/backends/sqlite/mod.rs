@@ -40,6 +40,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use tracing::info;
 
+use crate::backends::ExactFilter;
 use crate::error::HtsError;
 use crate::import::{BundleImportBackend, ImportStats};
 use crate::string_search::{ResourceSearchRow, ResourceStringSearch, filter_rows};
@@ -118,6 +119,42 @@ impl SqliteTerminologyBackend {
     }
 }
 
+/// The columns [`exact_search`] reads for a metadata-only listing.
+pub(super) const SEARCH_META_COLUMNS: &str = "id, url, version, name, title, status";
+/// The columns [`exact_search`] reads for stored resources.
+pub(super) const SEARCH_FULL_COLUMNS: &str =
+    "id, url, version, name, title, status, resource_json, fhir_id";
+
+/// The statement of an exact-match resource search and its parameters: the
+/// conditions `query` names (see [`ExactFilter`]), in the order
+/// [`crate::backends::search_order_by`] gives, one page.
+pub(super) fn exact_search(
+    table: &str,
+    columns: &str,
+    query: &ResourceSearchQuery,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let filter = ExactFilter::all_columns('?', query);
+    let sql = format!(
+        "SELECT {columns}
+         FROM {table}
+         WHERE {filter}
+         ORDER BY {order_by}
+         LIMIT {limit} OFFSET {offset}",
+        filter = filter.sql,
+        order_by = crate::backends::search_order_by(table, query),
+        limit = filter.placeholder_after(1),
+        offset = filter.placeholder_after(2),
+    );
+    let mut params: Vec<rusqlite::types::Value> = filter
+        .values
+        .into_iter()
+        .map(rusqlite::types::Value::Text)
+        .collect();
+    params.push(i64::from(query.count.unwrap_or(20)).into());
+    params.push(i64::from(query.offset.unwrap_or(0)).into());
+    (sql, params)
+}
+
 /// Search metadata using backend-neutral FHIR string matching, then hydrate
 /// only the selected page. Exact URL/version/status predicates stay in SQL.
 fn search_resources(
@@ -166,28 +203,21 @@ fn search_resources_in_transaction(
     search: ResourceStringSearch,
     synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
+    let filter = ExactFilter::url_version_status('?', &query);
     let metadata_sql = format!(
         "SELECT {columns}
          FROM {table}
-         WHERE (?1 IS NULL OR url = ?1)
-           AND (?2 IS NULL OR version = ?2)
-           AND (?3 IS NULL OR status = ?3)
+         WHERE {filter}
          ORDER BY {order_by}",
         columns = crate::string_search::metadata_select_list(table, &search, false),
+        filter = filter.sql,
         order_by = crate::backends::search_order_by(table, &query)
     );
     let mut statement = conn
         .prepare(&metadata_sql)
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
-        .query_map(
-            rusqlite::params![
-                query.url.as_deref(),
-                query.version.as_deref(),
-                query.status.as_deref()
-            ],
-            search_row,
-        )
+        .query_map(rusqlite::params_from_iter(filter.values.iter()), search_row)
         .map_err(|error| HtsError::StorageError(error.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
@@ -297,31 +327,29 @@ fn count_resources(
         return Ok(count.max(0) as u64);
     }
     let search = ResourceStringSearch::new(query);
-    let params = rusqlite::params![
-        query.url.as_deref(),
-        query.version.as_deref(),
-        query.status.as_deref()
-    ];
-    let filter = "WHERE (?1 IS NULL OR url = ?1)
-           AND (?2 IS NULL OR version = ?2)
-           AND (?3 IS NULL OR status = ?3)";
+    let filter = ExactFilter::url_version_status('?', query);
+    let params = || rusqlite::params_from_iter(filter.values.iter());
 
     if search.is_empty() {
         let count: i64 = conn
-            .prepare_cached(&format!("SELECT COUNT(*) FROM {table} {filter}"))
-            .and_then(|mut statement| statement.query_row(params, |row| row.get(0)))
+            .prepare_cached(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE {filter}",
+                filter = filter.sql
+            ))
+            .and_then(|mut statement| statement.query_row(params(), |row| row.get(0)))
             .map_err(|error| HtsError::StorageError(error.to_string()))?;
         return Ok(count.max(0) as u64);
     }
 
     let mut statement = conn
         .prepare_cached(&format!(
-            "SELECT {columns} FROM {table} {filter}",
-            columns = crate::string_search::metadata_select_list(table, &search, false)
+            "SELECT {columns} FROM {table} WHERE {filter}",
+            columns = crate::string_search::metadata_select_list(table, &search, false),
+            filter = filter.sql
         ))
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     let rows = statement
-        .query_map(params, search_row)
+        .query_map(params(), search_row)
         .map_err(|error| HtsError::StorageError(error.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
@@ -844,7 +872,15 @@ impl SqliteTerminologyBackend {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let uri = format!("file:hts_mem_{id}?mode=memory&cache=shared");
 
-        let manager = SqliteConnectionManager::file(&uri);
+        // An in-memory database has no path to tell it from the others of
+        // this process: every connection carries the id instead (see
+        // `value_set::database_key`).
+        let manager = SqliteConnectionManager::file(&uri).with_init(move |conn| {
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {table} AS SELECT {id} AS id",
+                table = value_set::MEMORY_DB_IDENTITY_TABLE
+            ))
+        });
         let pool = Pool::builder()
             .max_size(4)
             .build(manager)
@@ -1547,6 +1583,10 @@ fn write_refset_members(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "search_plan_hm_tests.rs"]
+mod search_plan_hm_tests;
 
 #[cfg(test)]
 mod tests {

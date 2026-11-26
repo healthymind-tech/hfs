@@ -29,6 +29,84 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresTerminologyBackend;
 
+/// The exact-match conditions of a resource search, for the columns the
+/// query names only.
+///
+/// A fixed `(?1 IS NULL OR url = ?1) AND …` covers every combination with one
+/// statement, but SQLite plans a statement once, without the bound values:
+/// it cannot tell that `?1` is set, scans the whole table and sorts it, and
+/// `idx_<table>_url` goes unused. A `url = ?1` it can serve from the index.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) struct ExactFilter {
+    /// `url = ?1 AND version = ?2`, or `1 = 1` when no column is named.
+    pub(crate) sql: String,
+    /// The values to bind, in placeholder order.
+    pub(crate) values: Vec<String>,
+    marker: char,
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+impl ExactFilter {
+    /// Conditions over `columns` (`(column, value)`; a `None` value adds no
+    /// condition), with placeholders `<marker>1`, `<marker>2`, … (`?` for
+    /// SQLite, `$` for PostgreSQL).
+    pub(crate) fn new(marker: char, columns: &[(&str, Option<&str>)]) -> Self {
+        let mut conditions = Vec::new();
+        let mut values = Vec::new();
+        for (column, value) in columns {
+            if let Some(value) = value {
+                values.push((*value).to_string());
+                conditions.push(format!("{column} = {marker}{}", values.len()));
+            }
+        }
+        let sql = if conditions.is_empty() {
+            "1 = 1".to_string()
+        } else {
+            conditions.join(" AND ")
+        };
+        Self {
+            sql,
+            values,
+            marker,
+        }
+    }
+
+    /// The `url` / `version` / `status` conditions of `query`.
+    pub(crate) fn url_version_status(
+        marker: char,
+        query: &crate::types::ResourceSearchQuery,
+    ) -> Self {
+        Self::new(
+            marker,
+            &[
+                ("url", query.url.as_deref()),
+                ("version", query.version.as_deref()),
+                ("status", query.status.as_deref()),
+            ],
+        )
+    }
+
+    /// The conditions of `query` on every exact-match column.
+    pub(crate) fn all_columns(marker: char, query: &crate::types::ResourceSearchQuery) -> Self {
+        Self::new(
+            marker,
+            &[
+                ("url", query.url.as_deref()),
+                ("version", query.version.as_deref()),
+                ("name", query.name.as_deref()),
+                ("title", query.title.as_deref()),
+                ("status", query.status.as_deref()),
+            ],
+        )
+    }
+
+    /// The placeholder of the `n`-th parameter after the values (from 1):
+    /// `LIMIT` and `OFFSET` follow the conditions.
+    pub(crate) fn placeholder_after(&self, n: usize) -> String {
+        format!("{}{}", self.marker, self.values.len() + n)
+    }
+}
+
 /// Precedence among `code_systems` rows sharing one canonical URL.
 ///
 /// This is the single definition of "which row wins when the caller did not pin
@@ -674,5 +752,48 @@ mod precedence_tests {
             &*vs_precedence_order_by("value_sets"),
             build_vs_precedence_order_by("value_sets").as_str()
         );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod exact_filter_tests {
+    use super::ExactFilter;
+    use crate::types::ResourceSearchQuery;
+
+    #[test]
+    fn only_the_named_columns_are_compared() {
+        let q = ResourceSearchQuery {
+            url: Some("http://x/vs".into()),
+            status: Some("active".into()),
+            ..Default::default()
+        };
+        let f = ExactFilter::all_columns('?', &q);
+        assert_eq!(f.sql, "url = ?1 AND status = ?2");
+        assert_eq!(f.values, ["http://x/vs", "active"]);
+        assert_eq!(f.placeholder_after(1), "?3");
+        assert_eq!(f.placeholder_after(2), "?4");
+
+        let f = ExactFilter::url_version_status('$', &q);
+        assert_eq!(f.sql, "url = $1 AND status = $2");
+    }
+
+    #[test]
+    fn no_named_column_matches_every_row() {
+        let f = ExactFilter::all_columns('$', &ResourceSearchQuery::default());
+        assert_eq!(f.sql, "1 = 1");
+        assert!(f.values.is_empty());
+        assert_eq!(f.placeholder_after(1), "$1");
+    }
+
+    #[test]
+    fn a_name_is_not_part_of_the_url_version_status_conditions() {
+        let q = ResourceSearchQuery {
+            name: Some("n".into()),
+            version: Some("2".into()),
+            ..Default::default()
+        };
+        let f = ExactFilter::url_version_status('?', &q);
+        assert_eq!(f.sql, "version = ?1");
+        assert_eq!(f.values, ["2"]);
     }
 }
