@@ -764,7 +764,11 @@ pub(crate) async fn home(
             futures_lite::future::zip(
                 // `_total`: the audit trail's size, which the dashboard
                 // counters do not see once events live in the audit tables.
-                fhir_get(&state, &scope, "/AuditEvent?_sort=-date&_count=6&_total=accurate"),
+                fhir_get(
+                    &state,
+                    &scope,
+                    "/AuditEvent?_sort=-date&_count=6&_total=accurate",
+                ),
                 sync_jobs_of(&backend),
             ),
         ),
