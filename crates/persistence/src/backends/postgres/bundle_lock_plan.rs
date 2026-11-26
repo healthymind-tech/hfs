@@ -403,7 +403,11 @@ mod tests {
                     Some(json!({"resourceType": "Patient", "id": "fixed"})),
                 )
             },
-            entry(BundleMethod::Put, "Patient/p1", Some(json!({"resourceType": "Patient"}))),
+            entry(
+                BundleMethod::Put,
+                "Patient/p1",
+                Some(json!({"resourceType": "Patient"})),
+            ),
         ];
         assert_eq!(
             plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS),
@@ -415,7 +419,9 @@ mod tests {
 
         // Unconditional Bundles are untouched by the switch.
         let plain = vec![post(json!({"resourceType": "Observation"}))];
-        assert!(!shared(plan_bundle_locks_with(&plain, MAX_BUNDLE_LOCK_KEYS, true)).conditional_targets);
+        assert!(
+            !shared(plan_bundle_locks_with(&plain, MAX_BUNDLE_LOCK_KEYS, true)).conditional_targets
+        );
 
         let search_parameter = vec![conditional(BundleMethod::Delete, "SearchParameter?code=x")];
         assert_eq!(
@@ -470,7 +476,10 @@ mod tests {
             plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS),
             BundleLockMode::Exclusive(ExclusiveReason::TooManyKeys(500))
         );
-        assert_eq!(shared(plan_bundle_locks(&entries, 800)).resources.len(), 500);
+        assert_eq!(
+            shared(plan_bundle_locks(&entries, 800)).resources.len(),
+            500
+        );
     }
 
     /// Every REST POST reaches storage without an id: the shared gate and no

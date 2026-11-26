@@ -1024,12 +1024,18 @@ async fn conditional_delete_bundles_delete_once() {
     for task in tasks {
         task.await.unwrap().expect("every bundle commits");
     }
-    assert_eq!(history_versions(&backend, &tenant, "doomed").await, ["1", "2"]);
+    assert_eq!(
+        history_versions(&backend, &tenant, "doomed").await,
+        ["1", "2"]
+    );
     assert_eq!(
         patients_with_identifier(&backend, &tenant, "CDEL").await,
         [("doomed".to_string(), "2".to_string(), true)]
     );
-    assert_eq!(index_rows(&backend, &tenant, "doomed", "identifier").await, 0);
+    assert_eq!(
+        index_rows(&backend, &tenant, "doomed", "identifier").await,
+        0
+    );
 }
 
 /// A Bundle with criteria-addressed entries no longer needs the exclusive
@@ -1061,7 +1067,10 @@ async fn conditional_bundles_run_beside_shared_gate_holders() {
         .map(|row| row.get(0))
         .collect();
     Box::new(tx).rollback().await.unwrap();
-    assert!(!gate.is_empty(), "the unplanned transaction held a tenant gate");
+    assert!(
+        !gate.is_empty(),
+        "the unplanned transaction held a tenant gate"
+    );
 
     // Hold this tenant's gate shared for the rest of the test. The listing
     // may include gates other tests of this binary hold exclusive; those are

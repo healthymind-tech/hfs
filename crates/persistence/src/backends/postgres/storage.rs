@@ -5309,7 +5309,8 @@ impl BundleProvider for PostgresBackend {
         // A Bundle with criteria-addressed entries runs under the shared gate
         // first and, if a target or its criteria is busy or moved under it,
         // once more under the exclusive gate (`LockPlan::conditional_targets`).
-        let optimistic = matches!(&lock_mode, BundleLockMode::Shared(plan) if plan.conditional_targets);
+        let optimistic =
+            matches!(&lock_mode, BundleLockMode::Shared(plan) if plan.conditional_targets);
         if !optimistic {
             return self
                 .run_transaction_bundle(tenant, entries, fhir_version, validator, lock_mode)

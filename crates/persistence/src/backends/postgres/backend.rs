@@ -1342,6 +1342,14 @@ impl PostgresBackend {
         self.patient_export_index_ready.load(Ordering::Acquire)
     }
 
+    /// Most distinct resource keys (and, separately, conditional creates) a
+    /// transaction Bundle may carry before it takes the tenant's exclusive
+    /// write gate; derived from the server's lock table at connect time, or
+    /// `HFS_PG_BUNDLE_LOCK_KEYS`.
+    pub fn bundle_lock_keys(&self) -> usize {
+        self.bundle_lock_keys
+    }
+
     /// The `search_index` layout this database is in.
     pub(crate) fn index_layout(&self) -> super::schema::IndexLayout {
         self.index_layout

@@ -37977,14 +37977,17 @@ mod postgres_integration {
             }
         }
 
-        /// (f) More than 128 explicit-id keys falls back to the exclusive gate
-        /// and still succeeds; exactly 128 keeps the shared gate and takes all
-        /// 128 keys.
+        /// (f) More explicit-id keys than the backend's cap (128 on a default
+        /// server and pool; it follows the lock table) falls back to the
+        /// exclusive gate and still succeeds; exactly the cap keeps the shared
+        /// gate and takes all its keys.
         #[tokio::test]
         async fn postgres_integration_bundle_lock_oversized_key_set_falls_back_to_exclusive() {
             let fx = Fixture::new().await;
+            let cap = fx.backend.bundle_lock_keys();
+            assert!(cap >= 128, "the cap never drops below 128: {cap}");
             for (puts, gate_mode, resource_keys) in
-                [(129usize, "ExclusiveLock", 0usize), (128, "ShareLock", 128)]
+                [(cap + 1, "ExclusiveLock", 0usize), (cap, "ShareLock", cap)]
             {
                 let tenant = create_tenant("bundle-lock-size");
                 let mut entries: Vec<BundleEntry> = (0..puts)
@@ -38416,15 +38419,17 @@ mod postgres_integration {
             assert_eq!(patched.content()["description"], "after");
         }
 
-        /// (f) More than 128 conditional creates falls back to the exclusive gate
-        /// and still succeeds, taking no criteria lock; exactly 128 keeps the
-        /// shared gate and takes all 128 criteria locks.
+        /// (f) More conditional creates than the backend's cap falls back to
+        /// the exclusive gate and still succeeds, taking no criteria lock;
+        /// exactly the cap keeps the shared gate and takes all its criteria
+        /// locks.
         #[tokio::test]
         async fn postgres_integration_bundle_lock_too_many_conditional_creates_fall_back_to_exclusive()
          {
             let fx = Fixture::new().await;
+            let cap = fx.backend.bundle_lock_keys();
             for (creates, gate_mode, criteria_locks) in
-                [(129usize, "ExclusiveLock", 0usize), (128, "ShareLock", 128)]
+                [(cap + 1, "ExclusiveLock", 0usize), (cap, "ShareLock", cap)]
             {
                 let tenant = create_tenant("bundle-lock-many-conditional");
                 let mut entries: Vec<BundleEntry> = (0..creates)
