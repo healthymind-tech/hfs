@@ -72,6 +72,7 @@ Timeouts:
 | `HFS_PG_STATEMENT_TIMEOUT_MS` | 30000 | 60000 | server-side cap per statement, sent in the startup packet so every pooled connection has it. 60 s because IG-sized transaction Bundles hold the tenant write gate for tens of seconds; concurrent bulk loaders at 30 s saw 0.5–4.9% of Bundles rolled back in the benchmark |
 | `HFS_PG_POOL_WAIT_TIMEOUT_SECS` | 10 | 10 | how long a request waits for a pooled connection before failing with 503 (`Unavailable`) |
 | `HFS_PG_CONNECT_TIMEOUT_SECS` | 5 | 10 | whole connection establishment (DNS, TCP, TLS, auth) |
+| `HFS_PG_SP_FINGERPRINT_TTL_MS` | 1000 | leave; `0` when several HFS instances share the database and a new SearchParameter must apply to the very next write on every instance | how long an ordinary write reuses the tenant's SearchParameter overlay without asking the database whether it changed. A SearchParameter written by the same process applies at once; one written by another instance applies to this instance's writes within the TTL |
 | `HFS_PG_PLAN_CACHE_MODE` | `force_custom_plan` | leave | see the type docs in `backends/postgres/backend.rs`: `auto` makes reference/OR-list searches up to 100× slower |
 | `HTS_PG_POOL_WAIT_TIMEOUT_SECS` | unset (wait forever) | 60 | new in this branch; opt-in |
 | `HTS_PG_CONNECT_TIMEOUT_SECS` | unset | 10 | new in this branch; opt-in |

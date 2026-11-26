@@ -362,6 +362,11 @@ StructureDefinitions (per tenant) become validatable profiles on write.
 | `HFS_VALIDATION_REHYDRATE` | `true` | Replay stored StructureDefinitions into the profile registries at startup (count and duration are logged) |
 | `HFS_VALIDATION_REHYDRATE_BATCH_SIZE` | `100` | StructureDefinitions per storage round-trip during startup rehydration |
 | `HFS_VALIDATION_REHYDRATE_WAIT_MS` | `60000` | While startup rehydration runs, validation (`$validate` and write-path checks) waits up to this long for it instead of answering from a partly filled registry |
+| `HFS_VALIDATION_THREADS` | half the CPUs (min 1) | Dedicated threads write-path validation (`log`/`enforce`) runs on, instead of the Tokio workers. The entries of a transaction Bundle are validated in parallel chunks on them; the pool size bounds validation parallelism across all requests. `0` validates on the request's task, one entry after the other |
+| `HFS_VALIDATION_CHUNK_SIZE` | 16–32, by Bundle size | Bundle entries validated per pool job |
+| `HFS_VALIDATION_LOG_LINES_PER_KEY` | `5` | `log` mode writes this many lines per distinct issue (tenant, resource type, severity, kind, path with indices normalised, message with numbers normalised) per interval; further ones are only counted. Identical issues within one request (a Bundle) are one line with `occurrences` |
+| `HFS_VALIDATION_LOG_INTERVAL_SECS` | `60` | Rate-limit interval of the `log` mode lines; each ends with one `… summary:` line per issue that had lines held back. `0` writes every line (no limit) |
+| `HFS_VALIDATION_LOG_MAX_KEYS` | `2000` | Distinct issues tracked per interval; the rest are counted together. Totals are on `/metrics`: `hfs_validation_log_issues_total{resource_type,severity}`, `hfs_validation_log_lines_suppressed_total` |
 | `HFS_VALIDATION_SHADOW_CORE` | `false` | Let a stored StructureDefinition with a core canonical (`http://hl7.org/fhir/StructureDefinition/…`) override the embedded definition. Off, so importing `hl7.fhir.r4.core` cannot replace the base types |
 
 Note: stored profiles (`derivation: constraint`, extensions) are registered

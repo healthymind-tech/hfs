@@ -46,6 +46,11 @@
 //! | `HFS_VALIDATION_TERMINOLOGY` | embedded | Required-binding checks: embedded (offline FHIR core value sets), remote (`$validate-code` against `HFS_TERMINOLOGY_SERVER`), or off |
 //! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
 //! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
+//! | `HFS_VALIDATION_THREADS` | half the CPUs | Threads write-path validation runs on, off the async workers; a Bundle's entries are validated in parallel chunks on them. `0` validates on the request's task |
+//! | `HFS_VALIDATION_CHUNK_SIZE` | 16–32 by Bundle size | Bundle entries validated per pool job |
+//! | `HFS_VALIDATION_LOG_LINES_PER_KEY` | 5 | `log` mode: lines written per distinct issue (tenant, resource type, severity, kind, normalised path and message) and interval; further ones are only counted |
+//! | `HFS_VALIDATION_LOG_INTERVAL_SECS` | 60 | `log` mode: rate-limit interval; each ends with one summary line per issue that had lines held back. `0` writes every line |
+//! | `HFS_VALIDATION_LOG_MAX_KEYS` | 2000 | `log` mode: distinct issues tracked per interval; the rest are counted together |
 //! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
 //! | `HFS_VALIDATION_IG_GLOBAL` | true | Hold every resource to the `ImplementationGuide.global` profiles of the stored ImplementationGuides |
 //!

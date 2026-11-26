@@ -13,6 +13,10 @@ use crate::core::ResourceStorage;
 use crate::tenant::TenantContext;
 
 pub mod retention;
+#[cfg(feature = "postgres")]
+pub mod table;
+#[cfg(feature = "postgres")]
+pub use table::TableAuditStore;
 
 /// The tenant an audit event is stored in: the configured audit tenant, else
 /// the tenant of the audited request, else the default tenant — so that the
@@ -87,7 +91,7 @@ impl<B> TxAuditStore<B> {
         }
     }
 
-    fn tenant_for(&self, request_tenant: Option<&str>) -> TenantContext {
+    pub(crate) fn tenant_for(&self, request_tenant: Option<&str>) -> TenantContext {
         audit_tenant(
             self.fixed_tenant.as_deref(),
             request_tenant,

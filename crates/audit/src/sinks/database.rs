@@ -57,6 +57,23 @@ pub trait AuditStorage: Send + Sync + 'static {
         }
         out
     }
+
+    /// Appends a batch of `AuditEvent`s (tenant, resource) in one write, for
+    /// stores with a dedicated audit table. `None`: the store has no such
+    /// write and the caller uses [`Self::create_resources`]. `Some(Err(_))`:
+    /// nothing of the batch was stored.
+    async fn append_events(
+        &self,
+        events: Vec<(Option<String>, serde_json::Value)>,
+    ) -> Option<Result<(), String>> {
+        let _ = events;
+        None
+    }
+
+    /// Whether [`Self::append_events`] is implemented.
+    fn appends(&self) -> bool {
+        false
+    }
 }
 
 /// How often a failed write is attempted before the event is spilled to the
@@ -156,6 +173,43 @@ impl DatabaseSink {
         }
     }
 
+    /// Stores a batch with one append. A failing append is retried with
+    /// back-off; if it keeps failing each event goes through the single write
+    /// (and from there, if need be, to the fallback file), so one event the
+    /// store refuses cannot hold back the rest of its batch.
+    async fn append(&self, records: Vec<crate::sink::AuditRecord>) {
+        let mut events = Vec::with_capacity(records.len());
+        for r in records {
+            match to_resource(&r.event) {
+                Ok(v) => events.push((r.tenant, v)),
+                Err(e) => {
+                    m::record_dropped(1, m::DropReason::Serialization);
+                    tracing::error!(error = %e, "Failed to serialize audit event to JSON Value");
+                }
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let mut delay = self.retry_delay;
+        for attempt in 1..=WRITE_ATTEMPTS {
+            match self.storage.append_events(events.clone()).await {
+                Some(Ok(())) => return,
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, attempt, events = events.len(), "Audit batch append failed");
+                    if attempt < WRITE_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                    }
+                }
+                None => break,
+            }
+        }
+        for (tenant, value) in events {
+            self.write(tenant.as_deref(), value).await;
+        }
+    }
+
     /// Writes the events of a previous run's fallback file to the database and
     /// renames the file (`*.replayed-<timestamp>`). Returns how many events
     /// were replayed. Events that still cannot be written stay in a new
@@ -238,6 +292,9 @@ impl AuditSink for DatabaseSink {
     /// write refused goes through the retrying single write (and from there,
     /// if need be, to the fallback file).
     async fn record_records(&self, records: Vec<crate::sink::AuditRecord>) {
+        if self.storage.appends() {
+            return self.append(records).await;
+        }
         let mut groups: Vec<(Option<String>, Vec<serde_json::Value>)> = Vec::new();
         for r in records {
             let value = match to_resource(&r.event) {

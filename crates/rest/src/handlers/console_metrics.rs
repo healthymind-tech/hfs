@@ -174,6 +174,13 @@ where
     // is now the day's *net* change (creations minus deletions, from the history
     // log), so it may be negative.
     let type_refs: Vec<&str> = types.iter().map(|t| t.as_str()).collect();
+    let audit_store_events = if type_refs.contains(&super::audit_events::AUDIT_EVENT) {
+        super::audit_events::store_count(&state, &tenant)
+            .await?
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let series: Vec<_> = crate::dashboard::resource_count_series(
         state.storage(),
         ctx,
@@ -184,9 +191,17 @@ where
     .await?
     .into_iter()
     .map(|s| {
+        // Events of the dedicated audit store are not stored resources; they
+        // are added to the `AuditEvent` total (the daily points cover the
+        // legacy resources only).
+        let total = if s.resource_type == super::audit_events::AUDIT_EVENT {
+            s.total + audit_store_events
+        } else {
+            s.total
+        };
         json!({
             "resource_type": s.resource_type,
-            "total": s.total,
+            "total": total,
             "points": s
                 .points
                 .into_iter()

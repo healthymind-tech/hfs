@@ -762,24 +762,59 @@ pub(crate) async fn home(
         futures_lite::future::zip(
             backend.history(&ep),
             futures_lite::future::zip(
-                fhir_get(&state, &scope, "/AuditEvent?_sort=-date&_count=6"),
+                // `_total`: the audit trail's size, which the dashboard
+                // counters do not see once events live in the audit tables.
+                fhir_get(
+                    &state,
+                    &scope,
+                    "/AuditEvent?_sort=-date&_count=6&_total=accurate",
+                ),
                 sync_jobs_of(&backend),
             ),
         ),
     )
     .await;
     let known = snap.as_ref().filter(|s| s.figures.is_known());
-    let total = known.map(|s| s.total_resources).unwrap_or(0).max(1);
-    let top_types = known
+    // The dashboard counts stored resources; events of the audit tables are
+    // not among them. The trail's real size (the API's union of both) takes
+    // the place of the counters' AuditEvent figure.
+    let audit_total = audit
+        .as_ref()
+        .ok()
+        .and_then(|b| b.get("total"))
+        .and_then(|t| t.as_u64());
+    let mut available: Vec<(String, u64)> = known
         .map(|s| {
             s.available
                 .iter()
+                .map(|t| (t.resource_type.clone(), t.total))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut total_resources = known.map(|s| s.total_resources);
+    if let (Some(audit_total), Some(total)) = (audit_total, total_resources.as_mut()) {
+        let counted = available
+            .iter()
+            .find(|(t, _)| t == "AuditEvent")
+            .map_or(0, |(_, n)| *n);
+        *total = total.saturating_sub(counted) + audit_total;
+        available.retain(|(t, _)| t != "AuditEvent");
+        if audit_total > 0 {
+            available.push(("AuditEvent".to_string(), audit_total));
+        }
+        available.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+    let total = total_resources.unwrap_or(0).max(1);
+    let top_types = known
+        .map(|_| {
+            available
+                .iter()
                 .take(6)
-                .map(|t| TypeRow {
-                    name: t.resource_type.clone(),
-                    total: t.total,
-                    percent: ((t.total * 100) / total).min(100) as u8,
-                    href: format!("/ui/e/{ep}/data/resources?type={}", t.resource_type),
+                .map(|(name, n)| TypeRow {
+                    name: name.clone(),
+                    total: *n,
+                    percent: ((n * 100) / total).min(100) as u8,
+                    href: format!("/ui/e/{ep}/data/resources?type={name}"),
                 })
                 .collect()
         })
@@ -796,7 +831,7 @@ pub(crate) async fn home(
     let can_admin = c.can_admin();
     render(HomePage {
         head: EpHeader::new(&e, &c.server_base, &c.env),
-        resources: known.map(|s| s.total_resources),
+        resources: total_resources,
         types: known.map(|s| s.distinct_types),
         export_jobs: known.and_then(|s| s.export_jobs.map(|j| j.running + j.queued)),
         import_jobs: known.and_then(|s| s.import_jobs_active),

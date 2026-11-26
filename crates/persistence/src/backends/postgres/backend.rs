@@ -51,12 +51,19 @@ struct StoredOverlay {
 }
 
 /// Default window in which a write trusts a validated overlay without probing
-/// the database again: zero, i.e. every write probes (the exact, previous
-/// behavior). Opt in with `HFS_PG_SP_FINGERPRINT_TTL_MS=<ms>` (for example
-/// `1000`): a SearchParameter committed by this process still invalidates the
-/// cache immediately; only one committed by another HFS process can then take
-/// up to that long to be seen by ordinary writes.
-const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::ZERO;
+/// the database again: one second. Before, every indexed write probed (a
+/// round trip in which PostgreSQL aggregates the tenant's SearchParameter
+/// rows) — the largest fixed cost of a single-resource write.
+///
+/// What the window means: a SearchParameter committed by **this** process
+/// invalidates the cache immediately, as before. One committed by **another**
+/// HFS process on the same database is used by this process's ordinary
+/// writes at most this long after its commit; resources written here in
+/// between are indexed without it and need the reindex a new SearchParameter
+/// needs anyway for the resources that already existed. Bulk submit always
+/// probes. `HFS_PG_SP_FINGERPRINT_TTL_MS=0` restores the probe on every
+/// write (no staleness between instances); a larger value widens the window.
+const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::from_millis(1000);
 
 fn overlay_fingerprint_ttl_from_env() -> Duration {
     std::env::var("HFS_PG_SP_FINGERPRINT_TTL_MS")

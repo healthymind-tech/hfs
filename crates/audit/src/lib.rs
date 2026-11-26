@@ -74,12 +74,13 @@ pub mod patient;
 pub mod rest_event;
 pub mod sink;
 pub mod sinks;
+pub mod store;
 
 // Re-exports for convenience
 pub use agent::AuditAgent;
 pub use balp::AuditAction;
 pub use builder::AuditEventBuilder;
-pub use config::{AuditBackend, AuditConfig, RetentionConfig};
+pub use config::{AuditBackend, AuditConfig, AuditStore, RetentionConfig};
 pub use context::RequestAudit;
 pub use correlation::{AuditCorrelation, BundleAuditEntry};
 pub use error::{AuditError, AuditResult};

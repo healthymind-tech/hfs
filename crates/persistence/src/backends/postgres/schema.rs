@@ -76,6 +76,7 @@ pub const FORK_MIGRATIONS: &[&str] = &[
     FORK_ENDPOINT_SYNC,
     FORK_IDP_CORE,
     FORK_SEARCH_INDEX_LIVENESS,
+    FORK_AUDIT_EVENT_TABLE,
 ];
 
 /// `search_index` rows follow their resource out of the database (row
@@ -105,6 +106,12 @@ pub const FORK_ENDPOINT_SYNC: &str = "hm-0010-endpoint-sync";
 /// `helios_idp::schema::IDP_CORE_SQL` (helios-idp's `pg_idp` test asserts
 /// the two are identical; persistence cannot depend on helios-idp).
 pub const FORK_IDP_CORE: &str = "hm-0020-idp-core";
+
+/// Dedicated append-only audit store: `audit_event` and `audit_event_ref`,
+/// partitioned by month, with their immutability trigger and partition
+/// helper (`super::audit_table`). Additive: a build without it keeps writing
+/// `AuditEvent` resources and is unaffected.
+pub use super::audit_table::FORK_AUDIT_EVENT_TABLE;
 
 /// Fork migration replacing the `search_index` extended statistics with
 /// dependency-only objects and lowering the token column's statistics
@@ -441,6 +448,7 @@ async fn run_fork_migrations(client: &mut deadpool_postgres::Client) -> StorageR
             FORK_ENDPOINT_SYNC => fork_endpoint_sync(client).await?,
             FORK_IDP_CORE => fork_idp_core(client).await?,
             FORK_SEARCH_INDEX_LIVENESS => fork_search_index_liveness(client).await?,
+            FORK_AUDIT_EVENT_TABLE => super::audit_table::fork_audit_event_table(client).await?,
             other => return Err(pg_error(format!("Unknown fork migration: {other}"))),
         }
         client

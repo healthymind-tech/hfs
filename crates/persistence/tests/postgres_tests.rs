@@ -5926,6 +5926,16 @@ mod postgres_integration {
     const PURGE_SEED_SQL: &[&str] = &[
         "INSERT INTO hfs_search_index_liveness (tenant_id, resource_type, orphan_resources) \
          VALUES ($1, 'Patient', 0) ON CONFLICT DO NOTHING",
+        // The dedicated audit tables (hm-0030; their monthly partitions are
+        // reached through the parents): one event in this month's partition
+        // and one in the default partition.
+        "INSERT INTO audit_event (tenant_id, recorded, id, event) \
+         VALUES ($1, now(), 'seed-ae', '{}'::jsonb), ($1, '1990-01-01T00:00:00Z', 'seed-ae-old', '{}'::jsonb) \
+         ON CONFLICT DO NOTHING",
+        "INSERT INTO audit_event_ref (tenant_id, ref_id, recorded, id, kind, ref_type) \
+         VALUES ($1, 'seed-p', now(), 'seed-ae', 'e', 'Patient'), \
+                ($1, 'seed-p', '1990-01-01T00:00:00Z', 'seed-ae-old', 'e', 'Patient') \
+         ON CONFLICT DO NOTHING",
         "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, param_url, value_string) \
          SELECT $1, 'Patient', 'seed-p', 'family', 'http://hl7.org/fhir/SearchParameter/Patient-family', 'Seed' \
          WHERE NOT EXISTS (SELECT 1 FROM search_index WHERE tenant_id = $1)",
@@ -5988,7 +5998,12 @@ mod postgres_integration {
                  JOIN information_schema.tables t \
                    ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
                  WHERE c.column_name = 'tenant_id' AND c.table_schema = current_schema() \
-                   AND t.table_type = 'BASE TABLE' ORDER BY 1",
+                   AND t.table_type = 'BASE TABLE' \
+                   AND NOT EXISTS (SELECT 1 FROM pg_class pc \
+                                   WHERE pc.relname = c.table_name \
+                                     AND pc.relnamespace = current_schema()::regnamespace \
+                                     AND pc.relispartition) \
+                 ORDER BY 1",
                 &[],
             )
             .await

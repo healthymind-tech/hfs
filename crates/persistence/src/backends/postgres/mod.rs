@@ -72,6 +72,7 @@
 //! );
 //! ```
 
+pub mod audit_table;
 mod backend;
 mod bulk_export;
 mod bulk_index_rebuild;

@@ -364,6 +364,33 @@ impl SubscriptionEngine {
         &self.ws_token_manager
     }
 
+    /// Whether a write of `resource_type` changes the engine's own state: a
+    /// Subscription, a SubscriptionTopic, or a `Basic` (which may carry an R4
+    /// backport topic).
+    pub fn is_lifecycle_type(resource_type: &str) -> bool {
+        matches!(
+            resource_type,
+            "Subscription" | "SubscriptionTopic" | "Basic"
+        )
+    }
+
+    /// Whether [`Self::on_resource_event`] could do anything with a write of
+    /// this type and interaction in this tenant: it is a lifecycle resource,
+    /// or one of the tenant's topics triggers on it. `false` is exactly the
+    /// case where `on_resource_event` would evaluate the event against zero
+    /// topics and return, so a caller may skip building the event.
+    pub fn may_handle(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        event_type: ResourceEventType,
+    ) -> bool {
+        Self::is_lifecycle_type(resource_type)
+            || self
+                .topic_registry
+                .has_matching_topic(tenant_id, resource_type, event_type)
+    }
+
     /// Called after a resource write has been committed.
     ///
     /// This method:
@@ -392,7 +419,9 @@ impl SubscriptionEngine {
 
         // Evaluate which subscriptions match this event.
         let matches = self.evaluator.evaluate(&event);
-        info!(
+        // Per written resource: debug, not info (a 450-entry Bundle was 450
+        // lines on a locked stdout).
+        debug!(
             tenant_id = %event.tenant_id,
             resource_type = %event.resource_type,
             resource_id = %event.resource_id,

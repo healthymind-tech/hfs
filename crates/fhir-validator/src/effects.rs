@@ -384,6 +384,62 @@ pub trait ConstraintEvaluator: Send + Sync {
         let _ = members;
         self.evaluate_all(resource, version, constraints)
     }
+
+    /// Every evaluation of one resource's invariants in one validation run:
+    /// the walk's slice-candidate checks, then the deferred constraints
+    /// (twice when `memberOf()` questions had to be asked first). An
+    /// implementation that prepares the resource (a typed parse) does that
+    /// once per session, on first use — and never when nothing is evaluated.
+    /// The default evaluates each call on its own.
+    fn session<'a>(
+        &'a self,
+        resource: &'a Value,
+        version: FhirVersion,
+    ) -> Box<dyn ConstraintSession + 'a> {
+        Box::new(PerCallSession {
+            evaluator: self,
+            resource,
+            version,
+        })
+    }
+}
+
+/// See [`ConstraintEvaluator::session`].
+pub trait ConstraintSession: Send + Sync {
+    /// Outcomes aligned index-for-index with `constraints`; `memberOf()` is
+    /// answered from `members` when given.
+    fn evaluate(
+        &self,
+        constraints: &[DeferredConstraint<'_>],
+        members: Option<&Arc<MemberOfAnswers>>,
+    ) -> Vec<ConstraintOutcome>;
+}
+
+/// A session that shares nothing between calls.
+struct PerCallSession<'a, E: ConstraintEvaluator + ?Sized> {
+    evaluator: &'a E,
+    resource: &'a Value,
+    version: FhirVersion,
+}
+
+impl<E: ConstraintEvaluator + ?Sized> ConstraintSession for PerCallSession<'_, E> {
+    fn evaluate(
+        &self,
+        constraints: &[DeferredConstraint<'_>],
+        members: Option<&Arc<MemberOfAnswers>>,
+    ) -> Vec<ConstraintOutcome> {
+        match members {
+            Some(m) => self.evaluator.evaluate_all_with_members(
+                self.resource,
+                self.version,
+                constraints,
+                m,
+            ),
+            None => self
+                .evaluator
+                .evaluate_all(self.resource, self.version, constraints),
+        }
+    }
 }
 
 /// `memberOf()` answers for one resource's invariants, filled from the
@@ -893,9 +949,43 @@ pub async fn execute_with(
     conformance: Option<Conformance>,
     errors: &mut Vec<ValidationError>,
 ) {
+    let session = handlers.constraints.map(|e| e.session(resource, version));
+    execute_in_session(
+        resource,
+        version,
+        deferred,
+        handlers,
+        conformance,
+        session.as_deref(),
+        errors,
+    )
+    .await;
+}
+
+/// [`execute_with`], with the invariants evaluated in `session` — the
+/// caller's, so a parse it already paid for is not repeated. `None` when
+/// there is no constraint evaluator.
+pub(crate) async fn execute_in_session(
+    resource: &Value,
+    version: FhirVersion,
+    deferred: &[Deferred],
+    handlers: &EffectHandlers<'_>,
+    conformance: Option<Conformance>,
+    session: Option<&dyn ConstraintSession>,
+    errors: &mut Vec<ValidationError>,
+) {
     let timing = tracing::enabled!(target: "helios_fhir_validator::timing", tracing::Level::DEBUG);
     let started = std::time::Instant::now();
-    execute_constraints(resource, version, deferred, handlers, conformance, errors).await;
+    execute_constraints(
+        resource,
+        version,
+        deferred,
+        handlers,
+        conformance,
+        session,
+        errors,
+    )
+    .await;
     let constraints = started.elapsed();
     execute_terminology(resource, deferred, handlers, errors).await;
     if timing {
@@ -915,9 +1005,10 @@ async fn execute_constraints(
     deferred: &[Deferred],
     handlers: &EffectHandlers<'_>,
     conformance: Option<Conformance>,
+    session: Option<&dyn ConstraintSession>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some(evaluator) = handlers.constraints else {
+    let Some(evaluator) = session else {
         return;
     };
 
@@ -995,9 +1086,7 @@ async fn execute_constraints(
             conformance: conformance.clone(),
             ..Default::default()
         });
-        let outcomes = crate::engine::on_large_stack(|| {
-            evaluator.evaluate_all_with_members(resource, version, &refs, &first)
-        });
+        let outcomes = crate::engine::on_large_stack(|| evaluator.evaluate(&refs, Some(&first)));
         let asked = std::mem::take(&mut *first.missed.lock().expect("memberOf lock"));
         if asked.is_empty() {
             outcomes
@@ -1016,20 +1105,16 @@ async fn execute_constraints(
                 missed: Mutex::default(),
                 conformance,
             });
-            crate::engine::on_large_stack(|| {
-                evaluator.evaluate_all_with_members(resource, version, &refs, &second)
-            })
+            crate::engine::on_large_stack(|| evaluator.evaluate(&refs, Some(&second)))
         }
     } else if wants_conformance {
         let answers = Arc::new(MemberOfAnswers {
             conformance,
             ..Default::default()
         });
-        crate::engine::on_large_stack(|| {
-            evaluator.evaluate_all_with_members(resource, version, &refs, &answers)
-        })
+        crate::engine::on_large_stack(|| evaluator.evaluate(&refs, Some(&answers)))
     } else {
-        crate::engine::on_large_stack(|| evaluator.evaluate_all(resource, version, &refs))
+        crate::engine::on_large_stack(|| evaluator.evaluate(&refs, None))
     };
     debug_assert_eq!(evaluated.len(), refs.len(), "evaluator must align outcomes");
     // A resource that does not parse into the typed model leaves every

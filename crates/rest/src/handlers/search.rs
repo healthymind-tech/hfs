@@ -376,6 +376,19 @@ where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     let strict = handling == Handling::Strict;
+    // `AuditEvent` lives in the dedicated audit store when that is in use.
+    if let Some(bundle) = super::audit_events::search_bundle(
+        state,
+        tenant,
+        compartment,
+        resource_type,
+        &pairs,
+        strict,
+    )
+    .await?
+    {
+        return Ok(bundle);
+    }
     // A search resolves in the version the client named with the `fhirVersion`
     // MIME parameter on `Accept`, else in the server default (#2254). Naming
     // one also restricts the matches to resources stored under it (set on the
@@ -1046,7 +1059,7 @@ pub(crate) fn append_ignored_params_outcome(
 /// to the searchset. Prefer [`append_warning_outcome_with_code`] for a
 /// warning whose FHIR issue type isn't "not supported" (e.g. #1061
 /// truncation, which is `incomplete`).
-fn append_warning_outcome(bundle_json: &mut serde_json::Value, message: &str) {
+pub(super) fn append_warning_outcome(bundle_json: &mut serde_json::Value, message: &str) {
     append_warning_outcome_with_code(
         bundle_json,
         crate::responses::operation_outcome::IssueType::NotSupported,
@@ -1193,7 +1206,11 @@ where
 }
 
 /// Builds a type-level search URL from base URL and parameters.
-fn build_search_url(base_url: &str, resource_type: &str, params: &SearchParams) -> String {
+pub(super) fn build_search_url(
+    base_url: &str,
+    resource_type: &str,
+    params: &SearchParams,
+) -> String {
     let query = encode_query(params);
     crate::public_url::PublicUrl::parse(base_url)
         .expect("request public base was built from validated configuration")
@@ -1228,7 +1245,7 @@ fn encode_query(params: &SearchParams) -> String {
 /// the Bundle, since that is the behavior the client asked for. `total` is
 /// never serialized as `null`: FHIR JSON primitives are present with a value
 /// or absent (#990).
-fn bundle_to_json_with_subsetting(
+pub(super) fn bundle_to_json_with_subsetting(
     bundle: SearchBundle,
     summary_mode: Option<SummaryMode>,
     total_required: bool,

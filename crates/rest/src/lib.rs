@@ -175,6 +175,8 @@ pub mod tenant;
 pub mod terminology;
 pub mod validation;
 pub mod validation_cache;
+pub mod validation_log;
+mod validation_pool;
 
 /// Test-only support helpers shared across the crate's unit tests.
 #[cfg(test)]
@@ -723,6 +725,9 @@ where
     .with_write_observability(observability.clone());
     if let Some(runtime) = &endpoints {
         state = state.with_endpoints(runtime.clone());
+    }
+    if let Some(reader) = audit_state.as_ref().and_then(|audit| audit.reader.clone()) {
+        state = state.with_audit_reader(reader);
     }
 
     // Stored StructureDefinitions are replayed into the profile registries
