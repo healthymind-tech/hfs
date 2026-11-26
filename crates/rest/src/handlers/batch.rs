@@ -178,7 +178,7 @@ where
 
     // Parse the body as JSON
     let body = read_body_within_limit(request, state.config().max_body_size).await?;
-    let bundle: Value = serde_json::from_slice(&body)?;
+    let mut bundle: Value = serde_json::from_slice(&body)?;
     // Validate it's a Bundle
     let resource_type = bundle
         .get("resourceType")
@@ -220,7 +220,7 @@ where
                 tenant,
                 fhir_version,
                 &prefer,
-                &bundle,
+                &mut bundle,
                 principal.as_ref(),
             )
             .await
@@ -524,7 +524,7 @@ async fn process_transaction<S>(
     tenant: TenantExtractor,
     fhir_version: FhirVersion,
     prefer: &PreferHeader,
-    bundle: &Value,
+    bundle: &mut Value,
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
@@ -545,11 +545,15 @@ where
     let correlation = AuditCorrelation::new("transaction");
     helios_audit::context::set_bundle_type("transaction");
 
-    let json_entries = bundle
-        .get("entry")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // The entries are taken out of the Bundle, and each entry's resource out
+    // of its entry (`parse_bundle_entry_taking`): the request body is parsed
+    // once and its resources move to the storage layer instead of being
+    // copied twice on the way (once with the entry array, once per entry).
+    // The caller drops the Bundle right after this call.
+    let mut json_entries: Vec<Value> = match bundle.get_mut("entry") {
+        Some(Value::Array(entries)) => std::mem::take(entries),
+        _ => Vec::new(),
+    };
 
     // Parse entries and track their original indices for response ordering.
     // The fourth element is the GET entry to run after the commit, classified
@@ -558,8 +562,8 @@ where
     let mut parsed_entries: Vec<(usize, BundleEntry, Option<String>, Option<DeferredGet>)> =
         Vec::with_capacity(json_entries.len());
 
-    for (index, entry) in json_entries.iter().enumerate() {
-        match parse_bundle_entry(entry) {
+    for (index, entry) in json_entries.iter_mut().enumerate() {
+        match parse_bundle_entry_taking(entry) {
             Ok((mut bundle_entry, full_url)) => {
                 // A GET entry is a search, read, vread or history read by its
                 // URL (#478, #2380). A `_history` URL that is none of the
@@ -849,6 +853,15 @@ where
     // are atomic, so any invalid write entry rejects the whole bundle before
     // anything executes. A PATCH entry's document is not stored; its result
     // is cleaned by the patch engine.
+    //
+    // The entries are validated in parallel on the validation thread pool,
+    // not one after the other on this task (`prepare_writes`); the outcome is
+    // the sequential one: the first failing entry's error. An entry whose
+    // request URL does not parse used to stop the loop there, after the
+    // entries before it had been validated — so those are still validated
+    // first, and only when they all pass is the URL error the answer.
+    let mut pending = Vec::new();
+    let mut bad_url = None;
     for (index, entry, _) in &mut indexed_entries {
         if !matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
             continue;
@@ -856,14 +869,25 @@ where
         let Some(resource) = entry.resource.as_mut() else {
             continue;
         };
-        let (resource_type, _) =
-            parse_request_url(&entry.url).map_err(|e| RestError::InvalidElementValue {
-                message: format!("Entry {}: {}", index, e),
-            })?;
-        state
-            .validation()
-            .prepare_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
-            .await?;
+        match parse_request_url(&entry.url) {
+            Ok((resource_type, _)) => pending.push(crate::validation::PendingWrite {
+                resource_type,
+                resource,
+            }),
+            Err(e) => {
+                bad_url = Some(RestError::InvalidElementValue {
+                    message: format!("Entry {}: {}", index, e),
+                });
+                break;
+            }
+        }
+    }
+    state
+        .validation_shared()
+        .prepare_writes(tenant.tenant_id(), fhir_version, pending)
+        .await?;
+    if let Some(error) = bad_url {
+        return Err(error);
     }
 
     // Sort by processing order: DELETE -> POST -> PUT/PATCH -> GET
@@ -3847,6 +3871,25 @@ fn rewrite_conditional_references(
 }
 
 fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), EntryParseError> {
+    parse_bundle_entry_with(entry, entry.get("resource").cloned())
+}
+
+/// [`parse_bundle_entry`] for a caller that owns the entry and needs its
+/// resource only in the parsed form: the resource is moved out of `entry`
+/// (which keeps `"resource": null`) instead of copied. `request` and
+/// `fullUrl` stay in place.
+fn parse_bundle_entry_taking(
+    entry: &mut Value,
+) -> Result<(BundleEntry, Option<String>), EntryParseError> {
+    let resource = entry.get_mut("resource").map(Value::take);
+    parse_bundle_entry_with(entry, resource)
+}
+
+/// [`parse_bundle_entry`] with the entry's resource handed in.
+fn parse_bundle_entry_with(
+    entry: &Value,
+    resource: Option<Value>,
+) -> Result<(BundleEntry, Option<String>), EntryParseError> {
     let request = entry
         .get("request")
         .ok_or(EntryParseError::MissingRequest)?;
@@ -3879,7 +3922,7 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
         raw_url
     };
 
-    let mut resource = entry.get("resource").cloned();
+    let mut resource = resource;
     // Per http.html#create the server ignores an id supplied on a POST — the
     // same strip create_handler applies. Bundles that repeat shared resources
     // under fixed ids (Synthea's Organizations/Practitioners) used to fail
@@ -6392,6 +6435,45 @@ mod tests {
     /// or a PUT that created answers 201 (Create); a PUT that matched answers
     /// 200 (Update). DELETE and non-2xx entries announce nothing here — DELETE
     /// is announced from its URL, and a failed entry never committed.
+    /// The owning parse moves the resource out of the entry and otherwise
+    /// yields exactly what the borrowing parse yields.
+    #[test]
+    fn parse_bundle_entry_taking_moves_the_resource_and_agrees_with_the_copy() {
+        for entry in [
+            serde_json::json!({
+                "fullUrl": "urn:uuid:0f3a9c1e-5b7d-4e2a-9c61-2f8d3b7a1e55",
+                "resource": { "resourceType": "Patient", "id": "client-id", "active": true },
+                "request": { "method": "POST", "url": "Patient", "ifNoneExist": "identifier=x" }
+            }),
+            serde_json::json!({
+                "resource": { "resourceType": "Patient", "id": "p1" },
+                "request": { "method": "PUT", "url": "Patient/p1", "ifMatch": "W/\"2\"" }
+            }),
+            serde_json::json!({ "request": { "method": "DELETE", "url": "Patient/p1" } }),
+        ] {
+            let (copied, copied_url) = parse_bundle_entry(&entry).expect("parses");
+            let mut owned = entry.clone();
+            let (taken, taken_url) = parse_bundle_entry_taking(&mut owned).expect("parses");
+            assert_eq!(taken.method, copied.method);
+            assert_eq!(taken.url, copied.url);
+            assert_eq!(taken.resource, copied.resource);
+            assert_eq!(taken.if_match, copied.if_match);
+            assert_eq!(taken.if_none_exist, copied.if_none_exist);
+            assert_eq!(taken_url, copied_url);
+            assert_eq!(owned["request"], entry["request"], "the request stays");
+            if entry.get("resource").is_some() {
+                assert!(owned["resource"].is_null(), "the resource moved out");
+            }
+        }
+        // A POST still loses its client id.
+        let mut post = serde_json::json!({
+            "resource": { "resourceType": "Patient", "id": "client-id" },
+            "request": { "method": "POST", "url": "Patient" }
+        });
+        let (parsed, _) = parse_bundle_entry_taking(&mut post).expect("parses");
+        assert!(parsed.resource.unwrap().get("id").is_none());
+    }
+
     #[test]
     fn transaction_write_event_type_maps_status_to_the_right_event() {
         assert_eq!(
@@ -7222,7 +7304,7 @@ mod tests {
                 "conditional create (If-None-Exist)",
             ),
         ] {
-            let bundle = serde_json::json!({
+            let mut bundle = serde_json::json!({
                 "resourceType": "Bundle",
                 "type": "transaction",
                 "entry": [entry],
@@ -7232,7 +7314,7 @@ mod tests {
                 tenant(),
                 FhirVersion::default(),
                 &PreferHeader::default(),
-                &bundle,
+                &mut bundle,
                 None,
             )
             .await

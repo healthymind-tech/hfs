@@ -529,6 +529,94 @@ async fn codes_of_contentless_code_systems_cannot_be_checked() {
     );
 }
 
+const CURRENCIES: &str = "http://hl7.org/fhir/ValueSet/currencies";
+const ISO_4217: &str = "urn:iso:std:iso:4217";
+
+/// `Money.currency` is a bare `code` bound (required) to `currencies`, which
+/// takes all of ISO 4217 — a code system no FHIR package carries. A server
+/// without its content cannot infer a system for any code and answers
+/// `false`; that used to be reported as two errors per Money ("The System URI
+/// could not be determined for the code 'USD'…", "…does not pass
+/// validation…"), ~100,000 of them in one Synthea load. It is "cannot be
+/// checked" (a warning), as for a Coding of a contentless system; with the
+/// code system's content on the server a wrong code is still an error.
+#[tokio::test]
+async fn bare_codes_of_contentless_code_systems_cannot_be_checked() {
+    let invoice = |currency: &str| {
+        json!({
+            "resourceType": "Invoice",
+            "status": "issued",
+            "totalNet": { "value": 12.5, "currency": currency }
+        })
+    };
+    let check = |server: TestServer, currency: &'static str| async move {
+        let response = server
+            .post("/Invoice/$validate")
+            .json(&invoice(currency))
+            .await;
+        response.assert_status_ok();
+        let outcome: Value = response.json();
+        (binding_issues(&outcome), outcome)
+    };
+    let mock = |content: Option<&str>, compose: Value| MockHts {
+        // The server knows the value set and finds no code in it.
+        known: Arc::new(HashMap::from([(CURRENCIES.to_string(), Vec::new())])),
+        code_systems: Arc::new(
+            content
+                .map(|c| (ISO_4217.to_string(), c.to_string()))
+                .into_iter()
+                .collect(),
+        ),
+        composes: Arc::new(HashMap::from([(CURRENCIES.to_string(), compose)])),
+        ..MockHts::default()
+    };
+    let whole_system = || json!({ "include": [{ "system": ISO_4217 }] });
+
+    // No ISO 4217 at all, or only a `content: not-present` stub: a warning.
+    for content in [None, Some("not-present")] {
+        let (ts_url, requests) = start_mock(mock(content, whole_system())).await;
+        let (issues, outcome) = check(hfs(&ts_url, "remote", "open"), "USD").await;
+        assert_eq!(issues.len(), 1, "{content:?}: {outcome:#}");
+        assert_eq!(issues[0].0, "warning", "{content:?}: {outcome:#}");
+        assert!(issues[0].1.contains("totalNet"), "{}", issues[0].1);
+        assert!(
+            issues[0].2.contains("could not be performed") && issues[0].2.contains(ISO_4217),
+            "{}",
+            issues[0].2
+        );
+        // The question was the bare code with `inferSystem`.
+        let asked = requests.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|body| {
+                param(body, "code").is_some_and(|p| p["valueCode"] == "USD")
+                    && param(body, "inferSystem").is_some()
+            }),
+            "{asked:?}"
+        );
+    }
+
+    // ISO 4217 with content on the server: "not in the value set" stands.
+    let (ts_url, _) = start_mock(mock(Some("complete"), whole_system())).await;
+    let (issues, outcome) = check(hfs(&ts_url, "remote", "open"), "XXZ").await;
+    assert_eq!(issues.len(), 2, "{outcome:#}");
+    assert!(issues.iter().all(|i| i.0 == "error"), "{outcome:#}");
+    assert!(
+        issues[0].2.contains("System URI could not be determined")
+            && issues[1].2.contains("does not pass validation"),
+        "{outcome:#}"
+    );
+
+    // An enumerated list is a real answer whatever the server holds.
+    let (ts_url, _) = start_mock(mock(
+        None,
+        json!({ "include": [{ "system": ISO_4217, "concept": [{ "code": "EUR" }] }] }),
+    ))
+    .await;
+    let (issues, outcome) = check(hfs(&ts_url, "remote", "open"), "USD").await;
+    assert_eq!(issues.len(), 2, "{outcome:#}");
+    assert!(issues.iter().all(|i| i.0 == "error"), "{outcome:#}");
+}
+
 /// The mock HTS plus `POST /` (FHIR batch of `ValueSet/$validate-code`
 /// entries), recording each batch it receives.
 async fn start_batching_mock_hts(

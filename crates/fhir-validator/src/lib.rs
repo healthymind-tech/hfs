@@ -86,9 +86,9 @@ pub use editor::{
     remove_at, schema_at, set_value,
 };
 pub use effects::{
-    CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
-    EffectHandlers, MemberOfAnswers, SliceBinding, TerminologyError, TerminologyErrorKind,
-    TerminologyFailMode, TerminologyProvider, TxCheck, TxVerdict,
+    CodedValue, ConstraintEvaluator, ConstraintOutcome, ConstraintSession, Deferred,
+    DeferredConstraint, EffectHandlers, MemberOfAnswers, SliceBinding, TerminologyError,
+    TerminologyErrorKind, TerminologyFailMode, TerminologyProvider, TxCheck, TxVerdict,
 };
 pub use engine::{
     ErrorKind, Severity, SyncOutcome, UnknownExtensionPolicy, UnknownProfilePolicy,

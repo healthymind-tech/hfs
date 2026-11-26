@@ -139,6 +139,27 @@ impl InMemoryTopicRegistry {
         topics.get(tenant_id)?.get(canonical_url).cloned()
     }
 
+    /// Whether any of the tenant's topics triggers on this resource type and
+    /// interaction — [`Self::matching_topics`] without building the matches.
+    /// The write path asks this for every written resource, so a tenant
+    /// without topics (or without one for the type) costs one map lookup.
+    pub fn has_matching_topic(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        event_type: ResourceEventType,
+    ) -> bool {
+        let topics = self.topics.read().unwrap();
+        topics.get(tenant_id).is_some_and(|catalog| {
+            catalog.values().any(|topic| {
+                topic.resource_triggers.iter().any(|trigger| {
+                    trigger.resource_type == resource_type
+                        && trigger.interactions.contains(&event_type)
+                })
+            })
+        })
+    }
+
     /// Evaluates which topics match a resource event.
     ///
     /// Checks the supplied tenant's topic triggers against the event's resource
