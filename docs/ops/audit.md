@@ -182,8 +182,10 @@ What the API serves from the tables (`crates/rest/src/handlers/audit_events.rs`)
   audit trail by default) or `$reindex`. To export the trail, page through
   `GET /AuditEvent?date=…` or read the retention archives. The console's
   per-type totals (`/console/metrics/resource-counts?types=AuditEvent`)
-  include the tables' events; the dashboard's "stored resources" figure
-  counts clinical resources and no longer grows with every read.
+  include the tables' events; the endpoint home's AuditEvent bar shows the
+  trail's real size. Known gap: the resource browser's type rail still shows
+  the dashboard counters' AuditEvent figure, which counts only the legacy
+  `AuditEvent` resources.
 - Tenant and endpoint isolation are unchanged: every query carries the
   request's tenant, which is the leading column of every index.
 - A token with a `patient/` scope sees the launch patient's events only.
@@ -399,12 +401,12 @@ HFS_AUDIT_BATCH_SIZE=256
 ```
 
 - Mount the archive and fallback paths on a persistent, backed-up volume.
-- Size: see the measured figures in `hfs-eval/eval/bench/` (2026-11): about
-  1.5 KB per event in the audit tables including the lookup rows and indexes,
-  against roughly 17 KB when an event was a FHIR resource (history, ~17
-  search-index rows, full text). 100 000 interactions/day ≈ 0.15 GB/day,
-  ~55 GB/year before retention. Watch `audit_event*` with
-  `pg_total_relation_size`.
+- Size (measured 2026-11, Synthea load of 527k resources): the audit tables
+  take about 3.7 KB per event including the lookup rows and every index
+  (1.98 GB for 527k events), against roughly 17 KB when an event was a FHIR
+  resource with history, ~17 search-index rows and full text. 100 000
+  interactions/day ≈ 0.37 GB/day, ~135 GB/year before retention. Watch
+  `audit_event*` with `pg_total_relation_size`.
 - Autovacuum is enough: the tables are insert-only, and retention drops
   partitions instead of deleting rows.
 - Give auditors a role/scope with `AuditEvent` read; nobody needs write.
