@@ -14075,7 +14075,6 @@ mod postgres_integration {
     /// seek when PostgreSQL plans the complete count query with or without bind
     /// values available.
     #[tokio::test]
-    #[ignore = "the search_index-only count it inspects is disabled (COUNT_FROM_INDEX_ALONE, orphan rows #2074)"]
     async fn postgres_reference_bare_id_count_plan_uses_target_index_for_custom_and_generic_plans()
     {
         use helios_persistence::core::SearchProvider;
@@ -14103,7 +14102,10 @@ mod postgres_integration {
             }
         }
 
-        let backend = create_backend_with_max_connections(1).await;
+        // Two connections: schema initialization (which reads the index
+        // layout the index-only count requires) needs a second one.
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
         let tenant = create_tenant("bare-reference-count-plan");
         let tenant_id = tenant.tenant_id().as_str();
         let target_id = "rare-plan-target";
@@ -14139,24 +14141,37 @@ mod postgres_integration {
             .unwrap();
         drop(client);
 
+        // The index-only count needs the type verified free of orphan rows.
+        assert_eq!(
+            backend
+                .verify_search_index_liveness(tenant_id, "Observation")
+                .await
+                .unwrap(),
+            0
+        );
+
         let mut query = observation_reference_query("subject", &[target_id]);
         query.total = Some(TotalMode::Accurate);
         let result = backend.search(&tenant, &query).await.unwrap();
         assert_eq!(result.total, Some(1));
 
-        // The pool has one connection, so this is the same PostgreSQL session
-        // on which search_count cached its actual statement.
-        let client = backend.get_client().await.unwrap();
-        let prepared_counts = client
-            .query(
-                "SELECT name, statement FROM pg_prepared_statements \
+        // Hold both pooled sessions and keep the one on which search_count
+        // cached its actual statement.
+        const PREPARED_COUNTS: &str = "SELECT name, statement FROM pg_prepared_statements \
                  WHERE statement LIKE 'SELECT COUNT(*) FROM (SELECT DISTINCT resource_id FROM search_index%' \
                    AND statement LIKE '%split_part(value_reference%' \
-                 ORDER BY name",
-                &[],
-            )
-            .await
-            .unwrap();
+                 ORDER BY name";
+        let first = backend.get_client().await.unwrap();
+        let second = backend.get_client().await.unwrap();
+        let on_first = first.query(PREPARED_COUNTS, &[]).await.unwrap();
+        let (client, prepared_counts) = if on_first.is_empty() {
+            let on_second = second.query(PREPARED_COUNTS, &[]).await.unwrap();
+            drop(first);
+            (second, on_second)
+        } else {
+            drop(second);
+            (first, on_first)
+        };
         assert_eq!(
             prepared_counts.len(),
             1,

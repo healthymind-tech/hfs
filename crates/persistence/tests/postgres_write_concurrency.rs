@@ -16,8 +16,9 @@ use std::sync::Arc;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
 use helios_persistence::core::{
-    BundleEntry, BundleMethod, BundleProvider, ResourceStorage, Transaction, TransactionOptions,
-    TransactionProvider,
+    BundleEntry, BundleMethod, BundleProvider, ConditionalCreateResult, ConditionalStorage,
+    ConditionalUpdateResult, EntityTagPrecondition, ResourceStorage, Transaction,
+    TransactionOptions, TransactionProvider,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::{Value, json};
@@ -526,4 +527,379 @@ async fn exclusive_gate_waits_are_not_cut_off_by_statement_timeout() {
         backend.count(&tenant, Some("Patient")).await.unwrap(),
         8 * 800
     );
+}
+
+/// The `resource_history` versions of one Patient, in order.
+async fn history_versions(
+    backend: &PostgresBackend,
+    tenant: &TenantContext,
+    id: &str,
+) -> Vec<String> {
+    backend
+        .get_client()
+        .await
+        .unwrap()
+        .query(
+            "SELECT version_id FROM resource_history
+             WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2
+             ORDER BY version_id::int",
+            &[&tenant.tenant_id().as_str(), &id],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+fn patient(id: &str, family: &str) -> Value {
+    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]})
+}
+
+fn identified_patient(value: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "urn:hm:mrn", "value": value}],
+        "name": [{"family": "Cond"}]
+    })
+}
+
+/// More PUTs in flight than the pool has connections: each one needs exactly
+/// one connection, so they queue for the pool and all succeed. A PUT used to
+/// hold a session-lock connection while it waited for a second one to write
+/// with; at pool size they starved each other until the pool's wait timeout
+/// (10 s) and failed 503.
+#[tokio::test]
+async fn puts_beyond_the_pool_size_need_one_connection_each() {
+    let backend = Arc::new(backend(3).await);
+    let tenant = tenant("putpool");
+    let started = std::time::Instant::now();
+    for round in 0..2 {
+        let mut tasks = Vec::new();
+        for n in 0..36 {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            tasks.push(tokio::spawn(async move {
+                let id = format!("p{n}");
+                backend
+                    .create_or_update(
+                        &tenant,
+                        "Patient",
+                        &id,
+                        patient(&id, &format!("r{round}")),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .map(|(stored, created)| (stored.version_id().to_string(), created))
+                    .map_err(|e| e.to_string())
+            }));
+        }
+        for task in tasks {
+            let (version, created) = task.await.unwrap().expect("every PUT succeeds");
+            assert_eq!(version, (round + 1).to_string());
+            assert_eq!(created, round == 0);
+        }
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "PUTs must not wait out the pool timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(history_versions(&backend, &tenant, "p7").await, ["1", "2"]);
+}
+
+/// Thirty PUTs of one id from three instances with small pools: every one
+/// succeeds, each is its own version, history is gapless, and the search
+/// index holds the rows of the last version only.
+#[tokio::test]
+async fn put_storm_on_one_id_keeps_every_version_with_small_pools() {
+    let instances = [
+        Arc::new(backend(2).await),
+        Arc::new(backend(2).await),
+        Arc::new(backend(2).await),
+    ];
+    let tenant = tenant("putstorm");
+    let mut tasks = Vec::new();
+    for n in 0..30 {
+        let backend = instances[n % 3].clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            backend
+                .create_or_update(
+                    &tenant,
+                    "Patient",
+                    "storm",
+                    patient("storm", &format!("f{n}")),
+                    FhirVersion::default(),
+                )
+                .await
+                .map(|(stored, created)| (stored.version_id().to_string(), created))
+                .map_err(|e| e.to_string())
+        }));
+    }
+    let mut versions = Vec::new();
+    let mut creates = 0;
+    for task in tasks {
+        let (version, created) = task.await.unwrap().expect("every PUT succeeds");
+        versions.push(version.parse::<u32>().unwrap());
+        creates += usize::from(created);
+    }
+    versions.sort_unstable();
+    assert_eq!(versions, (1..=30).collect::<Vec<_>>());
+    assert_eq!(creates, 1, "exactly one PUT created the resource");
+    let expected: Vec<String> = (1..=30).map(|v| v.to_string()).collect();
+    assert_eq!(
+        history_versions(&instances[0], &tenant, "storm").await,
+        expected
+    );
+    let current = instances[0]
+        .read(&tenant, "Patient", "storm")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id(), "30");
+    assert_eq!(
+        index_rows(&instances[0], &tenant, "storm", "family").await,
+        1,
+        "only the current version is indexed"
+    );
+}
+
+/// PUTs racing onto a deleted id: one restores it, the others update it, and
+/// the version chain continues past the deletion without a gap.
+#[tokio::test]
+async fn puts_racing_onto_a_deleted_id_restore_it_once() {
+    let backend = Arc::new(backend(3).await);
+    let tenant = tenant("putgone");
+    create_patient(&backend, &tenant, "gone").await;
+    backend.delete(&tenant, "Patient", "gone").await.unwrap();
+    assert_eq!(index_rows(&backend, &tenant, "gone", "family").await, 0);
+
+    let mut tasks = Vec::new();
+    for n in 0..10 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            backend
+                .create_or_update(
+                    &tenant,
+                    "Patient",
+                    "gone",
+                    patient("gone", &format!("back{n}")),
+                    FhirVersion::default(),
+                )
+                .await
+                .map(|(stored, created)| (stored.version_id().to_string(), created))
+                .map_err(|e| e.to_string())
+        }));
+    }
+    let mut restored = 0;
+    for task in tasks {
+        let (_, created) = task.await.unwrap().expect("every PUT succeeds");
+        restored += usize::from(created);
+    }
+    assert_eq!(restored, 1, "exactly one PUT restored the tombstone");
+    // v1 create, v2 delete, v3..v12 the ten PUTs.
+    let expected: Vec<String> = (1..=12).map(|v| v.to_string()).collect();
+    assert_eq!(history_versions(&backend, &tenant, "gone").await, expected);
+    assert_eq!(index_rows(&backend, &tenant, "gone", "family").await, 1);
+}
+
+/// Conditional creates beyond the pool size: distinct criteria all create
+/// (one connection each), and the same criteria from three instances create
+/// exactly once.
+#[tokio::test]
+async fn conditional_creates_use_one_connection_and_create_once() {
+    let instances = [
+        Arc::new(backend(2).await),
+        Arc::new(backend(2).await),
+        Arc::new(backend(2).await),
+    ];
+    let tenant = tenant("condpool");
+    let started = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for n in 0..24 {
+        let backend = instances[n % 3].clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            let value = format!("distinct-{n}");
+            backend
+                .conditional_create(
+                    &tenant,
+                    "Patient",
+                    identified_patient(&value),
+                    &format!("identifier=urn:hm:mrn|{value}"),
+                    FhirVersion::default(),
+                )
+                .await
+                .map(|result| matches!(result, ConditionalCreateResult::Created(_)))
+                .map_err(|e| e.to_string())
+        }));
+    }
+    for task in tasks {
+        assert!(task.await.unwrap().expect("conditional create succeeds"));
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "conditional creates must not wait out the pool timeout: {:?}",
+        started.elapsed()
+    );
+
+    let mut tasks = Vec::new();
+    for n in 0..18 {
+        let backend = instances[n % 3].clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            backend
+                .conditional_create(
+                    &tenant,
+                    "Patient",
+                    identified_patient("same"),
+                    "identifier=urn:hm:mrn|same",
+                    FhirVersion::default(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }));
+    }
+    let (mut created, mut exists) = (0, 0);
+    for task in tasks {
+        match task.await.unwrap().expect("conditional create succeeds") {
+            ConditionalCreateResult::Created(_) => created += 1,
+            ConditionalCreateResult::Exists(_) => exists += 1,
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert_eq!((created, exists), (1, 17));
+    let stored: i64 = instances[0]
+        .get_client()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'Patient'",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, 25);
+}
+
+/// Conditional upserts on one criteria from three instances: one creates,
+/// the rest update what it created, and nothing is duplicated.
+#[tokio::test]
+async fn conditional_upserts_on_one_criteria_create_once_then_update() {
+    let instances = [
+        Arc::new(backend(2).await),
+        Arc::new(backend(2).await),
+        Arc::new(backend(2).await),
+    ];
+    let tenant = tenant("condupsert");
+    let mut tasks = Vec::new();
+    for n in 0..12 {
+        let backend = instances[n % 3].clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            backend
+                .conditional_update(
+                    &tenant,
+                    "Patient",
+                    identified_patient("upsert"),
+                    "identifier=urn:hm:mrn|upsert",
+                    true,
+                    FhirVersion::default(),
+                    &EntityTagPrecondition::default(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }));
+    }
+    let (mut created, mut updated) = (0, 0);
+    let mut versions = Vec::new();
+    for task in tasks {
+        match task.await.unwrap().expect("conditional upsert succeeds") {
+            ConditionalUpdateResult::Created(stored) => {
+                created += 1;
+                versions.push(stored.version_id().parse::<u32>().unwrap());
+            }
+            ConditionalUpdateResult::Updated(stored) => {
+                updated += 1;
+                versions.push(stored.version_id().parse::<u32>().unwrap());
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert_eq!((created, updated), (1, 11));
+    versions.sort_unstable();
+    assert_eq!(versions, (1..=12).collect::<Vec<_>>());
+    let stored: i64 = instances[0]
+        .get_client()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'Patient'",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, 1);
+}
+
+/// A resource whose text is far over the size that can be indexed without a
+/// savepoint still stores, and a small one written on the same connection
+/// afterwards is indexed for full text (the unguarded statement left no
+/// aborted transaction behind).
+#[tokio::test]
+async fn single_writes_index_full_text_with_and_without_the_savepoint() {
+    let backend = backend(2).await;
+    let tenant = tenant("ftsguard");
+    let huge: String = (0..400_000)
+        .map(|n| format!("w{n} "))
+        .collect::<Vec<_>>()
+        .concat();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "huge", "name": [{"family": "Big", "text": huge}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("an oversized resource is stored");
+    create_patient(&backend, &tenant, "small").await;
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "small",
+            patient("small", "Renamed"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("update");
+    let client = backend.get_client().await.unwrap();
+    let fts: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM resource_fts
+             WHERE tenant_id = $1 AND resource_type = 'Patient'
+               AND content_tsvector @@ plainto_tsquery('english', 'Renamed')",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        fts, 1,
+        "the updated small resource is in the full-text index"
+    );
+    let rows: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM resource_fts WHERE tenant_id = $1 AND resource_type = 'Patient'",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 2);
 }

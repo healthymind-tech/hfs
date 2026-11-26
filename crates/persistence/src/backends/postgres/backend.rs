@@ -160,6 +160,9 @@ pub struct PostgresBackend {
     /// `pg_stats.null_frac` of the range-typed `search_index` value columns,
     /// with the time it was read; see `search_impl::range_estimate_correction`.
     pub(super) value_null_fractions: ValueNullFractions,
+    /// Which `(tenant, resource type)` pairs are verified to have no orphan
+    /// `search_index` rows; see `index_liveness.rs`. Shared by clones.
+    pub(super) index_liveness: Arc<super::index_liveness::IndexLiveness>,
     /// Bulk index rebuild window state (`begin/end_bulk_index_rebuild`),
     /// shared by clones; see `bulk_index_rebuild.rs`.
     pub(super) bulk_index_rebuild: super::bulk_index_rebuild::BulkIndexRebuild,
@@ -867,6 +870,7 @@ impl PostgresBackend {
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
             subscription_fanout: std::sync::OnceLock::new(),
             value_null_fractions: Arc::new(RwLock::new(None)),
+            index_liveness: Default::default(),
             bulk_index_rebuild: Default::default(),
             #[cfg(test)]
             reindex_test_hook: None,
