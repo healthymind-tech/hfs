@@ -2343,6 +2343,9 @@ impl ResourceStorage for PostgresBackend {
             "hfs_packages",
             "resource_change_feed",
             "search_parameter_epochs",
+            // hm-0040: a "verified" marker must not outlive the data it was
+            // verified against (a re-created tenant of the same id).
+            "hfs_search_index_liveness",
         ] {
             let exists: bool = tx
                 .query_one(
@@ -2364,6 +2367,7 @@ impl ResourceStorage for PostgresBackend {
         tx.commit().await.or_query_error("purge commit")?;
         client.mark_settled();
         drop(client);
+        self.forget_search_index_liveness(id);
         if let Err(error) = self.reload_stored_cache().await {
             tracing::warn!("SearchParameter cache reload after tenant purge failed: {error}");
         }

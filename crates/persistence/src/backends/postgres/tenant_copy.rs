@@ -191,6 +191,26 @@ impl PostgresBackend {
             report.rows.insert(table.to_string(), n);
         }
 
+        // hm-0040: the copied index rows have not been checked against the
+        // target's resources, so the target's "verified" markers go; its
+        // counts use the resources join until the next verification.
+        let markers: bool = tx
+            .query_one(
+                "SELECT to_regclass(format('%I.%I', current_schema(), 'hfs_search_index_liveness')) IS NOT NULL",
+                &[],
+            )
+            .await
+            .map_err(|e| err(format!("tenant copy: {e}")))?
+            .get(0);
+        if markers {
+            tx.execute(
+                "DELETE FROM hfs_search_index_liveness WHERE tenant_id = $1",
+                &[&target],
+            )
+            .await
+            .map_err(|e| err(format!("tenant copy: liveness markers: {e}")))?;
+        }
+
         // The tenant registry row (display name carried over when present).
         let registered = tx
             .query_one(
@@ -213,6 +233,7 @@ impl PostgresBackend {
             .await
             .map_err(|e| err(format!("tenant copy: commit: {e}")))?;
         drop(client);
+        self.forget_search_index_liveness(target);
         if let Err(e) = self.reload_stored_cache().await {
             tracing::warn!("SearchParameter cache reload after tenant copy failed: {e}");
         }
