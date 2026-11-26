@@ -18,6 +18,7 @@ use crate::error::RestError;
 use crate::responses::operation_outcome::{
     Issue, IssueSeverity, IssueType, OperationOutcomeBuilder,
 };
+use crate::validation_log::{IssueBatch, IssueSource, ValidationLog};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use helios_fhir::FhirVersion;
@@ -187,6 +188,25 @@ pub struct ValidationService {
     /// Severity of an unresolvable HL7-namespace uri
     /// (`HFS_VALIDATION_HL7_URLS`); `None` = off.
     hl7_urls: Option<Severity>,
+    /// Rate-limited log of the issues a write is not rejected for
+    /// (`HFS_VALIDATION_LOG_*`, see [`crate::validation_log`]).
+    issue_log: ValidationLog,
+}
+
+/// One client-supplied resource body waiting for
+/// [`ValidationService::prepare_writes`].
+pub struct PendingWrite<'a> {
+    /// The resource type the request addresses.
+    pub resource_type: String,
+    /// The body; cleaned in place.
+    pub resource: &'a mut Value,
+}
+
+/// What a pool thread hands back for one chunk of a Bundle.
+struct ValidatedChunk {
+    /// `(resource type, resource, outcome)` per item, in order.
+    items: Vec<(String, Value, Result<(), RestError>)>,
+    log: IssueBatch,
 }
 
 /// What the request's endpoint changes about validation (FHIR server
@@ -288,6 +308,7 @@ impl Default for ValidationService {
             endpoint_terminology: DashMap::new(),
             signatures: Some(helios_fhir_validator::SignatureOptions::default()),
             hl7_urls: Some(Severity::Error),
+            issue_log: ValidationLog::default(),
         }
     }
 }
@@ -398,6 +419,7 @@ impl ValidationService {
                 "warning" => Some(Severity::Warning),
                 _ => Some(Severity::Error),
             },
+            issue_log: ValidationLog::default(),
         }
     }
 
@@ -433,6 +455,21 @@ impl ValidationService {
     /// The configured write-path mode.
     pub fn mode(&self) -> ValidationMode {
         self.mode
+    }
+
+    /// Replace the limits of the validation issue log (the default is
+    /// `HFS_VALIDATION_LOG_*`).
+    pub fn with_issue_log_limits(
+        mut self,
+        limits: crate::validation_log::ValidationLogLimits,
+    ) -> Self {
+        self.issue_log = ValidationLog::new(limits);
+        self
+    }
+
+    /// The rate-limited log of write-path validation issues.
+    pub fn issue_log(&self) -> &ValidationLog {
+        &self.issue_log
     }
 
     /// The write-path mode of the request running on this task: its
@@ -693,10 +730,242 @@ impl ValidationService {
         resource_type: &str,
         resource: &mut Value,
     ) -> Result<(), RestError> {
+        let mut log = IssueBatch::default();
+        let result = self
+            .prepare_write_collect(tenant, version, resource_type, resource, &mut log)
+            .await;
+        self.issue_log.record(log);
+        result
+    }
+
+    /// [`Self::prepare_write`] for the request handlers: the same checks with
+    /// the same outcome, run on the validation thread pool
+    /// ([`crate::validation_pool`]) instead of the request's async task.
+    pub async fn prepare_write_offloaded(
+        self: &Arc<Self>,
+        tenant: &str,
+        version: FhirVersion,
+        resource_type: &str,
+        resource: &mut Value,
+    ) -> Result<(), RestError> {
+        self.prepare_writes(
+            tenant,
+            version,
+            vec![PendingWrite {
+                resource_type: resource_type.to_string(),
+                resource,
+            }],
+        )
+        .await
+    }
+
+    /// [`Self::prepare_write`] for every write entry of one Bundle, in entry
+    /// order, on the validation thread pool.
+    ///
+    /// What the caller sees is what validating the entries one after the
+    /// other gave: every resource is cleaned as [`Self::prepare_write`]
+    /// cleans it, and the error is the one of the **first** entry that fails
+    /// (entries behind a failed one may not be validated at all, as before).
+    /// What changes is where and when the work happens: the entries are cut
+    /// into chunks ([`crate::validation_pool::chunk_size`]), the chunks are
+    /// validated in parallel on pool threads, and the issues to log are
+    /// recorded once for the whole Bundle, so entries that repeat an issue
+    /// share one line.
+    ///
+    /// Under `off` nothing leaves the calling task. Under `log` the cleanup
+    /// runs here, in entry order, before any validation starts; under
+    /// `enforce` each resource is validated as sent and cleaned when it
+    /// passed, as in [`Self::prepare_write`].
+    pub async fn prepare_writes(
+        self: &Arc<Self>,
+        tenant: &str,
+        version: FhirVersion,
+        mut writes: Vec<PendingWrite<'_>>,
+    ) -> Result<(), RestError> {
+        let mode = self.effective_mode();
+        if mode != ValidationMode::Enforce {
+            for write in &mut writes {
+                drop_empty_elements(write.resource);
+            }
+        }
+        if mode == ValidationMode::Off || writes.is_empty() {
+            return Ok(());
+        }
+        let cleaned = mode != ValidationMode::Enforce;
+        if !crate::validation_pool::enabled() {
+            // The pool is off: on this task, one after the other.
+            let mut log = IssueBatch::default();
+            let mut result = Ok(());
+            for write in &mut writes {
+                result = self
+                    .validate_pending(
+                        tenant,
+                        version,
+                        &write.resource_type,
+                        write.resource,
+                        cleaned,
+                        &mut log,
+                    )
+                    .await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            self.issue_log.record(log);
+            return result;
+        }
+
+        // The pool threads own what they validate: the resources move out of
+        // the caller's slots and back in when their chunk is done.
+        let endpoint = crate::endpoint::current();
+        let first_failed = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let chunk_size = crate::validation_pool::chunk_size(writes.len());
+        let mut jobs = Vec::with_capacity(writes.len().div_ceil(chunk_size));
+        for (chunk_index, chunk) in writes.chunks_mut(chunk_size).enumerate() {
+            let items: Vec<(usize, String, Value)> = chunk
+                .iter_mut()
+                .enumerate()
+                .map(|(offset, write)| {
+                    (
+                        chunk_index * chunk_size + offset,
+                        std::mem::take(&mut write.resource_type),
+                        std::mem::take(write.resource),
+                    )
+                })
+                .collect();
+            let service = Arc::clone(self);
+            let tenant = tenant.to_string();
+            let first_failed = Arc::clone(&first_failed);
+            let work = async move {
+                service
+                    .validate_chunk(&tenant, version, items, cleaned, &first_failed)
+                    .await
+            };
+            // The request's endpoint is a task-local; the job is not on the
+            // request's task.
+            let endpoint = endpoint.clone();
+            jobs.push(crate::validation_pool::run(async move {
+                match endpoint {
+                    Some(endpoint) => crate::endpoint::scope(endpoint, work).await,
+                    None => work.await,
+                }
+            }));
+        }
+        let outcomes = futures::future::join_all(jobs).await;
+
+        let mut log = IssueBatch::default();
+        let mut result = Ok(());
+        let mut lost = false;
+        let mut slots = writes.iter_mut();
+        for outcome in outcomes {
+            let Some(chunk) = outcome else {
+                // The job panicked (logged by the pool); its resources are
+                // gone with it.
+                lost = true;
+                continue;
+            };
+            log.merge(chunk.log);
+            for (resource_type, resource, checked) in chunk.items {
+                if let Some(slot) = slots.next() {
+                    slot.resource_type = resource_type;
+                    *slot.resource = resource;
+                }
+                if result.is_ok() {
+                    result = checked;
+                }
+            }
+        }
+        self.issue_log.record(log);
+        if lost && result.is_ok() {
+            return Err(RestError::InternalError {
+                message: "write-path validation failed unexpectedly".to_string(),
+            });
+        }
+        result
+    }
+
+    /// One chunk of [`Self::prepare_writes`], on a pool thread: its items in
+    /// order, skipping those behind the first failure of the Bundle.
+    async fn validate_chunk(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        items: Vec<(usize, String, Value)>,
+        cleaned: bool,
+        first_failed: &std::sync::atomic::AtomicUsize,
+    ) -> ValidatedChunk {
+        use std::sync::atomic::Ordering;
+        let mut log = IssueBatch::default();
+        let mut done = Vec::with_capacity(items.len());
+        for (position, resource_type, mut resource) in items {
+            let checked = if position > first_failed.load(Ordering::Acquire) {
+                // An earlier entry already rejected the Bundle.
+                Ok(())
+            } else {
+                let checked = self
+                    .validate_pending(
+                        tenant,
+                        version,
+                        &resource_type,
+                        &mut resource,
+                        cleaned,
+                        &mut log,
+                    )
+                    .await;
+                if checked.is_err() {
+                    first_failed.fetch_min(position, Ordering::AcqRel);
+                }
+                checked
+            };
+            done.push((resource_type, resource, checked));
+        }
+        ValidatedChunk { items: done, log }
+    }
+
+    /// One resource of [`Self::prepare_writes`]: [`Self::prepare_write`]'s
+    /// steps, minus the cleanup when the caller already did it.
+    async fn validate_pending(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        resource_type: &str,
+        resource: &mut Value,
+        cleaned: bool,
+        log: &mut IssueBatch,
+    ) -> Result<(), RestError> {
+        if !cleaned {
+            return self
+                .prepare_write_collect(tenant, version, resource_type, resource, log)
+                .await;
+        }
+        let started = std::time::Instant::now();
+        let result = self
+            .check_write_collect(tenant, version, resource_type, resource, log)
+            .await;
+        debug!(
+            target: "helios_fhir_validator::timing",
+            resource_type = %resource_type,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "write-path validation (prepare_write)"
+        );
+        result
+    }
+
+    /// [`Self::prepare_write`], with the issues to log added to `log`
+    /// instead of written: the caller records them once for its request, so
+    /// the entries of one Bundle share their lines.
+    async fn prepare_write_collect(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        resource_type: &str,
+        resource: &mut Value,
+        log: &mut IssueBatch,
+    ) -> Result<(), RestError> {
         let started = std::time::Instant::now();
         let result = if self.effective_mode() == ValidationMode::Enforce {
             let checked = self
-                .check_write(tenant, version, resource_type, resource)
+                .check_write_collect(tenant, version, resource_type, resource, log)
                 .await;
             if checked.is_ok() {
                 drop_empty_elements(resource);
@@ -704,7 +973,7 @@ impl ValidationService {
             checked
         } else {
             drop_empty_elements(resource);
-            self.check_write(tenant, version, resource_type, resource)
+            self.check_write_collect(tenant, version, resource_type, resource, log)
                 .await
         };
         debug!(
@@ -723,12 +992,34 @@ impl ValidationService {
     /// A client-supplied body goes through [`Self::prepare_write`] instead;
     /// this is called directly only for content the server already cleaned,
     /// such as a PATCH result.
+    ///
+    /// Issues that do not reject the write (`log` mode; the warnings of an
+    /// `enforce` write that passes) are logged through the rate limiter of
+    /// [`crate::validation_log`] and counted in
+    /// `hfs_validation_log_issues_total`.
     pub async fn check_write(
         &self,
         tenant: &str,
         version: FhirVersion,
         resource_type: &str,
         resource: &Value,
+    ) -> Result<(), RestError> {
+        let mut log = IssueBatch::default();
+        let result = self
+            .check_write_collect(tenant, version, resource_type, resource, &mut log)
+            .await;
+        self.issue_log.record(log);
+        result
+    }
+
+    /// [`Self::check_write`], with the issues to log added to `log`.
+    async fn check_write_collect(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        resource_type: &str,
+        resource: &Value,
+        log: &mut IssueBatch,
     ) -> Result<(), RestError> {
         // FHIR server manager: the endpoint's mode and required profiles.
         let endpoint = self.endpoint_override(version);
@@ -754,25 +1045,7 @@ impl ValidationService {
         match mode {
             ValidationMode::Off => Ok(()),
             ValidationMode::Log => {
-                for issue in issues
-                    .iter()
-                    .filter(|i| i.severity != Severity::Information)
-                {
-                    let severity = if issue.severity == Severity::Error {
-                        "error"
-                    } else {
-                        "warning"
-                    };
-                    warn!(
-                        tenant = %tenant,
-                        resource_type = %resource_type,
-                        path = %issue.path,
-                        kind = ?issue.kind,
-                        severity = severity,
-                        "validation (log mode): {}",
-                        issue.message
-                    );
-                }
+                log.add_issues(IssueSource::LogMode, tenant, resource_type, &issues);
                 Ok(())
             }
             ValidationMode::Enforce => {
@@ -788,18 +1061,7 @@ impl ValidationService {
                     })
                 } else {
                     // Warnings only: proceed, but leave a trace.
-                    for issue in issues
-                        .iter()
-                        .filter(|i| i.severity != Severity::Information)
-                    {
-                        warn!(
-                            tenant = %tenant,
-                            resource_type = %resource_type,
-                            path = %issue.path,
-                            "validation warning on write: {}",
-                            issue.message
-                        );
-                    }
+                    log.add_issues(IssueSource::EnforceWarning, tenant, resource_type, &issues);
                     Ok(())
                 }
             }
@@ -2115,6 +2377,9 @@ impl RemoteTerminologyProvider {
     /// or every code system of the coded value has no content on the server
     /// while the value set takes that system wholesale or by filter (an
     /// enumerated `include.concept` list is still a real membership answer).
+    /// A bare `code` names no system, so there the systems the value set
+    /// takes wholesale are the ones that count: one without content on the
+    /// server leaves membership open.
     async fn unverifiable_system(
         &self,
         value_set: &str,
@@ -2147,6 +2412,29 @@ impl RemoteTerminologyProvider {
         }
         let systems = Self::coded_systems(coded);
         if systems.is_empty() {
+            // A bare `code` (`Money.currency`, bound to `currencies`) names
+            // no system: the server infers it from the value set. When the
+            // value set takes a code system wholesale (or by filter) and the
+            // server has no content for it — ISO 4217 is in no FHIR package —
+            // the inference finds nothing and the answer is `false` for
+            // every code, `USD` included. That is "cannot check" too.
+            if !matches!(coded, CodedValue::Code(_)) {
+                return None;
+            }
+            let compose = self.value_set_compose(value_set).await?;
+            let includes = compose.get("include").and_then(Value::as_array)?;
+            for include in includes {
+                let Some(system) = include.get("system").and_then(Value::as_str) else {
+                    continue;
+                };
+                let enumerated = include
+                    .get("concept")
+                    .and_then(Value::as_array)
+                    .is_some_and(|c| !c.is_empty());
+                if !enumerated && self.system_has_no_content(system).await? {
+                    return Some(system.to_string());
+                }
+            }
             return None;
         }
         for system in &systems {

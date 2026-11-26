@@ -47,11 +47,15 @@ pub fn init(service_name: &str) {
 /// The exporter configuration [`init`] installs: the `service` label and the
 /// explicit histogram buckets. Split out so tests can build an identical,
 /// thread-local recorder without installing a global one.
-pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
-    let histograms: [(&str, &[f64]); 7] = [
+pub fn builder(service_name: &str) -> PrometheusBuilder {
+    let histograms: [(&str, &[f64]); 8] = [
         ("http_request_duration_seconds", LATENCY_BUCKETS),
         (
             crate::audit_metrics::BATCH_WRITE_DURATION,
+            crate::audit_metrics::BATCH_BUCKETS,
+        ),
+        (
+            crate::audit_metrics::QUEUE_BLOCKED,
             crate::audit_metrics::BATCH_BUCKETS,
         ),
         (

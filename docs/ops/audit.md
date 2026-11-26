@@ -113,11 +113,141 @@ Recording costs the request a queue push, not a database write.
   database at the next start and renamed `*.replayed-<timestamp>`.
 - Events are written in batches, one database transaction per batch
   (SQLite/PostgreSQL), by `HFS_AUDIT_WRITERS` concurrent writers.
-- Lost only on a hard kill (`SIGKILL`, OOM, power loss) while events are
-  queued: at most the queue's content.
+- Sizing: the queue drains at `HFS_AUDIT_WRITERS` × `HFS_AUDIT_BATCH_SIZE`
+  events per round of writes. When it cannot keep up, requests wait for room
+  (`audit_queue_full_waits_total`, `audit_queue_blocked_seconds`) — the audit
+  trail is never sampled. With `HFS_AUDIT_STORE=resource` (events stored as
+  FHIR resources, the pre-table layout) a batch transaction takes one
+  transaction-level advisory lock per event, so keep
+  `HFS_AUDIT_WRITERS × HFS_AUDIT_BATCH_SIZE` (default 8 × 256 = 2,048) well
+  below PostgreSQL's lock table, `max_locks_per_transaction × max_connections`
+  (64 × 100 = 6,400 with stock settings; set `max_locks_per_transaction=256`
+  or more on a server that also takes large transaction Bundles). The table
+  store takes no advisory locks.
+- Lost only on a hard kill (`SIGKILL`, OOM, power loss): at most the queue's
+  content (`HFS_AUDIT_QUEUE_CAPACITY`), the batches the writers hold
+  (`WRITERS × BATCH_SIZE`) and the events of the requests in flight (a
+  request's events are queued after its work is done — a 447-entry Bundle
+  being answered at that instant is stored but not yet audited). A batch is
+  one statement: after a kill an event is either stored completely, with its
+  lookup rows, or not at all, and a replay never duplicates one.
 
 Measured overhead: see `hfs-eval/eval/results-p3-audit/REPORT.md` (target
 < 10 % on p95 read and write latency).
+
+## The audit tables (`HFS_AUDIT_STORE=table`)
+
+On PostgreSQL the database backend stores events in two dedicated tables
+(fork migration `hm-0030-audit-event-table`) instead of the general FHIR
+resource tables:
+
+| Table | Content |
+|---|---|
+| `audit_event` | one row per event: tenant, `recorded`, id, `action`, `outcome`, `type` code, `subtype` codes and the complete `AuditEvent` JSON (`jsonb`), partitioned by month on `recorded` (`audit_event_pYYYY_MM`, plus `audit_event_default`) |
+| `audit_event_ref` | one narrow row per `entity.what` / `agent.who` reference or identifier of an event, for the `patient`, `entity` and `agent` searches; partitioned the same way |
+
+An event is **not** a row of `resources`: it has no history row, no
+`search_index` rows and no full-text row, and writing it takes neither the
+tenant gate nor an advisory lock. A writer stores a whole batch
+(`HFS_AUDIT_BATCH_SIZE`) with one statement and one commit. The event JSON is
+exactly what the previous layout stored — the same builder produces it, BALP
+profile claims included.
+
+What the API serves from the tables (`crates/rest/src/handlers/audit_events.rs`):
+
+- `GET /AuditEvent/{id}`, `GET /AuditEvent/{id}/_history/1` and `GET
+  /AuditEvent/{id}/_history` (an event has exactly one version;
+  `meta.versionId` is `1` and `meta.lastUpdated` is `recorded`).
+- `GET /AuditEvent?…`, `POST /AuditEvent/_search` and `GET
+  /Patient/{id}/AuditEvent` with these parameters only: `_id`,
+  `_lastUpdated`, `date` (all prefixes, repeatable), `patient`, `entity`,
+  `agent` (a reference `Type/id`, a bare id, or the identifier value of an
+  agent such as the token `sub`; the recording server's own agent entry,
+  equal to `source.observer`, is not indexed), `type`, `subtype`, `action`, `outcome`
+  (tokens, `:not` supported), plus `_count`, `_sort=date|-date|
+  _lastUpdated|-_lastUpdated` (default `-date`), `_total`, `_summary`
+  (including `count`), `_elements` and `next` links.
+- **Dropped** compared with events stored as resources: every other
+  `AuditEvent` search parameter (`address`, `agent-name`, `agent-role`,
+  `altid`, `entity-name`, `entity-role`, `entity-type`, `policy`, `site`,
+  `source`), `_content` / `_text` / `_filter`, `_tag` / `_profile` /
+  `_security`, chained and `_has` searches, `_include` / `_revinclude`, sorting
+  by anything but the event time, all modifiers other than `:not` on tokens,
+  and type-level history (`GET /AuditEvent/_history`). The CapabilityStatement
+  lists exactly the supported parameters. Such a parameter is ignored with a
+  warning entry in the Bundle, or refused with `400` under
+  `Prefer: handling=strict`. Events in the tables are also not reachable
+  through `_revinclude=AuditEvent:*` on another type, `$export`
+  (`_type=AuditEvent`), endpoint duplicate/sync (which never carried the
+  audit trail by default) or `$reindex`. To export the trail, page through
+  `GET /AuditEvent?date=…` or read the retention archives. The console's
+  per-type totals (`/console/metrics/resource-counts?types=AuditEvent`)
+  include the tables' events; the endpoint home's AuditEvent bar shows the
+  trail's real size. Known gap: the resource browser's type rail still shows
+  the dashboard counters' AuditEvent figure, which counts only the legacy
+  `AuditEvent` resources.
+- Tenant and endpoint isolation are unchanged: every query carries the
+  request's tenant, which is the leading column of every index.
+- A token with a `patient/` scope sees the launch patient's events only.
+
+**Immutability** is enforced twice: the REST layer refuses create, update,
+patch and delete of `AuditEvent` as before, and a row trigger on both tables
+refuses every `UPDATE` and every `DELETE` outside a maintenance transaction
+(retention, tenant purge) — a client with plain SQL access cannot rewrite the
+trail without first disabling the trigger, which requires table ownership.
+For defence in depth run HFS with a role that does not own the tables and
+grant it only `SELECT, INSERT, DELETE` on them.
+
+**Transition from events stored as resources.** `hm-0030` is additive: it
+creates the tables and touches nothing else, so the previous version keeps
+working against a migrated database. From the first start of this version
+new events go to the tables; the `AuditEvent` resources written earlier stay
+where they are and every read (`/AuditEvent`, the console's Audit trail and
+Activity pages, HTS's `/AuditEvent`) merges both sources in `recorded` order,
+including paging and counts. The merge costs one extra indexed search per
+request for as long as legacy events exist. To end the transition and reclaim
+the space, move the legacy events:
+
+```
+HFS_AUDIT_BACKFILL=true      # background job; safe to interrupt and repeat
+```
+
+The job copies the legacy events into the tables (1,000 per batch, creating
+the months' partitions) and erases them from `resources`,
+`resource_history`, `search_index` and `resource_fts`; when none is left it
+records `hm-0031-audit-backfill` in `hm_schema_migrations` (progress in
+`hm_audit_backfill_state`) and logs the `VACUUM (ANALYZE)` to run. It is never
+started automatically. Legacy events that are not moved still expire through
+the row-by-row retention job below.
+
+**Rollback.** Setting `HFS_AUDIT_STORE=resource` (or starting the previous
+version) writes events as resources again; nothing needs restoring because
+`hm-0030` is additive. Events already in the tables are then not visible
+through the API until `table` is restored (they stay in the database). After
+a backfill the previous version no longer sees the moved events either:
+restore the pre-backfill dump if you need to go back past that point.
+
+**Partitions.** The current month and the next two always exist: the
+migration creates them, and every instance re-checks at start and every five
+minutes (creation is serialized by an advisory lock, so any number of
+instances may run it). An event whose month has no partition — a clock far
+off, a replayed fallback file from long ago — is stored in the default
+partition and moved when its partition is created. Nothing is lost if
+maintenance does not run.
+
+**`$everything` and compartment searches.** `AuditEvent` is a member of the
+R4 Patient compartment, but the record of who looked at a chart is not part
+of the chart. `GET /Patient/{id}/$everything` and `GET /Patient/{id}/*` leave
+`AuditEvent` out unless the request names it (`_type=AuditEvent`, or the
+explicit `GET /Patient/{id}/AuditEvent`); `HFS_COMPARTMENT_INCLUDE_AUDIT_EVENTS=true`
+restores the previous behaviour. (With the table store
+`$everything?_type=AuditEvent` returns legacy events only; use
+`/AuditEvent?patient=` or `/Patient/{id}/AuditEvent`.)
+
+SQLite, MongoDB and S3 keep storing events as resources whatever
+`HFS_AUDIT_STORE` says. `HFS_AUDIT_DATABASE_URL` pointing at a PostgreSQL
+database uses the tables there, and — new — those events are then served by
+the API as well.
 
 ## Retention
 
@@ -128,18 +258,22 @@ HFS_AUDIT_RETENTION_INTERVAL_HOURS=24      # default
 HFS_AUDIT_RETENTION_BATCH=1000             # default rows per transaction
 ```
 
-A background job (first run one minute after start, then every interval)
-deletes `AuditEvent`s whose stored version is older than the retention period,
-in every tenant, oldest first, `BATCH` at a time (each batch its own
-transaction: current row, history, search index and full-text rows). Age is
-the server's write time (`meta.lastUpdated`), which for server-generated
-events equals `recorded`.
+With the audit tables, retention works on whole months: a partition whose
+month lies entirely before `now − RETENTION_DAYS` is archived (when an archive
+directory is set) and then **dropped** — no row-by-row delete, no vacuum
+debt. An event is therefore kept for at least the retention period and for at
+most one month longer. Only one instance runs retention at a time (an
+advisory lock), so a cluster writes one archive, not one per instance. Events
+of the default partition and the legacy `AuditEvent` resources are purged row
+by row, `BATCH` at a time, by age (`recorded` / `meta.lastUpdated`), oldest
+first, in every tenant.
 
 With an archive directory each run writes one gzip NDJSON file
 `auditevent-<UTC timestamp>.ndjson.gz`, one line per event:
 `{"tenant": ..., "lastUpdated": ..., "resource": {AuditEvent}}`. A batch is
-flushed and `fsync`ed to the archive **before** it is deleted; if the archive
-cannot be written the run stops and deletes nothing more. To keep archives in
+flushed and `fsync`ed to the archive **before** it is deleted (a partition is
+dropped only after every one of its events is in the archive); if the archive
+cannot be written the run stops and removes nothing more. To keep archives in
 object storage, point the directory at a mounted bucket or sync it (e.g.
 `aws s3 sync --storage-class GLACIER`, `rclone`) from a cron job.
 
@@ -209,6 +343,7 @@ Both servers export the audit write path on `/metrics` (Prometheus, labelled
 | `audit_events_written_total` | counter | events handed to the store — `rate(...[5m])` is events/s |
 | `audit_queue_depth` | gauge | accepted but not yet written (queued + in flight) |
 | `audit_queue_full_waits_total` | counter | requests that waited for room (backpressure) |
+| `audit_queue_blocked_seconds` | histogram | how long a request waited for room in the full queue; `rate(audit_queue_blocked_seconds_sum[5m])` is request-seconds lost to audit backpressure per second |
 | `audit_batch_write_duration_seconds` | histogram | wall time of one batch write |
 | `audit_events_spilled_total{reason}` | counter | written to the fallback file instead (`shutdown`, `write_failure`) |
 | `audit_events_replayed_total` | counter | fallback events stored at start-up |
@@ -219,7 +354,10 @@ Both servers export the audit write path on `/metrics` (Prometheus, labelled
 Suggested alerts: `audit_events_dropped_total` increases (any loss);
 `audit_events_spilled_total{reason="write_failure"}` increases (the database
 refuses audit writes); `audit_queue_depth > 5000` for 5 minutes (the writer
-does not keep up); `histogram_quantile(0.95, rate(audit_batch_write_duration_seconds_bucket[5m])) > 1`.
+does not keep up); `rate(audit_queue_full_waits_total[5m]) > 0` for 5 minutes
+(requests are being slowed down by the audit writers: raise
+`HFS_AUDIT_WRITERS` / `HFS_AUDIT_BATCH_SIZE` or look at the database);
+`histogram_quantile(0.95, rate(audit_batch_write_duration_seconds_bucket[5m])) > 1`.
 
 ## Configuration reference
 
@@ -228,13 +366,16 @@ does not keep up); `histogram_quantile(0.95, rate(audit_batch_write_duration_sec
 | `HFS_AUDIT_BACKEND` | `none` | `none`, `file`, `database`, `cloudwatch` |
 | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | server agent / `source.observer` |
 | `HFS_AUDIT_TENANT` | *(request tenant)* | store every event in this tenant |
-| `HFS_AUDIT_DATABASE_URL` | *(primary DB)* | dedicated audit database (not searchable through the API) |
+| `HFS_AUDIT_STORE` | `table` | `table`: the dedicated audit tables (PostgreSQL); `resource`: `AuditEvent` resources in the general tables (the previous layout; always used on other backends) |
+| `HFS_AUDIT_BACKFILL` | `false` | move legacy `AuditEvent` resources into the audit tables in the background (see above) |
+| `HFS_COMPARTMENT_INCLUDE_AUDIT_EVENTS` | `false` | let `$everything` and `Patient/{id}/*` return `AuditEvent` without `_type` naming it |
+| `HFS_AUDIT_DATABASE_URL` | *(primary DB)* | dedicated audit database (PostgreSQL with the audit tables: searchable through the API; otherwise not) |
 | `HFS_AUDIT_FILE_PATH` | — | NDJSON file for `file` |
 | `HFS_AUDIT_EXCLUDE_PATHS` | — | extra exclusions, comma separated: `/path`, `/prefix/*`, `GET /path` |
 | `HFS_AUDIT_TRUST_FORWARDED_FOR` | `false` | client address from the first `X-Forwarded-For` hop (only behind a proxy that sets it) |
 | `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | events queued before requests wait |
-| `HFS_AUDIT_BATCH_SIZE` | `64` | events per writer batch |
-| `HFS_AUDIT_WRITERS` | `4` | concurrent writer tasks (database connections in use) |
+| `HFS_AUDIT_BATCH_SIZE` | `256` | events per writer batch (one database round trip and one commit) |
+| `HFS_AUDIT_WRITERS` | `8` | concurrent writer tasks (database connections in use) |
 | `HFS_AUDIT_SHUTDOWN_TIMEOUT` | `5` | seconds to drain the queue on shutdown before spilling the rest to the fallback file |
 | `HFS_AUDIT_FALLBACK_FILE` | `<data dir>/audit-fallback.ndjson` | spill file while the database is down |
 | `HFS_AUDIT_READS` | `true` (HTS: `false`) | record read-only requests (`GET`, `_search`, read-only operations) |
@@ -255,16 +396,19 @@ HFS_AUDIT_TRUST_FORWARDED_FOR=true          # HFS sits behind the reverse proxy
 HFS_AUDIT_RETENTION_DAYS=2190               # 6 years; set to your legal requirement
 HFS_AUDIT_RETENTION_ARCHIVE_DIR=/var/lib/hfs/audit-archive   # on a backed-up volume
 HFS_AUDIT_FALLBACK_FILE=/var/lib/hfs/audit-fallback.ndjson   # persistent volume
-HFS_AUDIT_WRITERS=4
+HFS_AUDIT_WRITERS=8
+HFS_AUDIT_BATCH_SIZE=256
 ```
 
 - Mount the archive and fallback paths on a persistent, backed-up volume.
-- Size: an event is ~1.5–2.5 KB of JSONB plus its search-index rows; budget
-  ~4 KB per interaction on PostgreSQL. 100 000 interactions/day ≈ 0.4 GB/day,
-  ~150 GB/year before retention. Watch the `resources` and `search_index`
-  table sizes.
-- Run `VACUUM (ANALYZE)` normally (autovacuum is enough); the daily purge
-  frees space for reuse rather than shrinking files.
+- Size (measured 2026-11, Synthea load of 527k resources): the audit tables
+  take about 3.7 KB per event including the lookup rows and every index
+  (1.98 GB for 527k events), against roughly 17 KB when an event was a FHIR
+  resource with history, ~17 search-index rows and full text. 100 000
+  interactions/day ≈ 0.37 GB/day, ~135 GB/year before retention. Watch
+  `audit_event*` with `pg_total_relation_size`.
+- Autovacuum is enough: the tables are insert-only, and retention drops
+  partitions instead of deleting rows.
 - Give auditors a role/scope with `AuditEvent` read; nobody needs write.
 - Keep `/metrics`, `/health` probes excluded (default).
 - HTS: `HTS_AUDIT_BACKEND=database`, `HTS_AUDIT_DATABASE_URL=<HFS DB URL>`,

@@ -59,6 +59,7 @@ fn server() -> (TestServer, CollectorSink) {
         exclusion_filter: ExclusionFilter::new(Vec::new()),
         server_address: String::new(),
         url_tenant_routing: false,
+        reader: None,
     });
     let app = helios_rest::routing::fhir_routes::create_routes(state).layer(
         axum::middleware::from_fn_with_state(audit, helios_audit::middleware::audit_middleware),

@@ -587,102 +587,128 @@ where
 
     let (items, page_info): (Vec<HistoryEntry>, PageInfo) = match level {
         HistoryLevel::Instance { resource_type, id } => {
-            // A `patient/` scope sees the history of the launch patient's
-            // resources only (#1618): the resource must currently be in the
-            // compartment — a deleted or absent one has no payload to prove it
-            // with — and versions from before it joined are left out of the
-            // page below.
-            if compartment.is_confined() {
-                let current = match state
-                    .storage()
-                    .read(tenant.context(), resource_type, id)
-                    .await
-                {
-                    Ok(current) => current,
-                    Err(helios_persistence::error::StorageError::Resource(
-                        helios_persistence::error::ResourceError::Gone { .. },
-                    )) => None,
-                    Err(e) => return Err(e.into()),
-                };
-                let Some(current) = current else {
-                    return Err(compartment.outside_compartment(format!(
-                        "history of {resource_type}/{id} is not available under a patient/ scope: the resource has no current version in the launch patient's compartment"
-                    )));
-                };
-                compartment.assert_member(
-                    || state.storage().search_param_registry(tenant.context()),
-                    current.fhir_version(),
-                    current.content(),
-                    "history",
-                )?;
-            }
-
-            let page = state
-                .storage()
-                .history_instance(tenant.context(), resource_type, id, &history_params)
-                .await
-                .map_err(|e| {
-                    warn!(error = %e, "Instance history failed");
-                    RestError::from(e)
-                })?;
-
-            // An existing resource always has at least its current version in
-            // history, so an empty *unfiltered* first page means the resource
-            // never existed. When a `_since` filter is in play, an empty page
-            // just means nothing matched, so we return an empty history Bundle
-            // rather than a 404. An empty page after a `_cursor` means the walk
-            // ran past the end (for example because versions were deleted
-            // between pages), not that the resource never existed, so that is
-            // an empty Bundle too.
-            //
-            // A `_count=0` page is empty whether or not the resource exists, so
-            // it proves nothing. Only then is storage asked how many versions
-            // the resource has: none means it never existed (404), anything
-            // else is the empty 200 Bundle. Every other request keeps the rule
-            // above and makes no extra call.
-            if params.since.is_none() && params.cursor.is_none() {
-                let never_existed = if history_params.pagination.count == 0 {
-                    state
-                        .storage()
-                        .history_instance_count(tenant.context(), resource_type, id)
-                        .await
-                        .map_err(|e| {
-                            warn!(error = %e, "Instance history count failed");
-                            RestError::from(e)
-                        })?
-                        == 0
-                } else {
-                    page.items.is_empty()
-                };
-                if never_existed {
-                    return Err(RestError::NotFound {
-                        resource_type: resource_type.clone(),
-                        id: id.clone(),
-                    });
-                }
-            }
-
-            // Under a confined grant, keep the versions that are in the
-            // compartment and the delete markers (no payload to judge); drop
-            // the rest (#1618).
-            let items: Vec<HistoryEntry> = if compartment.is_confined() {
-                let registry = state.storage().search_param_registry(tenant.context());
-                page.items
-                    .iter()
-                    .filter(|entry| {
-                        entry.resource.is_deleted()
-                            || compartment.is_readable(
-                                || registry.clone(),
-                                entry.resource.fhir_version(),
-                                entry.resource.content(),
-                            )
-                    })
-                    .cloned()
-                    .collect()
+            // An event of the dedicated audit store is immutable: its history
+            // is its one version. (Not served under a `patient/` scope, which
+            // goes through the compartment check on stored resources below.)
+            let audit_event = if compartment.is_confined() {
+                None
             } else {
-                page.items
+                super::audit_events::read(state, tenant, resource_type, id).await?
             };
-            (items, page.page_info)
+            if let Some(event) = audit_event {
+                let shown = history_params.pagination.count > 0
+                    && params.cursor.is_none()
+                    && params
+                        .since
+                        .is_none_or(|since| event.last_modified() >= since);
+                let items = if shown {
+                    vec![HistoryEntry {
+                        timestamp: event.last_modified(),
+                        resource: event,
+                        method: helios_persistence::core::HistoryMethod::Post,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                (items, PageInfo::end())
+            } else {
+                // A `patient/` scope sees the history of the launch patient's
+                // resources only (#1618): the resource must currently be in the
+                // compartment — a deleted or absent one has no payload to prove it
+                // with — and versions from before it joined are left out of the
+                // page below.
+                if compartment.is_confined() {
+                    let current = match state
+                        .storage()
+                        .read(tenant.context(), resource_type, id)
+                        .await
+                    {
+                        Ok(current) => current,
+                        Err(helios_persistence::error::StorageError::Resource(
+                            helios_persistence::error::ResourceError::Gone { .. },
+                        )) => None,
+                        Err(e) => return Err(e.into()),
+                    };
+                    let Some(current) = current else {
+                        return Err(compartment.outside_compartment(format!(
+                            "history of {resource_type}/{id} is not available under a patient/ scope: the resource has no current version in the launch patient's compartment"
+                        )));
+                    };
+                    compartment.assert_member(
+                        || state.storage().search_param_registry(tenant.context()),
+                        current.fhir_version(),
+                        current.content(),
+                        "history",
+                    )?;
+                }
+
+                let page = state
+                    .storage()
+                    .history_instance(tenant.context(), resource_type, id, &history_params)
+                    .await
+                    .map_err(|e| {
+                        warn!(error = %e, "Instance history failed");
+                        RestError::from(e)
+                    })?;
+
+                // An existing resource always has at least its current version in
+                // history, so an empty *unfiltered* first page means the resource
+                // never existed. When a `_since` filter is in play, an empty page
+                // just means nothing matched, so we return an empty history Bundle
+                // rather than a 404. An empty page after a `_cursor` means the walk
+                // ran past the end (for example because versions were deleted
+                // between pages), not that the resource never existed, so that is
+                // an empty Bundle too.
+                //
+                // A `_count=0` page is empty whether or not the resource exists, so
+                // it proves nothing. Only then is storage asked how many versions
+                // the resource has: none means it never existed (404), anything
+                // else is the empty 200 Bundle. Every other request keeps the rule
+                // above and makes no extra call.
+                if params.since.is_none() && params.cursor.is_none() {
+                    let never_existed = if history_params.pagination.count == 0 {
+                        state
+                            .storage()
+                            .history_instance_count(tenant.context(), resource_type, id)
+                            .await
+                            .map_err(|e| {
+                                warn!(error = %e, "Instance history count failed");
+                                RestError::from(e)
+                            })?
+                            == 0
+                    } else {
+                        page.items.is_empty()
+                    };
+                    if never_existed {
+                        return Err(RestError::NotFound {
+                            resource_type: resource_type.clone(),
+                            id: id.clone(),
+                        });
+                    }
+                }
+
+                // Under a confined grant, keep the versions that are in the
+                // compartment and the delete markers (no payload to judge); drop
+                // the rest (#1618).
+                let items: Vec<HistoryEntry> = if compartment.is_confined() {
+                    let registry = state.storage().search_param_registry(tenant.context());
+                    page.items
+                        .iter()
+                        .filter(|entry| {
+                            entry.resource.is_deleted()
+                                || compartment.is_readable(
+                                    || registry.clone(),
+                                    entry.resource.fhir_version(),
+                                    entry.resource.content(),
+                                )
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    page.items
+                };
+                (items, page.page_info)
+            }
         }
         HistoryLevel::Type { resource_type } => {
             let page = state

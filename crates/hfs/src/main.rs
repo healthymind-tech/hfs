@@ -985,7 +985,18 @@ fn validate_shared_sqlite_audit_path(path: &str, dedicated: bool) -> anyhow::Res
 type AuditStores = (
     Arc<dyn helios_audit::sinks::database::AuditStorage>,
     Option<Arc<dyn helios_persistence::core::RetentionStorage>>,
+    Option<AuditTableWiring>,
 );
+
+/// The dedicated audit tables, when the audit store uses them
+/// (`HFS_AUDIT_STORE=table` on PostgreSQL).
+struct AuditTableWiring {
+    /// Serves `AuditEvent` read and search.
+    reader: Arc<dyn helios_audit::store::AuditEventReader>,
+    /// Starts partition maintenance, retention and (when asked) the backfill
+    /// of legacy events, once the sink exists.
+    start: Box<dyn FnOnce(AuditConfig, Arc<dyn AuditSink>) + Send>,
+}
 
 async fn create_database_audit_storage(
     server_config: &ServerConfig,
@@ -1048,6 +1059,7 @@ async fn create_audit_sqlite_storage(
             server_config.default_tenant.clone(),
         )),
         Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
+        None,
     ))
 }
 
@@ -1095,6 +1107,63 @@ async fn create_audit_postgres_storage(
     // branches publish it as its own `audit` pool.
     let backend = Arc::new(backend);
     register_pg_pool_metrics("audit", backend.clone());
+    if audit_config.store == helios_audit::AuditStore::Table {
+        let store = Arc::new(helios_persistence::audit_store::TableAuditStore::new(
+            Arc::clone(&backend),
+            audit_config.tenant.clone(),
+            server_config.default_tenant.clone(),
+        ));
+        let table = store.table().clone();
+        // The month's partitions exist before the first event is written.
+        if let Err(e) = table.ensure_partitions(chrono::Utc::now(), 2).await {
+            warn!(error = %e, "Could not create audit partitions; events go to the default partition meanwhile");
+        }
+        let reader: Arc<dyn helios_audit::store::AuditEventReader> = Arc::new(table.clone());
+        let start = Box::new(move |config: AuditConfig, sink: Arc<dyn AuditSink>| {
+            helios_persistence::audit_store::retention::spawn_table(
+                table.clone(),
+                config.retention.clone(),
+                sink,
+                config.source_observer.clone(),
+            );
+            if config.backfill {
+                tokio::spawn(async move {
+                    info!(
+                        "Audit backfill started: moving legacy AuditEvent resources into the audit tables (HFS_AUDIT_BACKFILL)"
+                    );
+                    loop {
+                        match table.backfill_legacy(1000, Some(100)).await {
+                            Ok(report) if report.finished => {
+                                info!(
+                                    copied = report.copied,
+                                    purged = report.purged,
+                                    "Audit backfill finished: no legacy AuditEvent resources are left; run VACUUM (ANALYZE) on resources, resource_history, search_index and resource_fts"
+                                );
+                                break;
+                            }
+                            Ok(report) => {
+                                info!(
+                                    copied = report.copied,
+                                    purged = report.purged,
+                                    "Audit backfill progress"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Audit backfill paused; retrying in 60 s");
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        return Ok((
+            store,
+            // Legacy `AuditEvent` resources still expire through the row job.
+            Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
+            Some(AuditTableWiring { reader, start }),
+        ));
+    }
     Ok((
         Arc::new(helios_persistence::audit_store::TxAuditStore::new(
             Arc::clone(&backend),
@@ -1102,6 +1171,7 @@ async fn create_audit_postgres_storage(
             server_config.default_tenant.clone(),
         )),
         Some(backend as Arc<dyn helios_persistence::core::RetentionStorage>),
+        None,
     ))
 }
 
@@ -1202,6 +1272,7 @@ async fn create_audit_mongodb_storage(
             audit_config.tenant.clone(),
             server_config.default_tenant.clone(),
         )),
+        None,
         None,
     ))
 }
@@ -1315,6 +1386,7 @@ async fn create_audit_s3_storage(
             audit_config.tenant.clone(),
             server_config.default_tenant.clone(),
         )),
+        None,
         None,
     ))
 }
@@ -2322,6 +2394,7 @@ async fn init_audit(
 ) -> anyhow::Result<(Arc<dyn AuditSink>, Option<Arc<AuditMiddlewareState>>)> {
     let config = AuditConfig::from_env();
     let mut retention_store = None;
+    let mut audit_table: Option<AuditTableWiring> = None;
     let mut fallback_file = None;
 
     let sink: Arc<dyn AuditSink> = match config.backend {
@@ -2345,9 +2418,10 @@ async fn init_audit(
             Arc::new(helios_audit::FileSink::new(path).await?)
         }
         AuditBackend::Database => {
-            let (adapter, retention) =
+            let (adapter, retention, table) =
                 create_database_audit_storage(server_config, backend_mode, &config).await?;
             retention_store = retention;
+            audit_table = table;
             let fallback = config
                 .fallback_file
                 .clone()
@@ -2370,7 +2444,7 @@ async fn init_audit(
                 Ok(n) => info!(events = n, "Replayed audit events from the fallback file"),
                 Err(e) => warn!(error = %e, "Could not replay the audit fallback file"),
             }
-            info!(tenant = ?config.tenant, "Audit logging to the database (AuditEvent resources)");
+            info!(tenant = ?config.tenant, store = %config.store, "Audit logging to the database");
             Arc::new(db)
         }
         #[cfg(feature = "cloudwatch")]
@@ -2429,9 +2503,18 @@ async fn init_audit(
         None => {}
     }
 
-    let state = AuditMiddlewareState::new(Arc::clone(&sink), config)
+    let audit_reader = audit_table.map(|table| {
+        info!("Audit events are stored in the dedicated audit tables (HFS_AUDIT_STORE=table)");
+        (table.start)(config.clone(), Arc::clone(&sink));
+        table.reader
+    });
+
+    let mut state = AuditMiddlewareState::new(Arc::clone(&sink), config)
         .with_server_address(server_config.base_url.clone())
         .with_url_tenant_routing(server_config.multitenancy.routing_mode.supports_url_path());
+    if let Some(reader) = audit_reader {
+        state = state.with_reader(reader);
+    }
 
     Ok((sink, Some(Arc::new(state))))
 }

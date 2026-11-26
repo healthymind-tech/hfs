@@ -73,10 +73,17 @@ where
     );
 
     // Read the resource
-    let resource = state
-        .storage()
-        .read(tenant.context(), &resource_type, &id)
-        .await?;
+    // An `AuditEvent` is read from the dedicated audit store when that is in
+    // use; one written before it existed is still a stored resource.
+    let resource = match super::audit_events::read(&state, &tenant, &resource_type, &id).await? {
+        Some(event) => Some(event),
+        None => {
+            state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await?
+        }
+    };
 
     match resource {
         Some(stored) => {
@@ -242,10 +249,17 @@ where
     );
 
     // Read the resource
-    let resource = state
-        .storage()
-        .read(tenant.context(), &resource_type, &id)
-        .await?;
+    // An `AuditEvent` is read from the dedicated audit store when that is in
+    // use; one written before it existed is still a stored resource.
+    let resource = match super::audit_events::read(&state, &tenant, &resource_type, &id).await? {
+        Some(event) => Some(event),
+        None => {
+            state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await?
+        }
+    };
 
     match resource {
         Some(stored) => {

@@ -5924,6 +5924,18 @@ mod postgres_integration {
     /// child tables that hang off the job). Statements take `$1 = tenant id`.
     /// Tables the resource writes already fill are guarded by `NOT EXISTS`.
     const PURGE_SEED_SQL: &[&str] = &[
+        "INSERT INTO hfs_search_index_liveness (tenant_id, resource_type, orphan_resources) \
+         VALUES ($1, 'Patient', 0) ON CONFLICT DO NOTHING",
+        // The dedicated audit tables (hm-0030; their monthly partitions are
+        // reached through the parents): one event in this month's partition
+        // and one in the default partition.
+        "INSERT INTO audit_event (tenant_id, recorded, id, event) \
+         VALUES ($1, now(), 'seed-ae', '{}'::jsonb), ($1, '1990-01-01T00:00:00Z', 'seed-ae-old', '{}'::jsonb) \
+         ON CONFLICT DO NOTHING",
+        "INSERT INTO audit_event_ref (tenant_id, ref_id, recorded, id, kind, ref_type) \
+         VALUES ($1, 'seed-p', now(), 'seed-ae', 'e', 'Patient'), \
+                ($1, 'seed-p', '1990-01-01T00:00:00Z', 'seed-ae-old', 'e', 'Patient') \
+         ON CONFLICT DO NOTHING",
         "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, param_url, value_string) \
          SELECT $1, 'Patient', 'seed-p', 'family', 'http://hl7.org/fhir/SearchParameter/Patient-family', 'Seed' \
          WHERE NOT EXISTS (SELECT 1 FROM search_index WHERE tenant_id = $1)",
@@ -5986,7 +5998,12 @@ mod postgres_integration {
                  JOIN information_schema.tables t \
                    ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
                  WHERE c.column_name = 'tenant_id' AND c.table_schema = current_schema() \
-                   AND t.table_type = 'BASE TABLE' ORDER BY 1",
+                   AND t.table_type = 'BASE TABLE' \
+                   AND NOT EXISTS (SELECT 1 FROM pg_class pc \
+                                   WHERE pc.relname = c.table_name \
+                                     AND pc.relnamespace = current_schema()::regnamespace \
+                                     AND pc.relispartition) \
+                 ORDER BY 1",
                 &[],
             )
             .await
@@ -8646,7 +8663,24 @@ mod postgres_integration {
         }
         let client = backend.get_client().await.unwrap();
         assert_eq!(client.execute("UPDATE search_index SET value_reference='Patient/body-invalid' WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='patient'", &[&tenant_id]).await.unwrap(),1);
+        // A soft delete removes the resource's index rows (hm-0040 trigger);
+        // put them back afterwards to stand for stale rows of a deleted
+        // resource (a restored dump, an older writer), which the live body
+        // guard must still filter.
+        client
+            .batch_execute("CREATE TEMP TABLE stale_1625 AS SELECT * FROM search_index WHERE false")
+            .await
+            .unwrap();
+        client.execute("INSERT INTO stale_1625 SELECT * FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id='deleted-ob'", &[&tenant_id]).await.unwrap();
         client.execute("UPDATE resources SET is_deleted=TRUE WHERE tenant_id=$1 AND resource_type='Observation' AND id='deleted-ob'", &[&tenant_id]).await.unwrap();
+        let left: i64 = client.query_one("SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id='deleted-ob'", &[&tenant_id]).await.unwrap().get(0);
+        assert_eq!(left, 0, "the soft delete removed the resource's index rows");
+        client
+            .batch_execute(
+                "INSERT INTO search_index SELECT * FROM stale_1625; DROP TABLE stale_1625",
+            )
+            .await
+            .unwrap();
         // The writer deduplicates equal codings. The index has no uniqueness
         // constraint, so stale/duplicate index rows must not amplify the live
         // body guard either (the old scalar LIMIT allowed one lookup).
@@ -14075,7 +14109,6 @@ mod postgres_integration {
     /// seek when PostgreSQL plans the complete count query with or without bind
     /// values available.
     #[tokio::test]
-    #[ignore = "the search_index-only count it inspects is disabled (COUNT_FROM_INDEX_ALONE, orphan rows #2074)"]
     async fn postgres_reference_bare_id_count_plan_uses_target_index_for_custom_and_generic_plans()
     {
         use helios_persistence::core::SearchProvider;
@@ -14103,7 +14136,10 @@ mod postgres_integration {
             }
         }
 
-        let backend = create_backend_with_max_connections(1).await;
+        // Two connections: schema initialization (which reads the index
+        // layout the index-only count requires) needs a second one.
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
         let tenant = create_tenant("bare-reference-count-plan");
         let tenant_id = tenant.tenant_id().as_str();
         let target_id = "rare-plan-target";
@@ -14139,24 +14175,37 @@ mod postgres_integration {
             .unwrap();
         drop(client);
 
+        // The index-only count needs the type verified free of orphan rows.
+        assert_eq!(
+            backend
+                .verify_search_index_liveness(tenant_id, "Observation")
+                .await
+                .unwrap(),
+            0
+        );
+
         let mut query = observation_reference_query("subject", &[target_id]);
         query.total = Some(TotalMode::Accurate);
         let result = backend.search(&tenant, &query).await.unwrap();
         assert_eq!(result.total, Some(1));
 
-        // The pool has one connection, so this is the same PostgreSQL session
-        // on which search_count cached its actual statement.
-        let client = backend.get_client().await.unwrap();
-        let prepared_counts = client
-            .query(
-                "SELECT name, statement FROM pg_prepared_statements \
+        // Hold both pooled sessions and keep the one on which search_count
+        // cached its actual statement.
+        const PREPARED_COUNTS: &str = "SELECT name, statement FROM pg_prepared_statements \
                  WHERE statement LIKE 'SELECT COUNT(*) FROM (SELECT DISTINCT resource_id FROM search_index%' \
                    AND statement LIKE '%split_part(value_reference%' \
-                 ORDER BY name",
-                &[],
-            )
-            .await
-            .unwrap();
+                 ORDER BY name";
+        let first = backend.get_client().await.unwrap();
+        let second = backend.get_client().await.unwrap();
+        let on_first = first.query(PREPARED_COUNTS, &[]).await.unwrap();
+        let (client, prepared_counts) = if on_first.is_empty() {
+            let on_second = second.query(PREPARED_COUNTS, &[]).await.unwrap();
+            drop(first);
+            (second, on_second)
+        } else {
+            drop(second);
+            (first, on_first)
+        };
         assert_eq!(
             prepared_counts.len(),
             1,

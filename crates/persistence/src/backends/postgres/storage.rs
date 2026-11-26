@@ -1591,107 +1591,30 @@ impl ResourceStorage for PostgresBackend {
         tenant.check_permission(Operation::Create, resource_type)?;
 
         let mut client = self.guarded_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Extract or generate ID
-        let id = resource
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(crate::types::new_resource_id);
-
-        // Ensure the resource has correct type and id
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.clone()));
-        }
-
-        let now = Utc::now();
-        let version_id = "1";
-        let fhir_version_str = fhir_version.as_mime_param();
-        let is_deleted = false;
-
-        // Resource row, history row and the existence check in one statement.
-        //
-        // The check used to be its own `SELECT` — a round trip per create, on the
-        // path a bulk import takes for every resource — and it was racy besides:
-        // two concurrent creates of the same id could both pass it and one would
-        // then fail on the primary key with an internal error instead of
-        // `AlreadyExists`. `ON CONFLICT DO NOTHING` decides it atomically.
-        //
-        // On conflict the CTE yields no row, so the history insert selects
-        // nothing and the statement reports zero rows affected — one signal for
-        // both writes. A soft-deleted resource still occupies its primary key, so
-        // it conflicts too, exactly as the old check treated it.
         // Guarded foreground create: one transaction holds the advisory write
         // lock, the resource/history insert, and the search/FTS index writes.
-        // `SearchParameter` takes the exclusive tenant gate; every other type
-        // takes the shared gate plus its own resource key.
         let transaction = client
             .transaction()
             .await
             .map_err(|e| internal_error(format!("Failed to begin create: {e}")))?;
-        let write_result: StorageResult<()> = async {
-            if resource_type == "SearchParameter" {
-                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
-            } else {
-                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id.as_str())])
-                    .await?;
-            }
-            let inserted = execute_cached(
+        let write_result = self
+            .create_in_tx(
                 &transaction,
-                "WITH ins AS (
-                     INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                     ON CONFLICT (tenant_id, resource_type, id) DO NOTHING
-                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
-                 )
-                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM ins",
-                &[&tenant_id, &resource_type, &id, &version_id, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
-
-            if inserted == 0 {
-                return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                    resource_type: resource_type.to_string(),
-                    id: id.clone(),
-                }));
-            }
-
-            let extractor = self
-                .write_extractor(
-                    &transaction,
-                    tenant_id,
-                    !self.is_search_offloaded(),
-                    resource_type == "SearchParameter",
-                )
-                .await?;
-            self.index_resource_guarded(
-                &transaction,
-                &extractor,
-                tenant_id,
+                tenant,
                 resource_type,
-                &id,
-                now,
-                IndexWrite::Fresh,
-                &resource,
+                resource,
+                fhir_version,
+                WriteLocks::Acquire,
             )
-            .await
-        }
-        .await;
-        match write_result {
-            Ok(()) => {
+            .await;
+        let created = match write_result {
+            Ok(created) => {
                 transaction
                     .commit()
                     .await
                     .map_err(|e| internal_error(format!("Failed to commit create: {e}")))?;
                 client.mark_settled();
+                created
             }
             Err(error) => {
                 transaction
@@ -1701,33 +1624,11 @@ impl ResourceStorage for PostgresBackend {
                 client.mark_settled();
                 return Err(error);
             }
-        }
+        };
         drop(client);
-
-        // An overlay-affecting SearchParameter write: reload the stored cache
-        // and drop the per-tenant registries so they rebuild. Seeded spec
-        // copies never affect the overlay (see `create_affects_overlay`),
-        // which keeps bulk seeding from triggering an O(n²) reload storm.
-        if resource_type == "SearchParameter"
-            && self.tenant_registries().create_affects_overlay(&resource)
-        {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        // Return the stored resource with updated metadata
-        Ok(StoredResource::from_storage(
-            resource_type,
-            &id,
-            version_id,
-            tenant.tenant_id().clone(),
-            resource,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
+        self.after_committed_write(resource_type, Some(created.content()))
+            .await;
+        Ok(created)
     }
 
     async fn create_or_update(
@@ -1745,14 +1646,13 @@ impl ResourceStorage for PostgresBackend {
         // create fail as a duplicate. Both are transient for an unconditional
         // PUT: re-read and try again, a bounded number of times.
         //
-        // Racing PUTs of one id are serialized on a per-id criteria lock
-        // first (the same lock a conditional write on `_id` takes), so under
-        // heavy contention — thirty instances' worth of PUTs to one resource
-        // — the read-then-write does not lose its race repeatedly; the retry
-        // stays as a backstop for writers that do not take the lock.
-        let _id_lock = self
-            .lock_condition(tenant, resource_type, &format!("_id={id}"))
-            .await?;
+        // Racing PUTs of one id are serialized on the id's resource key, the
+        // advisory lock every write of that resource takes: each attempt
+        // reads the current row and writes the next version in one
+        // transaction under it (`create_or_update_once`), so under heavy
+        // contention — thirty instances' worth of PUTs to one resource — a
+        // PUT does not lose its race at all. The retry stays as a backstop
+        // for a database whose writers do not all take the key.
         const ATTEMPTS: usize = 8;
         let mut attempt = 0;
         loop {
@@ -2389,6 +2289,10 @@ impl ResourceStorage for PostgresBackend {
                 .await
                 .or_query_error("purge delete")?;
         }
+        // The tenant's audit trail in the dedicated audit tables (hm-0030).
+        super::audit_table::purge_tenant_in_txn(&tx, id)
+            .await
+            .or_query_error("purge audit events")?;
         // Per-user settings are keyed by user, not tenant, so they are not swept
         // by the deletes above — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313). Same transaction, so an
@@ -2440,6 +2344,9 @@ impl ResourceStorage for PostgresBackend {
             "hfs_packages",
             "resource_change_feed",
             "search_parameter_epochs",
+            // hm-0040: a "verified" marker must not outlive the data it was
+            // verified against (a re-created tenant of the same id).
+            "hfs_search_index_liveness",
         ] {
             let exists: bool = tx
                 .query_one(
@@ -2461,6 +2368,7 @@ impl ResourceStorage for PostgresBackend {
         tx.commit().await.or_query_error("purge commit")?;
         client.mark_settled();
         drop(client);
+        self.forget_search_index_liveness(id);
         if let Err(error) = self.reload_stored_cache().await {
             tracing::warn!("SearchParameter cache reload after tenant purge failed: {error}");
         }
@@ -2491,136 +2399,23 @@ impl PostgresBackend {
         tenant.check_permission(Operation::Update, resource_type)?;
 
         let mut client = self.guarded_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let id = current.id();
-
-        // The expected version is `current`'s, and the UPDATE below only matches a
-        // row that still carries it — so the new version follows from what the
-        // caller already read, with no round trip to ask what is stored.
-        let expected_version = current.version_id().to_string();
-        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Ensure the resource has correct type and id
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
-
-        let now = Utc::now();
-        let fhir_version_str = current.fhir_version().as_mime_param();
-
-        // Version check, update and history row in one statement. The check used
-        // to be a separate `SELECT` — a round trip on every update, and a
-        // check-then-act besides: a concurrent writer could bump the version in
-        // between and this update would overwrite it while reporting success.
-        // Folding the expected version into the `WHERE` makes the two atomic.
-        //
-        // Zero rows means the update matched nothing; which of the two reasons it
-        // was costs a query, but only on the path that is already failing.
-        //
         // Guarded foreground update: one transaction holds the advisory write
         // lock, the resource/history write, and the search/FTS index writes.
-        // `SearchParameter` takes the exclusive tenant gate; every other type
-        // takes the shared gate plus its own resource key.
         let transaction = client
             .transaction()
             .await
             .map_err(|e| internal_error(format!("Failed to begin update: {e}")))?;
-        let write_result: StorageResult<()> = async {
-            if resource_type == "SearchParameter" {
-                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
-            } else {
-                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
-            }
-            let updated = execute_cached(
-                &transaction,
-                "WITH upd AS (
-                     UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                     WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
-                       AND is_deleted = FALSE AND version_id = $7
-                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
-                 )
-                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
-                &[
-                    &new_version_str,
-                    &resource,
-                    &now,
-                    &tenant_id,
-                    &resource_type,
-                    &id,
-                    &expected_version,
-                    &fhir_version_str,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
-
-            if updated == 0 {
-                let actual = transaction
-                    .query_opt(
-                        "SELECT version_id FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                        &[&tenant_id, &resource_type, &id],
-                    )
-                    .await
-                    .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
-
-                return match actual {
-                    Some(row) => Err(StorageError::Concurrency(
-                        ConcurrencyError::VersionConflict {
-                            resource_type: resource_type.to_string(),
-                            id: id.to_string(),
-                            expected_version,
-                            actual_version: row.get::<_, String>(0),
-                        },
-                    )),
-                    None => Err(StorageError::Resource(ResourceError::NotFound {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                    })),
-                };
-            }
-
-            // Re-index the resource. `Replace` clears the old `search_index` rows
-            // inside the same statement that writes the new ones — the clearing
-            // `DELETE` used to be a `delete_search_index` call of its own here, i.e.
-            // a second statement and a second round trip binding the same three
-            // parameters. The `resource_fts` row stays either way:
-            // `index_fts_content_guarded` upserts over it on the same connection.
-            let extractor = self
-                .write_extractor(
-                    &transaction,
-                    tenant_id,
-                    !self.is_search_offloaded(),
-                    resource_type == "SearchParameter",
-                )
-                .await?;
-            self.index_resource_guarded(
-                &transaction,
-                &extractor,
-                tenant_id,
-                resource_type,
-                id,
-                now,
-                IndexWrite::Replace,
-                &resource,
-            )
-            .await
-        }
-        .await;
-        match write_result {
-            Ok(()) => {
+        let write_result = self
+            .store_update_in_tx(&transaction, tenant, current, resource, WriteLocks::Acquire)
+            .await;
+        let updated = match write_result {
+            Ok(updated) => {
                 transaction
                     .commit()
                     .await
                     .map_err(|e| internal_error(format!("Failed to commit update: {e}")))?;
                 client.mark_settled();
+                updated
             }
             Err(error) => {
                 transaction
@@ -2630,27 +2425,10 @@ impl PostgresBackend {
                 client.mark_settled();
                 return Err(error);
             }
-        }
+        };
         drop(client);
-
-        // A SearchParameter write invalidates the tenant overlays.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            tenant.tenant_id().clone(),
-            resource,
-            now,
-            now,
-            None,
-            current.fhir_version(),
-        ))
+        self.after_committed_write(resource_type, None).await;
+        Ok(updated)
     }
 }
 
@@ -2986,152 +2764,6 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Brings a soft-deleted resource back to life with new content.
-    ///
-    /// FHIR permits a deleted resource to be restored by a subsequent update
-    /// ([http.html#delete](https://hl7.org/fhir/http.html#delete)), so a `PUT`
-    /// onto a deleted id must succeed instead of failing with `Gone`. The
-    /// restored resource continues the existing version chain (the deletion
-    /// record keeps its version, the restore gets the next one) and keeps the
-    /// FHIR version the resource was originally stored under.
-    ///
-    /// The tombstone is re-read inside the transaction, under the same
-    /// per-resource advisory lock every other write path takes, so two PUTs
-    /// racing onto one tombstone serialize: the winner restores it, and the
-    /// loser finds no deleted row and reports `NotFound`, which
-    /// `create_or_update` turns into a fresh read-and-retry (landing on
-    /// `update`). Returns `NotFound` only under such a concurrent write — the
-    /// caller has already established a tombstone exists.
-    async fn restore_deleted(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        id: &str,
-        resource: Value,
-    ) -> StorageResult<StoredResource> {
-        tenant.check_permission(Operation::Update, resource_type)?;
-        let mut client = self.guarded_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
-
-        let now = Utc::now();
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|e| internal_error(format!("Failed to begin restore: {e}")))?;
-        let write_result: StorageResult<(String, String)> = async {
-            if resource_type == "SearchParameter" {
-                acquire_exclusive_write_gate(&transaction, tenant_id).await?;
-            } else {
-                acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
-            }
-            let row = transaction
-                .query_opt(
-                    "SELECT version_id, fhir_version FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = TRUE",
-                    &[&tenant_id, &resource_type, &id],
-                )
-                .await
-                .map_err(|e| internal_error(format!("Failed to read deleted resource: {e}")))?;
-            let Some(row) = row else {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            };
-            let deleted_version: String = row.get(0);
-            let fhir_version_str: String = row.get(1);
-            let new_version_str = (deleted_version.parse::<u64>().unwrap_or(0) + 1).to_string();
-            let is_deleted = false;
-            execute_cached(
-                &transaction,
-                "UPDATE resources
-                 SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
-                &[&new_version_str, &resource, &now, &tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to restore resource: {e}")))?;
-            execute_cached(
-                &transaction,
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert restore history: {e}")))?;
-            let extractor = self
-                .write_extractor(
-                    &transaction,
-                    tenant_id,
-                    !self.is_search_offloaded(),
-                    resource_type == "SearchParameter",
-                )
-                .await?;
-            self.index_resource_guarded(
-                &transaction,
-                &extractor,
-                tenant_id,
-                resource_type,
-                id,
-                now,
-                IndexWrite::Replace,
-                &resource,
-            )
-            .await?;
-            Ok((new_version_str, fhir_version_str))
-        }
-        .await;
-        let (new_version_str, fhir_version_str) = match write_result {
-            Ok(result) => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|e| internal_error(format!("Failed to commit restore: {e}")))?;
-                client.mark_settled();
-                result
-            }
-            Err(error) => {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|e| internal_error(format!("Failed to rollback restore: {e}")))?;
-                client.mark_settled();
-                return Err(error);
-            }
-        };
-        drop(client);
-
-        // A restored SearchParameter re-enters the tenant overlays.
-        if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            tenant.tenant_id().clone(),
-            resource,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
-    }
-
     /// Indexes a mutation on its already guarded transaction connection.
     ///
     /// The caller holds the advisory write lock and an open transaction on
@@ -3186,30 +2818,56 @@ impl PostgresBackend {
             ));
         }
 
-        match mode {
-            IndexWrite::Fresh => {
-                PostgresSearchIndexWriter::insert_rows(
-                    client,
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    &rows,
-                )
-                .await?;
+        let index_rows = async {
+            match mode {
+                IndexWrite::Fresh => {
+                    PostgresSearchIndexWriter::insert_rows(
+                        client,
+                        tenant_id,
+                        resource_type,
+                        resource_id,
+                        &rows,
+                    )
+                    .await
+                }
+                IndexWrite::Replace => {
+                    PostgresSearchIndexWriter::replace_rows(
+                        client,
+                        tenant_id,
+                        resource_type,
+                        resource_id,
+                        &rows,
+                    )
+                    .await
+                }
             }
-            IndexWrite::Replace => {
-                PostgresSearchIndexWriter::replace_rows(
-                    client,
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    &rows,
-                )
-                .await?;
-            }
+        };
+        if !self.fts_table_exists(client).await? {
+            return index_rows.await;
         }
-        self.index_fts_content_guarded(client, tenant_id, resource_type, resource_id, resource)
-            .await
+        let content = extract_searchable_content(resource);
+        if !content.fits_tsvector_limit() {
+            // Rare: the full-text statement may trip PostgreSQL's 1 MB
+            // `tsvector` limit, so it runs under a savepoint, after the index.
+            index_rows.await?;
+            return self
+                .index_fts_content_guarded(client, tenant_id, resource_type, resource_id, resource)
+                .await;
+        }
+        // The `search_index` and full-text statements leave in one flight; the
+        // server runs them in this order. Input this small cannot trip the
+        // `tsvector` limit (it is no larger than what the truncating retry
+        // itself sends), so the SAVEPOINT / RELEASE pair that guarded the
+        // statement — two more round trips on every write — is not needed.
+        let (indexed, fts) = tokio::join!(
+            index_rows,
+            Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &content)
+        );
+        indexed?;
+        fts.map_err(|e| {
+            let message = format!("Failed to insert FTS content: {e}");
+            internal_postgres_error(message, e)
+        })
     }
 
     /// A failed `to_tsvector` statement aborts its savepoint, not the mutation.
@@ -5344,34 +5002,51 @@ impl ConditionalStorage for PostgresBackend {
         // Search-then-create is atomic only under the criteria lock: without
         // it, concurrent requests (on one instance or several) all find no
         // match and all create — duplicate patients from a retried
-        // `If-None-Exist` POST.
-        let _criteria_lock = self
-            .lock_condition(tenant, resource_type, search_params)
+        // `If-None-Exist` POST. Lock, search and create share one transaction
+        // on one connection (`begin_conditional_write`).
+        tenant.check_permission(Operation::Create, resource_type)?;
+        let client = self
+            .begin_conditional_write(tenant, resource_type, search_params)
             .await?;
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => {
-                // No match - create the resource
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok(ConditionalCreateResult::Created(created))
-            }
-            1 => {
-                // Exactly one match - return the existing resource
-                Ok(ConditionalCreateResult::Exists(
-                    matches.into_iter().next().unwrap(),
-                ))
-            }
-            n => {
-                // Multiple matches - error condition
-                Ok(ConditionalCreateResult::MultipleMatches(n))
+        let result: StorageResult<ConditionalCreateResult> = async {
+            // Find matching resources based on search parameters
+            let matches = self
+                .find_matching_resources_on(&client, tenant, resource_type, search_params)
+                .await?;
+            match matches.len() {
+                0 => {
+                    // No match - create the resource
+                    let created = self
+                        .create_in_tx(
+                            &*client,
+                            tenant,
+                            resource_type,
+                            resource,
+                            fhir_version,
+                            WriteLocks::Acquire,
+                        )
+                        .await?;
+                    Ok(ConditionalCreateResult::Created(created))
+                }
+                1 => {
+                    // Exactly one match - return the existing resource
+                    Ok(ConditionalCreateResult::Exists(
+                        matches.into_iter().next().unwrap(),
+                    ))
+                }
+                n => {
+                    // Multiple matches - error condition
+                    Ok(ConditionalCreateResult::MultipleMatches(n))
+                }
             }
         }
+        .await;
+        let result = Self::end_conditional_write(client, result).await?;
+        if let ConditionalCreateResult::Created(created) = &result {
+            self.after_committed_write(resource_type, Some(created.content()))
+                .await;
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5386,45 +5061,84 @@ impl ConditionalStorage for PostgresBackend {
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
         // Same check-then-act as conditional create (an upsert creates on no
-        // match): serialize on the criteria.
-        let _criteria_lock = self
-            .lock_condition(tenant, resource_type, search_params)
+        // match): serialize on the criteria, in the transaction that writes.
+        let client = self
+            .begin_conditional_write(tenant, resource_type, search_params)
             .await?;
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => {
-                // `If-Match` names a version; nothing matched, so nothing
-                // can carry it and the create below must not run (#1381).
-                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
-                if upsert {
-                    // No match, but upsert is true - create new resource
-                    let created = self
-                        .create(tenant, resource_type, resource, fhir_version)
+        let result: StorageResult<ConditionalUpdateResult> = async {
+            // Find matching resources based on search parameters
+            let matches = self
+                .find_matching_resources_on(&client, tenant, resource_type, search_params)
+                .await?;
+            match matches.len() {
+                0 => {
+                    // `If-Match` names a version; nothing matched, so nothing
+                    // can carry it and the create below must not run (#1381).
+                    crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
+                    if upsert {
+                        // No match, but upsert is true - create new resource
+                        tenant.check_permission(Operation::Create, resource_type)?;
+                        let created = self
+                            .create_in_tx(
+                                &*client,
+                                tenant,
+                                resource_type,
+                                resource,
+                                fhir_version,
+                                WriteLocks::Acquire,
+                            )
+                            .await?;
+                        Ok(ConditionalUpdateResult::Created(created))
+                    } else {
+                        // No match and no upsert
+                        Ok(ConditionalUpdateResult::NoMatch)
+                    }
+                }
+                1 => {
+                    // Exactly one match - update it (preserves existing FHIR
+                    // version). The update compares-and-swaps on `existing`'s
+                    // version, the one `If-Match` is evaluated against here.
+                    let existing = matches.into_iter().next().unwrap();
+                    crate::core::conditional_if_match_gate(
+                        if_match,
+                        resource_type,
+                        Some(&existing),
+                    )?;
+                    tenant.check_permission(Operation::Update, resource_type)?;
+                    // Tags and security labels the update leaves out are kept
+                    // (#2562), as `update` does.
+                    let mut resource = resource;
+                    merge_update_meta(existing.content(), &mut resource);
+                    let updated = self
+                        .store_update_in_tx(
+                            &*client,
+                            tenant,
+                            &existing,
+                            resource,
+                            WriteLocks::Acquire,
+                        )
                         .await?;
-                    Ok(ConditionalUpdateResult::Created(created))
-                } else {
-                    // No match and no upsert
-                    Ok(ConditionalUpdateResult::NoMatch)
+                    Ok(ConditionalUpdateResult::Updated(updated))
+                }
+                n => {
+                    // Multiple matches - error condition
+                    Ok(ConditionalUpdateResult::MultipleMatches(n))
                 }
             }
-            1 => {
-                // Exactly one match - update it (preserves existing FHIR version).
-                // `update` compares-and-swaps on `existing`'s version, the one
-                // `If-Match` is evaluated against here.
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                let updated = self.update(tenant, &existing, resource).await?;
-                Ok(ConditionalUpdateResult::Updated(updated))
-            }
-            n => {
-                // Multiple matches - error condition
-                Ok(ConditionalUpdateResult::MultipleMatches(n))
-            }
         }
+        .await;
+        let result = Self::end_conditional_write(client, result).await?;
+        match &result {
+            ConditionalUpdateResult::Created(created) => {
+                self.after_committed_write(resource_type, Some(created.content()))
+                    .await;
+            }
+            ConditionalUpdateResult::Updated(_) => {
+                self.after_committed_write(resource_type, None).await;
+            }
+            _ => {}
+        }
+        Ok(result)
     }
 
     async fn conditional_delete(
@@ -8578,6 +8292,14 @@ struct SearchableContent {
 }
 
 impl SearchableContent {
+    /// Whether neither text can exceed PostgreSQL's 1 MB `tsvector` limit:
+    /// both are within [`FTS_MAX_INPUT_BYTES`], the size the truncating retry
+    /// cuts oversized input down to.
+    fn fits_tsvector_limit(&self) -> bool {
+        self.narrative.len() <= FTS_MAX_INPUT_BYTES
+            && self.full_content.len() <= FTS_MAX_INPUT_BYTES
+    }
+
     fn is_empty(&self) -> bool {
         self.narrative.is_empty() && self.full_content.is_empty()
     }
@@ -10054,8 +9776,477 @@ mod standalone_reindex_classify_tests {
     }
 }
 
+/// Whether an in-transaction write still has to take its advisory locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteLocks {
+    /// Take the tenant gate and the resource key (the exclusive gate for a
+    /// `SearchParameter`) in the same flight as the write.
+    Acquire,
+    /// The caller's transaction already holds them.
+    Held,
+}
+
+/// Resource row, history row and the existence check in one statement.
+///
+/// The check used to be its own `SELECT` — a round trip per create, on the
+/// path a bulk import takes for every resource — and it was racy besides:
+/// two concurrent creates of the same id could both pass it and one would
+/// then fail on the primary key with an internal error instead of
+/// `AlreadyExists`. `ON CONFLICT DO NOTHING` decides it atomically.
+///
+/// On conflict the CTE yields no row, so the history insert selects nothing
+/// and the statement reports zero rows affected — one signal for both writes.
+/// A soft-deleted resource still occupies its primary key, so it conflicts
+/// too, exactly as the old check treated it.
+const INSERT_RESOURCE_SQL: &str = "WITH ins AS (
+                     INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (tenant_id, resource_type, id) DO NOTHING
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version FROM ins";
+
+/// Version check, update and history row in one statement. The check used to
+/// be a separate `SELECT` — a round trip on every update, and a check-then-act
+/// besides: a concurrent writer could bump the version in between and this
+/// update would overwrite it while reporting success. Folding the expected
+/// version into the `WHERE` makes the two atomic.
+const UPDATE_RESOURCE_SQL: &str = "WITH upd AS (
+                     UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+                     WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                       AND is_deleted = FALSE AND version_id = $7
+                     RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+                 )
+                 INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd";
+
 impl PostgresBackend {
-    /// One read-then-write attempt of [`ResourceStorage::create_or_update`].
+    /// The advisory locks of a single-resource write: the exclusive tenant
+    /// gate for a `SearchParameter`, otherwise the shared gate plus the
+    /// resource's own key.
+    async fn acquire_resource_write_locks<C>(
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+        locks: WriteLocks,
+    ) -> StorageResult<()>
+    where
+        C: GenericClient + Sync,
+    {
+        match locks {
+            WriteLocks::Held => Ok(()),
+            WriteLocks::Acquire if resource_type == "SearchParameter" => {
+                acquire_exclusive_write_gate(client, tenant_id).await
+            }
+            WriteLocks::Acquire => {
+                acquire_shared_write_locks(client, tenant_id, &[(resource_type, id)]).await
+            }
+        }
+    }
+
+    /// Runs one resource write and indexes what it wrote, on the caller's
+    /// transaction: the locks, the resource statement `write` and the
+    /// SearchParameter freshness probe leave in one flight, the `search_index`
+    /// and full-text statements in a second.
+    ///
+    /// Each of these used to be awaited before the next was sent: nine round
+    /// trips for a create, with the transaction idle in between. The server
+    /// still executes them in the order they are sent — the lock statement is
+    /// polled, and so sent, first; the resource statement runs only once the
+    /// locks are granted — and a failure anywhere fails the write, whose
+    /// caller rolls the transaction back, as before.
+    ///
+    /// A `SearchParameter` keeps the sequential order: its extractor must be
+    /// read after its own row is written.
+    ///
+    /// Returns the rows `write` affected; zero means it matched nothing and
+    /// nothing was indexed.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_then_index<C, W>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+        last_updated: DateTime<Utc>,
+        mode: IndexWrite,
+        resource: &Value,
+        locks: WriteLocks,
+        write: W,
+        what: &str,
+    ) -> StorageResult<u64>
+    where
+        C: GenericClient + Sync,
+        W: std::future::Future<Output = Result<u64, tokio_postgres::Error>>,
+    {
+        let lock = Self::acquire_resource_write_locks(client, tenant_id, resource_type, id, locks);
+        let extracts = !self.is_search_offloaded();
+        let (written, extractor) = if resource_type == "SearchParameter" {
+            lock.await?;
+            let written = write
+                .await
+                .map_err(|e| internal_error(format!("Failed to {what} resource: {e}")))?;
+            (written, None)
+        } else {
+            let (locked, written, extractor) = tokio::join!(
+                lock,
+                write,
+                self.write_extractor(client, tenant_id, extracts, false)
+            );
+            locked?;
+            let written =
+                written.map_err(|e| internal_error(format!("Failed to {what} resource: {e}")))?;
+            (written, Some(extractor))
+        };
+        if written == 0 {
+            return Ok(0);
+        }
+        let extractor = match extractor {
+            Some(extractor) => extractor?,
+            None => {
+                self.write_extractor(client, tenant_id, extracts, true)
+                    .await?
+            }
+        };
+        self.index_resource_guarded(
+            client,
+            &extractor,
+            tenant_id,
+            resource_type,
+            id,
+            last_updated,
+            mode,
+            resource,
+        )
+        .await?;
+        Ok(written)
+    }
+
+    /// The body of [`ResourceStorage::create`] on the caller's transaction.
+    async fn create_in_tx<C>(
+        &self,
+        client: &C,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+        locks: WriteLocks,
+    ) -> StorageResult<StoredResource>
+    where
+        C: GenericClient + Sync,
+    {
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Extract or generate ID
+        let id = resource
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(crate::types::new_resource_id);
+
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.clone()));
+        }
+
+        let now = Utc::now();
+        let version_id = "1";
+        let fhir_version_str = fhir_version.as_mime_param();
+        let is_deleted = false;
+
+        let inserted = self
+            .write_then_index(
+                client,
+                tenant_id,
+                resource_type,
+                &id,
+                now,
+                IndexWrite::Fresh,
+                &resource,
+                locks,
+                execute_cached(
+                    client,
+                    INSERT_RESOURCE_SQL,
+                    &[
+                        &tenant_id,
+                        &resource_type,
+                        &id,
+                        &version_id,
+                        &resource,
+                        &now,
+                        &is_deleted,
+                        &fhir_version_str,
+                    ],
+                ),
+                "insert",
+            )
+            .await?;
+        if inserted == 0 {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.clone(),
+            }));
+        }
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            &id,
+            version_id,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
+    /// The body of [`PostgresBackend::store_update`] on the caller's
+    /// transaction: `resource` becomes the next version of `current`, and
+    /// only if `current`'s version is still the stored one.
+    async fn store_update_in_tx<C>(
+        &self,
+        client: &C,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+        locks: WriteLocks,
+    ) -> StorageResult<StoredResource>
+    where
+        C: GenericClient + Sync,
+    {
+        let resource_type = current.resource_type();
+        let tenant_id = tenant.tenant_id().as_str();
+        let id = current.id();
+
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let now = Utc::now();
+        let fhir_version_str = current.fhir_version().as_mime_param();
+
+        // Re-indexing uses `Replace`, which clears the old `search_index` rows
+        // inside the same statement that writes the new ones. The
+        // `resource_fts` row stays either way: the full-text statement upserts
+        // over it.
+        let updated = self
+            .write_then_index(
+                client,
+                tenant_id,
+                resource_type,
+                id,
+                now,
+                IndexWrite::Replace,
+                &resource,
+                locks,
+                execute_cached(
+                    client,
+                    UPDATE_RESOURCE_SQL,
+                    &[
+                        &new_version_str,
+                        &resource,
+                        &now,
+                        &tenant_id,
+                        &resource_type,
+                        &id,
+                        &expected_version,
+                        &fhir_version_str,
+                    ],
+                ),
+                "update",
+            )
+            .await?;
+
+        // Zero rows means the update matched nothing; which of the two reasons
+        // it was costs a query, but only on the path that is already failing.
+        if updated == 0 {
+            let actual = client
+                .query_opt(
+                    "SELECT version_id FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            current.fhir_version(),
+        ))
+    }
+
+    /// Brings a soft-deleted resource back to life with new content, on the
+    /// caller's transaction, which holds the resource's write locks.
+    ///
+    /// FHIR permits a deleted resource to be restored by a subsequent update
+    /// ([http.html#delete](https://hl7.org/fhir/http.html#delete)), so a `PUT`
+    /// onto a deleted id must succeed instead of failing with `Gone`. The
+    /// restored resource continues the existing version chain (the deletion
+    /// record keeps its version, the restore gets the next one) and keeps the
+    /// FHIR version the resource was originally stored under.
+    ///
+    /// `deleted_version` and `fhir_version_str` are the tombstone's, read by
+    /// the caller under the same locks; the statement still names the version,
+    /// so a tombstone that is no longer there (a writer that does not take the
+    /// key) reports `NotFound`, which `create_or_update` retries.
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_deleted_in_tx<C>(
+        &self,
+        client: &C,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        deleted_version: &str,
+        fhir_version_str: &str,
+    ) -> StorageResult<StoredResource>
+    where
+        C: GenericClient + Sync,
+    {
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let now = Utc::now();
+        let new_version_str = (deleted_version.parse::<u64>().unwrap_or(0) + 1).to_string();
+        let restored = self
+            .write_then_index(
+                client,
+                tenant_id,
+                resource_type,
+                id,
+                now,
+                IndexWrite::Replace,
+                &resource,
+                WriteLocks::Held,
+                execute_cached(
+                    client,
+                    "WITH upd AS (
+                         UPDATE resources
+                         SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
+                         WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                           AND is_deleted = TRUE AND version_id = $7
+                         RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+                     )
+                     INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                     SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
+                    &[
+                        &new_version_str,
+                        &resource,
+                        &now,
+                        &tenant_id,
+                        &resource_type,
+                        &id,
+                        &deleted_version,
+                        &fhir_version_str,
+                    ],
+                ),
+                "restore",
+            )
+            .await?;
+        if restored == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        let fhir_version = FhirVersion::from_storage(fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
+    /// What a committed single-resource write owes the SearchParameter
+    /// caches. `created` is the content of a create: a seeded spec copy never
+    /// affects the overlay (see `create_affects_overlay`), which keeps bulk
+    /// seeding from triggering an O(n²) reload storm; every other
+    /// SearchParameter write invalidates the tenant overlays.
+    async fn after_committed_write(&self, resource_type: &str, created: Option<&Value>) {
+        if resource_type != "SearchParameter" {
+            return;
+        }
+        if let Some(resource) = created
+            && !self.tenant_registries().create_affects_overlay(resource)
+        {
+            return;
+        }
+        if let Err(e) = self.reload_stored_cache().await {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+    }
+
+    /// One attempt of [`ResourceStorage::create_or_update`]: the read that
+    /// decides between create, update and restore, and the write, in one
+    /// transaction on one connection, under the resource's advisory key.
+    ///
+    /// This used to be a session advisory lock on a pooled connection held
+    /// for the whole request, a read on a second connection and the write on
+    /// a third (two at a time). With as many PUTs in flight as the pool has
+    /// connections, every one of them held its lock connection while waiting
+    /// for one to write with, and all failed 503 when the pool's wait ran out.
+    /// The resource key is the lock every other write of this id already
+    /// takes, so the read below cannot go stale before the write: a racing PUT
+    /// waits for the key and then reads what this one committed.
     async fn create_or_update_once(
         &self,
         tenant: &TenantContext,
@@ -10064,124 +10255,204 @@ impl PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut client = self.guarded_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin create-or-update: {e}")))?;
+        let write_result: StorageResult<(StoredResource, bool)> = async {
+            // The lock statement is sent first, so the read runs once the key
+            // is granted, on a snapshot taken then (the server's default
+            // isolation is READ COMMITTED; under a stricter default the
+            // version-guarded write below reports the conflict instead, and
+            // the caller retries).
+            let (locked, row) = tokio::join!(
+                Self::acquire_resource_write_locks(
+                    &transaction,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    WriteLocks::Acquire,
+                ),
+                async {
+                    let statement = transaction
+                        .prepare_cached(
+                            "SELECT version_id, data, last_updated, is_deleted, fhir_version
+                             FROM resources
+                             WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
+                        )
+                        .await?;
+                    transaction
+                        .query_opt(&statement, &[&tenant_id, &resource_type, &id])
+                        .await
+                }
+            );
+            locked?;
+            let row = row.map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
+            let Some(row) = row else {
+                // Create new with specific ID
+                tenant.check_permission(Operation::Create, resource_type)?;
                 let mut resource = resource;
                 if let Some(obj) = resource.as_object_mut() {
                     obj.insert("id".to_string(), Value::String(id.to_string()));
                 }
                 let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
+                    .create_in_tx(
+                        &transaction,
+                        tenant,
+                        resource_type,
+                        resource,
+                        fhir_version,
+                        WriteLocks::Held,
+                    )
                     .await?;
-                Ok((created, true))
-            }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Ok((created, true));
+            };
+            tenant.check_permission(Operation::Update, resource_type)?;
+            let version_id: String = row.get(0);
+            let fhir_version_str: String = row.get(4);
+            if row.get::<_, bool>(3) {
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
                 let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
+                    .restore_deleted_in_tx(
+                        &transaction,
+                        tenant,
+                        resource_type,
+                        id,
+                        resource,
+                        &version_id,
+                        &fhir_version_str,
+                    )
                     .await?;
-                Ok((restored, true))
+                return Ok((restored, true));
             }
-            Err(e) => Err(e),
+            // Update existing (preserves original FHIR version)
+            let last_updated: DateTime<Utc> = row.get(2);
+            let current = StoredResource::from_storage(
+                resource_type,
+                id,
+                version_id,
+                tenant.tenant_id().clone(),
+                row.get::<_, Value>(1),
+                last_updated,
+                last_updated,
+                None,
+                FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled),
+            );
+            // Tags and security labels the update leaves out are kept (#2562).
+            let mut resource = resource;
+            merge_update_meta(current.content(), &mut resource);
+            let updated = self
+                .store_update_in_tx(&transaction, tenant, &current, resource, WriteLocks::Held)
+                .await?;
+            Ok((updated, false))
         }
-    }
-}
-
-/// Held while a conditional interaction checks and writes; dropping it
-/// releases the session advisory lock (on a background task) and returns the
-/// connection to the pool.
-pub(crate) struct ConditionLock {
-    client: Option<deadpool_postgres::Client>,
-    key: i32,
-}
-
-impl Drop for ConditionLock {
-    fn drop(&mut self) {
-        let Some(client) = self.client.take() else {
-            return;
+        .await;
+        let (stored, created) = match write_result {
+            Ok(result) => {
+                transaction.commit().await.map_err(|e| {
+                    internal_error(format!("Failed to commit create-or-update: {e}"))
+                })?;
+                client.mark_settled();
+                result
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(|e| {
+                    internal_error(format!("Failed to rollback create-or-update: {e}"))
+                })?;
+                client.mark_settled();
+                return Err(error);
+            }
         };
-        let key = self.key;
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let _ = client
-                        .execute(
-                            "SELECT pg_advisory_unlock($1, $2)",
-                            &[&super::lock_protocol::CONDITION_LOCK_NAMESPACE, &key],
-                        )
-                        .await;
-                });
-            }
-            Err(_) => {
-                // Discard the session so the lock cannot leak into the pool.
-                let _ = deadpool_postgres::Object::take(client);
-            }
-        }
+        drop(client);
+        // A create under a client-assigned id is a create for the overlay
+        // rule only when nothing was there before; a restore re-enters it.
+        let fresh = created && stored.version_id() == "1";
+        self.after_committed_write(resource_type, fresh.then(|| stored.content()))
+            .await;
+        Ok((stored, created))
     }
-}
 
-impl PostgresBackend {
-    /// Takes the advisory lock serializing conditional creates / upserts on
-    /// `criteria` across every connection of every instance. Waiters poll
-    /// with `pg_try_advisory_lock` and give their connection back between
-    /// tries, so a queue of waiters cannot exhaust the pool the holder needs
-    /// for its own write.
-    async fn lock_condition(
+    /// Begins the transaction of a single conditional create / update on
+    /// `client` and takes its locks (see
+    /// [`super::lock_protocol::acquire_conditional_write_locks`]). `READ
+    /// COMMITTED` is pinned: the search that follows the lock wait must be a
+    /// new snapshot that sees what the lock's previous holder committed.
+    ///
+    /// The transaction is opened with a plain `BEGIN` on the client rather
+    /// than a `Transaction` object because the criteria search
+    /// (`search_with_client`) runs on a `Client`; an unsettled
+    /// [`GuardedClient`] rolls back when dropped.
+    async fn begin_conditional_write(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         criteria: &str,
-    ) -> StorageResult<ConditionLock> {
-        let key = super::lock_protocol::condition_key(
-            tenant.tenant_id().as_str(),
-            resource_type,
-            criteria,
-        )?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut backoff = std::time::Duration::from_millis(2);
-        loop {
-            let client = self.get_client().await?;
-            let acquired: bool = client
-                .query_one(
-                    "SELECT pg_try_advisory_lock($1, $2)",
-                    &[&super::lock_protocol::CONDITION_LOCK_NAMESPACE, &key],
-                )
-                .await
-                .map_err(|e| {
-                    StorageError::Backend(BackendError::Internal {
-                        backend_name: "postgres".to_string(),
-                        message: format!("conditional interaction lock: {e}"),
-                        source: None,
-                    })
-                })?
-                .get(0);
-            if acquired {
-                return Ok(ConditionLock {
-                    client: Some(client),
-                    key,
-                });
+    ) -> StorageResult<GuardedClient> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let key = super::lock_protocol::condition_key(tenant_id, resource_type, criteria)?;
+        let mut client = self.guarded_client().await?;
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin conditional write: {e}")))?;
+        if let Err(error) = super::lock_protocol::acquire_conditional_write_locks(
+            &*client,
+            tenant_id,
+            resource_type == "SearchParameter",
+            key,
+        )
+        .await
+        {
+            if client.batch_execute("ROLLBACK").await.is_ok() {
+                client.mark_settled();
             }
-            drop(client);
-            if std::time::Instant::now() >= deadline {
-                return Err(StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "postgres".to_string(),
-                    message: "timed out waiting for a concurrent conditional write on the same \
-                              criteria"
-                        .to_string(),
-                }));
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+            return Err(error);
         }
+        Ok(client)
+    }
+
+    /// Ends the transaction [`Self::begin_conditional_write`] opened: `COMMIT`
+    /// when the interaction succeeded, `ROLLBACK` otherwise.
+    async fn end_conditional_write<T>(
+        mut client: GuardedClient,
+        result: StorageResult<T>,
+    ) -> StorageResult<T> {
+        let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        match client.batch_execute(end).await {
+            Ok(()) => {
+                client.mark_settled();
+                result
+            }
+            // A failed ROLLBACK leaves the client unsettled, and it is
+            // discarded on drop; the interaction's own error is the news.
+            Err(_) if result.is_err() => result,
+            Err(e) => Err(internal_error(format!(
+                "Failed to commit conditional write: {e}"
+            ))),
+        }
+    }
+
+    /// The criteria search of a single conditional create / update, on the
+    /// connection that holds its locks and will write.
+    async fn find_matching_resources_on(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
+            return Ok(Vec::new());
+        };
+        let result = self
+            .search_with_client(client, tenant, &query, None)
+            .await?;
+        Ok(result.resources.items)
     }
 }
 

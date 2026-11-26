@@ -51,12 +51,19 @@ struct StoredOverlay {
 }
 
 /// Default window in which a write trusts a validated overlay without probing
-/// the database again: zero, i.e. every write probes (the exact, previous
-/// behavior). Opt in with `HFS_PG_SP_FINGERPRINT_TTL_MS=<ms>` (for example
-/// `1000`): a SearchParameter committed by this process still invalidates the
-/// cache immediately; only one committed by another HFS process can then take
-/// up to that long to be seen by ordinary writes.
-const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::ZERO;
+/// the database again: one second. Before, every indexed write probed (a
+/// round trip in which PostgreSQL aggregates the tenant's SearchParameter
+/// rows) — the largest fixed cost of a single-resource write.
+///
+/// What the window means: a SearchParameter committed by **this** process
+/// invalidates the cache immediately, as before. One committed by **another**
+/// HFS process on the same database is used by this process's ordinary
+/// writes at most this long after its commit; resources written here in
+/// between are indexed without it and need the reindex a new SearchParameter
+/// needs anyway for the resources that already existed. Bulk submit always
+/// probes. `HFS_PG_SP_FINGERPRINT_TTL_MS=0` restores the probe on every
+/// write (no staleness between instances); a larger value widens the window.
+const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::from_millis(1000);
 
 fn overlay_fingerprint_ttl_from_env() -> Duration {
     std::env::var("HFS_PG_SP_FINGERPRINT_TTL_MS")
@@ -160,6 +167,9 @@ pub struct PostgresBackend {
     /// `pg_stats.null_frac` of the range-typed `search_index` value columns,
     /// with the time it was read; see `search_impl::range_estimate_correction`.
     pub(super) value_null_fractions: ValueNullFractions,
+    /// Which `(tenant, resource type)` pairs are verified to have no orphan
+    /// `search_index` rows; see `index_liveness.rs`. Shared by clones.
+    pub(super) index_liveness: Arc<super::index_liveness::IndexLiveness>,
     /// Bulk index rebuild window state (`begin/end_bulk_index_rebuild`),
     /// shared by clones; see `bulk_index_rebuild.rs`.
     pub(super) bulk_index_rebuild: super::bulk_index_rebuild::BulkIndexRebuild,
@@ -867,6 +877,7 @@ impl PostgresBackend {
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
             subscription_fanout: std::sync::OnceLock::new(),
             value_null_fractions: Arc::new(RwLock::new(None)),
+            index_liveness: Default::default(),
             bulk_index_rebuild: Default::default(),
             #[cfg(test)]
             reindex_test_hook: None,

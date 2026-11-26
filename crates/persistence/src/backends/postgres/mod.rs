@@ -72,6 +72,7 @@
 //! );
 //! ```
 
+pub mod audit_table;
 mod backend;
 mod bulk_export;
 mod bulk_index_rebuild;
@@ -82,6 +83,7 @@ pub(crate) mod cached;
 mod cleanup;
 mod cluster_change_feed;
 mod cluster_jobs;
+mod index_liveness;
 mod lock_protocol;
 mod login_sessions;
 pub(crate) mod null_timestamp_facts;

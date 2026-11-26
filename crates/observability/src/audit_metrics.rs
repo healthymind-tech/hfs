@@ -10,6 +10,7 @@
 //! | `audit_events_written_total` | counter | events handed to the store (`rate()` = events/s) |
 //! | `audit_queue_depth` | gauge | events accepted but not yet written (queued + in flight) |
 //! | `audit_queue_full_waits_total` | counter | requests that waited because the queue was full (backpressure) |
+//! | `audit_queue_blocked_seconds` | histogram | how long a request waited for room in the full queue (`_sum` = total blocked time) |
 //! | `audit_batch_write_duration_seconds` | histogram | wall time of one batch write |
 //! | `audit_events_spilled_total{reason}` | counter | events written to the fallback file instead (`shutdown`, `write_failure`) |
 //! | `audit_events_replayed_total` | counter | spilled events stored at start-up |
@@ -26,6 +27,7 @@ pub const ENQUEUED: &str = "audit_events_enqueued_total";
 pub const WRITTEN: &str = "audit_events_written_total";
 pub const QUEUE_DEPTH: &str = "audit_queue_depth";
 pub const QUEUE_FULL_WAITS: &str = "audit_queue_full_waits_total";
+pub const QUEUE_BLOCKED: &str = "audit_queue_blocked_seconds";
 pub const BATCH_WRITE_DURATION: &str = "audit_batch_write_duration_seconds";
 pub const SPILLED: &str = "audit_events_spilled_total";
 pub const REPLAYED: &str = "audit_events_replayed_total";
@@ -75,6 +77,11 @@ pub fn record_queue_full_wait() {
     metrics::counter!(QUEUE_FULL_WAITS).increment(1);
 }
 
+/// One request waited `elapsed` for room in the full audit queue.
+pub fn observe_queue_blocked(elapsed: Duration) {
+    metrics::histogram!(QUEUE_BLOCKED).record(elapsed.as_secs_f64());
+}
+
 pub fn observe_batch_write(elapsed: Duration) {
     metrics::histogram!(BATCH_WRITE_DURATION).record(elapsed.as_secs_f64());
 }
@@ -119,6 +126,7 @@ mod tests {
             set_queue_depth(1);
             record_queue_full_wait();
             observe_batch_write(Duration::from_millis(3));
+            observe_queue_blocked(Duration::from_millis(40));
             record_spilled(2, SpillReason::Shutdown);
             record_spilled(1, SpillReason::WriteFailure);
             record_replayed(3);
@@ -141,6 +149,7 @@ mod tests {
             has("audit_batch_write_duration_seconds_bucket"),
             "a real histogram, not a summary: {text}"
         );
+        assert!(has("audit_queue_blocked_seconds_bucket"), "{text}");
         assert!(has("reason=\"shutdown\""), "{text}");
         assert!(has("reason=\"write_failure\""), "{text}");
         assert!(

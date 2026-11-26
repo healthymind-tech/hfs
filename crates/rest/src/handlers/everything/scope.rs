@@ -26,7 +26,10 @@ pub(crate) fn build_segments(version: FhirVersion, types: Option<&[String]>) -> 
     let members = crate::fhir_types::get_resource_type_names_for_version(version)
         .iter()
         .filter(|t| **t != "Patient")
-        .filter(|t| !helios_fhir::get_compartment_params(version, "Patient", t).is_empty());
+        .filter(|t| !helios_fhir::get_compartment_params(version, "Patient", t).is_empty())
+        // The audit trail is not part of the chart: `AuditEvent` is walked
+        // only when `_type` names it (or the deployment opted in).
+        .filter(|t| crate::handlers::audit_events::walk_includes(t, types));
     match types {
         None => segments.extend(members.map(|t| t.to_string())),
         Some(wanted) => {

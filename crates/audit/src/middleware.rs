@@ -62,6 +62,10 @@ pub struct AuditMiddlewareState {
     /// Whether requests may carry a tenant as a URL path prefix. Used to strip
     /// the prefix of a request refused before its tenant was resolved.
     pub url_tenant_routing: bool,
+    /// The dedicated audit store, when events are written to it
+    /// (`HFS_AUDIT_STORE=table`): the server serves `AuditEvent` read and
+    /// search from here.
+    pub reader: Option<Arc<dyn crate::store::AuditEventReader>>,
 }
 
 impl AuditMiddlewareState {
@@ -74,7 +78,14 @@ impl AuditMiddlewareState {
             exclusion_filter,
             server_address: String::new(),
             url_tenant_routing: false,
+            reader: None,
         }
+    }
+
+    /// Sets the dedicated audit store the server reads `AuditEvent` from.
+    pub fn with_reader(mut self, reader: Arc<dyn crate::store::AuditEventReader>) -> Self {
+        self.reader = Some(reader);
+        self
     }
 
     /// Sets the public base URL of the server.

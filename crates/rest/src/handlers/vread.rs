@@ -56,10 +56,21 @@ pub(crate) async fn execute_vread<S>(
 where
     S: ResourceStorage + VersionedStorage + SearchProvider + Send + Sync,
 {
-    let stored = state
-        .storage()
-        .vread(tenant.context(), resource_type, id, version_id)
-        .await?;
+    // An immutable `AuditEvent` of the dedicated audit store has one version.
+    let from_audit_store = if version_id == "1" {
+        super::audit_events::read(state, tenant, resource_type, id).await?
+    } else {
+        None
+    };
+    let stored = match from_audit_store {
+        Some(event) => Some(event),
+        None => {
+            state
+                .storage()
+                .vread(tenant.context(), resource_type, id, version_id)
+                .await?
+        }
+    };
 
     match stored {
         Some(stored) if stored.is_deleted() => {

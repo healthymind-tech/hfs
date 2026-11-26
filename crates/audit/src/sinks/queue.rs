@@ -43,8 +43,8 @@ impl Default for QueueConfig {
     fn default() -> Self {
         Self {
             capacity: 10_000,
-            batch_size: 64,
-            workers: 4,
+            batch_size: crate::config::DEFAULT_BATCH_SIZE,
+            workers: crate::config::DEFAULT_WRITERS,
             flush_timeout: Duration::from_secs(5),
             spill_file: None,
         }
@@ -60,6 +60,8 @@ pub struct QueueStats {
     pub written: AtomicU64,
     /// Calls that had to wait because the queue was full.
     pub waited_for_room: AtomicU64,
+    /// Total time callers spent waiting for room, in microseconds.
+    pub blocked_micros: AtomicU64,
     /// Events written to the spill file at a flush timeout.
     pub spilled: AtomicU64,
 }
@@ -248,7 +250,14 @@ impl AuditSink for QueuedSink {
             }
             Err(mpsc::error::TrySendError::Closed(r)) => r,
         };
-        if let Err(mpsc::error::SendError(r)) = self.tx.send(record).await {
+        let blocked = Instant::now();
+        let sent = self.tx.send(record).await;
+        let waited = blocked.elapsed();
+        self.stats
+            .blocked_micros
+            .fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        m::observe_queue_blocked(waited);
+        if let Err(mpsc::error::SendError(r)) = sent {
             // No worker left (runtime shutting down): write it ourselves.
             self.inner.record_records(vec![r]).await;
             self.stats.written.fetch_add(1, Ordering::Relaxed);
@@ -284,6 +293,7 @@ impl AuditSink for QueuedSink {
             written = self.stats.written.load(Ordering::Relaxed),
             spilled = self.stats.spilled.load(Ordering::Relaxed),
             waited_for_room = self.stats.waited_for_room.load(Ordering::Relaxed),
+            blocked_ms = self.stats.blocked_micros.load(Ordering::Relaxed) / 1000,
             "Audit queue flushed"
         );
     }

@@ -520,6 +520,9 @@ impl Validator {
         opts: &ValidationOptions,
         effects: &EffectHandlers<'_>,
     ) -> Vec<ValidationError> {
+        // One session for the whole run: the walk's checks and the deferred
+        // constraints share the resource's typed parse.
+        let session = effects.constraints.map(|e| e.session(resource, version));
         let check = |root: &Value, path: &str, id: &str, expression: &str| -> bool {
             let Some(evaluator) = effects.constraints else {
                 return true;
@@ -530,8 +533,12 @@ impl Validator {
                 expression,
                 own_resource: false,
             }];
+            let outcomes = match &session {
+                Some(session) if std::ptr::eq(root, resource) => session.evaluate(&c, None),
+                _ => evaluator.evaluate_all(root, version, &c),
+            };
             !matches!(
-                evaluator.evaluate_all(root, version, &c).first(),
+                outcomes.first(),
                 Some(crate::effects::ConstraintOutcome::Failed)
             )
         };
@@ -584,12 +591,13 @@ impl Validator {
                 .chain(&tx)
                 .all(|e| e.severity != Severity::Error)
         });
-        crate::effects::execute_with(
+        crate::effects::execute_in_session(
             resource,
             version,
             &deferred,
             effects,
             Some(conformance),
+            session.as_deref(),
             &mut errors,
         )
         .await;
