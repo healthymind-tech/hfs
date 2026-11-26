@@ -38,7 +38,9 @@ use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource, merge_update_meta};
 
 use super::PostgresBackend;
-use super::bundle_lock_plan::{BundleLockMode, MAX_BUNDLE_LOCK_KEYS, plan_bundle_locks};
+use super::bundle_lock_plan::{
+    BundleLockMode, ExclusiveReason, conditional_targets_enabled, plan_bundle_locks_with,
+};
 use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::{GuardedClient, ReindexAdmission};
 use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
@@ -644,6 +646,7 @@ mod reindex_groups_tests {
             resources: vec![("Patient".to_string(), "planned".to_string())],
             minted_creates: true,
             criteria_locks: true,
+            conditional_targets: false,
         };
 
         let outcome = backend
@@ -5285,7 +5288,11 @@ impl BundleProvider for PostgresBackend {
         // SearchParameter, addresses an entry by search criteria, cannot be
         // classified or is too large for the lock table takes the exclusive
         // gate, as every bundle once did.
-        let lock_mode = plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS);
+        let lock_mode = plan_bundle_locks_with(
+            &entries,
+            self.bundle_lock_keys,
+            conditional_targets_enabled() && self.supports_conditional_in_transaction(),
+        );
         match &lock_mode {
             BundleLockMode::Shared(plan) => tracing::debug!(
                 lock_mode = "shared",
@@ -5300,8 +5307,119 @@ impl BundleProvider for PostgresBackend {
                 "transaction bundle lock plan"
             ),
         }
-        self.run_transaction_bundle(tenant, entries, fhir_version, validator, lock_mode)
+        // A Bundle with criteria-addressed entries runs under the shared gate
+        // first and, if a target or its criteria is busy or moved under it,
+        // once more under the exclusive gate (`LockPlan::conditional_targets`).
+        let optimistic = matches!(&lock_mode, BundleLockMode::Shared(plan) if plan.conditional_targets);
+        if !optimistic {
+            return self
+                .run_transaction_bundle(tenant, entries, fhir_version, validator, lock_mode)
+                .await;
+        }
+        match self
+            .run_transaction_bundle(tenant, entries.clone(), fhir_version, validator, lock_mode)
             .await
+        {
+            Err(TransactionError::Transient { reason, .. })
+                if reason == CONDITIONAL_TARGETS_CONTENDED =>
+            {
+                tracing::debug!(
+                    entries = entries.len(),
+                    "transaction bundle: conditional targets contended, retrying under the exclusive gate"
+                );
+                self.run_transaction_bundle(
+                    tenant,
+                    entries,
+                    fhir_version,
+                    validator,
+                    BundleLockMode::Exclusive(ExclusiveReason::ConditionalEntry),
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+}
+
+/// The `Transient` reason a shared run of a Bundle with criteria-addressed
+/// entries ends with when it could not lock its targets, or they moved before
+/// it had; `process_transaction` answers it by running the Bundle under the
+/// exclusive gate. A caller that runs a plan directly sees a retryable error.
+const CONDITIONAL_TARGETS_CONTENDED: &str =
+    "conditional targets were contended under the shared tenant gate";
+
+impl PostgresBackend {
+    /// Locks the targets a shared-gate Bundle resolved for its
+    /// criteria-addressed entries and confirms them
+    /// ([`super::bundle_lock_plan::LockPlan::conditional_targets`]).
+    ///
+    /// Takes, without waiting, the resource key of every resolved target and
+    /// the criteria lock of every such entry, then resolves again — a new
+    /// `READ COMMITTED` snapshot, which sees whatever committed before the
+    /// keys were taken. Returns the second resolution when every entry
+    /// resolves to the same resource version as before (from here on a writer
+    /// of those resources waits for this transaction), and `None` when a lock
+    /// was busy or a target changed, in which case the caller rolls back and
+    /// the Bundle runs under the exclusive gate.
+    async fn lock_conditional_targets(
+        &self,
+        tenant: &TenantContext,
+        tx: &mut super::transaction::PostgresTransaction,
+        entries: &[BundleEntry],
+        targets: HashMap<usize, crate::core::ConditionalTarget>,
+    ) -> Result<Option<HashMap<usize, crate::core::ConditionalTarget>>, TransactionError> {
+        let lock_failure = |error: StorageError| {
+            super::lock_protocol::transient_bundle_error(&error).unwrap_or_else(|| {
+                TransactionError::RolledBack {
+                    reason: format!("Failed to lock conditional targets: {error}"),
+                }
+            })
+        };
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut identities: Vec<(String, String)> = Vec::new();
+        let mut criteria: Vec<i32> = Vec::new();
+        for (index, target) in &targets {
+            if let Some(resolved) = &target.resolved {
+                identities.push((
+                    resolved.resource_type().to_string(),
+                    resolved.id().to_string(),
+                ));
+            }
+            let query = entries[*index]
+                .url
+                .split_once('?')
+                .map_or("", |(_, query)| query);
+            if let Some(key) =
+                super::lock_protocol::criteria_key_for(tenant_id, &target.resource_type, query)
+                    .map_err(lock_failure)?
+            {
+                criteria.push(key);
+            }
+        }
+        if !tx
+            .try_lock_conditional_targets(&identities, &criteria)
+            .await
+            .map_err(lock_failure)?
+        {
+            return Ok(None);
+        }
+        let confirmed = crate::core::resolve_conditional_targets(tx, entries, None).await?;
+        let version = |target: &crate::core::ConditionalTarget| {
+            target.resolved.as_ref().map(|resource| {
+                (
+                    resource.resource_type().to_string(),
+                    resource.id().to_string(),
+                    resource.version_id().to_string(),
+                )
+            })
+        };
+        let unchanged = confirmed.len() == targets.len()
+            && confirmed.iter().all(|(index, target)| {
+                targets
+                    .get(index)
+                    .is_some_and(|before| version(before) == version(target))
+            });
+        Ok(unchanged.then_some(confirmed))
     }
 }
 
@@ -5349,6 +5467,8 @@ impl PostgresBackend {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
 
         let options = TransactionOptions::new().fhir_version(fhir_version);
+        let lock_conditional_targets =
+            matches!(&lock_mode, BundleLockMode::Shared(plan) if plan.conditional_targets);
 
         // Start a transaction
         let begun = match lock_mode {
@@ -5390,6 +5510,29 @@ impl PostgresBackend {
                 let _ = Box::new(tx).rollback().await;
                 return Err(e);
             }
+        };
+        // Under the shared gate the targets were found without their keys:
+        // take them now, without waiting, and look again.
+        let targets = if lock_conditional_targets {
+            match self
+                .lock_conditional_targets(tenant, &mut tx, &entries, targets)
+                .await
+            {
+                Ok(Some(targets)) => targets,
+                Ok(None) => {
+                    let _ = Box::new(tx).rollback().await;
+                    return Err(TransactionError::Transient {
+                        attempts: 1,
+                        reason: CONDITIONAL_TARGETS_CONTENDED.to_string(),
+                    });
+                }
+                Err(e) => {
+                    let _ = Box::new(tx).rollback().await;
+                    return Err(e);
+                }
+            }
+        } else {
+            targets
         };
 
         // `create` no longer sends its insert on the spot — the transaction

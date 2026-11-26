@@ -19,7 +19,7 @@
 //! | `POST`, no `resource.id` (every REST POST) | none: the id is minted inside the transaction, so nobody else can address the resource before `COMMIT` |
 //! | `POST` with `resource.id` | key for `(type, id)` |
 //! | `PUT`, `PATCH`, `DELETE`, `GET` `Type/id` | key for `(type, id)` |
-//! | `PUT`, `PATCH`, `DELETE` `Type?criteria` | **exclusive**: the target is found by a search inside the transaction, so its key is not known before `BEGIN` |
+//! | `PUT`, `PATCH`, `DELETE` `Type?criteria` | none before `BEGIN`: the target is found by a search inside the transaction, and its key and the criteria lock are then taken *without waiting*; if any is busy the Bundle starts over under the **exclusive** gate (see [`LockPlan::conditional_targets`]) |
 //! | anything naming a `SearchParameter` | **exclusive** |
 //! | an entry the planner cannot classify | **exclusive**, so its error is the one it always was |
 //! | more than [`MAX_BUNDLE_LOCK_KEYS`] distinct keys | **exclusive**, to stay inside the lock table |
@@ -76,6 +76,57 @@ use super::storage::parse_resource_url;
 /// gate lock, which is what every Bundle did before the plan existed.
 pub(super) const MAX_BUNDLE_LOCK_KEYS: usize = 128;
 
+/// Largest cap [`bundle_lock_key_cap`] derives on its own.
+pub(super) const MAX_DERIVED_BUNDLE_LOCK_KEYS: usize = 4096;
+
+/// Environment override of the per-Bundle key cap.
+pub(super) const BUNDLE_LOCK_KEYS_ENV: &str = "HFS_PG_BUNDLE_LOCK_KEYS";
+
+/// The cap on distinct resource keys (and, separately, on conditional
+/// creates) a Bundle may carry before it takes the exclusive gate, for this
+/// server and pool.
+///
+/// [`MAX_BUNDLE_LOCK_KEYS`] is sized for a default server (6,400 lock-table
+/// slots). A migration that keeps ids — Bundles of several hundred `PUT
+/// Type/id` entries — is over it on every Bundle, so each one takes the
+/// exclusive gate and the tenant's writers run one at a time. The lock table
+/// is a server setting, so the cap follows it:
+///
+/// * `configured` ([`BUNDLE_LOCK_KEYS_ENV`]) is used as given (at least 1):
+///   the operator has sized `max_locks_per_transaction` for it.
+/// * otherwise half of the lock table (`lock_table_slots`, i.e.
+///   `max_locks_per_transaction x (max_connections +
+///   max_prepared_transactions)`) is shared among `pool_size` Bundles that
+///   each hold up to `2 x cap + 1` locks, never below
+///   [`MAX_BUNDLE_LOCK_KEYS`] (what every server got before) and never above
+///   [`MAX_DERIVED_BUNDLE_LOCK_KEYS`]. The other half is left to relation
+///   locks, reindex groups, bulk-submit batches and other instances.
+///
+/// A default server therefore keeps 128. `max_locks_per_transaction = 1024`
+/// with `max_connections = 200` and a pool of 64 gives 800. A Bundle that
+/// still finds the table full ends as a retryable 503, as before.
+pub(super) fn bundle_lock_key_cap(
+    configured: Option<usize>,
+    lock_table_slots: Option<usize>,
+    pool_size: usize,
+) -> usize {
+    if let Some(configured) = configured {
+        return configured.max(1);
+    }
+    let Some(slots) = lock_table_slots else {
+        return MAX_BUNDLE_LOCK_KEYS;
+    };
+    (slots / 2 / pool_size.max(1) / 2).clamp(MAX_BUNDLE_LOCK_KEYS, MAX_DERIVED_BUNDLE_LOCK_KEYS)
+}
+
+/// [`BUNDLE_LOCK_KEYS_ENV`], when set to a positive integer.
+pub(super) fn configured_bundle_lock_keys() -> Option<usize> {
+    std::env::var(BUNDLE_LOCK_KEYS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
 const SEARCH_PARAMETER: &str = "SearchParameter";
 
 /// What a planned (shared-gate) transaction locks, and what it may then touch.
@@ -92,6 +143,28 @@ pub(super) struct LockPlan {
     /// before it searches again and creates (a Bundle). Bulk submit has no
     /// `ifNoneExist` and sets this false.
     pub(super) criteria_locks: bool,
+    /// Whether the Bundle has entries addressed by search criteria (`PUT`,
+    /// `PATCH`, `DELETE` `Type?criteria`) whose targets are locked after they
+    /// are resolved.
+    ///
+    /// Such a Bundle used to take the exclusive gate, because the key of a
+    /// target is not known before `BEGIN`; every other writer of the tenant
+    /// then waited for it, and it for them. Now it begins shared, resolves the
+    /// targets, and takes each target's resource key and each entry's criteria
+    /// lock with `pg_try_advisory_xact_lock` — never waiting, so it cannot
+    /// deadlock against writers that take their keys in sorted order. It then
+    /// resolves again (a new `READ COMMITTED` snapshot) and goes on only if
+    /// every entry still resolves to the same version; a writer of a locked
+    /// target can no longer interleave after that. If a lock is busy or a
+    /// target moved, the Bundle rolls back and runs once more under the
+    /// exclusive gate, exactly as it always did.
+    ///
+    /// What the shared run does not exclude is what `ifNoneExist` under the
+    /// shared gate does not exclude either (see
+    /// `PostgresTransaction::lock_criteria`): a writer that takes neither a
+    /// locked key nor the criteria lock can create a resource that newly
+    /// matches the criteria while the Bundle runs.
+    pub(super) conditional_targets: bool,
 }
 
 impl LockPlan {
@@ -101,6 +174,7 @@ impl LockPlan {
             resources,
             minted_creates: false,
             criteria_locks: false,
+            conditional_targets: false,
         }
     }
 }
@@ -138,15 +212,73 @@ fn url_type(url: &str) -> Option<&str> {
     path.rsplit('/').find(|segment| !segment.is_empty())
 }
 
+/// Environment switch for [`LockPlan::conditional_targets`]: `0`, `false`,
+/// `off` or `no` sends every Bundle with a criteria-addressed entry back to
+/// the exclusive gate.
+pub(super) const CONDITIONAL_SHARED_ENV: &str = "HFS_PG_BUNDLE_CONDITIONAL_SHARED";
+
+/// [`CONDITIONAL_SHARED_ENV`], read once. Default on.
+pub(super) fn conditional_targets_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var(CONDITIONAL_SHARED_ENV)
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        )
+    })
+}
+
 /// Derives how `entries` lock, from the entries alone. No database access.
+/// A criteria-addressed entry takes the exclusive gate (the plan before
+/// [`LockPlan::conditional_targets`]; see [`plan_bundle_locks_with`]).
+#[cfg(test)]
 pub(super) fn plan_bundle_locks(entries: &[BundleEntry], max_keys: usize) -> BundleLockMode {
+    plan_bundle_locks_with(entries, max_keys, false)
+}
+
+/// [`plan_bundle_locks`], with criteria-addressed entries planned shared when
+/// `conditional_targets` is set.
+pub(super) fn plan_bundle_locks_with(
+    entries: &[BundleEntry],
+    max_keys: usize,
+    conditional_targets: bool,
+) -> BundleLockMode {
     use BundleLockMode::Exclusive;
 
     let mut keys: BTreeSet<(String, String)> = BTreeSet::new();
     let mut conditional_creates = 0usize;
+    let mut conditional_entries = 0usize;
     for entry in entries {
         if entry.criteria.is_some() {
-            return Exclusive(ExclusiveReason::ConditionalEntry);
+            if !conditional_targets {
+                return Exclusive(ExclusiveReason::ConditionalEntry);
+            }
+            let body_type = entry
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.get("resourceType"))
+                .and_then(Value::as_str);
+            let Some(resource_type) = crate::core::conditional_resource_type(entry) else {
+                return Exclusive(ExclusiveReason::ConditionalEntry);
+            };
+            if resource_type == SEARCH_PARAMETER || body_type == Some(SEARCH_PARAMETER) {
+                return Exclusive(ExclusiveReason::SearchParameter);
+            }
+            // A conditional `PUT` that matches nothing creates under the id
+            // its body carries, if it carries one; that id needs its key.
+            if entry.method == BundleMethod::Put
+                && let Some(id) = entry
+                    .resource
+                    .as_ref()
+                    .and_then(|resource| resource.get("id"))
+                    .and_then(Value::as_str)
+            {
+                keys.insert((resource_type.to_string(), id.to_string()));
+            }
+            conditional_entries += 1;
+            continue;
         }
         match entry.method {
             BundleMethod::Post => {
@@ -189,8 +321,17 @@ pub(super) fn plan_bundle_locks(entries: &[BundleEntry], max_keys: usize) -> Bun
             }
         }
     }
-    if keys.len() > max_keys {
-        return Exclusive(ExclusiveReason::TooManyKeys(keys.len()));
+    // Each criteria-addressed entry can come to hold one resource key (its
+    // target's) and one criteria lock.
+    if keys.len() + conditional_entries > max_keys {
+        return Exclusive(ExclusiveReason::TooManyKeys(
+            keys.len() + conditional_entries,
+        ));
+    }
+    if conditional_creates + conditional_entries > max_keys {
+        return Exclusive(ExclusiveReason::TooManyConditionalCreates(
+            conditional_creates + conditional_entries,
+        ));
     }
     if conditional_creates > max_keys {
         return Exclusive(ExclusiveReason::TooManyConditionalCreates(
@@ -201,6 +342,7 @@ pub(super) fn plan_bundle_locks(entries: &[BundleEntry], max_keys: usize) -> Bun
         resources: keys.into_iter().collect(),
         minted_creates: true,
         criteria_locks: true,
+        conditional_targets: conditional_entries > 0,
     })
 }
 
@@ -243,6 +385,92 @@ mod tests {
             .iter()
             .map(|(t, i)| (t.as_str(), i.as_str()))
             .collect()
+    }
+
+    /// Criteria-addressed entries plan shared when asked to, with the key of
+    /// an id a conditional `PUT` may create under; a SearchParameter and an
+    /// over-cap Bundle still take the exclusive gate.
+    #[test]
+    fn conditional_entries_plan_shared_when_enabled() {
+        let entries = vec![
+            conditional(BundleMethod::Put, "Patient?identifier=a"),
+            conditional(BundleMethod::Delete, "Patient?identifier=b"),
+            BundleEntry {
+                criteria: Some(Vec::<SearchParameter>::new()),
+                ..entry(
+                    BundleMethod::Put,
+                    "Patient?identifier=c",
+                    Some(json!({"resourceType": "Patient", "id": "fixed"})),
+                )
+            },
+            entry(BundleMethod::Put, "Patient/p1", Some(json!({"resourceType": "Patient"}))),
+        ];
+        assert_eq!(
+            plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS),
+            BundleLockMode::Exclusive(ExclusiveReason::ConditionalEntry)
+        );
+        let plan = shared(plan_bundle_locks_with(&entries, MAX_BUNDLE_LOCK_KEYS, true));
+        assert!(plan.conditional_targets);
+        assert_eq!(keys(&plan), [("Patient", "fixed"), ("Patient", "p1")]);
+
+        // Unconditional Bundles are untouched by the switch.
+        let plain = vec![post(json!({"resourceType": "Observation"}))];
+        assert!(!shared(plan_bundle_locks_with(&plain, MAX_BUNDLE_LOCK_KEYS, true)).conditional_targets);
+
+        let search_parameter = vec![conditional(BundleMethod::Delete, "SearchParameter?code=x")];
+        assert_eq!(
+            plan_bundle_locks_with(&search_parameter, MAX_BUNDLE_LOCK_KEYS, true),
+            BundleLockMode::Exclusive(ExclusiveReason::SearchParameter)
+        );
+
+        let many: Vec<_> = (0..5)
+            .map(|n| conditional(BundleMethod::Delete, &format!("Patient?identifier={n}")))
+            .collect();
+        assert_eq!(
+            plan_bundle_locks_with(&many, 4, true),
+            BundleLockMode::Exclusive(ExclusiveReason::TooManyKeys(5))
+        );
+    }
+
+    /// The cap follows the server's lock table and never drops below the
+    /// historical 128; an explicit setting wins.
+    #[test]
+    fn key_cap_follows_the_lock_table() {
+        // Default server (64 x 100) and the stock pool: unchanged.
+        assert_eq!(bundle_lock_key_cap(None, Some(6_400), 32), 128);
+        // Unknown server settings: unchanged.
+        assert_eq!(bundle_lock_key_cap(None, None, 32), 128);
+        // max_locks_per_transaction=1024, max_connections=200, pool 64.
+        assert_eq!(bundle_lock_key_cap(None, Some(204_800), 64), 800);
+        // Never derived above the ceiling.
+        assert_eq!(
+            bundle_lock_key_cap(None, Some(10_000_000), 16),
+            MAX_DERIVED_BUNDLE_LOCK_KEYS
+        );
+        // Explicit: used as given, even below 128; zero is not a cap.
+        assert_eq!(bundle_lock_key_cap(Some(2_000), Some(6_400), 32), 2_000);
+        assert_eq!(bundle_lock_key_cap(Some(16), Some(6_400), 32), 16);
+        assert_eq!(bundle_lock_key_cap(Some(0), None, 0), 1);
+    }
+
+    /// A Bundle of 500 `PUT Type/id` entries plans shared under a cap sized
+    /// for it and exclusive under the default.
+    #[test]
+    fn a_raised_cap_keeps_id_bearing_bundles_shared() {
+        let entries: Vec<_> = (0..500)
+            .map(|n| {
+                entry(
+                    BundleMethod::Put,
+                    &format!("Patient/p{n}"),
+                    Some(json!({"resourceType": "Patient", "id": format!("p{n}")})),
+                )
+            })
+            .collect();
+        assert_eq!(
+            plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS),
+            BundleLockMode::Exclusive(ExclusiveReason::TooManyKeys(500))
+        );
+        assert_eq!(shared(plan_bundle_locks(&entries, 800)).resources.len(), 500);
     }
 
     /// Every REST POST reaches storage without an id: the shared gate and no

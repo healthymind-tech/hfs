@@ -21,6 +21,7 @@ use helios_persistence::core::{
     TransactionOptions, TransactionProvider,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue};
 use serde_json::{Value, json};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
@@ -896,4 +897,200 @@ async fn single_writes_index_full_text_with_and_without_the_savepoint() {
         .unwrap()
         .get(0);
     assert_eq!(rows, 2);
+}
+
+/// A `PUT`/`DELETE Patient?identifier=urn:hm:mrn|<value>` entry with its
+/// criteria typed, as the REST layer sends it.
+fn conditional_entry(method: BundleMethod, value: &str, family: Option<&str>) -> BundleEntry {
+    BundleEntry {
+        method,
+        url: format!("Patient?identifier=urn:hm:mrn|{value}"),
+        resource: family.map(|family| {
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "urn:hm:mrn", "value": value}],
+                "name": [{"family": family}]
+            })
+        }),
+        criteria: Some(vec![SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq(format!("urn:hm:mrn|{value}"))],
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }
+}
+
+async fn patients_with_identifier(
+    backend: &PostgresBackend,
+    tenant: &TenantContext,
+    value: &str,
+) -> Vec<(String, String, bool)> {
+    backend
+        .get_client()
+        .await
+        .unwrap()
+        .query(
+            "SELECT id, version_id, is_deleted FROM resources
+             WHERE tenant_id = $1 AND resource_type = 'Patient'
+               AND data @> jsonb_build_object('identifier',
+                     jsonb_build_array(jsonb_build_object('value', $2::text)))",
+            &[&tenant.tenant_id().as_str(), &value],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+/// Bundles with a conditional `PUT` on the same criteria: one creates, the
+/// others update that resource, whichever of them ran under the shared gate
+/// and whichever fell back to the exclusive one. Nothing is duplicated and
+/// no update is lost.
+#[tokio::test]
+async fn conditional_put_bundles_on_one_criteria_upsert_one_resource() {
+    let backend = Arc::new(backend(16).await);
+    let tenant = tenant("condput");
+    let mut tasks = Vec::new();
+    for client in 0..10 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            let entries = vec![
+                conditional_entry(BundleMethod::Put, "CPUT", Some(&format!("c{client}"))),
+                post_patient_entry("beside", client),
+            ];
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().expect("every bundle commits");
+    }
+    let stored = patients_with_identifier(&backend, &tenant, "CPUT").await;
+    assert_eq!(stored.len(), 1, "one resource for the criteria: {stored:?}");
+    let (id, version, deleted) = &stored[0];
+    assert_eq!((version.as_str(), *deleted), ("10", false));
+    let expected: Vec<String> = (1..=10).map(|v| v.to_string()).collect();
+    assert_eq!(history_versions(&backend, &tenant, id).await, expected);
+}
+
+/// Bundles with a conditional `DELETE` on the same criteria: the resource is
+/// deleted exactly once and every Bundle commits.
+#[tokio::test]
+async fn conditional_delete_bundles_delete_once() {
+    let backend = Arc::new(backend(16).await);
+    let tenant = tenant("conddel");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "doomed",
+                "identifier": [{"system": "urn:hm:mrn", "value": "CDEL"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut tasks = Vec::new();
+    for client in 0..8 {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            let entries = vec![
+                conditional_entry(BundleMethod::Delete, "CDEL", None),
+                post_patient_entry("beside", client),
+            ];
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().expect("every bundle commits");
+    }
+    assert_eq!(history_versions(&backend, &tenant, "doomed").await, ["1", "2"]);
+    assert_eq!(
+        patients_with_identifier(&backend, &tenant, "CDEL").await,
+        [("doomed".to_string(), "2".to_string(), true)]
+    );
+    assert_eq!(index_rows(&backend, &tenant, "doomed", "identifier").await, 0);
+}
+
+/// A Bundle with criteria-addressed entries no longer needs the exclusive
+/// tenant gate: it commits while another session holds the gate shared, as
+/// every in-flight single write and planned Bundle does. (It used to queue
+/// behind all of them, and they behind it.)
+#[tokio::test]
+async fn conditional_bundles_run_beside_shared_gate_holders() {
+    let backend = Arc::new(backend(4).await);
+    let tenant = tenant("condshared");
+    // Learn the tenant's gate key from a transaction that holds it.
+    let holder = backend.get_client().await.unwrap();
+    let tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
+    // 1212568391 = 0x48465347, the tenant gate namespace ("HFSG").
+    let gate: Vec<i32> = holder
+        .query(
+            "SELECT (objid::int8 - CASE WHEN objid::int8 > 2147483647 THEN 4294967296 ELSE 0 END)::int4
+             FROM pg_locks
+             WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock'
+               AND classid::int8 = 1212568391",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    Box::new(tx).rollback().await.unwrap();
+    assert!(!gate.is_empty(), "the unplanned transaction held a tenant gate");
+
+    // Hold this tenant's gate shared for the rest of the test. The listing
+    // may include gates other tests of this binary hold exclusive; those are
+    // tried without waiting and simply not taken.
+    holder.batch_execute("BEGIN").await.unwrap();
+    let mut held = 0;
+    for key in &gate {
+        let taken: bool = holder
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock_shared(1212568391, $1)",
+                &[key],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        held += i32::from(taken);
+    }
+    assert!(held >= 1, "this tenant's gate is free and now held shared");
+
+    let entries = vec![
+        conditional_entry(BundleMethod::Put, "CSHARED", Some("first")),
+        post_patient_entry("beside", 0),
+    ];
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        backend.process_transaction(&tenant, entries, FhirVersion::default()),
+    )
+    .await;
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    run.expect("the Bundle must not wait for the exclusive gate")
+        .expect("the Bundle commits");
+    assert_eq!(
+        patients_with_identifier(&backend, &tenant, "CSHARED")
+            .await
+            .len(),
+        1
+    );
 }

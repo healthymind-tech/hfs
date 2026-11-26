@@ -705,6 +705,41 @@ pub(super) async fn try_criteria_lock(
     Ok(row.get::<_, bool>(0))
 }
 
+/// Tries to take every resource key in `resources` and every criteria key in
+/// `criteria` in `EXCLUSIVE` mode without waiting, in one statement.
+///
+/// Returns `true` when all were taken; they are then held to `COMMIT`.
+/// `false` means at least one is held elsewhere; the ones that were free may
+/// have been taken, so the caller must roll back. `bool_and` over the whole
+/// input (no short circuit) keeps the statement a plain aggregate.
+///
+/// A failure is marked for [`transient_bundle_error`] like the other criteria
+/// lock statements: a full lock table here is a retryable outcome.
+pub(super) async fn try_resource_and_criteria_locks(
+    client: &impl GenericClient,
+    resources: &[i32],
+    criteria: &[i32],
+) -> StorageResult<bool> {
+    let row = client
+        .query_one(
+            "SELECT COALESCE(bool_and(pg_try_advisory_xact_lock(ns, k)), TRUE) \
+             FROM (SELECT $1::int4 AS ns, unnest($2::int4[]) AS k \
+                   UNION ALL \
+                   SELECT $3::int4, unnest($4::int4[])) keys",
+            &[
+                &RESOURCE_LOCK_NAMESPACE,
+                &resources,
+                &CRITERIA_LOCK_NAMESPACE,
+                &criteria,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            criteria_lock_failure(lock_error("failed to try conditional target locks", e))
+        })?;
+    Ok(row.get::<_, bool>(0))
+}
+
 /// Waits until no other transaction holds the criteria lock `key` `EXCLUSIVE`,
 /// and returns holding nothing (#1747).
 ///
