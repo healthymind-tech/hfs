@@ -427,3 +427,80 @@ async fn deleting_a_resource_row_removes_its_index_rows() {
         .get(0);
     assert_eq!(markers, 0);
 }
+
+async fn markers(backend: &PostgresBackend, tenant: &str) -> i64 {
+    backend
+        .get_client()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT COUNT(*) FROM hfs_search_index_liveness WHERE tenant_id = $1",
+            &[&tenant],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A purged tenant keeps no "verified" marker, so a tenant re-created under
+/// the same id is verified again before its counts use the index alone.
+#[tokio::test]
+async fn purging_a_tenant_removes_its_verification() {
+    let backend = backend_or_skip!("purge");
+    let t = tenant("count-purge");
+    let other = tenant("count-purge-other");
+    for n in 0..3 {
+        put(&backend, &t, &format!("p{n}"), "AAA").await;
+        put(&backend, &other, &format!("p{n}"), "AAA").await;
+    }
+    assert_eq!(verify(&backend, &t).await, 0);
+    assert_eq!(verify(&backend, &other).await, 0);
+    assert_counts(&backend, &t, "AAA", 3, "before purge").await;
+    let before = fast_count_statements(&backend).await;
+    assert!(before >= 1);
+
+    backend.purge_tenant_data("count-purge").await.unwrap();
+    assert_eq!(markers(&backend, "count-purge").await, 0);
+    assert_eq!(markers(&backend, "count-purge-other").await, 1);
+
+    // Re-created under the same id: exact, through the join, until verified.
+    for n in 0..2 {
+        put(&backend, &t, &format!("q{n}"), "AAA").await;
+    }
+    let after_purge = fast_count_statements(&backend).await;
+    assert_counts(&backend, &t, "AAA", 2, "re-created tenant").await;
+    assert_eq!(
+        fast_count_statements(&backend).await,
+        after_purge,
+        "the re-created tenant is not counted from the index before it is verified"
+    );
+    assert_counts(&backend, &other, "AAA", 3, "other tenant").await;
+}
+
+/// Copying a tenant into another clears the target's markers: the copied
+/// index rows were never checked against the target's resources.
+#[tokio::test]
+async fn copying_into_a_tenant_removes_its_verification() {
+    use helios_persistence::backends::postgres::TenantCopyOptions;
+    let backend = backend_or_skip!("copy");
+    let source = tenant("count-copy-src");
+    let target = tenant("count-copy-dst");
+    for n in 0..3 {
+        put(&backend, &source, &format!("s{n}"), "AAA").await;
+    }
+    put(&backend, &target, "t0", "AAA").await;
+    assert_eq!(verify(&backend, &target).await, 0);
+    assert_eq!(markers(&backend, "count-copy-dst").await, 1);
+    backend
+        .copy_tenant(
+            "count-copy-src",
+            "count-copy-dst",
+            &TenantCopyOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(markers(&backend, "count-copy-dst").await, 0);
+    assert_counts(&backend, &target, "AAA", 4, "after copy").await;
+    assert_eq!(verify(&backend, &target).await, 0);
+    assert_counts(&backend, &target, "AAA", 4, "after re-verification").await;
+}

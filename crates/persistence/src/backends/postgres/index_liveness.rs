@@ -159,6 +159,12 @@ impl IndexLiveness {
         }
     }
 
+    fn forget_tenant(&self, tenant: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|(t, _), _| t != tenant);
+        }
+    }
+
     fn forget(&self, key: &Key) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.remove(key);
@@ -179,6 +185,13 @@ impl PostgresBackend {
         self.index_liveness
             .index_only_counts
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drops this process's cached answers for `tenant`, after its markers
+    /// were deleted (tenant purge, tenant copy into it). Other instances
+    /// re-read the marker table within [`TTL`] and verify again.
+    pub(crate) fn forget_search_index_liveness(&self, tenant: &str) {
+        self.index_liveness.forget_tenant(tenant);
     }
 
     /// True only when `(tenant, resource_type)` is known to have no orphan

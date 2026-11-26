@@ -5924,6 +5924,8 @@ mod postgres_integration {
     /// child tables that hang off the job). Statements take `$1 = tenant id`.
     /// Tables the resource writes already fill are guarded by `NOT EXISTS`.
     const PURGE_SEED_SQL: &[&str] = &[
+        "INSERT INTO hfs_search_index_liveness (tenant_id, resource_type, orphan_resources) \
+         VALUES ($1, 'Patient', 0) ON CONFLICT DO NOTHING",
         "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, param_url, value_string) \
          SELECT $1, 'Patient', 'seed-p', 'family', 'http://hl7.org/fhir/SearchParameter/Patient-family', 'Seed' \
          WHERE NOT EXISTS (SELECT 1 FROM search_index WHERE tenant_id = $1)",
@@ -8646,7 +8648,24 @@ mod postgres_integration {
         }
         let client = backend.get_client().await.unwrap();
         assert_eq!(client.execute("UPDATE search_index SET value_reference='Patient/body-invalid' WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='patient'", &[&tenant_id]).await.unwrap(),1);
+        // A soft delete removes the resource's index rows (hm-0040 trigger);
+        // put them back afterwards to stand for stale rows of a deleted
+        // resource (a restored dump, an older writer), which the live body
+        // guard must still filter.
+        client
+            .batch_execute("CREATE TEMP TABLE stale_1625 AS SELECT * FROM search_index WHERE false")
+            .await
+            .unwrap();
+        client.execute("INSERT INTO stale_1625 SELECT * FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id='deleted-ob'", &[&tenant_id]).await.unwrap();
         client.execute("UPDATE resources SET is_deleted=TRUE WHERE tenant_id=$1 AND resource_type='Observation' AND id='deleted-ob'", &[&tenant_id]).await.unwrap();
+        let left: i64 = client.query_one("SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id='deleted-ob'", &[&tenant_id]).await.unwrap().get(0);
+        assert_eq!(left, 0, "the soft delete removed the resource's index rows");
+        client
+            .batch_execute(
+                "INSERT INTO search_index SELECT * FROM stale_1625; DROP TABLE stale_1625",
+            )
+            .await
+            .unwrap();
         // The writer deduplicates equal codings. The index has no uniqueness
         // constraint, so stale/duplicate index rows must not amplify the live
         // body guard either (the old scalar LIMIT allowed one lookup).
