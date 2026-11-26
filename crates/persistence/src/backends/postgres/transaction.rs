@@ -27,7 +27,7 @@ use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::GuardedClient;
 use super::lock_protocol::{
     acquire_criteria_lock, acquire_exclusive_write_gate, acquire_shared_write_locks,
-    criteria_key_for, try_criteria_lock, wait_for_criteria_lock,
+    criteria_key_for, sorted_resource_keys, try_criteria_lock, wait_for_criteria_lock,
 };
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
@@ -781,6 +781,7 @@ impl PostgresBackend {
             resources: Vec::new(),
             minted_creates: true,
             criteria_locks: false,
+            conditional_targets: false,
         };
         let mut tx = self.begin_bundle_transaction(tenant, options, plan).await?;
         for (resource_type, id) in &fresh {
@@ -1017,6 +1018,66 @@ impl PostgresTransaction {
         }
         self.criteria_held.insert(key);
         Ok(true)
+    }
+
+    /// Takes, without waiting, the resource key of every `targets` identity
+    /// and every criteria key in `criteria`, and adds the identities to the
+    /// lock plan so the transaction may write them
+    /// ([`LockPlan::conditional_targets`]).
+    ///
+    /// Returns `false` when any of them is held by another transaction. Some
+    /// may have been taken by then; the caller rolls back, which releases
+    /// them. Nothing here waits, so the order the keys are tried in cannot
+    /// deadlock against a writer that queues for its keys in sorted order.
+    pub(crate) async fn try_lock_conditional_targets(
+        &mut self,
+        targets: &[(String, String)],
+        criteria: &[i32],
+    ) -> StorageResult<bool> {
+        self.ensure_usable()?;
+        let tenant_id = self.tenant.tenant_id().as_str();
+        let resource_keys = match sorted_resource_keys(tenant_id, targets) {
+            Ok(keys) => keys,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        let mut criteria_keys: Vec<i32> = criteria
+            .iter()
+            .copied()
+            .filter(|key| !self.criteria_held.contains(key))
+            .collect();
+        criteria_keys.sort_unstable();
+        criteria_keys.dedup();
+        if resource_keys.is_empty() && criteria_keys.is_empty() {
+            return Ok(true);
+        }
+        let outcome = match self.client() {
+            Ok(client) => {
+                super::lock_protocol::try_resource_and_criteria_locks(
+                    client,
+                    &resource_keys,
+                    &criteria_keys,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(true) => {
+                if let Some(planned) = self.planned_keys.as_mut() {
+                    planned.extend(targets.iter().cloned());
+                }
+                self.criteria_held.extend(criteria_keys);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// The criteria key a conditional create must still take, if any: `None`
@@ -2171,6 +2232,7 @@ mod reindex_groups_tests {
                 .collect(),
             minted_creates: true,
             criteria_locks: true,
+            conditional_targets: false,
         }
     }
 

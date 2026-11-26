@@ -163,6 +163,10 @@ pub struct PostgresBackend {
     /// Which `(tenant, resource type)` pairs are verified to have no orphan
     /// `search_index` rows; see `index_liveness.rs`. Shared by clones.
     pub(super) index_liveness: Arc<super::index_liveness::IndexLiveness>,
+    /// Most distinct resource keys (and conditional creates) a transaction
+    /// Bundle may carry under the shared tenant gate; see
+    /// `bundle_lock_plan::bundle_lock_key_cap`.
+    pub(super) bundle_lock_keys: usize,
     /// Bulk index rebuild window state (`begin/end_bulk_index_rebuild`),
     /// shared by clones; see `bulk_index_rebuild.rs`.
     pub(super) bulk_index_rebuild: super::bulk_index_rebuild::BulkIndexRebuild,
@@ -818,6 +822,19 @@ impl PostgresBackend {
             .ok()
             .and_then(|row| row.try_get::<_, i32>(0).ok())
             .and_then(|n| usize::try_from(n).ok());
+        // Size of the server's shared lock table, for the per-Bundle advisory
+        // key cap (`bundle_lock_plan::bundle_lock_key_cap`).
+        let lock_table_slots = client
+            .query_one(
+                "SELECT current_setting('max_locks_per_transaction')::int8 \
+                      * (current_setting('max_connections')::int8 \
+                         + current_setting('max_prepared_transactions')::int8)",
+                &[],
+            )
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<_, i64>(0).ok())
+            .and_then(|n| usize::try_from(n).ok());
         drop(client);
         let pool_registration = server_max.map(|server_max| {
             Arc::new(super::pool_budget::register(
@@ -831,6 +848,20 @@ impl PostgresBackend {
         });
         if pool_registration.is_some() && config.limit_pool_to_server {
             config.max_connections = pool.status().max_size;
+        }
+
+        let bundle_lock_keys = super::bundle_lock_plan::bundle_lock_key_cap(
+            super::bundle_lock_plan::configured_bundle_lock_keys(),
+            lock_table_slots,
+            config.max_connections,
+        );
+        if bundle_lock_keys != super::bundle_lock_plan::MAX_BUNDLE_LOCK_KEYS {
+            tracing::info!(
+                bundle_lock_keys,
+                lock_table_slots,
+                pool = config.max_connections,
+                "transaction Bundles keep the shared tenant gate up to this many id-bearing entries"
+            );
         }
 
         // Initialize the per-tenant search parameter registries. Base params
@@ -871,6 +902,7 @@ impl PostgresBackend {
             subscription_fanout: std::sync::OnceLock::new(),
             value_null_fractions: Arc::new(RwLock::new(None)),
             index_liveness: Default::default(),
+            bundle_lock_keys,
             bulk_index_rebuild: Default::default(),
             #[cfg(test)]
             reindex_test_hook: None,

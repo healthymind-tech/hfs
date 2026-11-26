@@ -41,6 +41,7 @@ PostgreSQL may use ~24 GB:
 | `idle_in_transaction_session_timeout` | 10 min | a crashed client must not hold locks forever |
 | `autovacuum_vacuum_scale_factor` / `analyze` | 0.05 / 0.02 | `search_index` is the largest table by far (≈30 rows per resource) and the default 20% means a 6M-row backlog before it is vacuumed |
 | `jit` | off | JIT compile time dominates the short search queries |
+| `max_locks_per_transaction` | 1024 (default 64; needs a restart) | transaction Bundles hold one advisory lock per id-bearing entry. With the default lock table a Bundle of more than 128 such entries takes the tenant's exclusive write gate and every other writer waits for it; with 1024 the cap rises with the table (§2a). About 55 MB of shared memory at `max_connections=200` |
 
 **Disk.** The production database currently sits on a rotating HDD
 (`random_page_cost=4`, `effective_io_concurrency=2` in
@@ -84,6 +85,34 @@ Pool occupancy is exported on `/metrics` as `postgres_pool_max_connections`,
 ([monitoring.md](monitoring.md)). If `postgres_pool_waiting_callers` is above zero
 for minutes while PostgreSQL CPU is low, raise the pool; if PostgreSQL CPU is
 saturated, raising it makes things worse — find the slow query instead (§4).
+
+## 2a. Write locks: what runs side by side
+
+Writes take PostgreSQL advisory locks, all at transaction level:
+
+| Write | Locks | Runs beside other writes of the tenant |
+|---|---|---|
+| single create / update / delete, `PUT Type/id` | tenant gate shared + the resource's key | yes |
+| conditional create (`If-None-Exist`), `PUT Type?criteria` | the same, plus the lock of its criteria | yes; two writers on the same criteria queue |
+| transaction Bundle | tenant gate shared + one key per id-bearing entry (`PUT`/`PATCH`/`DELETE`/`GET Type/id`, `POST` with an id); nothing for a plain `POST` | yes |
+| Bundle with `PUT`/`PATCH`/`DELETE Type?criteria` entries | shared; the targets' keys and the criteria locks are taken without waiting once the targets are known; if one is busy the Bundle starts over under the exclusive gate | yes, unless it had to fall back |
+| Bundle over the key cap, anything touching a `SearchParameter`, purge, reindex clear | tenant gate **exclusive** | no: it waits for every writer and they wait for it |
+
+Each of these uses one pooled connection for the whole request. (Until
+hm/perf-count a `PUT Type/id` and a conditional create held a session lock on
+a second pooled connection: with as many of them in flight as the pool has
+connections they all failed 503 after `HFS_PG_POOL_WAIT_TIMEOUT_SECS`.)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HFS_PG_BUNDLE_LOCK_KEYS` | derived: half of the lock table (`max_locks_per_transaction × (max_connections + max_prepared_transactions)`) shared among `HFS_PG_MAX_CONNECTIONS` Bundles of `2 × cap + 1` locks, never below 128, never above 4096 | most id-bearing entries (and, separately, most `ifNoneExist` creates) a Bundle may carry under the shared gate. Logged at startup when it is not 128. A stock server gives 128; `max_locks_per_transaction=1024`, `max_connections=200` and a pool of 64 give 800 |
+| `HFS_PG_BUNDLE_CONDITIONAL_SHARED` | on | `off` sends every Bundle with a criteria-addressed entry back to the exclusive gate (the behaviour before hm/perf-count) |
+| `HFS_PG_INDEX_COUNT` | on | `off` keeps `_summary=count` / `_total=accurate` on the `resources` join ([index-strategy.md §7](index-strategy.md#7-counting-from-the-index-and-orphan-index-rows-hm-0040)) |
+
+A Bundle that finds the lock table full (`out of shared memory`, SQLSTATE
+53200) ends as a retryable 503, not as a failed request; if that shows up in
+the log, raise `max_locks_per_transaction` or set `HFS_PG_BUNDLE_LOCK_KEYS`
+lower.
 
 ## 3. Roles and security
 
