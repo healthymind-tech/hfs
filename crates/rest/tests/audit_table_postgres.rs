@@ -96,9 +96,9 @@ async fn fixture(name: &str, table: bool) -> Option<Fixture> {
     };
     // The app owns its backend; the audit store has a pool of its own, as in
     // `hfs`.
-    let app_backend = Arc::try_unwrap(self::backend().await?)
-        .ok()
-        .expect("sole owner");
+    let Ok(app_backend) = Arc::try_unwrap(self::backend().await?) else {
+        panic!("the app backend has a single owner");
+    };
     let app = helios_rest::create_app_with_auth(
         app_backend,
         config,

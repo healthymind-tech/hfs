@@ -304,6 +304,17 @@ fn cursor_sql(alias: &str, query: &AuditQuery, params: &mut Params, out: &mut Ve
 fn token_sql(filter: &TokenFilter, params: &mut Params) -> String {
     const ACTION_SYSTEM: &str = "http://hl7.org/fhir/audit-event-action";
     const OUTCOME_SYSTEM: &str = "http://hl7.org/fhir/audit-event-outcome";
+    if filter.negate
+        && filter.field == TokenField::Outcome
+        && matches!(filter.values.as_slice(), [v] if v.code.as_deref() == Some("0")
+            && v.system.as_deref().is_none_or(|s| s == OUTCOME_SYSTEM))
+    {
+        // "Everything that did not succeed": spelled exactly like the partial
+        // index `idx_audit_event_failed`, so the planner can use it. Decided
+        // before any value is bound: an unused parameter has no type, and
+        // PostgreSQL refuses the statement.
+        return "e.outcome IS DISTINCT FROM '0'".to_string();
+    }
     let mut parts = Vec::new();
     for value in &filter.values {
         let part = match filter.field {
@@ -361,15 +372,6 @@ fn token_sql(filter: &TokenFilter, params: &mut Params) -> String {
             },
         };
         parts.push(part);
-    }
-    if filter.negate
-        && filter.field == TokenField::Outcome
-        && matches!(filter.values.as_slice(), [v] if v.code.as_deref() == Some("0")
-            && v.system.as_deref().is_none_or(|s| s == OUTCOME_SYSTEM))
-    {
-        // "Everything that did not succeed": spelled exactly like the partial
-        // index `idx_audit_event_failed`, so the planner can use it.
-        return "e.outcome IS DISTINCT FROM '0'".to_string();
     }
     let any = format!("({})", parts.join(" OR "));
     if filter.negate {
