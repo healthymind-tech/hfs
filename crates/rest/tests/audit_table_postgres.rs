@@ -780,3 +780,114 @@ async fn history_capabilities_and_counts_reflect_the_audit_store() {
     assert!(total("AuditEvent").as_i64().unwrap() >= n, "{counts}");
     assert_eq!(total("Patient"), 2);
 }
+
+/// Production regression (2026-11-26): the merged count and the merged pages
+/// are per tenant, include legacy events whatever their search-index rows,
+/// and the legacy half is read in write order (not by a date sort key).
+#[tokio::test]
+async fn merged_counts_are_per_tenant_and_exact() {
+    let f = fixture_or_skip!("count", true);
+    let other = format!("{}_b", f.tenant);
+    let legacy = |tenant: &str, id: String, minutes: i64| {
+        let backend = Arc::clone(&f.backend);
+        let ctx = TenantContext::new(TenantId::new(tenant), TenantPermissions::full_access());
+        async move {
+            let recorded =
+                chrono::Utc::now() - chrono::Duration::days(3) + chrono::Duration::minutes(minutes);
+            backend
+                .create(
+                    &ctx,
+                    "AuditEvent",
+                    json!({
+                        "resourceType": "AuditEvent", "id": id,
+                        "type": {"system": "http://terminology.hl7.org/CodeSystem/audit-event-type", "code": "rest"},
+                        "action": "R", "outcome": "0",
+                        "recorded": recorded.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        "agent": [{"requestor": true, "who": {"display": "old"}}],
+                        "source": {"observer": {"reference": "Device/hfs"}},
+                        "entity": [{"what": {"reference": "Patient/p1"}}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    for i in 0..40 {
+        legacy(&f.tenant, format!("a-{i:02}"), i).await;
+    }
+    for i in 0..7 {
+        legacy(&other, format!("b-{i}"), i).await;
+    }
+    // Legacy events whose search-index rows are gone (written by an older
+    // path, or a reindex that never ran) still count and still page.
+    let client = f.backend.get_client().await.unwrap();
+    client
+        .execute(
+            "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = 'AuditEvent' \
+             AND resource_id IN ('a-03', 'a-04', 'a-05')",
+            &[&f.tenant],
+        )
+        .await
+        .unwrap();
+    f.seed_clinical().await; // 4 table events in this tenant
+
+    let legacy_a = f
+        .sql_count("SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent' AND NOT is_deleted")
+        .await;
+    let table_a = f
+        .sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1")
+        .await;
+    assert_eq!(legacy_a, 40);
+    let total = f.bundle("/AuditEvent?_summary=count").await["total"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        total,
+        legacy_a + table_a,
+        "this tenant's legacy + table events, nothing else"
+    );
+
+    let other_total: Value = f
+        .server
+        .get("/AuditEvent?_summary=count")
+        .add_header(X_TENANT_ID, HeaderValue::from_str(&other).unwrap())
+        .await
+        .json();
+    assert_eq!(
+        other_total["total"], 7,
+        "the other tenant: its own 7 legacy events"
+    );
+
+    // Paging the whole trail returns every event once, newest first.
+    let mut seen: Vec<String> = Vec::new();
+    let mut url = Some("/AuditEvent?_count=9".to_string());
+    while let Some(u) = url {
+        let page = f.bundle(&u).await;
+        seen.extend(
+            entries(&page)
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string()),
+        );
+        url = next_link(&page);
+        assert!(seen.len() < 200, "paging does not end");
+    }
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "no event twice");
+    for id in ["a-00", "a-03", "a-04", "a-05", "a-39"] {
+        assert!(seen.iter().any(|s| s == id), "{id} is listed");
+    }
+    let legacy_order: Vec<&String> = seen.iter().filter(|s| s.starts_with("a-")).collect();
+    let expected: Vec<String> = (0..40).rev().map(|i| format!("a-{i:02}")).collect();
+    assert_eq!(
+        legacy_order,
+        expected.iter().collect::<Vec<_>>(),
+        "legacy events newest first"
+    );
+    assert!(
+        !seen.iter().any(|s| s.starts_with("b-")),
+        "no event of the other tenant"
+    );
+}

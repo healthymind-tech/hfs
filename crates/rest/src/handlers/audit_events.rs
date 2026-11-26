@@ -195,6 +195,39 @@ pub(crate) fn restrict_capability(entry: &mut serde_json::Value) {
     }
 }
 
+/// The generic search that reads the legacy half of the trail (`AuditEvent`
+/// resources written before the audit tables existed).
+///
+/// It is ordered by `_lastUpdated`, not by `date`: a legacy event is never
+/// updated, so its `meta.lastUpdated` is the instant the server wrote it, the
+/// same instant (to the millisecond) it put in `recorded`. Ordering by `date`
+/// made the generic search compute the sort key from `search_index` for every
+/// legacy row and sort them all — 2.6 s per request on 72k legacy events in
+/// production — while `_lastUpdated` walks an index and stops after one page
+/// (0.8 ms).
+fn legacy_search_pairs(
+    criteria: &[(String, String)],
+    ascending: bool,
+    count: usize,
+    offset: u32,
+) -> Vec<(String, String)> {
+    let mut pairs = criteria.to_vec();
+    pairs.push((
+        "_sort".to_string(),
+        if ascending {
+            "_lastUpdated"
+        } else {
+            "-_lastUpdated"
+        }
+        .to_string(),
+    ));
+    pairs.push(("_count".to_string(), count.to_string()));
+    if offset > 0 {
+        pairs.push(("_offset".to_string(), offset.to_string()));
+    }
+    pairs
+}
+
 /// Position of a page in the merged trail.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 struct Cursor {
@@ -239,14 +272,11 @@ const RESULT_PARAMS: &[&str] = &[
     "_pretty",
 ];
 
+/// The merge key: for a store event its `recorded` (which [`to_stored`]
+/// makes its `last_modified`), for a legacy resource the instant it was
+/// written — the order each stream is read in (see [`legacy_search_pairs`]).
 fn recorded_of(resource: &StoredResource) -> DateTime<Utc> {
-    resource
-        .content()
-        .get("recorded")
-        .and_then(|v| v.as_str())
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|| resource.last_modified())
+    resource.last_modified()
 }
 
 /// A page of the merged trail.
@@ -471,15 +501,7 @@ where
 
     // The legacy half of the query, built by the generic query builder.
     let legacy_query = |count: usize, offset: u32| -> RestResult<_> {
-        let mut legacy_pairs = parsed.used.clone();
-        legacy_pairs.push((
-            "_sort".to_string(),
-            if query.ascending { "date" } else { "-date" }.to_string(),
-        ));
-        legacy_pairs.push(("_count".to_string(), count.to_string()));
-        if offset > 0 {
-            legacy_pairs.push(("_offset".to_string(), offset.to_string()));
-        }
+        let legacy_pairs = legacy_search_pairs(&parsed.used, query.ascending, count, offset);
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
         let mut q = crate::extractors::build_search_query_for_version(
@@ -619,6 +641,30 @@ mod tests {
 
     fn ids(v: &[StoredResource]) -> Vec<&str> {
         v.iter().map(|r| r.id()).collect()
+    }
+
+    #[test]
+    fn the_legacy_half_is_read_in_last_updated_order() {
+        let criteria = vec![("patient".to_string(), "Patient/p1".to_string())];
+        let desc = legacy_search_pairs(&criteria, false, 21, 0);
+        assert_eq!(
+            desc,
+            vec![
+                ("patient".to_string(), "Patient/p1".to_string()),
+                ("_sort".to_string(), "-_lastUpdated".to_string()),
+                ("_count".to_string(), "21".to_string()),
+            ]
+        );
+        let asc = legacy_search_pairs(&[], true, 6, 40);
+        assert!(asc.contains(&("_sort".to_string(), "_lastUpdated".to_string())));
+        assert!(asc.contains(&("_offset".to_string(), "40".to_string())));
+        assert!(
+            !desc
+                .iter()
+                .chain(&asc)
+                .any(|(k, v)| k == "_sort" && v.trim_start_matches('-') == "date"),
+            "a date sort makes the generic search sort every legacy row"
+        );
     }
 
     #[test]
