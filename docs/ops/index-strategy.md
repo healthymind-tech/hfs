@@ -441,3 +441,111 @@ expansion itself is cached by HFS for `HFS_SEARCH_EXPANSION_CACHE_TTL_SECS`).
   `code:in` uses (default: every VSAC/eCQM ValueSet HTS holds) after an HTS
   restart, terminology import or IG install, so the first clinical search or
   measure run finds them in HTS's expansion cache.
+
+## 7. Counting from the index, and orphan index rows (hm-0040)
+
+`_summary=count` and `_total=accurate` on a single search filter
+(`Observation?code=…`) are answered from `search_index` alone: the distinct
+resource ids of the matching rows. The general statement instead joins
+`resources` and checks `is_deleted` once per match, which is what made the
+count grow with the number of matches (§7.3).
+
+The two are the same number only if `search_index` holds no *orphan* rows —
+rows whose resource is deleted or absent. Three things make that so:
+
+1. **The database removes index rows with the resource.** Migration
+   `hm-0040-search-index-liveness` adds row triggers on `resources`: after a
+   `DELETE`, and after an `UPDATE` that sets `is_deleted` to true, the
+   resource's `search_index` rows are deleted in the same transaction. This
+   holds for every path, including retention, purge and hand-written SQL. The
+   triggers cost nothing on create or update (`UPDATE OF is_deleted` does not
+   fire unless the statement assigns that column); a delete pays one probe of
+   `idx_search_resource` per row.
+2. **Writers index only what they hold.** Index rows are written in the
+   transaction that inserts or updates the resource row, or (reindex, deferred
+   bulk indexing) for resources re-read as live under the resource's advisory
+   key.
+3. **Existing rows are checked before they are trusted.** The first count on a
+   `(tenant, resource type)` starts one background statement that looks for
+   indexed ids without a live resource. A clean result is recorded in
+   `hfs_search_index_liveness` and used by every instance from then on. Until
+   it is recorded the count uses the `resources` join, so the answer is exact
+   either way.
+
+`AuditEvent` is never counted from the index (audit events are moving to
+their own table). A version-restricted count and a count on a legacy-layout
+database also keep the join.
+
+### 7.1 When orphan rows are found
+
+The server logs a warning and keeps the joined count for that type; it does
+not delete anything:
+
+```
+WARN search_index holds rows for resources that are deleted or absent; counts for this type keep the slower resources join until they are removed tenant=default resource_type=Observation orphan_resources=3
+```
+
+Look at them, and remove them if they are not wanted (searches already ignore
+them — every page statement joins `resources`):
+
+```sql
+-- what is there
+SELECT s.resource_id, count(*) FROM search_index s
+WHERE s.tenant_id = 'default' AND s.resource_type = 'Observation'
+  AND NOT EXISTS (SELECT 1 FROM resources r
+                  WHERE r.tenant_id = s.tenant_id AND r.resource_type = s.resource_type
+                    AND r.id = s.resource_id AND r.is_deleted = FALSE)
+GROUP BY 1;
+-- remove
+DELETE FROM search_index s
+WHERE s.tenant_id = 'default' AND s.resource_type = 'Observation'
+  AND NOT EXISTS (SELECT 1 FROM resources r
+                  WHERE r.tenant_id = s.tenant_id AND r.resource_type = s.resource_type
+                    AND r.id = s.resource_id AND r.is_deleted = FALSE);
+```
+
+The server re-checks a type with recorded orphans every 10 minutes; to force a
+check now, delete its row from `hfs_search_index_liveness`. Deleting a row of
+a clean type makes the server verify that type again (instances notice within
+60 s).
+
+### 7.2 Switches, rollout, rollback
+
+- `HFS_PG_INDEX_COUNT=off` keeps every count on the `resources` join.
+- Rollout: the migration runs at startup and only creates a small table, a
+  function and three triggers (`CREATE TRIGGER` takes a brief
+  `SHARE ROW EXCLUSIVE` lock on `resources`: writers wait for it, readers do
+  not).
+  Older binaries keep working against a migrated database. The first count per
+  type after the upgrade is as slow as before while its check runs (one pass
+  over the type's index rows; the statement runs without a statement timeout).
+- Rollback:
+
+```sql
+DROP TRIGGER IF EXISTS trg_search_index_follow_delete ON resources;
+DROP TRIGGER IF EXISTS trg_search_index_follow_soft_delete ON resources;
+DROP TRIGGER IF EXISTS trg_search_index_follow_truncate ON resources;
+DROP FUNCTION IF EXISTS hfs_search_index_follow_resource();
+DROP TABLE IF EXISTS hfs_search_index_liveness;
+DELETE FROM hm_schema_migrations WHERE name = 'hm-0040-search-index-liveness';
+```
+
+  A binary that knows the migration finds no marker table and keeps the join.
+- What is not covered: index rows inserted by hand for a resource that does
+  not exist, after the type was verified. Nothing in the server does that; if
+  you do, delete the type's marker row afterwards.
+
+### 7.3 Measured
+
+Benchmark host, 527,113 Synthea resources plus the creates of earlier runs,
+`Observation?code=http://loinc.org|72514-3` (17,837 matches), 1 client, 200
+requests after 20 warm-ups, median / p95 of the HTTP request:
+
+| | through `resources` (before) | from the index (after) | HAPI 8.12 |
+|---|---|---|---|
+| `_summary=count` | 114 / 142 ms | 32 / 38 ms | 20 / 25 ms |
+| `_total=accurate&_count=50` | 121 / 143 ms | 36 / 43 ms | 62 / 66 ms |
+
+The migration applied to the loaded database in under a second and the
+Observation type (about 3.4 M index rows) was verified in the background
+before the measured requests.
