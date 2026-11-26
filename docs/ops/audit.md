@@ -124,8 +124,13 @@ Recording costs the request a queue push, not a database write.
   (64 × 100 = 6,400 with stock settings; set `max_locks_per_transaction=256`
   or more on a server that also takes large transaction Bundles). The table
   store takes no advisory locks.
-- Lost only on a hard kill (`SIGKILL`, OOM, power loss) while events are
-  queued: at most the queue's content.
+- Lost only on a hard kill (`SIGKILL`, OOM, power loss): at most the queue's
+  content (`HFS_AUDIT_QUEUE_CAPACITY`), the batches the writers hold
+  (`WRITERS × BATCH_SIZE`) and the events of the requests in flight (a
+  request's events are queued after its work is done — a 447-entry Bundle
+  being answered at that instant is stored but not yet audited). A batch is
+  one statement: after a kill an event is either stored completely, with its
+  lookup rows, or not at all, and a replay never duplicates one.
 
 Measured overhead: see `hfs-eval/eval/results-p3-audit/REPORT.md` (target
 < 10 % on p95 read and write latency).
@@ -150,14 +155,15 @@ profile claims included.
 
 What the API serves from the tables (`crates/rest/src/handlers/audit_events.rs`):
 
-- `GET /AuditEvent/{id}`, `GET /AuditEvent/{id}/_history/1` (an event has
-  exactly one version; `meta.versionId` is `1` and `meta.lastUpdated` is
-  `recorded`).
+- `GET /AuditEvent/{id}`, `GET /AuditEvent/{id}/_history/1` and `GET
+  /AuditEvent/{id}/_history` (an event has exactly one version;
+  `meta.versionId` is `1` and `meta.lastUpdated` is `recorded`).
 - `GET /AuditEvent?…`, `POST /AuditEvent/_search` and `GET
   /Patient/{id}/AuditEvent` with these parameters only: `_id`,
   `_lastUpdated`, `date` (all prefixes, repeatable), `patient`, `entity`,
   `agent` (a reference `Type/id`, a bare id, or the identifier value of an
-  agent such as the token `sub`), `type`, `subtype`, `action`, `outcome`
+  agent such as the token `sub`; the recording server's own agent entry,
+  equal to `source.observer`, is not indexed), `type`, `subtype`, `action`, `outcome`
   (tokens, `:not` supported), plus `_count`, `_sort=date|-date|
   _lastUpdated|-_lastUpdated` (default `-date`), `_total`, `_summary`
   (including `count`), `_elements` and `next` links.
@@ -167,12 +173,17 @@ What the API serves from the tables (`crates/rest/src/handlers/audit_events.rs`)
   `source`), `_content` / `_text` / `_filter`, `_tag` / `_profile` /
   `_security`, chained and `_has` searches, `_include` / `_revinclude`, sorting
   by anything but the event time, all modifiers other than `:not` on tokens,
-  and `GET /AuditEvent/{id}/_history`. Such a parameter is ignored with a
+  and type-level history (`GET /AuditEvent/_history`). The CapabilityStatement
+  lists exactly the supported parameters. Such a parameter is ignored with a
   warning entry in the Bundle, or refused with `400` under
   `Prefer: handling=strict`. Events in the tables are also not reachable
   through `_revinclude=AuditEvent:*` on another type, `$export`
   (`_type=AuditEvent`), endpoint duplicate/sync (which never carried the
-  audit trail by default) or `$reindex`.
+  audit trail by default) or `$reindex`. To export the trail, page through
+  `GET /AuditEvent?date=…` or read the retention archives. The console's
+  per-type totals (`/console/metrics/resource-counts?types=AuditEvent`)
+  include the tables' events; the dashboard's "stored resources" figure
+  counts clinical resources and no longer grows with every read.
 - Tenant and endpoint isolation are unchanged: every query carries the
   request's tenant, which is the leading column of every index.
 - A token with a `patient/` scope sees the launch patient's events only.

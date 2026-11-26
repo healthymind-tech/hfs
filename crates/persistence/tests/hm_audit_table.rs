@@ -105,7 +105,8 @@ fn event(
         "outcome": outcome,
         "agent": [
             {"requestor": true, "who": {"identifier": {"value": user}}},
-            {"requestor": false, "who": {"reference": "Device/hfs"}}
+            {"requestor": false, "who": {"reference": "Device/hfs"}},
+            {"requestor": false, "who": {"reference": "Device/gateway"}}
         ],
         "source": {"observer": {"reference": "Device/hfs"}},
         "entity": entities
@@ -146,7 +147,12 @@ fn sample(now: DateTime<Utc>, n: usize) -> Vec<Value> {
     let base = month_start(now).and_hms_opt(1, 0, 0).unwrap().and_utc();
     (0..n)
         .map(|i| {
-            let (action, subtype) = [("C", "create"), ("R", "read"), ("U", "update"), ("E", "search-type")][i % 4];
+            let (action, subtype) = [
+                ("C", "create"),
+                ("R", "read"),
+                ("U", "update"),
+                ("E", "search-type"),
+            ][i % 4];
             event(
                 &format!("ev-{i:04}"),
                 // Several events share an instant, to exercise the id tie-break.
@@ -168,7 +174,9 @@ async fn the_migration_creates_partitioned_tables_and_is_idempotent() {
     assert_eq!(
         sql_count(
             &backend,
-            &format!("SELECT count(*) FROM hm_schema_migrations WHERE name = '{FORK_AUDIT_EVENT_TABLE}'")
+            &format!(
+                "SELECT count(*) FROM hm_schema_migrations WHERE name = '{FORK_AUDIT_EVENT_TABLE}'"
+            )
         )
         .await,
         1
@@ -177,18 +185,30 @@ async fn the_migration_creates_partitioned_tables_and_is_idempotent() {
     assert_eq!(
         sql_count(
             &backend,
-            &format!("SELECT count(*) FROM hm_schema_migrations WHERE name = '{FORK_AUDIT_BACKFILL}'")
+            &format!(
+                "SELECT count(*) FROM hm_schema_migrations WHERE name = '{FORK_AUDIT_BACKFILL}'"
+            )
         )
         .await,
         0
     );
     let now = Utc::now();
-    let months: Vec<NaiveDate> = table.partitions().await.unwrap().iter().map(|p| p.month).collect();
+    let months: Vec<NaiveDate> = table
+        .partitions()
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.month)
+        .collect();
     assert_eq!(months.len(), 3, "this month and the next two: {months:?}");
     assert_eq!(months[0], month_start(now));
     for t in ["audit_event_default", "audit_event_ref_default"] {
         assert_eq!(
-            sql_count(&backend, &format!("SELECT count(*) FROM pg_class WHERE relname = '{t}'")).await,
+            sql_count(
+                &backend,
+                &format!("SELECT count(*) FROM pg_class WHERE relname = '{t}'")
+            )
+            .await,
             1
         );
     }
@@ -198,13 +218,18 @@ async fn the_migration_creates_partitioned_tables_and_is_idempotent() {
         .get_client()
         .await
         .unwrap()
-        .batch_execute(helios_persistence::backends::postgres::audit_table::FORK_AUDIT_EVENT_TABLE_SQL)
+        .batch_execute(
+            helios_persistence::backends::postgres::audit_table::FORK_AUDIT_EVENT_TABLE_SQL,
+        )
         .await
         .unwrap();
     assert_eq!(table.ensure_partitions(now, 2).await.unwrap(), 0);
     assert_eq!(table.partitions().await.unwrap().len(), 3);
     // The upstream ladder's version table is not touched by the fork migration.
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM schema_version").await, 1);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM schema_version").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -213,20 +238,37 @@ async fn appended_events_are_searchable_with_fhir_semantics() {
     let now = Utc::now();
     let events = sample(now, 60);
     table
-        .append(events.iter().cloned().map(|e| ("t1".to_string(), e)).collect())
+        .append(
+            events
+                .iter()
+                .cloned()
+                .map(|e| ("t1".to_string(), e))
+                .collect(),
+        )
         .await
         .unwrap();
     // No row of the general resource tables was written.
     for t in ["resources", "resource_history", "search_index"] {
         assert_eq!(
-            sql_count(&backend, &format!("SELECT count(*) FROM {t} WHERE resource_type = 'AuditEvent'")).await,
+            sql_count(
+                &backend,
+                &format!("SELECT count(*) FROM {t} WHERE resource_type = 'AuditEvent'")
+            )
+            .await,
             0,
             "{t}"
         );
     }
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event").await, 60);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event").await,
+        60
+    );
 
-    let rows: Vec<AuditRow> = events.iter().cloned().map(|e| AuditRow::from_event(e, now)).collect();
+    let rows: Vec<AuditRow> = events
+        .iter()
+        .cloned()
+        .map(|e| AuditRow::from_event(e, now))
+        .collect();
     let month = month_start(now).format("%Y-%m").to_string();
     let day = month_start(now).format("%Y-%m-%d").to_string();
     let criteria: Vec<Vec<(&str, &str)>> = vec![
@@ -240,16 +282,23 @@ async fn appended_events_are_searchable_with_fhir_semantics() {
         vec![("entity", "Observation/o1,Observation/o2")],
         vec![("agent", "alice")],
         vec![("agent", "Device/hfs")],
+        vec![("agent", "Device/gateway")],
         vec![("action", "C")],
         vec![("action", "C,U")],
         vec![("action:not", "R")],
         vec![("outcome", "4")],
         vec![("outcome:not", "0")],
         vec![("type", "rest")],
-        vec![("type", "http://terminology.hl7.org/CodeSystem/audit-event-type|rest")],
+        vec![(
+            "type",
+            "http://terminology.hl7.org/CodeSystem/audit-event-type|rest",
+        )],
         vec![("type", "http://other|rest")],
         vec![("subtype", "create")],
-        vec![("subtype", "http://hl7.org/fhir/restful-interaction|search-type")],
+        vec![(
+            "subtype",
+            "http://hl7.org/fhir/restful-interaction|search-type",
+        )],
         vec![("subtype", "http://hl7.org/fhir/restful-interaction|")],
         vec![("subtype:not", "read")],
         vec![("date", &month)],
@@ -259,7 +308,12 @@ async fn appended_events_are_searchable_with_fhir_semantics() {
         vec![("_id", "ev-0003,ev-0004,nope")],
         vec![("patient", "p1"), ("action", "C")],
         vec![("patient", "p1"), ("entity", "Observation/o0")],
-        vec![("patient", "p1"), ("entity", "Observation/o0"), ("outcome", "0"), ("subtype", "create")],
+        vec![
+            ("patient", "p1"),
+            ("entity", "Observation/o0"),
+            ("outcome", "0"),
+            ("subtype", "create"),
+        ],
         vec![("agent", "bob"), ("date", &month), ("action", "R,E")],
     ];
     for c in &criteria {
@@ -275,7 +329,11 @@ async fn appended_events_are_searchable_with_fhir_semantics() {
             let got = table.search("t1", &q).await.unwrap();
             let got_ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
             assert_eq!(got_ids, expected, "criteria {c:?} ascending {ascending}");
-            assert_eq!(table.count("t1", &q).await.unwrap() as usize, expected.len(), "count {c:?}");
+            assert_eq!(
+                table.count("t1", &q).await.unwrap() as usize,
+                expected.len(),
+                "count {c:?}"
+            );
 
             // Keyset paging returns the same list, without gaps or repeats.
             let mut paged = Vec::new();
@@ -319,15 +377,47 @@ async fn tenants_do_not_see_each_others_events() {
     let now = Utc::now();
     table
         .append(vec![
-            ("a".to_string(), event("e1", now, "C", "create", "0", "Observation/1", Some("p"), "u")),
-            ("b".to_string(), event("e2", now, "C", "create", "0", "Observation/1", Some("p"), "u")),
+            (
+                "a".to_string(),
+                event(
+                    "e1",
+                    now,
+                    "C",
+                    "create",
+                    "0",
+                    "Observation/1",
+                    Some("p"),
+                    "u",
+                ),
+            ),
+            (
+                "b".to_string(),
+                event(
+                    "e2",
+                    now,
+                    "C",
+                    "create",
+                    "0",
+                    "Observation/1",
+                    Some("p"),
+                    "u",
+                ),
+            ),
         ])
         .await
         .unwrap();
     for (tenant, own, other) in [("a", "e1", "e2"), ("b", "e2", "e1")] {
-        for c in [vec![], vec![("patient", "p")], vec![("entity", "Observation/1"), ("action", "C")]] {
+        for c in [
+            vec![],
+            vec![("patient", "p")],
+            vec![("entity", "Observation/1"), ("action", "C")],
+        ] {
             let got = table.search(tenant, &query(&c, 10)).await.unwrap();
-            assert_eq!(got.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec![own], "{tenant} {c:?}");
+            assert_eq!(
+                got.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+                vec![own],
+                "{tenant} {c:?}"
+            );
             assert_eq!(table.count(tenant, &query(&c, 10)).await.unwrap(), 1);
         }
         assert!(table.read(tenant, own).await.unwrap().is_some());
@@ -341,7 +431,19 @@ async fn stored_events_cannot_be_updated_or_deleted() {
     let (table, backend) = table_or_skip!("immutable");
     let now = Utc::now();
     table
-        .append(vec![("t".to_string(), event("e1", now, "C", "create", "0", "Observation/1", Some("p"), "u"))])
+        .append(vec![(
+            "t".to_string(),
+            event(
+                "e1",
+                now,
+                "C",
+                "create",
+                "0",
+                "Observation/1",
+                Some("p"),
+                "u",
+            ),
+        )])
         .await
         .unwrap();
     let client = backend.get_client().await.unwrap();
@@ -363,15 +465,39 @@ async fn stored_events_cannot_be_updated_or_deleted() {
     assert!(db_message(&err).contains("append-only"), "{err:?}");
     client.batch_execute("ROLLBACK").await.unwrap();
     assert_eq!(table.count("t", &query(&[], 1)).await.unwrap(), 1);
-    assert_eq!(table.read("t", "e1").await.unwrap().unwrap().event["outcome"], "0");
+    assert_eq!(
+        table.read("t", "e1").await.unwrap().unwrap().event["outcome"],
+        "0"
+    );
 
     // Writing the same event again (a replayed batch) neither fails nor duplicates.
-    let mut changed = event("e1", now, "D", "delete", "8", "Observation/1", Some("p"), "u");
+    let mut changed = event(
+        "e1",
+        now,
+        "D",
+        "delete",
+        "8",
+        "Observation/1",
+        Some("p"),
+        "u",
+    );
     changed["recorded"] = table.read("t", "e1").await.unwrap().unwrap().event["recorded"].clone();
-    table.append(vec![("t".to_string(), changed)]).await.unwrap();
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event").await, 1);
-    assert_eq!(table.read("t", "e1").await.unwrap().unwrap().event["action"], "C");
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_ref").await, 4);
+    table
+        .append(vec![("t".to_string(), changed)])
+        .await
+        .unwrap();
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event").await,
+        1
+    );
+    assert_eq!(
+        table.read("t", "e1").await.unwrap().unwrap().event["action"],
+        "C"
+    );
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_ref").await,
+        4
+    );
 }
 
 #[tokio::test]
@@ -380,8 +506,32 @@ async fn a_tenant_purge_removes_its_audit_trail_only() {
     let now = Utc::now();
     table
         .append(vec![
-            ("gone".to_string(), event("e1", now, "C", "create", "0", "Observation/1", Some("p"), "u")),
-            ("kept".to_string(), event("e2", now, "C", "create", "0", "Observation/1", Some("p"), "u")),
+            (
+                "gone".to_string(),
+                event(
+                    "e1",
+                    now,
+                    "C",
+                    "create",
+                    "0",
+                    "Observation/1",
+                    Some("p"),
+                    "u",
+                ),
+            ),
+            (
+                "kept".to_string(),
+                event(
+                    "e2",
+                    now,
+                    "C",
+                    "create",
+                    "0",
+                    "Observation/1",
+                    Some("p"),
+                    "u",
+                ),
+            ),
         ])
         .await
         .unwrap();
@@ -389,7 +539,11 @@ async fn a_tenant_purge_removes_its_audit_trail_only() {
     assert_eq!(table.count("gone", &query(&[], 1)).await.unwrap(), 0);
     assert_eq!(table.count("kept", &query(&[], 1)).await.unwrap(), 1);
     assert_eq!(
-        sql_count(&backend, "SELECT count(*) FROM audit_event_ref WHERE tenant_id = 'gone'").await,
+        sql_count(
+            &backend,
+            "SELECT count(*) FROM audit_event_ref WHERE tenant_id = 'gone'"
+        )
+        .await,
         0
     );
 }
@@ -405,30 +559,66 @@ async fn months_without_a_partition_use_the_default_and_roll_over() {
         .map(|i| {
             (
                 "t".to_string(),
-                event(&format!("f{i}"), future + Duration::seconds(i), "C", "create", "0", "Observation/1", Some("p"), "u"),
+                event(
+                    &format!("f{i}"),
+                    future + Duration::seconds(i),
+                    "C",
+                    "create",
+                    "0",
+                    "Observation/1",
+                    Some("p"),
+                    "u",
+                ),
             )
         })
         .collect();
     table.append(events).await.unwrap();
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_default").await, 5);
-    assert_eq!(table.count("t", &query(&[("patient", "p")], 1)).await.unwrap(), 5);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_default").await,
+        5
+    );
+    assert_eq!(
+        table
+            .count("t", &query(&[("patient", "p")], 1))
+            .await
+            .unwrap(),
+        5
+    );
 
     // The partition appears: the rows move into it and stay searchable.
     assert!(table.ensure_partition(month_start(future)).await.unwrap());
     assert!(!table.ensure_partition(month_start(future)).await.unwrap());
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_default").await, 0);
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_ref_default").await, 0);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_default").await,
+        0
+    );
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_ref_default").await,
+        0
+    );
     let name = format!("audit_event_p{}", month_start(future).format("%Y_%m"));
-    assert_eq!(sql_count(&backend, &format!("SELECT count(*) FROM {name}")).await, 5);
-    let found = table.search("t", &query(&[("patient", "p")], 10)).await.unwrap();
+    assert_eq!(
+        sql_count(&backend, &format!("SELECT count(*) FROM {name}")).await,
+        5
+    );
+    let found = table
+        .search("t", &query(&[("patient", "p")], 10))
+        .await
+        .unwrap();
     assert_eq!(found.len(), 5);
     assert_eq!(found[0].id, "f4");
     // New rows of that month go straight to the partition, and it is immutable too.
     table
-        .append(vec![("t".to_string(), event("f9", future, "C", "create", "0", "Observation/1", None, "u"))])
+        .append(vec![(
+            "t".to_string(),
+            event("f9", future, "C", "create", "0", "Observation/1", None, "u"),
+        )])
         .await
         .unwrap();
-    assert_eq!(sql_count(&backend, &format!("SELECT count(*) FROM {name}")).await, 6);
+    assert_eq!(
+        sql_count(&backend, &format!("SELECT count(*) FROM {name}")).await,
+        6
+    );
     let err = backend
         .get_client()
         .await
@@ -443,7 +633,9 @@ async fn months_without_a_partition_use_the_default_and_roll_over() {
     let mut tasks = Vec::new();
     for _ in 0..8 {
         let table = table.clone();
-        tasks.push(tokio::spawn(async move { table.ensure_partition(month).await }));
+        tasks.push(tokio::spawn(
+            async move { table.ensure_partition(month).await },
+        ));
     }
     let mut created = 0;
     for t in tasks {
@@ -482,11 +674,23 @@ async fn retention_archives_then_drops_whole_expired_months() {
     {
         events.push((
             if i % 2 == 0 { "a" } else { "b" }.to_string(),
-            event(&format!("r{i}"), at(when), "C", "create", "0", "Observation/1", Some("p"), "u"),
+            event(
+                &format!("r{i}"),
+                at(when),
+                "C",
+                "create",
+                "0",
+                "Observation/1",
+                Some("p"),
+                "u",
+            ),
         ));
     }
     table.append(events).await.unwrap();
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_default").await, 2);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_default").await,
+        2
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let config = RetentionConfig {
@@ -503,18 +707,47 @@ async fn retention_archives_then_drops_whole_expired_months() {
     lock.release().await;
 
     let report = run_table_once(&table, &config, now).await.unwrap();
-    assert_eq!(report.purged, 4, "two August events and two of the default partition");
-    let names: Vec<String> = table.partitions().await.unwrap().into_iter().map(|p| p.name).collect();
-    assert!(!names.contains(&"audit_event_p2026_08".to_string()), "{names:?}");
-    assert!(names.contains(&"audit_event_p2026_09".to_string()), "{names:?}");
     assert_eq!(
-        sql_count(&backend, "SELECT count(*) FROM pg_class WHERE relname = 'audit_event_ref_p2026_08'").await,
+        report.purged, 4,
+        "two August events and two of the default partition"
+    );
+    let names: Vec<String> = table
+        .partitions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert!(
+        !names.contains(&"audit_event_p2026_08".to_string()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"audit_event_p2026_09".to_string()),
+        "{names:?}"
+    );
+    assert_eq!(
+        sql_count(
+            &backend,
+            "SELECT count(*) FROM pg_class WHERE relname = 'audit_event_ref_p2026_08'"
+        )
+        .await,
         0
     );
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event").await, 3);
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_default").await, 0);
     assert_eq!(
-        sql_count(&backend, "SELECT count(*) FROM audit_event_ref WHERE recorded < '2026-09-01'").await,
+        sql_count(&backend, "SELECT count(*) FROM audit_event").await,
+        3
+    );
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_default").await,
+        0
+    );
+    assert_eq!(
+        sql_count(
+            &backend,
+            "SELECT count(*) FROM audit_event_ref WHERE recorded < '2026-09-01'"
+        )
+        .await,
         0
     );
 
@@ -531,23 +764,36 @@ async fn retention_archives_then_drops_whole_expired_months() {
         .map(|l| {
             let v: Value = serde_json::from_str(l).unwrap();
             assert_eq!(v["resource"]["resourceType"], "AuditEvent");
-            format!("{}/{}", v["tenant"].as_str().unwrap(), v["resource"]["id"].as_str().unwrap())
+            format!(
+                "{}/{}",
+                v["tenant"].as_str().unwrap(),
+                v["resource"]["id"].as_str().unwrap()
+            )
         })
         .collect();
     archived.sort();
     assert_eq!(archived, vec!["a/r0", "a/r6", "b/r1", "b/r5"]);
 
     // Nothing more to do; an unwritable archive stops a run before it drops anything.
-    assert_eq!(run_table_once(&table, &config, now).await.unwrap().purged, 0);
+    assert_eq!(
+        run_table_once(&table, &config, now).await.unwrap().purged,
+        0
+    );
     let blocked = RetentionConfig {
         days: Some(1),
         archive_dir: Some("/proc/hfs-no-such-dir/archive".to_string()),
         ..config.clone()
     };
     assert!(run_table_once(&table, &blocked, now).await.is_err());
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event").await, 3);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event").await,
+        3
+    );
     // No retention configured: a no-op.
-    let off = RetentionConfig { days: None, ..config };
+    let off = RetentionConfig {
+        days: None,
+        ..config
+    };
     assert_eq!(run_table_once(&table, &off, now).await.unwrap().purged, 0);
 }
 
@@ -566,7 +812,16 @@ async fn legacy_events_stay_visible_and_the_backfill_moves_them() {
             .create(
                 &tenant("default"),
                 "AuditEvent",
-                event(&format!("old-{i:02}"), when, "R", "read", "0", "Observation/1", Some("p1"), "u"),
+                event(
+                    &format!("old-{i:02}"),
+                    when,
+                    "R",
+                    "read",
+                    "0",
+                    "Observation/1",
+                    Some("p1"),
+                    "u",
+                ),
                 FhirVersion::default(),
             )
             .await
@@ -578,27 +833,58 @@ async fn legacy_events_stay_visible_and_the_backfill_moves_them() {
         .map(|i| {
             (
                 None,
-                event(&format!("new-{i}"), now - Duration::seconds(10 - i), "C", "create", "0", "Observation/2", Some("p1"), "u"),
+                event(
+                    &format!("new-{i}"),
+                    now - Duration::seconds(10 - i),
+                    "C",
+                    "create",
+                    "0",
+                    "Observation/2",
+                    Some("p1"),
+                    "u",
+                ),
             )
         })
         .collect();
     assert!(store.appends());
     store.append_events(fresh).await.unwrap().unwrap();
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM resources WHERE resource_type = 'AuditEvent'").await, 25);
+    assert_eq!(
+        sql_count(
+            &backend,
+            "SELECT count(*) FROM resources WHERE resource_type = 'AuditEvent'"
+        )
+        .await,
+        25
+    );
     assert!(table.has_legacy_events("default").await.unwrap());
 
     // The union read (HTS's /AuditEvent) sees both sources, newest first.
-    let all = store.search_audit_events(&pairs(&[("_count", "1000")])).await.unwrap();
+    let all = store
+        .search_audit_events(&pairs(&[("_count", "1000")]))
+        .await
+        .unwrap();
     assert_eq!(all.len(), 30);
     assert_eq!(all[0]["id"], "new-4");
     assert_eq!(all[4]["id"], "new-0");
     assert_eq!(all[5]["id"], "old-24");
     assert_eq!(all[29]["id"], "old-00");
-    let top = store.search_audit_events(&pairs(&[("_count", "7")])).await.unwrap();
+    let top = store
+        .search_audit_events(&pairs(&[("_count", "7")]))
+        .await
+        .unwrap();
     assert_eq!(top.len(), 7);
-    assert_eq!(top[6]["id"], "old-23", "{:?}", top.iter().map(|e| e["id"].clone()).collect::<Vec<_>>());
+    assert_eq!(
+        top[6]["id"],
+        "old-23",
+        "{:?}",
+        top.iter().map(|e| e["id"].clone()).collect::<Vec<_>>()
+    );
     let by_patient = store
-        .search_audit_events(&pairs(&[("patient", "Patient/p1"), ("subtype", "read"), ("_count", "100")]))
+        .search_audit_events(&pairs(&[
+            ("patient", "Patient/p1"),
+            ("subtype", "read"),
+            ("_count", "100"),
+        ]))
         .await
         .unwrap();
     assert_eq!(by_patient.len(), 25);
@@ -611,13 +897,27 @@ async fn legacy_events_stay_visible_and_the_backfill_moves_them() {
 
     // The backfill, interrupted after one batch and then resumed.
     let first = table.backfill_legacy(10, Some(1)).await.unwrap();
-    assert_eq!((first.copied, first.purged, first.finished), (10, 10, false));
-    assert_eq!(store.search_audit_events(&pairs(&[("_count", "1000")])).await.unwrap().len(), 30);
+    assert_eq!(
+        (first.copied, first.purged, first.finished),
+        (10, 10, false)
+    );
+    assert_eq!(
+        store
+            .search_audit_events(&pairs(&[("_count", "1000")]))
+            .await
+            .unwrap()
+            .len(),
+        30
+    );
     let rest = table.backfill_legacy(10, None).await.unwrap();
     assert_eq!((rest.copied, rest.purged, rest.finished), (15, 15, true));
     for t in ["resources", "resource_history", "search_index"] {
         assert_eq!(
-            sql_count(&backend, &format!("SELECT count(*) FROM {t} WHERE resource_type = 'AuditEvent'")).await,
+            sql_count(
+                &backend,
+                &format!("SELECT count(*) FROM {t} WHERE resource_type = 'AuditEvent'")
+            )
+            .await,
             0,
             "{t}"
         );
@@ -625,13 +925,28 @@ async fn legacy_events_stay_visible_and_the_backfill_moves_them() {
     assert!(!table.has_legacy_events("default").await.unwrap());
     assert_eq!(table.count("default", &query(&[], 1)).await.unwrap(), 30);
     assert_eq!(
-        sql_count(&backend, &format!("SELECT count(*) FROM hm_schema_migrations WHERE name = '{FORK_AUDIT_BACKFILL}'")).await,
+        sql_count(
+            &backend,
+            &format!(
+                "SELECT count(*) FROM hm_schema_migrations WHERE name = '{FORK_AUDIT_BACKFILL}'"
+            )
+        )
+        .await,
         1
     );
-    assert_eq!(sql_count(&backend, "SELECT copied FROM hm_audit_backfill_state").await, 25);
+    assert_eq!(
+        sql_count(&backend, "SELECT copied FROM hm_audit_backfill_state").await,
+        25
+    );
     // Old months got partitions of their own rather than the default one.
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM audit_event_default").await, 0);
-    let all = store.search_audit_events(&pairs(&[("_count", "1000")])).await.unwrap();
+    assert_eq!(
+        sql_count(&backend, "SELECT count(*) FROM audit_event_default").await,
+        0
+    );
+    let all = store
+        .search_audit_events(&pairs(&[("_count", "1000")]))
+        .await
+        .unwrap();
     assert_eq!(all.len(), 30);
     assert_eq!(all[5]["id"], "old-24");
     let moved = table.read("default", "old-07").await.unwrap().unwrap();
@@ -645,10 +960,16 @@ async fn legacy_events_stay_visible_and_the_backfill_moves_them() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writers_and_the_queued_sink_lose_nothing() {
     let (table, backend) = table_or_skip!("writers");
-    let store: Arc<dyn AuditStorage> =
-        Arc::new(TableAuditStore::new(Arc::clone(&backend), Some("audit".to_string()), "default".to_string()));
+    let store: Arc<dyn AuditStorage> = Arc::new(TableAuditStore::new(
+        Arc::clone(&backend),
+        Some("audit".to_string()),
+        "default".to_string(),
+    ));
     let sink = Arc::new(helios_audit::QueuedSink::new(
-        Arc::new(helios_audit::DatabaseSink::new(store, FhirVersion::default())),
+        Arc::new(helios_audit::DatabaseSink::new(
+            store,
+            FhirVersion::default(),
+        )),
         helios_audit::QueueConfig {
             capacity: 64,
             batch_size: 50,
@@ -678,8 +999,18 @@ async fn concurrent_writers_and_the_queued_sink_lose_nothing() {
     sink.flush().await;
     assert_eq!(sink.pending(), 0);
     assert_eq!(table.count("audit", &query(&[], 1)).await.unwrap(), 2000);
-    assert_eq!(sql_count(&backend, "SELECT count(DISTINCT id) FROM audit_event").await, 2000);
-    assert_eq!(sql_count(&backend, "SELECT count(*) FROM resources WHERE resource_type = 'AuditEvent'").await, 0);
+    assert_eq!(
+        sql_count(&backend, "SELECT count(DISTINCT id) FROM audit_event").await,
+        2000
+    );
+    assert_eq!(
+        sql_count(
+            &backend,
+            "SELECT count(*) FROM resources WHERE resource_type = 'AuditEvent'"
+        )
+        .await,
+        0
+    );
     // The writers took no advisory locks and left no transaction open.
     assert_eq!(
         sql_count(&backend, "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())").await,

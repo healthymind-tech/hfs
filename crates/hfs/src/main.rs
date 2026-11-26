@@ -1128,15 +1128,25 @@ async fn create_audit_postgres_storage(
             );
             if config.backfill {
                 tokio::spawn(async move {
-                    info!("Audit backfill started: moving legacy AuditEvent resources into the audit tables (HFS_AUDIT_BACKFILL)");
+                    info!(
+                        "Audit backfill started: moving legacy AuditEvent resources into the audit tables (HFS_AUDIT_BACKFILL)"
+                    );
                     loop {
                         match table.backfill_legacy(1000, Some(100)).await {
                             Ok(report) if report.finished => {
-                                info!(copied = report.copied, purged = report.purged, "Audit backfill finished: no legacy AuditEvent resources are left; run VACUUM (ANALYZE) on resources, resource_history, search_index and resource_fts");
+                                info!(
+                                    copied = report.copied,
+                                    purged = report.purged,
+                                    "Audit backfill finished: no legacy AuditEvent resources are left; run VACUUM (ANALYZE) on resources, resource_history, search_index and resource_fts"
+                                );
                                 break;
                             }
                             Ok(report) => {
-                                info!(copied = report.copied, purged = report.purged, "Audit backfill progress");
+                                info!(
+                                    copied = report.copied,
+                                    purged = report.purged,
+                                    "Audit backfill progress"
+                                );
                             }
                             Err(e) => {
                                 warn!(error = %e, "Audit backfill paused; retrying in 60 s");

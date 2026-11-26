@@ -377,9 +377,15 @@ where
 {
     let strict = handling == Handling::Strict;
     // `AuditEvent` lives in the dedicated audit store when that is in use.
-    if let Some(bundle) =
-        super::audit_events::search_bundle(state, tenant, compartment, resource_type, &pairs, strict)
-            .await?
+    if let Some(bundle) = super::audit_events::search_bundle(
+        state,
+        tenant,
+        compartment,
+        resource_type,
+        &pairs,
+        strict,
+    )
+    .await?
     {
         return Ok(bundle);
     }
@@ -1200,7 +1206,11 @@ where
 }
 
 /// Builds a type-level search URL from base URL and parameters.
-pub(super) fn build_search_url(base_url: &str, resource_type: &str, params: &SearchParams) -> String {
+pub(super) fn build_search_url(
+    base_url: &str,
+    resource_type: &str,
+    params: &SearchParams,
+) -> String {
     let query = encode_query(params);
     crate::public_url::PublicUrl::parse(base_url)
         .expect("request public base was built from validated configuration")

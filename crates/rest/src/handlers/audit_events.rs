@@ -135,6 +135,66 @@ where
     Ok(event.map(|e| to_stored(tenant, e)))
 }
 
+/// Number of events of the request's tenant in the audit store; `None` when
+/// the store is not in use.
+pub(crate) async fn store_count<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+) -> RestResult<Option<u64>>
+where
+    S: ResourceStorage,
+{
+    let Some(adapter) = state.audit_events() else {
+        return Ok(None);
+    };
+    adapter
+        .reader
+        .count(tenant.tenant_id(), &AuditQuery::default())
+        .await
+        .map(Some)
+        .map_err(read_error)
+}
+
+/// Narrows the CapabilityStatement entry of `AuditEvent` to what the audit
+/// store serves: the supported search parameters, no `_include` /
+/// `_revinclude`, no type-level history. Other entries are left alone.
+pub(crate) fn restrict_capability(entry: &mut serde_json::Value) {
+    if entry.get("type").and_then(|t| t.as_str()) != Some(AUDIT_EVENT) {
+        return;
+    }
+    if let Some(params) = entry.get_mut("searchParam").and_then(|p| p.as_array_mut()) {
+        params.retain(|p| {
+            p.get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| SUPPORTED_SEARCH_PARAMS.contains(&n))
+        });
+        for p in params.iter_mut() {
+            // Only `:not` on tokens is honoured.
+            let token = p.get("type").and_then(|t| t.as_str()) == Some("token")
+                && p.get("name").and_then(|n| n.as_str()) != Some("_id");
+            if let Some(obj) = p.as_object_mut() {
+                obj.remove("extension");
+                if token {
+                    obj.insert(
+                        "extension".to_string(),
+                        serde_json::json!([{
+                            "url": super::capabilities::SEARCH_MODIFIER_EXTENSION_URL,
+                            "valueCode": "not"
+                        }]),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        obj.remove("searchInclude");
+        obj.remove("searchRevInclude");
+    }
+    if let Some(interactions) = entry.get_mut("interaction").and_then(|i| i.as_array_mut()) {
+        interactions.retain(|i| i.get("code").and_then(|c| c.as_str()) != Some("history-type"));
+    }
+}
+
 /// Position of a page in the merged trail.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 struct Cursor {
@@ -358,10 +418,13 @@ where
         shown.push(("_sort".to_string(), sort.to_string()));
     }
     let requested_count = match last("_count") {
-        Some(v) => Some(v.parse::<usize>().map_err(|_| RestError::InvalidParameter {
-            param: "_count".to_string(),
-            message: format!("invalid _count value '{v}'"),
-        })?),
+        Some(v) => Some(
+            v.parse::<usize>()
+                .map_err(|_| RestError::InvalidParameter {
+                    param: "_count".to_string(),
+                    message: format!("invalid _count value '{v}'"),
+                })?,
+        ),
         None => None,
     };
     let count = requested_count
@@ -589,7 +652,11 @@ mod tests {
             res("l2", "2026-11-02T00:00:00Z", false),
         ];
         let m = merge(table.clone(), legacy.clone(), 3, false);
-        assert_eq!(ids(&m.items), vec!["t3", "l3", "l2"], "store first on a tie");
+        assert_eq!(
+            ids(&m.items),
+            vec!["t3", "l3", "l2"],
+            "store first on a tie"
+        );
         assert_eq!(m.last_table.as_ref().map(|k| k.1.as_str()), Some("t3"));
         assert_eq!((m.from_legacy, m.more), (2, true));
         let m = merge(table, legacy, 10, false);
@@ -605,9 +672,39 @@ mod tests {
         let m = merge(asc_t, asc_l, 10, true);
         assert_eq!(ids(&m.items), vec!["l0", "t1", "l2"]);
         let m = merge(Vec::new(), Vec::new(), 5, false);
+        let mut entry = serde_json::json!({
+            "type": "AuditEvent",
+            "interaction": [{"code": "read"}, {"code": "history-instance"}, {"code": "history-type"}, {"code": "search-type"}],
+            "searchParam": [
+                {"name": "_id", "type": "token"}, {"name": "_text", "type": "string"},
+                {"name": "date", "type": "date"}, {"name": "entity-name", "type": "string"},
+                {"name": "outcome", "type": "token", "extension": [{"url": "x", "valueCode": "text"}]}
+            ],
+            "searchInclude": ["AuditEvent:patient"], "searchRevInclude": ["Provenance:target"]
+        });
+        restrict_capability(&mut entry);
+        let names: Vec<&str> = entry["searchParam"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["_id", "date", "outcome"]);
+        assert_eq!(entry["searchParam"][2]["extension"][0]["valueCode"], "not");
+        assert!(entry.get("searchInclude").is_none() && entry.get("searchRevInclude").is_none());
+        assert_eq!(entry["interaction"].as_array().unwrap().len(), 3);
+        let mut other = serde_json::json!({"type": "Patient", "searchInclude": ["x"]});
+        restrict_capability(&mut other);
+        assert_eq!(other["searchInclude"][0], "x");
         assert!(walk_includes("Observation", None));
-        assert!(!walk_includes(AUDIT_EVENT, None), "left out unless asked for");
-        assert!(!walk_includes(AUDIT_EVENT, Some(&["Observation".to_string()])));
+        assert!(
+            !walk_includes(AUDIT_EVENT, None),
+            "left out unless asked for"
+        );
+        assert!(!walk_includes(
+            AUDIT_EVENT,
+            Some(&["Observation".to_string()])
+        ));
         assert!(walk_includes(AUDIT_EVENT, Some(&[AUDIT_EVENT.to_string()])));
         assert!(m.items.is_empty() && m.last_table.is_none() && m.from_legacy == 0 && !m.more);
     }

@@ -131,7 +131,10 @@ impl Fixture {
     }
 
     async fn get(&self, path: &str) -> axum_test::TestResponse {
-        self.server.get(path).add_header(X_TENANT_ID, self.t()).await
+        self.server
+            .get(path)
+            .add_header(X_TENANT_ID, self.t())
+            .await
     }
 
     async fn bundle(&self, path: &str) -> Value {
@@ -153,8 +156,14 @@ impl Fixture {
 
     async fn seed_clinical(&self) {
         for (path, body) in [
-            ("/Patient/p1", json!({"resourceType": "Patient", "id": "p1"})),
-            ("/Patient/p2", json!({"resourceType": "Patient", "id": "p2"})),
+            (
+                "/Patient/p1",
+                json!({"resourceType": "Patient", "id": "p1"}),
+            ),
+            (
+                "/Patient/p2",
+                json!({"resourceType": "Patient", "id": "p2"}),
+            ),
             (
                 "/Observation/o1",
                 json!({"resourceType": "Observation", "id": "o1", "status": "final",
@@ -205,19 +214,30 @@ async fn interactions_land_in_the_audit_tables_and_are_served_from_them() {
     let f = fixture_or_skip!("served", true);
     f.seed_clinical().await;
     f.get("/Observation/o1").await.assert_status_ok();
-    f.get("/Observation?subject=Patient/p1").await.assert_status_ok();
-    f.get("/Observation/missing").await.assert_status(StatusCode::NOT_FOUND);
+    f.get("/Observation?subject=Patient/p1")
+        .await
+        .assert_status_ok();
+    f.get("/Observation/missing")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
 
     // Nothing of the audit trail is in the resource tables.
     assert_eq!(
-        f.sql_count("SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent'").await,
+        f.sql_count(
+            "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent'"
+        )
+        .await,
         0
     );
     assert_eq!(
         f.sql_count("SELECT count(*) FROM search_index WHERE tenant_id = $1 AND resource_type = 'AuditEvent'").await,
         0
     );
-    assert_eq!(f.sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1").await, 7);
+    assert_eq!(
+        f.sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1")
+            .await,
+        7
+    );
 
     let all = f.bundle("/AuditEvent?_count=100").await;
     assert_eq!(all["resourceType"], "Bundle");
@@ -241,7 +261,9 @@ async fn interactions_land_in_the_audit_tables_and_are_served_from_them() {
         .find(|e| e["entity"].to_string().contains("Observation/o1") && e["action"] != "R")
         .unwrap();
     assert!(
-        create["meta"]["profile"].to_string().contains("IHE.BasicAudit"),
+        create["meta"]["profile"]
+            .to_string()
+            .contains("IHE.BasicAudit"),
         "the BALP profile claim survives storage: {create}"
     );
     let full_urls: Vec<&str> = all["entry"]
@@ -250,22 +272,46 @@ async fn interactions_land_in_the_audit_tables_and_are_served_from_them() {
         .iter()
         .filter_map(|e| e["fullUrl"].as_str())
         .collect();
-    assert!(full_urls[0].starts_with(&format!("{BASE}/AuditEvent/")), "{full_urls:?}");
+    assert!(
+        full_urls[0].starts_with(&format!("{BASE}/AuditEvent/")),
+        "{full_urls:?}"
+    );
 
     // Criteria of the fixed parameter set.
     let count = |v: &Value| entries(v).len();
-    assert_eq!(count(&f.bundle("/AuditEvent?patient=Patient/p1&_count=100").await), 4);
+    assert_eq!(
+        count(&f.bundle("/AuditEvent?patient=Patient/p1&_count=100").await),
+        4
+    );
     assert_eq!(count(&f.bundle("/AuditEvent?patient=p2").await), 2);
-    assert_eq!(count(&f.bundle("/AuditEvent?entity=Observation/o1").await), 2);
-    assert_eq!(count(&f.bundle("/AuditEvent?entity=Observation/o1&action=R").await), 1);
+    assert_eq!(
+        count(&f.bundle("/AuditEvent?entity=Observation/o1").await),
+        2
+    );
+    assert_eq!(
+        count(&f.bundle("/AuditEvent?entity=Observation/o1&action=R").await),
+        1
+    );
     assert_eq!(count(&f.bundle("/AuditEvent?outcome=4").await), 1);
     assert_eq!(count(&f.bundle("/AuditEvent?outcome:not=0").await), 1);
     // The Observation search, and every AuditEvent search made so far.
-    assert_eq!(count(&f.bundle("/AuditEvent?subtype=search-type&_count=100").await), 8);
-    assert_eq!(count(&f.bundle("/AuditEvent?type=rest&date=ge2020&_count=100").await), 15);
+    assert_eq!(
+        count(&f.bundle("/AuditEvent?subtype=search-type&_count=100").await),
+        8
+    );
+    assert_eq!(
+        count(
+            &f.bundle("/AuditEvent?type=rest&date=ge2020&_count=100")
+                .await
+        ),
+        15
+    );
     assert_eq!(count(&f.bundle("/AuditEvent?date=lt2020").await), 0);
     let by_id = f
-        .bundle(&format!("/AuditEvent?_id={}", create["id"].as_str().unwrap()))
+        .bundle(&format!(
+            "/AuditEvent?_id={}",
+            create["id"].as_str().unwrap()
+        ))
         .await;
     assert_eq!(entries(&by_id)[0]["id"], create["id"]);
 
@@ -280,7 +326,9 @@ async fn interactions_land_in_the_audit_tables_and_are_served_from_them() {
     assert!(!entries(&resp.json::<Value>()).is_empty());
 
     // Counts.
-    let n = f.sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1").await;
+    let n = f
+        .sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1")
+        .await;
     let summary = f.bundle("/AuditEvent?_summary=count").await;
     assert_eq!(summary["total"], n);
     assert!(summary.get("entry").is_none());
@@ -298,7 +346,9 @@ async fn search_pages_through_the_whole_trail_in_both_orders() {
     }
     for sort in ["-date", "date"] {
         let mut seen: Vec<String> = Vec::new();
-        let mut url = Some(format!("/AuditEvent?entity=Observation/o1&_sort={sort}&_count=5"));
+        let mut url = Some(format!(
+            "/AuditEvent?entity=Observation/o1&_sort={sort}&_count=5"
+        ));
         let mut pages = 0;
         while let Some(u) = url {
             let page = f.bundle(&u).await;
@@ -319,7 +369,10 @@ async fn search_pages_through_the_whole_trail_in_both_orders() {
         assert_eq!(unique.len(), 13, "no event twice ({sort})");
         let first = f.bundle(&format!("/AuditEvent/{}", seen[0])).await;
         let last = f.bundle(&format!("/AuditEvent/{}", seen[12])).await;
-        let (a, b) = (first["recorded"].as_str().unwrap(), last["recorded"].as_str().unwrap());
+        let (a, b) = (
+            first["recorded"].as_str().unwrap(),
+            last["recorded"].as_str().unwrap(),
+        );
         if sort == "date" {
             assert!(a <= b);
         } else {
@@ -327,15 +380,23 @@ async fn search_pages_through_the_whole_trail_in_both_orders() {
         }
     }
     // A cursor of another search type is refused, not silently restarted.
-    f.get("/AuditEvent?_cursor=bogus").await.assert_status(StatusCode::BAD_REQUEST);
+    f.get("/AuditEvent?_cursor=bogus")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn unsupported_parameters_are_reported_or_refused() {
     let f = fixture_or_skip!("params", true);
     f.seed_clinical().await;
-    let lenient = f.bundle("/AuditEvent?entity-name=x&_content=y&action=C&_count=50").await;
-    assert_eq!(entries(&lenient).len(), 4, "the supported criterion still applies");
+    let lenient = f
+        .bundle("/AuditEvent?entity-name=x&_content=y&action=C&_count=50")
+        .await;
+    assert_eq!(
+        entries(&lenient).len(),
+        4,
+        "the supported criterion still applies"
+    );
     let outcome = lenient["entry"]
         .as_array()
         .unwrap()
@@ -343,9 +404,15 @@ async fn unsupported_parameters_are_reported_or_refused() {
         .find(|e| e["search"]["mode"] == "outcome")
         .expect("a warning entry");
     let text = outcome["resource"].to_string();
-    assert!(text.contains("entity-name") && text.contains("_content"), "{text}");
+    assert!(
+        text.contains("entity-name") && text.contains("_content"),
+        "{text}"
+    );
     let self_link = lenient["link"][0]["url"].as_str().unwrap();
-    assert!(self_link.contains("action=C") && !self_link.contains("entity-name"), "{self_link}");
+    assert!(
+        self_link.contains("action=C") && !self_link.contains("entity-name"),
+        "{self_link}"
+    );
 
     let strict = f
         .server
@@ -354,10 +421,18 @@ async fn unsupported_parameters_are_reported_or_refused() {
         .add_header(PREFER, HeaderValue::from_static("handling=strict"))
         .await;
     strict.assert_status(StatusCode::BAD_REQUEST);
-    f.get("/AuditEvent?date=whenever").await.assert_status(StatusCode::BAD_REQUEST);
-    f.get("/AuditEvent?patient:identifier=x").await.assert_status(StatusCode::BAD_REQUEST);
+    f.get("/AuditEvent?date=whenever")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    f.get("/AuditEvent?patient:identifier=x")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
     let sorted = f.bundle("/AuditEvent?_sort=outcome").await;
-    assert!(sorted.to_string().contains("_sort value 'outcome' is not supported"));
+    assert!(
+        sorted
+            .to_string()
+            .contains("_sort value 'outcome' is not supported")
+    );
     f.server
         .get("/AuditEvent?_sort=outcome")
         .add_header(X_TENANT_ID, f.t())
@@ -381,15 +456,30 @@ async fn events_are_readable_by_id_and_immutable_through_the_api() {
     let vread = f.get(&format!("/AuditEvent/{id}/_history/1")).await;
     vread.assert_status_ok();
     assert_eq!(vread.json::<Value>()["id"], id);
-    f.get(&format!("/AuditEvent/{id}/_history/2")).await.assert_status(StatusCode::NOT_FOUND);
-    f.get("/AuditEvent/no-such-event").await.assert_status(StatusCode::NOT_FOUND);
+    f.get(&format!("/AuditEvent/{id}/_history/2"))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    f.get("/AuditEvent/no-such-event")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
 
     let mut tampered = event.clone();
     tampered["outcome"] = json!("8");
     for resp in [
-        f.server.put(&format!("/AuditEvent/{id}")).add_header(X_TENANT_ID, f.t()).json(&tampered).await,
-        f.server.delete(&format!("/AuditEvent/{id}")).add_header(X_TENANT_ID, f.t()).await,
-        f.server.post("/AuditEvent").add_header(X_TENANT_ID, f.t()).json(&tampered).await,
+        f.server
+            .put(&format!("/AuditEvent/{id}"))
+            .add_header(X_TENANT_ID, f.t())
+            .json(&tampered)
+            .await,
+        f.server
+            .delete(&format!("/AuditEvent/{id}"))
+            .add_header(X_TENANT_ID, f.t())
+            .await,
+        f.server
+            .post("/AuditEvent")
+            .add_header(X_TENANT_ID, f.t())
+            .json(&tampered)
+            .await,
     ] {
         assert!(
             resp.status_code().is_client_error(),
@@ -400,7 +490,10 @@ async fn events_are_readable_by_id_and_immutable_through_the_api() {
     let again = f.get(&format!("/AuditEvent/{id}")).await.json::<Value>();
     assert_eq!(again, event);
     assert_eq!(
-        f.sql_count("SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent'").await,
+        f.sql_count(
+            "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent'"
+        )
+        .await,
         0
     );
 }
@@ -426,7 +519,9 @@ async fn a_tenant_sees_only_its_own_trail() {
     assert_eq!(entries(&mine).len(), 2);
     assert_eq!(entries(&theirs).len(), 1);
     let their_id = entries(&theirs)[0]["id"].as_str().unwrap().to_string();
-    f.get(&format!("/AuditEvent/{their_id}")).await.assert_status(StatusCode::NOT_FOUND);
+    f.get(&format!("/AuditEvent/{their_id}"))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
     f.server
         .get(&format!("/AuditEvent/{their_id}"))
         .add_header(X_TENANT_ID, other_h())
@@ -440,7 +535,8 @@ async fn events_written_before_the_tables_stay_visible_in_one_trail() {
     let ctx = TenantContext::new(TenantId::new(&f.tenant), TenantPermissions::full_access());
     // The trail as the previous layout left it: AuditEvent resources.
     for i in 0..9 {
-        let recorded = chrono::Utc::now() - chrono::Duration::days(30) + chrono::Duration::minutes(i);
+        let recorded =
+            chrono::Utc::now() - chrono::Duration::days(30) + chrono::Duration::minutes(i);
         f.backend
             .create(
                 &ctx,
@@ -462,7 +558,9 @@ async fn events_written_before_the_tables_stay_visible_in_one_trail() {
     }
     f.seed_clinical().await; // 4 new events, 2 of them about Patient/p1
 
-    let summary = f.bundle("/AuditEvent?patient=Patient/p1&_summary=count").await;
+    let summary = f
+        .bundle("/AuditEvent?patient=Patient/p1&_summary=count")
+        .await;
     assert_eq!(summary["total"], 11);
 
     let mut seen = Vec::new();
@@ -481,11 +579,24 @@ async fn events_written_before_the_tables_stay_visible_in_one_trail() {
     // by patient is itself an event about that patient); the page requests
     // themselves are newer than the first page and so never appear.
     assert_eq!(seen.len(), 12);
-    assert!(seen[..3].iter().all(|id| !id.starts_with("old-")), "new events first: {seen:?}");
-    assert_eq!(&seen[3..], ["old-8", "old-7", "old-6", "old-5", "old-4", "old-3", "old-2", "old-1", "old-0"]);
+    assert!(
+        seen[..3].iter().all(|id| !id.starts_with("old-")),
+        "new events first: {seen:?}"
+    );
+    assert_eq!(
+        &seen[3..],
+        [
+            "old-8", "old-7", "old-6", "old-5", "old-4", "old-3", "old-2", "old-1", "old-0"
+        ]
+    );
 
-    let asc = f.bundle("/AuditEvent?patient=Patient/p1&_sort=date&_count=3").await;
-    let ids: Vec<&str> = entries(&asc).iter().map(|e| e["id"].as_str().unwrap()).collect();
+    let asc = f
+        .bundle("/AuditEvent?patient=Patient/p1&_sort=date&_count=3")
+        .await;
+    let ids: Vec<&str> = entries(&asc)
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids, ["old-0", "old-1", "old-2"]);
 
     // Legacy events are still read by id, and still cannot be changed.
@@ -517,7 +628,11 @@ async fn compartment_walks_leave_the_audit_trail_out_unless_asked() {
             t
         };
         let everything = f.bundle("/Patient/p1/$everything").await;
-        assert_eq!(types(&everything), ["Observation", "Patient"], "table={table}");
+        assert_eq!(
+            types(&everything),
+            ["Observation", "Patient"],
+            "table={table}"
+        );
         let wildcard = f.bundle("/Patient/p1/*").await;
         assert_eq!(types(&wildcard), ["Observation"], "table={table}");
 
@@ -527,7 +642,9 @@ async fn compartment_walks_leave_the_audit_trail_out_unless_asked() {
         assert!(events.len() >= 3, "table={table}: {explicit}");
         assert!(events.iter().all(|e| e["resourceType"] == "AuditEvent"));
         assert!(
-            events.iter().all(|e| e["entity"].to_string().contains("Patient/p1")),
+            events
+                .iter()
+                .all(|e| e["entity"].to_string().contains("Patient/p1")),
             "only this patient's events (table={table})"
         );
     }
@@ -537,15 +654,129 @@ async fn compartment_walks_leave_the_audit_trail_out_unless_asked() {
 async fn the_resource_store_escape_hatch_keeps_the_previous_behaviour() {
     let f = fixture_or_skip!("resource", false);
     f.seed_clinical().await;
-    assert_eq!(f.sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1").await, 0);
     assert_eq!(
-        f.sql_count("SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent'").await,
+        f.sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1")
+            .await,
+        0
+    );
+    assert_eq!(
+        f.sql_count(
+            "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'AuditEvent'"
+        )
+        .await,
         4
     );
     let all = f.bundle("/AuditEvent?_count=100").await;
     assert_eq!(entries(&all).len(), 4);
     assert!(
-        entries(&all)[0]["meta"]["profile"].to_string().contains(balp::profiles::PATIENT_UPDATE)
-            || entries(&all)[0]["meta"]["profile"].to_string().contains("IHE.BasicAudit")
+        entries(&all)[0]["meta"]["profile"]
+            .to_string()
+            .contains(balp::profiles::PATIENT_UPDATE)
+            || entries(&all)[0]["meta"]["profile"]
+                .to_string()
+                .contains("IHE.BasicAudit")
     );
+}
+
+#[tokio::test]
+async fn history_capabilities_and_counts_reflect_the_audit_store() {
+    let f = fixture_or_skip!("surface", true);
+    f.seed_clinical().await;
+    f.get("/Observation/o1").await.assert_status_ok();
+
+    // Reference + another criterion (the lookup-driven plan with a probe filter).
+    let reads = f
+        .bundle("/AuditEvent?patient=Patient/p1&action=R&_count=50")
+        .await;
+    assert_eq!(entries(&reads).len(), 1);
+    let writes = f
+        .bundle("/AuditEvent?patient=Patient/p1&action=C&outcome=0&subtype=create&_total=accurate")
+        .await;
+    assert_eq!(entries(&writes).len(), 2);
+    assert_eq!(writes["total"], 2);
+    assert_eq!(
+        entries(&f.bundle("/AuditEvent?outcome:not=0").await).len(),
+        0
+    );
+    f.get("/Observation/none")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(
+        entries(&f.bundle("/AuditEvent?outcome:not=0").await).len(),
+        1
+    );
+
+    // Instance history: the one version of an immutable event.
+    let id = entries(&reads)[0]["id"].as_str().unwrap().to_string();
+    let history = f.bundle(&format!("/AuditEvent/{id}/_history")).await;
+    assert_eq!(history["type"], "history");
+    let versions = history["entry"].as_array().unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0]["resource"]["id"], id.as_str());
+    assert_eq!(versions[0]["resource"]["meta"]["versionId"], "1");
+    assert_eq!(versions[0]["request"]["method"], "POST");
+    f.get("/AuditEvent/nope/_history")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    // The CapabilityStatement advertises what the store answers, no more.
+    let metadata = f.bundle("/metadata").await;
+    let audit = metadata["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["type"] == "AuditEvent")
+        .expect("AuditEvent entry");
+    let mut names: Vec<&str> = audit["searchParam"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "_id",
+            "_lastUpdated",
+            "action",
+            "agent",
+            "date",
+            "entity",
+            "outcome",
+            "patient",
+            "subtype",
+            "type"
+        ]
+    );
+    assert!(audit.get("searchRevInclude").is_none() && audit.get("searchInclude").is_none());
+    let codes: Vec<&str> = audit["interaction"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["read", "vread", "history-instance", "search-type"]);
+    let patient = metadata["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["type"] == "Patient")
+        .unwrap();
+    assert!(
+        patient["searchParam"].as_array().unwrap().len() > 10,
+        "other types are untouched"
+    );
+
+    // The console's per-type totals count the store's events.
+    let n = f
+        .sql_count("SELECT count(*) FROM audit_event WHERE tenant_id = $1")
+        .await;
+    let counts = f
+        .bundle("/console/metrics/resource-counts?types=AuditEvent,Patient")
+        .await;
+    let series = counts["series"].as_array().unwrap();
+    let total = |t: &str| series.iter().find(|s| s["resource_type"] == t).unwrap()["total"].clone();
+    assert!(total("AuditEvent").as_i64().unwrap() >= n, "{counts}");
+    assert_eq!(total("Patient"), 2);
 }

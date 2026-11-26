@@ -39,7 +39,7 @@ use crate::state::AppState;
 /// FHIR R4/R5 `CapabilityStatement.rest.resource.searchParam` has no native
 /// `modifier` element, so the modifiers a backend actually honors are carried as
 /// repeating `valueCode` extensions on the `searchParam` entry.
-const SEARCH_MODIFIER_EXTENSION_URL: &str =
+pub(super) const SEARCH_MODIFIER_EXTENSION_URL: &str =
     "http://heliossoftware.com/fhir/StructureDefinition/capabilitystatement-search-modifier";
 
 /// Handler for the capabilities interaction.
@@ -223,6 +223,14 @@ where
                 &revinclude_by_target,
                 version,
             )
+        })
+        .map(|mut entry| {
+            // `AuditEvent` served from the dedicated audit store answers a
+            // fixed parameter set and has no type-level history.
+            if state.audit_events().is_some() {
+                super::audit_events::restrict_capability(&mut entry);
+            }
+            entry
         })
         .collect();
 

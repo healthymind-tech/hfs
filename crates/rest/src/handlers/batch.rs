@@ -3870,11 +3870,12 @@ fn rewrite_conditional_references(
     }
 }
 
+#[cfg(test)]
 fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), EntryParseError> {
     parse_bundle_entry_with(entry, entry.get("resource").cloned())
 }
 
-/// [`parse_bundle_entry`] for a caller that owns the entry and needs its
+/// Parses a Bundle entry for a caller that owns the entry and needs its
 /// resource only in the parsed form: the resource is moved out of `entry`
 /// (which keeps `"resource": null`) instead of copied. `request` and
 /// `fullUrl` stay in place.
@@ -3885,7 +3886,7 @@ fn parse_bundle_entry_taking(
     parse_bundle_entry_with(entry, resource)
 }
 
-/// [`parse_bundle_entry`] with the entry's resource handed in.
+/// Parses a Bundle entry with the entry's resource handed in.
 fn parse_bundle_entry_with(
     entry: &Value,
     resource: Option<Value>,

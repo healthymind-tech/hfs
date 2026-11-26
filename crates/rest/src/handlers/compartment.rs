@@ -282,7 +282,10 @@ where
             // The audit trail is not part of the chart: `AuditEvent` is
             // searched only when `_type` names it (or the deployment opted in).
             .filter(|target_type| {
-                crate::handlers::audit_events::walk_includes(target_type, requested_types.as_deref())
+                crate::handlers::audit_events::walk_includes(
+                    target_type,
+                    requested_types.as_deref(),
+                )
             })
             .collect();
 

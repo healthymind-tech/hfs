@@ -185,7 +185,9 @@ async fn open_dedicated(url: &str, audit: &AuditConfig) -> anyhow::Result<Stores
                 if let Err(e) = store.table().ensure_partitions(chrono::Utc::now(), 2).await {
                     tracing::warn!(error = %e, "Could not create audit partitions");
                 }
-                tracing::info!("HTS audit events go to the dedicated audit tables (HTS_AUDIT_STORE=table)");
+                tracing::info!(
+                    "HTS audit events go to the dedicated audit tables (HTS_AUDIT_STORE=table)"
+                );
                 return Ok((
                     store.clone(),
                     store,

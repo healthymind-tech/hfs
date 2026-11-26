@@ -103,7 +103,13 @@ pub fn split_reference(reference: &str) -> Option<(String, String)> {
     Some((ty.to_string(), id.to_string()))
 }
 
-fn refs_of(node: Option<&Value>, key: &str, kind: RefKind, out: &mut Vec<AuditRef>) {
+fn refs_of(
+    node: Option<&Value>,
+    key: &str,
+    kind: RefKind,
+    skip: Option<&str>,
+    out: &mut Vec<AuditRef>,
+) {
     for item in node.and_then(Value::as_array).into_iter().flatten() {
         let Some(target) = item.get(key) else {
             continue;
@@ -111,6 +117,7 @@ fn refs_of(node: Option<&Value>, key: &str, kind: RefKind, out: &mut Vec<AuditRe
         if let Some((ref_type, ref_id)) = target
             .get("reference")
             .and_then(Value::as_str)
+            .filter(|r| Some(*r) != skip)
             .and_then(split_reference)
         {
             out.push(AuditRef {
@@ -160,8 +167,27 @@ impl AuditRow {
             .unwrap_or(now);
         let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
         let mut refs = Vec::new();
-        refs_of(event.get("entity"), "what", RefKind::Entity, &mut refs);
-        refs_of(event.get("agent"), "who", RefKind::Agent, &mut refs);
+        refs_of(
+            event.get("entity"),
+            "what",
+            RefKind::Entity,
+            None,
+            &mut refs,
+        );
+        // The server itself is an agent of every event it records
+        // (`source.observer`): a lookup row for it would select nothing.
+        let observer = event
+            .get("source")
+            .and_then(|s| s.get("observer"))
+            .and_then(|o| o.get("reference"))
+            .and_then(Value::as_str);
+        refs_of(
+            event.get("agent"),
+            "who",
+            RefKind::Agent,
+            observer,
+            &mut refs,
+        );
         let mut seen = std::collections::HashSet::new();
         refs.retain(|r| seen.insert(r.clone()));
         Self {
@@ -312,7 +338,10 @@ pub struct AuditQuery {
 impl AuditQuery {
     /// Whether the query has no criteria at all.
     pub fn is_unfiltered(&self) -> bool {
-        self.ids.is_none() && self.dates.is_empty() && self.refs.is_empty() && self.tokens.is_empty()
+        self.ids.is_none()
+            && self.dates.is_empty()
+            && self.refs.is_empty()
+            && self.tokens.is_empty()
     }
 }
 
@@ -383,7 +412,11 @@ pub trait AuditEventReader: Send + Sync + 'static {
     async fn count(&self, tenant: &str, query: &AuditQuery) -> Result<u64, AuditReadError>;
 
     /// One event by id.
-    async fn read(&self, tenant: &str, id: &str) -> Result<Option<StoredAuditEvent>, AuditReadError>;
+    async fn read(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<StoredAuditEvent>, AuditReadError>;
 }
 
 /// The criteria of a request, parsed by [`parse_search`].
@@ -473,8 +506,11 @@ fn parse_date_bound(name: &str, value: &str) -> Result<DateBound, AuditReadError
         Some("le") => (DatePrefix::Le, &value[2..]),
         _ => (DatePrefix::Eq, value),
     };
-    let (lo, hi) = parse_date_range(rest)
-        .ok_or_else(|| bad(format!("invalid date value {value:?} for parameter {name:?}")))?;
+    let (lo, hi) = parse_date_range(rest).ok_or_else(|| {
+        bad(format!(
+            "invalid date value {value:?} for parameter {name:?}"
+        ))
+    })?;
     Ok(DateBound { prefix, lo, hi })
 }
 
@@ -740,8 +776,8 @@ mod tests {
                 ("e", "Patient", "p1"),
                 ("e", "", "req-1"),
                 ("a", "", "user-7"),
-                ("a", "Device", "hfs"),
-            ]
+            ],
+            "the observing server's own agent entry is not indexed"
         );
         // The stored JSON is the event, untouched.
         assert_eq!(row.event, event());
@@ -796,7 +832,14 @@ mod tests {
             parse_date_range("2026-11-02T10:00:00").unwrap(),
             (t("2026-11-02T10:00:00Z"), t("2026-11-02T10:00:01Z"))
         );
-        for bad in ["", "20", "2026-13", "2026-02-30", "yesterday", "2026-11-02Tnoon"] {
+        for bad in [
+            "",
+            "20",
+            "2026-13",
+            "2026-02-30",
+            "yesterday",
+            "2026-11-02Tnoon",
+        ] {
             assert!(parse_date_range(bad).is_none(), "{bad}");
         }
     }
@@ -851,10 +894,7 @@ mod tests {
             [("_id:missing", "true")],
         ] {
             assert!(
-                matches!(
-                    parse_search(&p(&pairs)),
-                    Err(AuditReadError::BadRequest(_))
-                ),
+                matches!(parse_search(&p(&pairs)), Err(AuditReadError::BadRequest(_))),
                 "{pairs:?}"
             );
         }
@@ -866,7 +906,10 @@ mod tests {
         let m = |pairs: &[(&str, &str)]| matches(&parse_search(&p(pairs)).unwrap().query, &row);
         assert!(m(&[]));
         assert!(m(&[("date", "2026-11-20")]));
-        assert!(m(&[("date", "ge2026-11-20T10:11:12Z"), ("date", "le2026-11-20")]));
+        assert!(m(&[
+            ("date", "ge2026-11-20T10:11:12Z"),
+            ("date", "le2026-11-20")
+        ]));
         assert!(!m(&[("date", "gt2026-11-20")]));
         assert!(!m(&[("date", "lt2026-11-20")]));
         assert!(m(&[("date", "ne2026-11-21")]));
@@ -878,7 +921,10 @@ mod tests {
         assert!(m(&[("entity", "o1")]));
         assert!(!m(&[("entity", "Encounter/o1")]));
         assert!(!m(&[("entity", "Device/hfs")]), "the device is an agent");
-        assert!(m(&[("agent", "Device/hfs")]));
+        assert!(
+            !m(&[("agent", "Device/hfs")]),
+            "the observer is not indexed as an agent"
+        );
         assert!(m(&[("agent", "user-7")]), "identifier value");
         assert!(m(&[("entity", "req-1")]), "X-Request-Id entity");
         assert!(m(&[("action", "C")]));
@@ -894,7 +940,10 @@ mod tests {
         )]));
         assert!(!m(&[("type", "http://other|rest")]));
         assert!(m(&[("subtype", "create")]));
-        assert!(m(&[("subtype", "http://hl7.org/fhir/restful-interaction|")]));
+        assert!(m(&[(
+            "subtype",
+            "http://hl7.org/fhir/restful-interaction|"
+        )]));
         assert!(!m(&[("subtype", "delete")]));
         assert!(m(&[("_id", "0193a5c0-0000-7000-8000-000000000001,zz")]));
         assert!(!m(&[("_id", "zz")]));

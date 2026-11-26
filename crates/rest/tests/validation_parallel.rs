@@ -31,7 +31,7 @@ fn service(mode: &str) -> Arc<ValidationService> {
 fn untidy_patient(n: usize) -> Value {
     json!({
         "resourceType": "Patient",
-        "active": n % 2 == 0,
+        "active": n.is_multiple_of(2),
         "name": [{ "family": format!("Family{n}"), "given": [] }],
         "telecom": [],
         "address": [{ "city": "Taipei", "line": [], "period": {} }]
@@ -41,7 +41,7 @@ fn untidy_patient(n: usize) -> Value {
 fn tidy_patient(n: usize) -> Value {
     json!({
         "resourceType": "Patient",
-        "active": n % 2 == 0,
+        "active": n.is_multiple_of(2),
         "name": [{ "family": format!("Family{n}") }]
     })
 }

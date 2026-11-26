@@ -433,7 +433,7 @@ impl ValidationLog {
                 lines_suppressed: state.suppressed,
             })
             .collect();
-        counts.sort_by(|a, b| b.issues.cmp(&a.issues));
+        counts.sort_by_key(|c| std::cmp::Reverse(c.issues));
         counts
     }
 
@@ -514,7 +514,7 @@ impl Inner {
             .into_iter()
             .filter(|(_, state)| state.suppressed > 0)
             .collect();
-        held.sort_by(|a, b| b.1.issues.cmp(&a.1.issues));
+        held.sort_by_key(|h| std::cmp::Reverse(h.1.issues));
         let mut lines = held.len();
         for (key, state) in held {
             warn!(
