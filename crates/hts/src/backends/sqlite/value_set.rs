@@ -70,11 +70,38 @@ use super::SqliteTerminologyBackend;
 // typical operation imports happen at startup and the cache is then stable
 // for the life of the process, so the cost amortises over millions of
 // subsequent requests.
-type SystemIdCacheMap = HashMap<String, (String, Option<String>)>;
+//
+// The map is process-wide but its entries belong to one database each (see
+// `database_key`): a process may hold several — the main store and the
+// `tx-resource` overlays, an embedded HTS next to a standalone one, the test
+// apps of one test binary — and the row a URL resolves to in one says
+// nothing about another.
+type SystemIdCacheMap = HashMap<String, HashMap<String, (String, Option<String>)>>;
 static SYSTEM_ID_CACHE: OnceLock<RwLock<SystemIdCacheMap>> = OnceLock::new();
 
 fn cs_id_cache() -> &'static RwLock<SystemIdCacheMap> {
     SYSTEM_ID_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// The per-connection table an in-memory database's connections carry their
+/// database's id in (see [`database_key`]).
+pub(super) const MEMORY_DB_IDENTITY_TABLE: &str = "hts_db_identity";
+
+/// Identifies the database behind `conn` among the databases of this
+/// process: the file path, or for an in-memory database (which has none) the
+/// id its pool gave every connection in [`MEMORY_DB_IDENTITY_TABLE`]. A
+/// connection with neither — an in-memory one opened outside the backend's
+/// pool — gets the empty key, shared by all such connections.
+fn database_key(conn: &Connection) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match conn.path() {
+        Some(path) if !path.is_empty() => Cow::Borrowed(path),
+        _ => conn
+            .prepare_cached(&format!("SELECT id FROM temp.{MEMORY_DB_IDENTITY_TABLE}"))
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|id| Cow::Owned(format!("memory:{id}")))
+            .unwrap_or(Cow::Borrowed("")),
+    }
 }
 
 /// Truncate a URL to at most 80 characters for `hts::probe` log labels,
@@ -103,8 +130,8 @@ pub(crate) fn invalidate_cs_id_cache() {
 
 /// Resolve `system_id` for a CodeSystem canonical URL, preferring rows that
 /// actually have concepts (skipping empty stubs imported by terminology
-/// packages). Uses a process-wide cache to avoid the EXISTS subquery on every
-/// request.
+/// packages). Uses a process-wide cache (per database) to avoid the EXISTS
+/// subquery on every request.
 fn resolve_system_id_cached(conn: &Connection, url: &str) -> Result<Option<String>, HtsError> {
     if let Some(rec) = resolve_system_id_with_version_cached(conn, url)? {
         Ok(Some(rec.0))
@@ -120,8 +147,9 @@ fn resolve_system_id_with_version_cached(
     conn: &Connection,
     url: &str,
 ) -> Result<Option<(String, Option<String>)>, HtsError> {
+    let database = database_key(conn);
     if let Ok(read) = cs_id_cache().read() {
-        if let Some(rec) = read.get(url) {
+        if let Some(rec) = read.get(database.as_ref()).and_then(|urls| urls.get(url)) {
             return Ok(Some(rec.clone()));
         }
     }
@@ -161,7 +189,9 @@ fn resolve_system_id_with_version_cached(
 
     if let Some(ref rec) = row {
         if let Ok(mut w) = cs_id_cache().write() {
-            w.insert(url.to_owned(), rec.clone());
+            w.entry(database.into_owned())
+                .or_default()
+                .insert(url.to_owned(), rec.clone());
         }
     }
 

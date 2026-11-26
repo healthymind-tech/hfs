@@ -315,9 +315,7 @@ mod set_current {
     use tower::ServiceExt;
 
     const ADMIN_PASSWORD: &str = "expand-cache-test-password";
-    // URLs of this test's own: the SQLite backend resolves a CodeSystem url
-    // through a process-wide cache, and the other tests of this binary store
-    // one version under theirs.
+    // Two versions of a CodeSystem, under URLs of this test's own.
     const PIN_CS_URL: &str = "http://hts.test/inval-pin/cs";
     const PIN_VS_URL: &str = "http://hts.test/inval-pin/vs";
     const PIN_IMPLICIT_VS: &str = "http://hts.test/inval-pin/cs%3Ffhir_vs";

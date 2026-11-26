@@ -872,7 +872,15 @@ impl SqliteTerminologyBackend {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let uri = format!("file:hts_mem_{id}?mode=memory&cache=shared");
 
-        let manager = SqliteConnectionManager::file(&uri);
+        // An in-memory database has no path to tell it from the others of
+        // this process: every connection carries the id instead (see
+        // `value_set::database_key`).
+        let manager = SqliteConnectionManager::file(&uri).with_init(move |conn| {
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {table} AS SELECT {id} AS id",
+                table = value_set::MEMORY_DB_IDENTITY_TABLE
+            ))
+        });
         let pool = Pool::builder()
             .max_size(4)
             .build(manager)
